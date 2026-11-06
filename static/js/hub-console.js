@@ -1,7 +1,7 @@
 // Console entry point: top bar, layout, session polling and wiring of all panels.
 import { hubApi } from './hub-api.js';
-import { state, prefs, savePrefs, on, emit, reloadProfiles } from './console-state.js';
-import { $, $$, toast, copyText, openModal, initModalSystem } from './ui-kit.js';
+import { state, prefs, savePrefs, on, emit, setHubConnected, reloadProfiles } from './console-state.js';
+import { $, $$, toast, copyText, openModal, initModalSystem, icon } from './ui-kit.js';
 import { initSessionLauncher, expandLauncher } from './session-launcher.js';
 import { initSessionWorkspace } from './session-workspace.js';
 import { initEventFeed } from './event-feed.js';
@@ -14,7 +14,7 @@ const POLL_HIDDEN_MS = 10000;
 let pollTimer = 0;
 let polling = false;
 let refreshQueued = false;
-let connected = null; // null = never polled, true / false afterwards
+let deepLinkHandled = false;
 
 // ------------------------------------------------------------------- polling
 async function refreshSessions() {
@@ -33,6 +33,7 @@ async function refreshSessions() {
       return;
     }
     state.sessions = data.sessions || [];
+    state.persistedSessions = data.persisted_sessions || [];
     state.recentEvents = data.recent_events || [];
     state.globalSeq = data.global_seq || 0;
     state.sessionsLoaded = true;
@@ -41,6 +42,7 @@ async function refreshSessions() {
     }
     setConnected(true);
     emit('sessions:changed');
+    handleDeepLink();
   } catch (err) {
     console.error('[hub-console] session poll failed', err);
     setConnected(false);
@@ -61,9 +63,32 @@ function setConnected(ok) {
   const dot = $('#connDot');
   dot.dataset.state = ok ? 'ok' : 'error';
   $('#endpointChip').title = ok ? '已连接 Hub · 点击复制 MCP 接入地址' : '与 Hub 的连接已断开，正在重试…';
-  if (connected === true && !ok) toast('与 Hub 的连接已断开，正在自动重试…', 'error');
-  if (connected === false && ok) toast('已重新连接到 Hub', 'success');
-  connected = ok;
+  updateConnBanner(ok);
+  setHubConnected(ok);
+}
+
+/** F6: one persistent banner in the workspace instead of toasts for every failed poll. */
+function updateConnBanner(ok) {
+  const banner = $('#connBanner');
+  if (!banner) return;
+  if (ok === true) {
+    banner.hidden = true;
+    banner.textContent = '';
+    return;
+  }
+  banner.hidden = false;
+  banner.dataset.tone = ok === false ? 'danger' : 'pending';
+  banner.innerHTML = ok === false
+    ? `${icon('alert')}<span>与 Hub 的连接已断开，正在重试…</span>`
+    : `${icon('info')}<span>正在连接 Hub…</span>`;
+}
+
+/** F3: ?session=<id> activates that session once the first poll has answered. */
+function handleDeepLink() {
+  if (deepLinkHandled || !state.sessionsLoaded) return;
+  deepLinkHandled = true;
+  const id = new URL(location.href).searchParams.get('session');
+  if (id) emit('session:open', id);
 }
 
 // -------------------------------------------------------------------- layout
@@ -132,6 +157,7 @@ async function init() {
     if (!document.hidden) requestRefresh();
   });
 
+  updateConnBanner(null); // 正在连接 Hub…
   await Promise.all([
     reloadProfiles(false).catch((err) => toast(`加载 Profile 失败：${err.message}`, 'error')),
     refreshSessions(),

@@ -1,12 +1,17 @@
 // Profile & model settings modal: tab switching plus the profile list and editor.
 import { hubApi } from './hub-api.js';
-import { state, on, reloadProfiles, engineName, sortEngines } from './console-state.js';
-import { $, $$, escapeHtml, icon, toast, confirmDialog, setBusy, openModal, registerModal, isModalOpen } from './ui-kit.js';
+import {
+  state, on, reloadProfiles, engineName, sortProfiles, engineModels, engineDefaultModel,
+  defaultModelSource, defaultThinkingSource,
+} from './console-state.js';
+import {
+  $, $$, escapeHtml, icon, toast, confirmDialog, setBusy, openModal, registerModal, isModalOpen,
+} from './ui-kit.js';
 import { renderEngineCatalog } from './engine-catalog.js';
 import { initRoutingGuide, refreshRoutingGuide, saveRoutingGuide, isRoutingDirty, discardRoutingChanges } from './routing-guide.js';
 
 const MODAL_ID = 'profileModal';
-const CUSTOM_MODEL = '__custom__';
+
 // Last-resort launch commands for a new profile when no existing profile of that engine exists yet.
 const FALLBACK_COMMANDS = {
   omp: 'C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe',
@@ -17,10 +22,25 @@ const FALLBACK_COMMANDS = {
   pwsh: 'pwsh.exe',
 };
 
+const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'dsh', 'pwsh'];
+
+// Keys the editor renders itself, so the read-only "高级" box shows only what is left.
+const SHOWN_KEYS = new Set([
+  'id', 'name', 'engine', 'kind', 'command', 'args', 'default_model', 'default_thinking_level',
+  'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'gui_url', 'dsh_tier',
+]);
+// Values the hub computes on the way out; they are not stored keys.
+const COMPUTED_KEYS = new Set([
+  'all_discovered_models', 'available_models', 'available_thinking_levels', 'model_details',
+]);
+
 let selectedId = null; // id of the saved profile being edited; null while editing a new draft
 let dirty = false;
 let activeTab = 'profiles';
 let filterText = '';
+let argsError = '';
+let serverError = '';
+let saveBusy = false;
 
 export function initProfileManager() {
   registerModal(MODAL_ID, { beforeClose: confirmDiscardAll });
@@ -38,15 +58,18 @@ export function initProfileManager() {
   $('#btnRescan').addEventListener('click', rescanModels);
   $('#editEngine').addEventListener('change', onEngineChange);
   $('#editModelSelect').addEventListener('change', onModelSelectChange);
-  $('#editModelCustom').addEventListener('input', updateModelWarning);
-  $('#editArgs').addEventListener('input', validateArgs);
+  $('#editArgs').addEventListener('input', updateArgsValidation);
   $('#editId').addEventListener('input', () => showFieldError('editId', ''));
   $('#editName').addEventListener('input', () => {
     if (!selectedId) $('#editorTitle').textContent = $('#editName').value.trim() || '新建 Profile';
   });
 
   const pane = $('#profileEditorPane');
-  pane.addEventListener('input', () => setDirty(true));
+  pane.addEventListener('input', () => {
+    serverError = '';
+    refreshEditorError();
+    setDirty(true);
+  });
   pane.addEventListener('change', () => setDirty(true));
   pane.addEventListener('click', (ev) => {
     const link = ev.target.closest('[data-goto-tab]');
@@ -97,64 +120,42 @@ function firstProfileId() {
 }
 
 function sortedProfileEntries() {
-  const order = sortEngines(new Set(Object.values(state.profiles).map((p) => p.engine || 'other')));
-  return Object.entries(state.profiles).sort(([, a], [, b]) =>
-    order.indexOf(a.engine || 'other') - order.indexOf(b.engine || 'other'));
+  return sortProfiles(Object.entries(state.profiles));
 }
 
 // ------------------------------------------------------------- profile list
 function matchesFilter(id, p) {
   if (!filterText) return true;
   return [id, p.name, p.engine, p.default_model, p.default_thinking_level, p.when_to_use]
-    .some((v) => String(v || '').toLowerCase().includes(filterText));
+    .some((value) => String(value || '').toLowerCase().includes(filterText));
 }
 
 function renderProfileList() {
-  const groups = new Map();
-  let total = 0;
-  let shown = 0;
-  for (const [id, p] of sortedProfileEntries()) {
-    total += 1;
-    if (!matchesFilter(id, p)) continue;
-    shown += 1;
-    const engine = p.engine || 'other';
-    if (!groups.has(engine)) groups.set(engine, []);
-    groups.get(engine).push([id, p]);
-  }
-  $('#profileListCount').textContent = filterText ? `${shown} / ${total}` : String(total);
+  const all = sortedProfileEntries();
+  const shown = all.filter(([id, p]) => matchesFilter(id, p));
+  $('#profileListCount').textContent = filterText ? `${shown.length} / ${all.length}` : String(all.length);
 
   const list = $('#profileList');
-  if (!shown) {
+  if (!shown.length) {
     list.innerHTML = `<div class="list-empty">${filterText ? '没有匹配的 Profile' : '还没有 Profile，点击「新建」创建一个。'}</div>`;
     return;
   }
-  list.innerHTML = [...groups.keys()].map((engine) => `
-    <div class="pm-group">
-      <div class="pm-group-head">
-        <span class="engine-dot" data-engine="${escapeHtml(engine)}"></span>
-        <span>${escapeHtml(engineName(engine))}</span>
-        <span class="pm-group-count">${groups.get(engine).length}</span>
-      </div>
-      ${groups.get(engine).map(([id, p]) => profileItemHtml(id, p)).join('')}
-    </div>`).join('');
+  list.innerHTML = shown.map(([id, p]) => profileItemHtml(id, p)).join('');
 }
 
 function profileItemHtml(id, p) {
   const enabled = p.enabled !== false;
-  const when = (p.when_to_use || '').trim();
-  const pills = [
-    p.default_model ? `<span class="pill pill-model">${escapeHtml(p.default_model)}</span>` : '',
-    p.default_thinking_level ? `<span class="pill pill-effort">${icon('gauge')}${escapeHtml(p.default_thinking_level)}</span>` : '',
-  ].join('');
+  const engine = p.engine || 'other';
+  const model = p.default_model || engineDefaultModel(engine) || '未设置模型';
+  const level = p.default_thinking_level || '未设置思考等级';
   return `
     <button type="button" class="pm-item${enabled ? '' : ' is-disabled'}" role="option" data-id="${escapeHtml(id)}" aria-selected="${id === selectedId}">
       <span class="pm-item-row">
         <span class="pm-item-name">${escapeHtml(p.name || id)}</span>
-        ${enabled ? '' : '<span class="tag-off">已停用</span>'}
+        <span class="engine-badge" data-engine="${escapeHtml(engine)}">${escapeHtml(engine)}</span>
       </span>
       <span class="pm-item-id">${escapeHtml(id)}</span>
-      ${pills ? `<span class="pm-item-pills">${pills}</span>` : ''}
-      ${when ? `<span class="pm-item-when" title="${escapeHtml(when)}">${escapeHtml(when)}</span>` : ''}
+      <span class="pm-item-defaults">${escapeHtml(model)} · ${escapeHtml(level)}${enabled ? '' : ' · 已停用'}</span>
     </button>`;
 }
 
@@ -174,34 +175,70 @@ function selectProfile(id) {
 // ------------------------------------------------------------------- editor
 function fillEditorFromProfile(id) {
   const p = state.profiles[id];
-  writeEditor({
+  if (!p) return;
+  writeDraft(profileDraft(id, p));
+}
+
+function profileDraft(id, p) {
+  return {
     isNew: false,
     id,
+    name: p.name || '',
+    engine: p.engine || '',
+    kind: p.kind === 'web_gui' ? 'web_gui' : 'tui',
     enabled: p.enabled !== false,
     when_to_use: p.when_to_use || '',
-    name: p.name || '',
-    engine: p.engine || 'omp',
-    kind: p.kind || 'tui',
+    description: p.description || '',
     default_model: p.default_model || '',
     default_thinking_level: p.default_thinking_level || '',
+    model_source: defaultModelSource(p),
+    thinking_source: defaultThinkingSource(p),
     command: p.command || '',
+    argsText: (Array.isArray(p.args) ? p.args : []).join('\n'),
     task_mode: p.task_mode || '',
-    startup_delay_sec: p.startup_delay_sec ?? 2.5,
-    argsText: JSON.stringify(p.args || []),
-    description: p.description || '',
-  });
+    delayText: p.startup_delay_sec ?? '',
+    gui_url: p.gui_url || '',
+    dsh_tier: p.dsh_tier === 'pro' ? 'pro' : 'flash',
+    extra: p,
+  };
 }
 
-function ensureOption(select, value) {
-  if (value && ![...select.options].some((o) => o.value === value)) select.appendChild(new Option(value, value));
+function readDraft() {
+  const engine = $('#editEngine').value;
+  const isDsh = engine === 'dsh';
+  const modelChoice = $('#editModelSelect').value;
+  const thinkingChoice = $('#editThinking').value;
+  return {
+    isNew: !selectedId,
+    id: $('#editId').value.trim(),
+    name: $('#editName').value.trim(),
+    engine,
+    kind: isDsh && $('#editKind').value === 'web_gui' ? 'web_gui' : 'tui',
+    enabled: $('#editEnabled').checked,
+    when_to_use: $('#editWhenToUse').value.trim(),
+    description: $('#editDesc').value.trim(),
+    default_model: modelChoice,
+    default_thinking_level: thinkingChoice,
+    model_source: modelChoice ? 'profile' : 'engine',
+    thinking_source: thinkingChoice ? 'profile' : 'engine',
+    command: $('#editCommand').value.trim(),
+    argsText: $('#editArgs').value,
+    task_mode: $('#editTaskMode').value,
+    delayText: $('#editDelay').value,
+    gui_url: $('#editGuiUrl').value.trim(),
+    dsh_tier: $('#editDshTier').value,
+    extra: selectedId ? state.profiles[selectedId] : null,
+  };
 }
 
-function writeEditor(d) {
-  $('#editorTitle').textContent = d.isNew ? (d.name || '新建 Profile') : (d.name || d.id);
+function writeDraft(d) {
+  $('#editorTitle').textContent = d.isNew ? (d.name || '新建 Profile') : (d.name || d.id || '编辑 Profile');
   $('#editorSubtitle').textContent = d.isNew ? '新 Profile · 保存后即可通过 MCP 调用' : d.id;
   $('#editorSubtitle').classList.toggle('is-id', !d.isNew);
   $('#editEnabled').checked = d.enabled;
   $('#editWhenToUse').value = d.when_to_use;
+  $('#editName').value = d.name;
+  $('#editDesc').value = d.description;
 
   const idInput = $('#editId');
   idInput.value = d.id;
@@ -211,83 +248,129 @@ function writeEditor(d) {
     : 'ID 创建后不可修改；需要改名时请用「复制为新 Profile」。';
   showFieldError('editId', '');
 
-  $('#editName').value = d.name;
-  for (const [sel, value] of [['#editEngine', d.engine], ['#editKind', d.kind], ['#editTaskMode', d.task_mode]]) {
-    ensureOption($(sel), value);
-    $(sel).value = value;
-  }
+  setEngineSelect(d.engine);
+  $('#editKind').value = d.kind === 'web_gui' ? 'web_gui' : 'tui';
   $('#editCommand').value = d.command;
-  $('#editDelay').value = d.startup_delay_sec;
   $('#editArgs').value = d.argsText;
-  validateArgs();
-  $('#editDesc').value = d.description;
-  populateEngineFields(d.engine, d.default_model, d.default_thinking_level);
+  ensureOption($('#editTaskMode'), d.task_mode);
+  $('#editTaskMode').value = d.task_mode || '';
+  $('#editDelay').value = d.delayText;
+  $('#editGuiUrl').value = d.gui_url;
+  $('#editDshTier').value = d.dsh_tier;
 
+  renderEngineGroups(d.engine);
+  populateDefaults(d.engine, d.model_source === 'engine' ? '' : d.default_model,
+    d.thinking_source === 'engine' ? '' : d.default_thinking_level);
+  renderEngineInfo(d.engine);
+  renderAdvanced(d.extra, d.isNew);
+
+  argsError = '';
+  serverError = '';
+  refreshEditorError();
+  updateArgsValidation();
+  setDirty(false);
   $('#btnDeleteProfile').hidden = d.isNew;
   $('#btnDuplicateProfile').hidden = d.isNew;
-  setDirty(false);
+  syncSaveButton();
 }
 
-function readEditor() {
-  const modelChoice = $('#editModelSelect').value;
-  return {
-    id: $('#editId').value.trim(),
-    enabled: $('#editEnabled').checked,
-    when_to_use: $('#editWhenToUse').value.trim(),
-    name: $('#editName').value.trim(),
-    engine: $('#editEngine').value,
-    kind: $('#editKind').value,
-    default_model: modelChoice === CUSTOM_MODEL ? $('#editModelCustom').value.trim() : modelChoice,
-    default_thinking_level: $('#editThinking').value,
-    command: $('#editCommand').value.trim(),
-    task_mode: $('#editTaskMode').value,
-    startup_delay_sec: $('#editDelay').value,
-    argsText: $('#editArgs').value,
-    description: $('#editDesc').value.trim(),
-  };
+function setEngineSelect(engine) {
+  const sel = $('#editEngine');
+  sel.innerHTML = '';
+  if (!engine) sel.appendChild(new Option('选择引擎…', ''));
+  for (const value of ENGINE_IDS) {
+    sel.appendChild(new Option(`${value} · ${engineName(value)}`, value));
+  }
+  if (engine && ![...sel.options].some((option) => option.value === engine)) {
+    sel.appendChild(new Option(engine, engine));
+  }
+  sel.value = engine || '';
 }
 
-function populateEngineFields(engine, currentModel, currentThinking) {
+function renderEngineGroups(engine) {
+  const isDsh = engine === 'dsh';
+  $('#groupLaunch').hidden = isDsh;
+  $('#groupDsh').hidden = !isDsh;
+}
+
+function ensureOption(select, value) {
+  if (value && ![...select.options].some((option) => option.value === value)) {
+    select.appendChild(new Option(value, value));
+  }
+}
+
+/** 默认模型 / 默认思考等级: "" means "let the hub decide" and is saved as null. */
+function populateDefaults(engine, modelValue, thinkingValue) {
   const cat = state.enginesCatalog[engine] || {};
-  const all = cat.all_discovered_models || cat.available_models || [];
-  const disabled = new Set(cat.disabled_models || []);
-  const levels = cat.available_thinking_levels || [];
-
+  const models = engineModels(engine);
   const modelSel = $('#editModelSelect');
   modelSel.innerHTML = '';
   modelSel.appendChild(new Option(`引擎默认（${cat.default_model || '自动'}）`, ''));
-  for (const m of all) modelSel.appendChild(new Option(disabled.has(m) ? `${m}（已停用）` : m, m));
-  modelSel.appendChild(new Option('自定义模型 ID…', CUSTOM_MODEL));
-
-  const custom = $('#editModelCustom');
-  if (!currentModel || all.includes(currentModel)) {
-    modelSel.value = currentModel || '';
-    custom.value = '';
-    custom.hidden = true;
-  } else {
-    modelSel.value = CUSTOM_MODEL;
-    custom.value = currentModel;
-    custom.hidden = false;
+  for (const model of models) {
+    const label = model.enabled === false ? `${model.id} (已停用)` : model.id;
+    const option = new Option(label, model.id);
+    option.disabled = model.enabled === false;
+    option.title = model.note || model.label || model.id;
+    modelSel.appendChild(option);
   }
-  updateModelWarning();
+  ensureOption(modelSel, modelValue);
+  modelSel.value = modelValue || '';
+  populateThinkingSelect(engine, modelSel.value, thinkingValue);
+}
 
-  const thinkSel = $('#editThinking');
-  thinkSel.innerHTML = '';
-  thinkSel.appendChild(new Option(`引擎默认（${cat.default_thinking_level || '自动'}）`, ''));
-  for (const level of levels) thinkSel.appendChild(new Option(level, level));
-  ensureOption(thinkSel, currentThinking);
-  thinkSel.value = currentThinking || '';
+function populateThinkingSelect(engine, modelValue, thinkingValue) {
+  const cat = state.enginesCatalog[engine] || {};
+  const models = engineModels(engine);
+  const model = modelValue ? models.find((m) => m.id === modelValue) : null;
+  const levels = model ? (model.thinking_levels || []) : (cat.available_thinking_levels || []);
+  const sel = $('#editThinking');
+  sel.innerHTML = '';
+  sel.appendChild(new Option('按模型默认', ''));
+  for (const level of levels.filter(Boolean)) sel.appendChild(new Option(level, level));
+  ensureOption(sel, thinkingValue);
+  sel.value = thinkingValue || '';
+}
 
-  renderEngineInfo(engine);
+function renderAdvanced(profile, isNew) {
+  const box = $('#advancedBox');
+  const list = $('#advancedList');
+  const entries = (isNew || !profile) ? [] : Object.entries(profile).filter(([key]) => {
+    if (SHOWN_KEYS.has(key) || COMPUTED_KEYS.has(key) || key.endsWith('_source')) return false;
+    return true;
+  });
+  if (!entries.length) {
+    box.hidden = true;
+    list.innerHTML = '';
+    return;
+  }
+  box.hidden = false;
+  list.innerHTML = entries.map(([key, value]) =>
+    `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(formatValue(value))}</dd>`).join('');
+}
+
+function formatValue(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function renderEngineInfo(engine) {
+  const card = $('#engineInfo');
+  if (!engine) {
+    card.innerHTML = `<div class="info-card-head">${icon('cpu')}<strong>引擎识别信息</strong></div>
+      <div class="field-help">选择引擎后显示本机的可执行文件、模型与思考等级参数。</div>`;
+    return;
+  }
   const cat = state.enginesCatalog[engine] || {};
   const flags = cat.cli_flags_template || {};
   const enabled = cat.available_models || [];
   const all = cat.all_discovered_models || enabled;
   const levels = cat.available_thinking_levels || [];
-  $('#engineInfo').innerHTML = `
+  card.innerHTML = `
     <div class="info-card-head">
       ${icon('cpu')}<strong>${escapeHtml(cat.name || engine)}</strong>
       <span class="state-badge ${cat.installed ? 'ok' : 'off'}">${cat.installed ? '已安装' : '未检测到本地程序'}</span>
@@ -302,17 +385,34 @@ function renderEngineInfo(engine) {
     </dl>`;
 }
 
-function onEngineChange() {
+async function onEngineChange() {
   const engine = $('#editEngine').value;
-  if (!selectedId) {
-    const defaults = engineDefaults(engine);
-    $('#editCommand').value = defaults.command;
-    ensureOption($('#editTaskMode'), defaults.task_mode);
-    $('#editTaskMode').value = defaults.task_mode;
-    $('#editArgs').value = defaults.argsText;
-    validateArgs();
+  const previousEngine = selectedId && state.profiles[selectedId] ? (state.profiles[selectedId].engine || '') : '';
+  serverError = '';
+  refreshEditorError();
+  if (selectedId && previousEngine && engine && engine !== previousEngine) {
+    const ok = await confirmDialog({
+      title: '更换引擎？',
+      message: '更换引擎会重置命令、参数和任务传入方式。继续？',
+      confirmText: '更换引擎',
+    });
+    if (!ok) {
+      $('#editEngine').value = previousEngine;
+      return;
+    }
   }
-  populateEngineFields(engine, '', '');
+  if (!selectedId || engine !== previousEngine) {
+    applyEngineDefaults(engine);
+    populateDefaults(engine, '', '');
+  } else {
+    populateDefaults(engine, $('#editModelSelect').value, $('#editThinking').value);
+  }
+  renderEngineGroups(engine);
+  renderEngineInfo(engine);
+  renderAdvanced(selectedId ? state.profiles[selectedId] : null, !selectedId);
+  updateArgsValidation();
+  setDirty(true);
+  syncSaveButton();
 }
 
 /** Defaults for a new profile, learned from the existing profiles of the same engine. */
@@ -321,57 +421,101 @@ function engineDefaults(engine) {
     const counts = new Map();
     for (const p of Object.values(state.profiles)) {
       if (p.engine !== engine) continue;
-      const v = pick(p);
-      if (v) counts.set(v, (counts.get(v) || 0) + 1);
+      const value = pick(p);
+      if (value) counts.set(value, (counts.get(value) || 0) + 1);
     }
     return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
   };
   return {
     command: mostCommon((p) => p.command) || FALLBACK_COMMANDS[engine] || '',
     task_mode: mostCommon((p) => p.task_mode) || '',
-    argsText: mostCommon((p) => JSON.stringify(p.args || [])) || '[]',
+    argsText: mostCommon((p) => (Array.isArray(p.args) ? p.args.join('\n') : '')) || '',
   };
 }
 
+function applyEngineDefaults(engine) {
+  const defaults = engineDefaults(engine);
+  $('#editCommand').value = defaults.command;
+  ensureOption($('#editTaskMode'), defaults.task_mode);
+  $('#editTaskMode').value = defaults.task_mode;
+  $('#editArgs').value = defaults.argsText;
+}
+
 function onModelSelectChange() {
-  const custom = $('#editModelCustom');
-  const isCustom = $('#editModelSelect').value === CUSTOM_MODEL;
-  custom.hidden = !isCustom;
-  if (isCustom) custom.focus();
-  updateModelWarning();
+  populateThinkingSelect($('#editEngine').value, $('#editModelSelect').value, $('#editThinking').value);
+  setDirty(true);
 }
 
-function updateModelWarning() {
-  const cat = state.enginesCatalog[$('#editEngine').value] || {};
-  const choice = $('#editModelSelect').value;
-  const model = choice === CUSTOM_MODEL ? $('#editModelCustom').value.trim() : choice;
-  const warn = $('#editModelWarn');
-  const isDisabled = model && (cat.disabled_models || []).includes(model);
-  warn.hidden = !isDisabled;
-  warn.textContent = isDisabled ? '该模型已在「模型开关」中停用，主 Agent 将无法使用它。' : '';
+// -------------------------------------------------------- args validation
+function parseArgsText(text) {
+  return String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-function validateArgs() {
-  const input = $('#editArgs');
-  let value = [];
-  let message = '';
-  try {
-    value = JSON.parse(input.value.trim() || '[]');
-    if (!Array.isArray(value)) message = '必须是 JSON 数组，例如 [] 或 ["--auto-approve"]';
-  } catch {
-    message = 'JSON 格式不正确，例如 [] 或 ["--auto-approve"]';
+/** Returns the injected flag the user must not put in args, or "" (spec B5 / F7). */
+function injectedFlag(engine, args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (engine === 'omp') {
+      if (arg.startsWith('--model=')) return '--model=';
+      if (arg.startsWith('--thinking=')) return '--thinking=';
+    } else if (engine === 'kimi') {
+      if (arg === '-m' || arg === '--model') return arg;
+      if (arg.startsWith('--model=')) return '--model';
+    } else if (engine === 'agy') {
+      if (arg === '--model' || arg === '--effort') return arg;
+      if (arg.startsWith('--model=')) return '--model';
+      if (arg.startsWith('--effort=')) return '--effort';
+    } else if (engine === 'codex') {
+      if (arg === '-m' || arg === '--model') return arg;
+      if (arg.startsWith('--model=')) return '--model';
+      if (arg === '-c') {
+        const next = String(args[i + 1] || '').trim();
+        if (next.startsWith('model_reasoning_effort')) return '-c model_reasoning_effort';
+        if (next.startsWith('model=')) return '-c model=';
+      }
+    }
   }
-  input.classList.toggle('is-invalid', !!message);
-  $('#editArgsError').textContent = message;
-  $('#editArgsError').hidden = !message;
-  return { ok: !message, value };
+  return '';
 }
 
+function updateArgsValidation() {
+  const engine = $('#editEngine').value;
+  const args = parseArgsText($('#editArgs').value);
+  const flag = engine === 'dsh' ? '' : injectedFlag(engine, args);
+  argsError = flag
+    ? `参数里不要写模型或思考等级（${flag}）：Hub 会按启动时的选择自动注入。`
+    : '';
+  $('#editArgs').classList.toggle('is-invalid', !!argsError);
+  refreshEditorError();
+  syncSaveButton();
+}
+
+// ------------------------------------------------------------ feedback/state
 function showFieldError(fieldId, message) {
   $(`#${fieldId}`).classList.toggle('is-invalid', !!message);
   const err = $(`#${fieldId}Error`);
+  if (!err) return;
   err.textContent = message;
   err.hidden = !message;
+}
+
+function refreshEditorError() {
+  const message = argsError || serverError;
+  const bar = $('#editorErrors');
+  bar.hidden = !message;
+  bar.textContent = message;
+  bar.dataset.tone = argsError ? 'validation' : 'server';
+}
+
+function showEditorError(message) {
+  serverError = message || '';
+  refreshEditorError();
+}
+
+function syncSaveButton() {
+  const btn = $('#btnSaveProfile');
+  if (!btn) return;
+  btn.disabled = saveBusy || !!argsError;
 }
 
 function setDirty(value) {
@@ -412,34 +556,38 @@ async function confirmDiscardProfile() {
 async function startNewProfile() {
   if (!(await confirmDiscardProfile())) return;
   selectedId = null;
-  const engine = 'omp';
-  const defaults = engineDefaults(engine);
-  writeEditor({
+  writeDraft({
     isNew: true,
     id: '',
+    name: '',
+    engine: '',
+    kind: 'tui',
     enabled: true,
     when_to_use: '',
-    name: '',
-    engine,
-    kind: 'tui',
+    description: '',
     default_model: '',
     default_thinking_level: '',
-    command: defaults.command,
-    task_mode: defaults.task_mode,
-    startup_delay_sec: 2.5,
-    argsText: defaults.argsText,
-    description: '',
+    model_source: 'engine',
+    thinking_source: 'engine',
+    command: '',
+    argsText: '',
+    task_mode: '',
+    delayText: 2.5,
+    gui_url: '',
+    dsh_tier: 'flash',
+    extra: null,
   });
   renderProfileList();
-  $('#editId').focus();
+  $('#editEngine').focus();
 }
 
 function duplicateProfile() {
-  const current = readEditor();
-  let id = `${current.id}-copy`;
-  for (let n = 2; state.profiles[id]; n += 1) id = `${current.id}-copy-${n}`;
+  const draft = readDraft();
+  const base = draft.id || 'profile';
+  let id = `${base}-copy`;
+  for (let n = 2; state.profiles[id]; n += 1) id = `${base}-copy-${n}`;
   selectedId = null;
-  writeEditor({ ...current, isNew: true, id, name: current.name ? `${current.name}（副本）` : '' });
+  writeDraft({ ...draft, isNew: true, id, name: draft.name ? `${draft.name}（副本）` : '' });
   setDirty(true);
   renderProfileList();
   $('#editId').focus();
@@ -447,7 +595,15 @@ function duplicateProfile() {
 }
 
 async function saveProfile() {
-  const d = readEditor();
+  if (saveBusy) return;
+  serverError = '';
+  refreshEditorError();
+  const d = readDraft();
+  if (!d.engine) {
+    showEditorError('请先选择引擎');
+    $('#editEngine').focus();
+    return;
+  }
   if (!d.id) {
     showFieldError('editId', '请填写 Profile ID');
     $('#editId').focus();
@@ -463,30 +619,41 @@ async function saveProfile() {
     $('#editId').focus();
     return;
   }
-  const args = validateArgs();
-  if (!args.ok) {
+  const args = parseArgsText(d.argsText);
+  const flag = d.engine === 'dsh' ? '' : injectedFlag(d.engine, args);
+  if (flag) {
+    updateArgsValidation();
     $('#editArgs').focus();
     return;
   }
-  const delay = parseFloat(d.startup_delay_sec);
+  const isDsh = d.engine === 'dsh';
+  const command = isDsh ? (d.command || 'pwsh.exe') : d.command;
+  if (!command) {
+    showEditorError('请填写命令');
+    $('#editCommand').focus();
+    return;
+  }
+  const delay = parseFloat(d.delayText);
   const payload = {
     id: d.id,
-    enabled: d.enabled,
-    when_to_use: d.when_to_use,
     name: d.name || d.id,
     engine: d.engine,
-    kind: d.kind,
+    kind: isDsh ? d.kind : 'tui',
+    enabled: d.enabled,
+    when_to_use: d.when_to_use || null,
+    description: d.description || null,
     default_model: d.default_model || null,
     default_thinking_level: d.default_thinking_level || null,
-    command: d.command,
-    args: args.value,
-    startup_delay_sec: Number.isFinite(delay) ? delay : 2.5,
-    description: d.description,
+    command,
+    args,
+    task_mode: d.task_mode || null,
+    startup_delay_sec: Number.isFinite(delay) ? delay : null,
+    gui_url: isDsh ? (d.gui_url || null) : null,
+    dsh_tier: isDsh ? d.dshTier : null,
   };
-  // Unset task_mode is omitted, so the server keeps its own default instead of a guessed mode.
-  if (d.task_mode) payload.task_mode = d.task_mode;
 
   const btn = $('#btnSaveProfile');
+  saveBusy = true;
   setBusy(btn, true);
   try {
     await hubApi.saveProfile(payload);
@@ -495,9 +662,12 @@ async function saveProfile() {
     await reloadProfiles(false);
     toast(`已保存 ${payload.name}`, 'success');
   } catch (err) {
-    toast(`保存失败：${err.message}`, 'error');
+    // FastAPI 400 detail lands here (B8); show it in the same inline error bar.
+    showEditorError(err.message);
   } finally {
+    saveBusy = false;
     setBusy(btn, false);
+    syncSaveButton();
   }
 }
 

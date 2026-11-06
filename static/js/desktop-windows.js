@@ -1,11 +1,16 @@
 // "纳管桌面 GUI 窗口" modal: list top-level Win32 windows and attach one as a desktop_gui session.
 import { hubApi } from './hub-api.js';
-import { emit, setActiveSession, upsertSession } from './console-state.js';
-import { $, escapeHtml, icon, toast, setBusy, openModal, closeModal } from './ui-kit.js';
+import { state, on, emit, setActiveSession, upsertSession } from './console-state.js';
+import { $, escapeHtml, icon, toast, setBusy, openModal, closeModal, isModalOpen } from './ui-kit.js';
 
 const MODAL_ID = 'win32Modal';
+const LIVE_STATUSES = new Set(['starting', 'running', 'waiting_parent']);
 let windows = [];
 let query = '';
+
+const isLive = (s) => (typeof s.process_alive === 'boolean'
+  ? s.process_alive
+  : LIVE_STATUSES.has(s.status));
 
 export function initDesktopWindows() {
   $('#win32Search').addEventListener('input', (ev) => {
@@ -14,6 +19,10 @@ export function initDesktopWindows() {
   });
   $('#btnWin32Refresh').addEventListener('click', load);
   $('#win32List').addEventListener('click', onAttachClick);
+  // A session list change can turn a window into 已纳管 (e.g. attached from another tab).
+  on('sessions:changed', () => {
+    if (isModalOpen(MODAL_ID)) render();
+  });
 }
 
 export function openDesktopWindows() {
@@ -36,25 +45,40 @@ async function load() {
   }
 }
 
+function attachedSessionFor(hwnd) {
+  return state.sessions.find((s) => s.kind === 'desktop_gui'
+    && String(s.hwnd) === String(hwnd) && isLive(s)) || null;
+}
+
+function processNameOf(win) {
+  return win.process_name || win.exe_name || win.process || win.app || '';
+}
+
 function render() {
-  const rows = windows.filter((w) => !query || `${w.title} ${w.pid} ${w.hwnd}`.toLowerCase().includes(query));
+  const rows = windows.filter((w) => !query
+    || `${w.title} ${w.pid} ${w.hwnd} ${processNameOf(w)}`.toLowerCase().includes(query));
   $('#win32Count').textContent = query ? `${rows.length} / ${windows.length} 个窗口` : `${windows.length} 个窗口`;
   $('#win32List').innerHTML = rows.length
-    ? rows.map((w) => `
+    ? rows.map((w) => {
+      const attached = attachedSessionFor(w.hwnd);
+      const proc = processNameOf(w);
+      return `
         <div class="win-row">
           <div class="win-icon">${icon('monitor')}</div>
           <div class="win-info">
             <div class="win-title" title="${escapeHtml(w.title)}">${escapeHtml(w.title || '（无标题）')}</div>
-            <div class="win-meta">HWND ${escapeHtml(w.hwnd)} · PID ${escapeHtml(w.pid)} · ${escapeHtml(w.width)}×${escapeHtml(w.height)}</div>
+            <div class="win-meta">HWND ${escapeHtml(w.hwnd)} · PID ${escapeHtml(w.pid)} · ${escapeHtml(w.width)}×${escapeHtml(w.height)}${proc ? ` · ${escapeHtml(proc)}` : ''}</div>
           </div>
-          <button type="button" class="btn btn-sm btn-primary" data-hwnd="${escapeHtml(w.hwnd)}">纳入总控台</button>
-        </div>`).join('')
+          ${attached ? '<span class="state-badge ok">已纳管</span>' : ''}
+          <button type="button" class="btn btn-sm btn-primary" data-hwnd="${escapeHtml(w.hwnd)}" ${attached ? 'disabled' : ''}>纳入总控台</button>
+        </div>`;
+    }).join('')
     : `<div class="list-state">${query ? '没有匹配的窗口' : '没有发现可纳管的窗口'}</div>`;
 }
 
 async function onAttachClick(ev) {
   const btn = ev.target.closest('[data-hwnd]');
-  if (!btn) return;
+  if (!btn || btn.disabled) return;
   const win = windows.find((w) => String(w.hwnd) === btn.dataset.hwnd);
   if (!win) return;
   setBusy(btn, true);

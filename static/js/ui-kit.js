@@ -28,6 +28,27 @@ export function formatClock(epochSeconds) {
   return new Date(epochSeconds * 1000).toLocaleTimeString('zh-CN', { hour12: false });
 }
 
+/** First non-empty line of a multi-line text, trimmed; "" when there is none. */
+export function firstLine(text) {
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+/** Clock time today, otherwise date + clock (used by the 历史 list and the record modal). */
+export function formatWhen(epochSeconds) {
+  if (!epochSeconds) return '';
+  const date = new Date(epochSeconds * 1000);
+  const clock = date.toLocaleTimeString('zh-CN', { hour12: false });
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  return sameDay ? clock : `${date.toLocaleDateString('zh-CN')} ${clock}`;
+}
+
 /** Shortens a long path to its last segments, e.g. "…\\repo\\static". */
 export function shortPath(path, max = 42) {
   const p = String(path || '');
@@ -142,9 +163,40 @@ export function initModalSystem() {
   // Esc closes the top-most modal only; terminals keep Esc when no modal is open.
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape' || !modalStack.length) return;
+    // An inline editor that handles Esc itself (e.g. the model note input) keeps the modal open.
+    if (ev.target instanceof Element && ev.target.closest('[data-esc-local]')) return;
     ev.preventDefault();
     ev.stopPropagation();
     closeModal(modalStack[modalStack.length - 1].id);
+  }, true);
+
+  // Keep Tab / Shift+Tab inside the top-most modal (spec F9).
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Tab' || !modalStack.length) return;
+    const top = modalStack[modalStack.length - 1];
+    const modal = document.getElementById(top.id)?.querySelector('.modal');
+    if (!modal) return;
+    const focusables = Array.from(modal.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )).filter((el) => el.getClientRects().length > 0);
+    if (!focusables.length) {
+      ev.preventDefault();
+      modal.focus();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (!modal.contains(active)) {
+      ev.preventDefault();
+      (ev.shiftKey ? last : first).focus();
+    } else if (ev.shiftKey && active === first) {
+      ev.preventDefault();
+      last.focus();
+    } else if (!ev.shiftKey && active === last) {
+      ev.preventDefault();
+      first.focus();
+    }
   }, true);
 
   // Backdrop click closes, but not when a text selection drag ends on the backdrop.

@@ -43,6 +43,7 @@
     <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.3 19a10 10 0 1 1 17.4 0"/></symbol>
     <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
     <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></symbol>
     <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></symbol>
   </svg>
 
@@ -82,7 +83,7 @@
       <svg class="icon" aria-hidden="true"><use href="#i-plug"></use></svg><span class="btn-label">接入指南</span>
     </button>
     <button class="btn" data-cmd="open-profiles" title="管理 Profile、模型开关与路由总则">
-      <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span class="btn-label">Profile 与模型</span>
+      <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span class="btn-label keep-label">Profile 与模型</span>
     </button>
   </header>
 
@@ -92,7 +93,7 @@
         <div class="section-head">
           <h2 class="section-title" id="launcherTitle">
             <button type="button" class="section-toggle" id="launcherToggle" aria-expanded="false" aria-controls="launcherBody" title="展开 / 收起">
-              <svg class="icon icon-sm chev" aria-hidden="true"><use href="#i-chevron-down"></use></svg>拉起 Sub-Agent
+              <svg class="icon icon-sm chev" aria-hidden="true"><use href="#i-chevron-down"></use></svg>启动 Sub-Agent
             </button>
           </h2>
           <button class="btn btn-ghost btn-sm" data-cmd="open-profiles" title="编辑 Profile 与调用说明">
@@ -104,39 +105,42 @@
           <span class="field-label">Profile</span>
           <select id="profileSelect"></select>
         </label>
-        <div class="field-row">
-          <label class="field">
-            <span class="field-label">模型</span>
-            <select id="modelSelect"></select>
-          </label>
-          <label class="field">
-            <span class="field-label">思考等级</span>
-            <select id="thinkingSelect"></select>
-          </label>
-        </div>
         <div class="hint-box" id="whenToUseHint" title="点击展开 / 收起"></div>
+        <label class="field" id="modelField">
+          <span class="field-label">模型</span>
+          <select id="modelSelect"></select>
+        </label>
+        <div class="field" id="thinkingField">
+          <span class="field-label">思考等级</span>
+          <div class="level-pills" id="thinkingPills" role="radiogroup" aria-label="思考等级"></div>
+        </div>
+        <div class="run-preview" id="runPreview" hidden></div>
         <label class="field">
           <span class="field-label">初始任务 <span class="opt">可选</span></span>
           <textarea id="taskInput" rows="2" placeholder="留空则直接进入交互界面"></textarea>
         </label>
         <label class="field">
           <span class="field-label">工作目录 <span class="opt">可选</span></span>
-          <input id="cwdInput" type="text" class="mono-input" list="cwdHistory" placeholder="默认使用 Hub 当前目录" spellcheck="false" />
+          <input id="cwdInput" type="text" class="mono-input" list="cwdHistory" placeholder="默认：Hub 当前目录" spellcheck="false" />
           <datalist id="cwdHistory"></datalist>
         </label>
-        <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="Ctrl + Enter（在任务输入框内）">
-          <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>拉起 Agent <kbd>Ctrl ↵</kbd>
+        <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="启动 Sub-Agent（Ctrl + Enter）">
+          <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>启动 <kbd>Ctrl ↵</kbd>
         </button>
         </div>
       </section>
 
       <section class="sessions-section" aria-labelledby="sessionsTitle">
         <div class="section-head">
-          <h2 class="section-title" id="sessionsTitle">会话 <span class="count-badge" id="sessionCount">0</span></h2>
+          <h2 class="section-title" id="sessionsTitle">会话</h2>
           <span class="section-meta grow" id="sessionSummary" style="text-align:right"></span>
           <button class="icon-btn sm" data-cmd="refresh-sessions" title="立即刷新会话列表" aria-label="刷新会话列表">
             <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
           </button>
+        </div>
+        <div class="sessions-switch" role="group" aria-label="会话列表视图">
+          <button type="button" data-session-tab="live" aria-pressed="true">进行中 <span class="count-badge" id="liveCount">0</span></button>
+          <button type="button" data-session-tab="history" aria-pressed="false">历史 <span class="count-badge" id="historyCount">0</span></button>
         </div>
         <div class="session-list" id="sessionList" role="listbox" aria-label="会话列表"></div>
       </section>
@@ -145,13 +149,13 @@
         <button type="button" class="events-toggle" id="eventsToggle" aria-expanded="true" aria-controls="eventFeed">
           <svg class="icon icon-sm chev" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
           <span class="section-title">事件流</span>
-          <span class="seq" id="globalSeq" title="全局事件序号">#0</span>
         </button>
         <div class="event-feed" id="eventFeed"></div>
       </section>
     </aside>
 
     <main class="workspace">
+      <div class="conn-banner" id="connBanner" role="status" aria-live="polite" hidden></div>
       <div id="gridContainer" class="grid grid-single"></div>
     </main>
   </div>
@@ -165,10 +169,10 @@
         </h3>
         <div class="tabs" role="tablist" aria-label="设置分区">
           <button type="button" class="tab" role="tab" data-tab="profiles" aria-selected="true">
-            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-layers"></use></svg>Profiles
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-layers"></use></svg>Profile 列表
           </button>
           <button type="button" class="tab" role="tab" data-tab="catalog" aria-selected="false">
-            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-cpu"></use></svg>模型开关
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-cpu"></use></svg>引擎与模型
           </button>
           <button type="button" class="tab" role="tab" data-tab="routing" aria-selected="false">
             <svg class="icon icon-sm" aria-hidden="true"><use href="#i-compass"></use></svg>路由总则
@@ -214,29 +218,21 @@
             </div>
 
             <div class="pm-editor-scroll" id="profileEditor">
-              <section class="callout">
-                <div class="callout-title">
-                  <svg class="icon icon-sm" aria-hidden="true"><use href="#i-compass"></use></svg>何时调用 <code>when_to_use</code>
-                </div>
-                <p class="callout-desc">写给主 Agent 的调用时机说明：在什么任务、什么情况下应选择这个 Profile。</p>
-                <textarea id="editWhenToUse" rows="3" placeholder="例如：需要低延迟、高并发地执行简单代码搜索、日志分析或单文件小改动时优先调用；跨多文件的复杂架构设计请改用 codex-gpt-6.1-sol-high。"></textarea>
-              </section>
-
               <section class="form-section">
-                <h5 class="form-section-title">基本信息</h5>
+                <h5 class="form-section-title">基本</h5>
                 <div class="form-grid">
                   <label class="field">
-                    <span class="field-label">Profile ID <code>agent_type</code></span>
-                    <input id="editId" type="text" class="mono-input" placeholder="例如 omp-dsflash-max" spellcheck="false" />
+                    <span class="field-label">名称 <code>name</code></span>
+                    <input id="editName" type="text" placeholder="例如 OMP（Oh-My-Pi）" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">ID <code>agent_type</code></span>
+                    <input id="editId" type="text" class="mono-input" placeholder="例如 omp" spellcheck="false" />
                     <span class="field-help" id="editIdHelp"></span>
                     <span class="field-error" id="editIdError" hidden></span>
                   </label>
                   <label class="field">
-                    <span class="field-label">显示名称 <code>name</code></span>
-                    <input id="editName" type="text" placeholder="例如 OMP (deepseek-flash · max)" />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">Agent 引擎 <code>engine</code></span>
+                    <span class="field-label">引擎 <code>engine</code></span>
                     <select id="editEngine">
                       <option value="omp">omp · Oh-My-Pi CLI</option>
                       <option value="kimi">kimi · Kimi Code CLI</option>
@@ -247,44 +243,50 @@
                     </select>
                     <span class="field-help">决定可选模型列表与参数注入方式</span>
                   </label>
-                  <label class="field">
-                    <span class="field-label">终端类型 <code>kind</code></span>
-                    <select id="editKind">
-                      <option value="tui">tui · ConPTY 伪终端</option>
-                      <option value="web_gui">web_gui · 内嵌 Web GUI + 终端</option>
-                      <option value="desktop_gui">desktop_gui · Win32 桌面窗口</option>
-                    </select>
+                  <div class="field full">
+                    <label class="field-label" for="editWhenToUse">何时调用 <code>when_to_use</code></label>
+                    <textarea id="editWhenToUse" rows="3" placeholder="例如：需要低延迟、高并发地执行简单代码搜索、日志分析或单文件小改动时优先调用。"></textarea>
+                    <span class="field-help">写给主 Agent 的调用时机说明：在什么任务、什么情况下应选择这个 Profile。</span>
+                  </div>
+                  <label class="field full">
+                    <span class="field-label">说明 <code>description</code></span>
+                    <input id="editDesc" type="text" placeholder="描述该 Profile 的技术配置" />
                   </label>
                 </div>
               </section>
 
               <section class="form-section">
-                <h5 class="form-section-title">模型与思考等级</h5>
+                <h5 class="form-section-title">默认值</h5>
                 <div class="form-grid">
                   <div class="field">
                     <label class="field-label" for="editModelSelect">默认模型 <code>default_model</code></label>
                     <select id="editModelSelect"></select>
-                    <input id="editModelCustom" type="text" class="mono-input" placeholder="输入模型 ID" spellcheck="false" hidden />
-                    <span class="field-help warn" id="editModelWarn" hidden></span>
+                    <span class="field-help">选「引擎默认」时会保存为空值，由引擎默认模型接管。</span>
                   </div>
-                  <label class="field">
-                    <span class="field-label">默认思考等级 <code>default_thinking_level</code></span>
+                  <div class="field">
+                    <label class="field-label" for="editThinking">默认思考等级 <code>default_thinking_level</code></label>
                     <select id="editThinking"></select>
-                  </label>
+                    <span class="field-help">选「按模型默认」时会保存为空值，由模型默认等级接管。</span>
+                  </div>
                 </div>
               </section>
 
-              <section class="form-section">
-                <h5 class="form-section-title">启动方式</h5>
+              <section class="form-section" id="groupLaunch">
+                <h5 class="form-section-title">启动</h5>
                 <div class="form-grid">
                   <label class="field full">
-                    <span class="field-label">可执行文件 <code>command</code></span>
+                    <span class="field-label">命令 <code>command</code></span>
                     <input id="editCommand" type="text" class="mono-input" placeholder="例如 C:\Users\me\.local\bin\omp.exe" spellcheck="false" />
                   </label>
+                  <div class="field full">
+                    <label class="field-label" for="editArgs">参数 <code>args</code></label>
+                    <textarea id="editArgs" rows="4" class="mono-input" spellcheck="false" placeholder="每行一个参数，空行忽略&#10;例如：--auto-approve"></textarea>
+                    <span class="field-help">模型与思考等级参数由 Hub 按启动时的选择自动注入，无需在此重复。</span>
+                  </div>
                   <label class="field">
-                    <span class="field-label">任务下发模式 <code>task_mode</code></span>
+                    <span class="field-label">任务传入方式 <code>task_mode</code></span>
                     <select id="editTaskMode">
-                      <option value="">未设置 · 使用服务端默认（pty_input）</option>
+                      <option value="">未设置（默认 pty_input）</option>
                       <option value="omp_positional">omp_positional · OMP 位置参数 + 会话目录</option>
                       <option value="codex_positional">codex_positional · Codex 位置参数</option>
                       <option value="agy_interactive_flag">agy_interactive_flag · AGY -i 交互参数</option>
@@ -296,21 +298,42 @@
                     <span class="field-label">启动等待（秒） <code>startup_delay_sec</code></span>
                     <input id="editDelay" type="number" step="0.5" min="0" />
                   </label>
+                </div>
+              </section>
+
+              <section class="form-section" id="groupDsh" hidden>
+                <h5 class="form-section-title">DSH</h5>
+                <div class="form-grid">
                   <label class="field full">
-                    <span class="field-label">附加启动参数 <code>args</code></span>
-                    <input id="editArgs" type="text" class="mono-input" placeholder='例如 [] 或 ["--auto-approve"]' spellcheck="false" />
-                    <span class="field-help">JSON 数组。模型与思考等级参数由 Hub 自动注入，无需在此重复。</span>
-                    <span class="field-error" id="editArgsError" hidden></span>
+                    <span class="field-label">DSH Web 地址 <code>gui_url</code></span>
+                    <input id="editGuiUrl" type="text" class="mono-input" placeholder="例如 http://127.0.0.1:3080" spellcheck="false" />
                   </label>
-                  <label class="field full">
-                    <span class="field-label">技术备注 <code>description</code></span>
-                    <input id="editDesc" type="text" placeholder="描述该 Profile 的技术配置" />
+                  <label class="field">
+                    <span class="field-label">档位 <code>dsh_tier</code></span>
+                    <select id="editDshTier">
+                      <option value="flash">flash</option>
+                      <option value="pro">pro</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">会话形式 <code>kind</code></span>
+                    <select id="editKind">
+                      <option value="tui">tui · 终端</option>
+                      <option value="web_gui">web_gui · 内嵌 Web GUI + 终端</option>
+                    </select>
                   </label>
                 </div>
               </section>
 
               <section class="info-card" id="engineInfo" aria-label="引擎识别信息"></section>
+
+              <details class="adv-box" id="advancedBox" hidden>
+                <summary>高级（只读）</summary>
+                <dl class="kv-list" id="advancedList"></dl>
+              </details>
             </div>
+
+            <div class="pm-editor-errors" id="editorErrors" hidden></div>
 
             <div class="pm-editor-foot">
               <button class="btn btn-ghost btn-danger-text" id="btnDeleteProfile">
@@ -405,14 +428,21 @@
         </div>
         <div class="guide-step">
           <div class="step-title"><span class="step-num">3</span>暴露的 MCP 工具</div>
-          <div class="tool-chips">
-            <code>discover_agent_models_and_thinking_levels</code>
-            <code>list_agent_profiles</code>
-            <code>spawn_subagent</code>
-            <code>send_to_subagent</code>
-            <code>get_subagent_status_and_trace</code>
-            <code>summarize_subagent_transcript</code>
-            <code>get_subagent_final_response</code>
+          <div class="tool-list">
+            <div class="tool-row"><code>list_agent_profiles</code><span>列出所有可调用的 Profile、路由指南与模型开关状态。</span></div>
+            <div class="tool-row"><code>discover_agent_models_and_thinking_levels</code><span>重新扫描本机引擎的模型与思考等级，并返回可用列表。</span></div>
+            <div class="tool-row"><code>spawn_subagent</code><span>按指定 Profile、模型与思考等级启动一个 Sub-Agent 会话。</span></div>
+            <div class="tool-row"><code>get_subagent_status_and_trace</code><span>查询会话执行到第几步、调用了哪些工具与当前活动。</span></div>
+            <div class="tool-row"><code>get_subagent_final_response</code><span>读取会话的最终回复与任务总结，进程结束后仍可查询。</span></div>
+            <div class="tool-row"><code>send_to_subagent</code><span>向运行中的 Sub-Agent 发送消息或补充指令。</span></div>
+            <div class="tool-row"><code>reply_to_subagent</code><span>回复 Sub-Agent 的提问或审批请求，解除它的等待。</span></div>
+            <div class="tool-row"><code>respond_to_subagent_approval_or_choice</code><span>代批高风险操作，或代选 Sub-Agent 的交互选项。</span></div>
+            <div class="tool-row"><code>wait_subagent_events</code><span>阻塞监听 Sub-Agent 发来的消息、提问与完成事件。</span></div>
+            <div class="tool-row"><code>summarize_subagent_transcript</code><span>解析引擎原生日志，返回高信噪比的执行摘要。</span></div>
+            <div class="tool-row"><code>read_subagent_screen</code><span>读取 Sub-Agent 的终端画面，可选择附带原始 TUI 文本。</span></div>
+            <div class="tool-row"><code>list_active_sessions</code><span>列出正在运行的会话，以及持久化的历史会话。</span></div>
+            <div class="tool-row"><code>terminate_subagent</code><span>终止指定会话，并持久化它的最终回复。</span></div>
+            <div class="tool-row"><code>attach_desktop_gui_window</code><span>按窗口标题把本机桌面窗口纳入总控台投屏。</span></div>
           </div>
         </div>
       </div>
@@ -432,7 +462,7 @@
         </button>
       </header>
       <div class="modal-body">
-        <p class="lead">选择一个桌面窗口纳入总控台实时投屏。纳管后可在窗格中一键把原窗口收纳到屏幕外（后台渲染），避免桌面窗口乱跳。</p>
+        <p class="lead">纳管后窗口会移出屏幕，画面显示在总控台里；可以随时移回屏幕。</p>
         <div class="win-tools">
           <label class="search-input">
             <svg class="icon icon-sm" aria-hidden="true"><use href="#i-search"></use></svg>
@@ -444,6 +474,38 @@
           </button>
         </div>
         <div class="win-list" id="win32List"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session record (历史) -->
+  <div class="modal-backdrop" id="historyModal" hidden>
+    <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle" tabindex="-1">
+      <header class="modal-head">
+        <h3 class="modal-title" id="historyModalTitle">
+          <svg class="icon" aria-hidden="true"><use href="#i-archive"></use></svg>会话记录
+        </h3>
+        <div class="grow"></div>
+        <button class="icon-btn" data-close-modal aria-label="关闭" title="关闭 (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+      <div class="modal-body" id="historyBody">
+        <section class="history-meta" id="historyMeta"></section>
+        <section class="history-block">
+          <div class="hb-head">
+            <h4>最终回复</h4>
+            <div class="grow"></div>
+            <button type="button" class="btn btn-ghost btn-sm" data-action="copy-final">
+              <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>复制
+            </button>
+          </div>
+          <pre class="history-pre" id="historyFinal"></pre>
+        </section>
+        <section class="history-block">
+          <div class="hb-head"><h4>过程摘要</h4></div>
+          <pre class="history-pre" id="historySummary"></pre>
+        </section>
       </div>
     </div>
   </div>

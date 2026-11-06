@@ -14,6 +14,7 @@ async function request(method, url, body, { timeoutMs } = {}) {
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
   }
   if (!res.ok) {
+    // FastAPI puts the actionable text in `detail`; surface it as the Error message.
     const detail = data?.detail ?? data?.error ?? `${res.status} ${res.statusText}`;
     const err = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
     err.status = res.status;
@@ -30,12 +31,17 @@ export const hubApi = {
   deleteProfile: (id) => request('DELETE', `/api/profiles/${enc(id)}`),
   toggleEngineModel: (engine, model, enabled) =>
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled }),
+  setModelNote: (engine, model, enabled, note) =>
+    request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled, note }),
   saveRoutingGuide: (text) => request('POST', '/api/routing-guide', { global_routing_instructions: text }),
 
   listSessions: () => request('GET', '/api/sessions', undefined, { timeoutMs: 10000 }),
   createSession: (body) => request('POST', '/api/sessions', body),
+  launchPreview: (body) => request('POST', '/api/launch-preview', body),
   sendInput: (id, text) => request('POST', `/api/sessions/${enc(id)}/input`, { text }),
   terminateSession: (id) => request('DELETE', `/api/sessions/${enc(id)}`),
+  sessionFinal: (id) => request('GET', `/api/sessions/${enc(id)}/final`),
+  transcriptSummary: (id) => request('GET', `/api/sessions/${enc(id)}/transcript-summary`),
 
   listWin32Windows: () => request('GET', '/api/win32/windows'),
   windowFrame: (id) => request('GET', `/api/sessions/${enc(id)}/frame`),

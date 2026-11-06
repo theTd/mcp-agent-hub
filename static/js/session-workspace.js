@@ -1,23 +1,14 @@
 // Session list in the sidebar plus the terminal / web GUI / desktop panes in the workspace.
 import { hubApi } from './hub-api.js';
 import { state, on, emit, setActiveSession, removeSession } from './console-state.js';
-import { $, escapeHtml, icon, formatDuration, shortPath, toast, confirmDialog, setBusy } from './ui-kit.js';
+import {
+  $, $$, escapeHtml, icon, formatDuration, shortPath, toast, confirmDialog, setBusy,
+  openModal, copyText, firstLine, formatWhen,
+} from './ui-kit.js';
+import { statusLabel, statusTone, activityLabel } from './session-status-text.js';
 
-// ------------------------------------------------------------- status model
-const STATUS = {
-  starting: { label: '启动中', tone: 'info' },
-  running: { label: '运行中', tone: 'success' },
-  waiting_parent: { label: '等待主 Agent', tone: 'warning' },
-  completed: { label: '已完成', tone: 'violet' },
-  exited: { label: '已退出', tone: 'muted' },
-  terminated: { label: '已终止', tone: 'danger' },
-};
+const HISTORY_MODAL = 'historyModal';
 const LIVE_STATUSES = new Set(['starting', 'running', 'waiting_parent']);
-
-const statusMeta = (status) => STATUS[status] || { label: status || '未知', tone: 'muted' };
-const isLive = (status) => LIVE_STATUSES.has(status);
-const engineKey = (s) => (s.kind === 'desktop_gui' ? 'desktop' : s.engine || s.kind || 'tui');
-
 const QUICK_KEYS = {
   enter: { text: '\r', label: '⏎', title: '发送 Enter' },
   yes: { text: 'y\r', label: 'y⏎', title: '发送 y + Enter（确认）' },
@@ -51,23 +42,37 @@ const TERMINAL_THEME = {
 
 const cards = new Map(); // session_id -> { el, sig }
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
-const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed }
+const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
 const streams = new Map(); // session_id -> { stopped, timer }
+
+let sessionsMode = 'live'; // 'live' | 'history'
+let historyRecordId = null;
 
 export function initSessionWorkspace() {
   $('#sessionList').addEventListener('click', onSessionListClick);
   $('#sessionList').addEventListener('keydown', onSessionListKeydown);
   $('#gridContainer').addEventListener('click', onWorkspaceClick);
   $('#gridContainer').addEventListener('dblclick', onWorkspaceDblClick);
+  $$('[data-session-tab]').forEach((tab) => tab.addEventListener('click', () => setSessionsMode(tab.dataset.sessionTab)));
+  $('#historyModal').addEventListener('click', onHistoryModalClick);
 
   on('sessions:changed', renderAll);
   on('session:activated', () => {
     renderAll();
-    focusActiveTerminal();
+    focusActiveSession();
   });
   on('layout:changed', renderWorkspace);
+  on('session:open', openSessionOrHistory);
+  on('history:open', openHistoryRecord);
   window.addEventListener('resize', scheduleFitAll);
+  // Alt+↑ / Alt+↓ also works while the terminal has focus (capture phase sees it first).
+  document.addEventListener('keydown', onGlobalKeydown, true);
   renderAll();
+}
+
+export function setSessionsMode(mode) {
+  sessionsMode = mode === 'history' ? 'history' : 'live';
+  renderSessionList();
 }
 
 function renderAll() {
@@ -76,21 +81,60 @@ function renderAll() {
   renderWorkspace();
 }
 
+// ---------------------------------------------------------- session shapes
+const isLive = (s) => (typeof s.process_alive === 'boolean' ? s.process_alive : LIVE_STATUSES.has(s.status));
+const engineKey = (s) => (s.kind === 'desktop_gui' ? 'desktop' : s.engine || s.kind || 'tui');
+const profileLabel = (s) => s.profile_name || s.profile_id || '会话';
+
+function sessionTitle(s) {
+  const task = firstLine(s.last_task);
+  return `${profileLabel(s)} · ${task || '交互会话'}`;
+}
+
+function cwdBase(cwd) {
+  const parts = String(cwd || '').split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+function orderedSessions() {
+  return [...state.sessions].reverse(); // newest first
+}
+
+function historyEntries() {
+  const live = new Set(state.sessions.map((s) => s.session_id));
+  return state.persistedSessions
+    .filter((rec) => !live.has(rec.session_id))
+    .sort((a, b) => (b.ended_at || b.updated_at || b.created_at || 0) - (a.ended_at || a.updated_at || a.created_at || 0));
+}
+
+function modelLine(s) {
+  return [s.effective_model, s.effective_thinking_level].filter(Boolean).join(' · ');
+}
+
 // ------------------------------------------------------------- session list
 function renderSessionList() {
   const list = $('#sessionList');
-  const ordered = [...state.sessions].reverse();
-  $('#sessionCount').textContent = String(state.sessions.length);
-  renderSessionSummary();
+  $('#liveCount').textContent = String(state.sessions.length);
+  $('#historyCount').textContent = String(historyEntries().length);
+  $$('[data-session-tab]').forEach((tab) =>
+    tab.setAttribute('aria-pressed', String(tab.dataset.sessionTab === sessionsMode)));
+  const waiting = state.sessions.filter((s) => s.status === 'waiting_parent').length;
+  $('#sessionSummary').innerHTML = waiting ? `<span class="warn">${waiting} 个待回复</span>` : '';
 
+  if (sessionsMode === 'history') {
+    renderHistoryList(list);
+    return;
+  }
+
+  const ordered = orderedSessions();
   if (!ordered.length) {
-    list.innerHTML = state.sessionsLoaded
-      ? '<div class="list-empty">暂无会话</div>'
-      : '';
+    list.innerHTML = state.sessionsLoaded ? '<div class="list-empty">暂无会话</div>' : '';
     cards.clear();
     return;
   }
   list.querySelector('.list-empty')?.remove();
+  // Coming back from 历史: the list holds history rows, not cards.
+  if (list.querySelector('.history-item')) list.innerHTML = '';
 
   ordered.forEach((s, index) => {
     let card = cards.get(s.session_id);
@@ -103,7 +147,10 @@ function renderSessionList() {
       card = { el, sig: '' };
       cards.set(s.session_id, card);
     }
-    const sig = [s.title, s.status, s.engine, s.kind, s.effective_model, s.effective_thinking_level].join('|');
+    const sig = [
+      sessionTitle(s), s.status, s.process_alive, s.engine, s.kind,
+      s.effective_model, s.effective_thinking_level, s.cwd,
+    ].join('|');
     if (sig !== card.sig) {
       card.el.innerHTML = sessionCardHtml(s);
       card.sig = sig;
@@ -115,56 +162,76 @@ function renderSessionList() {
   });
 }
 
-function renderSessionSummary() {
-  const live = state.sessions.filter((s) => isLive(s.status)).length;
-  const waiting = state.sessions.filter((s) => s.status === 'waiting_parent').length;
-  const el = $('#sessionSummary');
-  if (!state.sessions.length) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = `${live} 个运行中${waiting ? ` · <span class="warn">${waiting} 个待回复</span>` : ''}`;
-}
-
-function pillsHtml(s) {
-  const model = s.effective_model ? `<span class="pill pill-model" title="模型">${escapeHtml(s.effective_model)}</span>` : '';
-  const effort = s.effective_thinking_level
-    ? `<span class="pill pill-effort" title="思考等级">${icon('gauge')}${escapeHtml(s.effective_thinking_level)}</span>`
-    : '';
-  return model + effort;
+function metaBitsHtml(s) {
+  const bits = [];
+  const model = modelLine(s);
+  if (model) bits.push(`<span class="sc-meta-text" title="${escapeHtml(model)}">${escapeHtml(model)}</span>`);
+  const folder = cwdBase(s.cwd);
+  if (folder) bits.push(`<span class="sc-meta-text" title="${escapeHtml(s.cwd || '')}">${icon('folder', 'icon-xs')}${escapeHtml(folder)}</span>`);
+  const tail = String(s.session_id || '').slice(-6);
+  if (tail) bits.push(`<span class="sc-meta-id" title="${escapeHtml(s.session_id || '')}">${escapeHtml(tail)}</span>`);
+  return bits.map((bit) => `<span class="dot-sep"></span>${bit}`).join('');
 }
 
 function sessionCardHtml(s) {
-  const st = statusMeta(s.status);
-  const pills = pillsHtml(s);
+  const live = isLive(s);
   return `
     <div class="sc-row">
-      <span class="status-dot" data-status="${escapeHtml(s.status)}" title="${escapeHtml(st.label)}"></span>
-      <span class="sc-title" title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</span>
+      <span class="status-dot" data-status="${escapeHtml(s.status)}" title="${escapeHtml(statusLabel(s.status))}"></span>
+      <span class="sc-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</span>
       <button type="button" class="icon-btn sm danger sc-close" data-action="close"
-        title="${isLive(s.status) ? '终止会话' : '移除会话'}" aria-label="${isLive(s.status) ? '终止会话' : '移除会话'}">${icon('x')}</button>
+        title="${live ? '终止会话' : '移除'}" aria-label="${live ? '终止会话' : '移除'}">${icon('x')}</button>
     </div>
-    ${pills ? `<div class="sc-pills">${pills}</div>` : ''}
     <div class="sc-activity" data-ref="activity"></div>
     <div class="sc-meta">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
-      <span class="status-text" data-tone="${st.tone}">${escapeHtml(st.label)}</span>
-      <span class="dot-sep"></span>
+      <span class="status-text" data-tone="${statusTone(s.status)}">${escapeHtml(statusLabel(s.status))}</span>
+      ${metaBitsHtml(s)}
       <span data-ref="idle"></span>
     </div>`;
 }
 
 function activityText(s) {
-  if (s.current_activity) return s.current_activity;
-  return s.last_task ? `任务：${s.last_task}` : '';
+  return activityLabel(s.current_activity);
 }
 
 function idleText(s) {
-  if (isLive(s.status)) return `空闲 ${formatDuration(s.idle_seconds)}`;
-  return s.exit_code !== null && s.exit_code !== undefined ? `退出码 ${s.exit_code}` : s.session_id;
+  if (isLive(s)) return `空闲 ${formatDuration(s.idle_seconds)}`;
+  return s.exit_code !== null && s.exit_code !== undefined ? `退出码 ${s.exit_code}` : '';
+}
+
+function renderHistoryList(list) {
+  const entries = historyEntries();
+  if (!entries.length) {
+    list.innerHTML = '<div class="list-empty">暂无历史会话</div>';
+    return;
+  }
+  list.innerHTML = entries.map(historyItemHtml).join('');
+}
+
+function historyItemHtml(rec) {
+  const model = [rec.effective_model, rec.effective_thinking_level].filter(Boolean).join(' · ');
+  const when = formatWhen(rec.ended_at || rec.updated_at || rec.created_at);
+  return `
+    <div class="history-item" data-id="${escapeHtml(rec.session_id)}" tabindex="0" role="option">
+      <div class="hi-row">
+        <span class="status-dot" data-status="${escapeHtml(rec.status || '')}"></span>
+        <span class="hi-title" title="${escapeHtml(sessionTitle(rec))}">${escapeHtml(sessionTitle(rec))}</span>
+      </div>
+      <div class="hi-meta">
+        <span class="status-text" data-tone="${statusTone(rec.status)}">${escapeHtml(statusLabel(rec.status))}</span>
+        ${when ? `<span class="dot-sep"></span><span>结束 ${escapeHtml(when)}</span>` : ''}
+        ${model ? `<span class="dot-sep"></span><span class="hi-model" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` : ''}
+      </div>
+    </div>`;
 }
 
 async function onSessionListClick(ev) {
+  if (sessionsMode === 'history') {
+    const item = ev.target.closest('.history-item');
+    if (item) openHistoryRecord(item.dataset.id);
+    return;
+  }
   const card = ev.target.closest('.session-card');
   if (!card) return;
   if (ev.target.closest('[data-action="close"]')) {
@@ -172,17 +239,26 @@ async function onSessionListClick(ev) {
     await closeSession(card.dataset.id);
     return;
   }
-  if (state.activeSessionId === card.dataset.id) focusActiveTerminal();
+  if (state.activeSessionId === card.dataset.id) focusActiveSession();
   else setActiveSession(card.dataset.id);
 }
 
 function onSessionListKeydown(ev) {
+  if (sessionsMode === 'history') {
+    const item = ev.target.closest('.history-item');
+    if (!item || ev.target !== item) return;
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      openHistoryRecord(item.dataset.id);
+    }
+    return;
+  }
   const card = ev.target.closest('.session-card');
   if (!card || ev.target !== card) return;
   if (ev.key === 'Enter' || ev.key === ' ') {
     ev.preventDefault();
     setActiveSession(card.dataset.id);
-    focusActiveTerminal();
+    focusActiveSession();
   } else if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
     ev.preventDefault();
     const next = ev.key === 'ArrowDown' ? card.nextElementSibling : card.previousElementSibling;
@@ -225,24 +301,25 @@ function renderWorkspace() {
   }
   placeholder?.remove();
 
-  state.sessions.forEach((s, index) => {
+  // Walking oldest → newest and prepending keeps the DOM in newest-first order while
+  // never moving a pane that is already attached (moving an iframe reloads it).
+  for (const s of [...orderedSessions()].reverse()) {
     const isVisible = visibleIds.has(s.session_id);
     let pane = panes.get(s.session_id);
     if (!pane) {
-      if (!isVisible) return; // panes (and their terminals) are created lazily on first view
+      if (!isVisible) continue; // panes (and their terminals) are created lazily on first view
       pane = createPane(s);
       panes.set(s.session_id, pane);
     }
     pane.el.hidden = !isVisible;
     updatePane(pane, s);
-    // Insert new panes only; existing ones are never moved (moving an iframe reloads it).
-    if (!pane.el.isConnected) grid.insertBefore(pane.el, grid.children[index] || null);
+    if (!pane.el.isConnected) grid.insertBefore(pane.el, grid.firstChild);
     if (isVisible && !pane.mounted) {
       mountPaneBody(pane, s);
       pane.mounted = true;
     }
     if (isVisible && s.kind === 'desktop_gui') ensureStream(s.session_id);
-  });
+  }
   scheduleFitAll();
 }
 
@@ -255,9 +332,9 @@ function emptyStateHtml() {
     <div class="empty-state" data-kind="empty">
       <div class="empty-illus">${icon('terminal', 'icon-xl')}</div>
       <h2 class="empty-title">还没有运行中的 Sub-Agent</h2>
-      <p class="empty-desc">在左侧选择 Profile 后点击「拉起 Agent」，或让任意 MCP 客户端调用 <code>spawn_subagent</code>。所有终端与 GUI 窗口都会集中显示在这里。</p>
+      <p class="empty-desc">展开左侧「启动 Sub-Agent」选择 Profile 后启动，或让任意 MCP 客户端调用 <code>spawn_subagent</code>。</p>
       <div class="empty-actions">
-        <button type="button" class="btn btn-primary" data-cmd="focus-launcher">${icon('play')}拉起 Agent</button>
+        <button type="button" class="btn btn-primary" data-cmd="focus-launcher">${icon('play')}启动 Sub-Agent</button>
         <button type="button" class="btn" data-cmd="open-win32">${icon('monitor')}纳管桌面窗口</button>
         <button type="button" class="btn" data-cmd="open-mcp-guide">${icon('plug')}MCP 接入指南</button>
       </div>
@@ -283,24 +360,31 @@ function createPane(s) {
     el,
     head: ref('head'),
     body: ref('body'),
-    refs: { dot: ref('dot'), status: ref('status'), step: ref('step'), activity: ref('activity'), cwd: ref('cwd'), idle: ref('idle') },
+    refs: {
+      dot: ref('dot'), status: ref('status'), step: ref('step'),
+      activity: ref('activity'), cwd: ref('cwd'), idle: ref('idle'),
+    },
     headSig: '',
     mounted: false,
   };
 }
 
 function paneHeadHtml(s) {
-  const live = isLive(s.status);
+  const live = isLive(s);
+  const wsOpen = !!terminals.get(s.session_id)?.wsOpen;
   const isDesktop = s.kind === 'desktop_gui';
-  const keys = Object.entries(QUICK_KEYS).map(([key, k]) =>
-    `<button type="button" data-action="key" data-key="${key}" title="${k.title}" ${live ? '' : 'disabled'}>${k.label}</button>`).join('');
+  const keys = Object.entries(QUICK_KEYS).map(([key, k]) => {
+    const enabled = live && wsOpen;
+    const title = enabled ? k.title : '终端未连接';
+    return `<button type="button" data-action="key" data-key="${key}" title="${escapeHtml(title)}" ${enabled ? '' : 'disabled'}>${k.label}</button>`;
+  }).join('');
   const tuckButton = s.tucked_offscreen
-    ? `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="false" title="把原窗口移回桌面">${icon('eye', 'icon-sm')}<span class="btn-label">恢复桌面显示</span></button>`
-    : `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="true" title="把原窗口收纳到屏幕外，后台继续渲染">${icon('archive', 'icon-sm')}<span class="btn-label">收纳原窗口</span></button>`;
+    ? `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="false" title="把原窗口移回屏幕">${icon('eye', 'icon-sm')}<span class="btn-label">移回屏幕</span></button>`
+    : `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="true" title="把原窗口移出屏幕，画面继续显示在总控台">${icon('archive', 'icon-sm')}<span class="btn-label">移出屏幕</span></button>`;
   return `
     <div class="pane-title">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
-      <strong title="${escapeHtml(s.title)}">${escapeHtml(s.title)}</strong>
+      <strong title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</strong>
       ${pillsHtml(s)}
     </div>
     <div class="pane-actions">
@@ -308,29 +392,75 @@ function paneHeadHtml(s) {
       ${state.layoutMode === 'matrix'
         ? `<button type="button" class="icon-btn sm" data-action="focus-single" title="在单窗口视图中打开（或双击标题栏）" aria-label="在单窗口视图中打开">${icon('maximize')}</button>`
         : ''}
-      <button type="button" class="icon-btn sm danger" data-action="close" title="${live ? '终止会话' : '移除会话'}" aria-label="${live ? '终止会话' : '移除会话'}">${icon('x')}</button>
+      <button type="button" class="icon-btn sm danger" data-action="close" title="${live ? '终止会话' : '移除'}" aria-label="${live ? '终止会话' : '移除'}">${icon('x')}</button>
     </div>`;
 }
 
+function pillsHtml(s) {
+  const model = s.effective_model ? `<span class="pill pill-model" title="模型">${escapeHtml(s.effective_model)}</span>` : '';
+  const effort = s.effective_thinking_level
+    ? `<span class="pill pill-effort" title="思考等级">${icon('gauge')}${escapeHtml(s.effective_thinking_level)}</span>`
+    : '';
+  return model + effort;
+}
+
 function updatePane(pane, s) {
-  const sig = [state.layoutMode, s.title, s.status, s.kind, s.engine, s.effective_model, s.effective_thinking_level, s.tucked_offscreen].join('|');
+  const sig = [
+    state.layoutMode, sessionTitle(s), s.status, s.process_alive, s.kind, s.engine,
+    s.effective_model, s.effective_thinking_level, s.tucked_offscreen,
+    terminals.get(s.session_id)?.wsOpen ? '1' : '0',
+  ].join('|');
   if (sig !== pane.headSig) {
     pane.head.innerHTML = paneHeadHtml(s);
     pane.headSig = sig;
   }
-  const st = statusMeta(s.status);
   pane.el.dataset.status = s.status;
   pane.el.classList.toggle('focused', s.session_id === state.activeSessionId);
   pane.refs.dot.dataset.status = s.status;
-  pane.refs.status.textContent = st.label;
-  pane.refs.status.dataset.tone = st.tone;
+  pane.refs.status.textContent = statusLabel(s.status);
+  pane.refs.status.dataset.tone = statusTone(s.status);
   pane.refs.step.textContent = s.step_count ? `第 ${s.step_count} 步` : '';
   pane.refs.activity.textContent = activityText(s);
   pane.refs.activity.title = activityText(s);
   pane.refs.cwd.hidden = !s.cwd;
   pane.refs.cwd.title = s.cwd || '';
   pane.refs.cwd.querySelector('span').textContent = shortPath(s.cwd);
-  pane.refs.idle.textContent = idleText(s);
+  pane.refs.idle.textContent = `空闲 ${formatDuration(s.idle_seconds)}`;
+  updateWaitingBanner(pane, s);
+}
+
+function pendingQuestionText(s) {
+  const interaction = s.pending_interaction;
+  let text = '';
+  if (typeof interaction === 'string') text = interaction;
+  else if (interaction && typeof interaction === 'object') {
+    text = interaction.question || interaction.text || interaction.prompt || interaction.title || '';
+    const options = Array.isArray(interaction.options) ? interaction.options.filter(Boolean) : [];
+    if (options.length) text += `\n选项：${options.map((opt, i) => `${i + 1}) ${opt}`).join('  ')}`;
+  }
+  text = String(text || '').trim();
+  return text || activityText(s);
+}
+
+function updateWaitingBanner(pane, s) {
+  const waiting = s.status === 'waiting_parent';
+  let banner = pane.el.querySelector('.pane-banner');
+  if (!waiting) {
+    banner?.remove();
+    return;
+  }
+  const question = pendingQuestionText(s);
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.className = 'pane-banner';
+    banner.innerHTML = `
+      <span class="pb-icon">${icon('message')}</span>
+      <div class="pb-text"><div class="pb-title">等待主 Agent 回复</div><div class="pb-question"></div></div>
+      <button type="button" class="icon-btn sm" data-action="copy-question" title="复制问题">${icon('copy')}</button>`;
+    pane.el.insertBefore(banner, pane.body);
+  }
+  banner.querySelector('.pb-question').textContent = question;
+  banner.dataset.question = question;
 }
 
 function safeGuiUrl(url) {
@@ -347,14 +477,14 @@ function mountPaneBody(pane, s) {
   if (guiUrl) {
     pane.body.innerHTML = `
       <div class="web-gui-split">
-        <iframe src="${escapeHtml(guiUrl)}" title="${escapeHtml(s.title)} Web GUI"></iframe>
+        <iframe src="${escapeHtml(guiUrl)}" title="${escapeHtml(sessionTitle(s))} Web GUI"></iframe>
         <div class="web-gui-term"></div>
       </div>`;
     attachTerminal(s.session_id, pane.body.querySelector('.web-gui-term'));
   } else if (s.kind === 'desktop_gui') {
     pane.body.innerHTML = `
       <div class="desktop-stream">
-        <img alt="${escapeHtml(s.title)} 窗口画面" draggable="false" hidden />
+        <img alt="${escapeHtml(sessionTitle(s))} 窗口画面" draggable="false" hidden />
         <div class="stream-overlay"><span class="spinner"></span>正在获取窗口画面…</div>
       </div>`;
     pane.body.querySelector('img').addEventListener('click', (ev) => onDesktopClick(ev, s.session_id));
@@ -405,7 +535,7 @@ function createTerminal(sessionId) {
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
 
-  const t = { term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0 };
+  const t = { term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0, wsOpen: false };
   const sendResize = () => {
     if (t.opened && t.ws?.readyState === WebSocket.OPEN) {
       t.ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -418,13 +548,17 @@ function createTerminal(sessionId) {
       // The server replays the whole history on every connect, so start from a clean screen.
       if (t.retries > 0) term.reset();
       t.retries = 0;
+      t.wsOpen = true;
       sendResize();
+      refreshPaneHead(sessionId);
     };
     ws.onmessage = (ev) => term.write(ev.data);
     ws.onclose = () => {
+      t.wsOpen = false;
+      refreshPaneHead(sessionId);
       if (t.disposed) return;
       const session = state.sessions.find((x) => x.session_id === sessionId);
-      if (!session || !isLive(session.status)) {
+      if (!session || !isLive(session)) {
         term.write('\r\n\x1b[90m── 终端连接已关闭 ──\x1b[0m\r\n');
         return;
       }
@@ -443,6 +577,12 @@ function createTerminal(sessionId) {
   t.ro.observe(host);
   terminals.set(sessionId, t);
   return t;
+}
+
+function refreshPaneHead(sessionId) {
+  const pane = panes.get(sessionId);
+  const session = state.sessions.find((x) => x.session_id === sessionId);
+  if (pane && session) updatePane(pane, session);
 }
 
 function attachTerminal(sessionId, container) {
@@ -478,8 +618,26 @@ function flushFits() {
   fitQueue.clear();
 }
 
-function focusActiveTerminal() {
-  requestAnimationFrame(() => terminals.get(state.activeSessionId)?.term.focus());
+function focusActiveSession() {
+  const id = state.activeSessionId;
+  const pane = panes.get(id);
+  if (pane && state.layoutMode === 'matrix') pane.el.scrollIntoView({ block: 'nearest' });
+  requestAnimationFrame(() => terminals.get(id)?.term.focus());
+}
+
+function onGlobalKeydown(ev) {
+  if (!ev.altKey || (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown')) return;
+  if (document.querySelector('.modal-backdrop:not([hidden])')) return;
+  const ordered = orderedSessions();
+  if (!ordered.length) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const delta = ev.key === 'ArrowDown' ? 1 : -1;
+  const index = ordered.findIndex((s) => s.session_id === state.activeSessionId);
+  let nextIndex;
+  if (index < 0) nextIndex = delta > 0 ? 0 : ordered.length - 1;
+  else nextIndex = Math.min(ordered.length - 1, Math.max(0, index + delta));
+  if (nextIndex !== index) setActiveSession(ordered[nextIndex].session_id);
 }
 
 // ----------------------------------------------------------- desktop streams
@@ -548,7 +706,7 @@ async function onWorkspaceClick(ev) {
   if (!action) return;
   switch (action.dataset.action) {
     case 'key':
-      await sendKey(id, action.dataset.key);
+      sendKey(id, action.dataset.key);
       break;
     case 'close':
       await closeSession(id);
@@ -559,6 +717,11 @@ async function onWorkspaceClick(ev) {
     case 'focus-single':
       openInSingleView(id);
       break;
+    case 'copy-question': {
+      const question = paneEl.querySelector('.pane-banner')?.dataset.question || '';
+      if (question) copyText(question, '已复制问题');
+      break;
+    }
     default:
       break;
   }
@@ -573,18 +736,20 @@ function onWorkspaceDblClick(ev) {
 function openInSingleView(id) {
   setActiveSession(id);
   emit('layout:set', 'single');
-  focusActiveTerminal();
+  focusActiveSession();
 }
 
-async function sendKey(id, key) {
+/** Quick keys go through the pane's PTY WebSocket, never through the REST /input route. */
+function sendKey(id, key) {
   const k = QUICK_KEYS[key];
   if (!k) return;
-  try {
-    await hubApi.sendInput(id, k.text);
-  } catch (err) {
-    toast(`发送按键失败：${err.message}`, 'error');
+  const t = terminals.get(id);
+  if (!t || t.ws?.readyState !== WebSocket.OPEN) {
+    toast('终端未连接，无法发送按键', 'error', 2500);
+    return;
   }
-  terminals.get(id)?.term.focus();
+  t.ws.send(JSON.stringify({ type: 'input', data: k.text }));
+  t.term.focus();
 }
 
 async function toggleTuck(id, tuck, button) {
@@ -603,11 +768,12 @@ async function toggleTuck(id, tuck, button) {
 async function closeSession(id) {
   const s = state.sessions.find((x) => x.session_id === id);
   if (!s) return;
-  const live = isLive(s.status);
+  const live = isLive(s);
+  const label = profileLabel(s);
   if (live) {
     const ok = await confirmDialog({
       title: '终止这个会话？',
-      message: `「${s.title}」仍在运行。终止后进程会被结束，未完成的任务将中断。`,
+      message: `「${label}」仍在运行。终止后进程会被结束，未完成的任务将中断。`,
       confirmText: '终止会话',
       danger: true,
     });
@@ -617,8 +783,96 @@ async function closeSession(id) {
     await hubApi.terminateSession(id);
     removeSession(id);
     emit('sessions:refresh-request');
-    toast(live ? `已终止 ${s.title}` : `已移除 ${s.title}`, 'success', 2000);
+    toast(live ? `已终止 ${label}` : `已移除 ${label}`, 'success', 2000);
   } catch (err) {
     toast(`关闭失败：${err.message}`, 'error');
   }
+}
+
+// ------------------------------------------------------------ history record
+function openSessionOrHistory(id) {
+  if (!id) return;
+  if (state.sessions.some((s) => s.session_id === id)) {
+    setActiveSession(id);
+    return;
+  }
+  openHistoryRecord(id);
+}
+
+function openHistoryRecord(id) {
+  if (!id) return;
+  historyRecordId = id;
+  const rec = state.persistedSessions.find((r) => r.session_id === id)
+    || state.sessions.find((s) => s.session_id === id)
+    || { session_id: id };
+  renderHistoryMeta(rec, null);
+  setHistoryText('#historyFinal', '加载中…');
+  setHistoryText('#historySummary', '加载中…');
+  openModal(HISTORY_MODAL);
+  loadHistoryRecord(id, rec);
+}
+
+async function loadHistoryRecord(id, rec) {
+  const [finalRes, summaryRes] = await Promise.allSettled([
+    hubApi.sessionFinal(id),
+    hubApi.transcriptSummary(id),
+  ]);
+  if (historyRecordId !== id) return;
+
+  if (finalRes.status === 'fulfilled') {
+    const final = finalRes.value || {};
+    renderHistoryMeta(rec, final);
+    setHistoryText('#historyFinal', String(final.final_response || '').trim() || '（暂无最终回复）');
+  } else {
+    setHistoryText('#historyFinal', `加载失败：${finalRes.reason?.message || finalRes.reason}`, true);
+  }
+
+  if (summaryRes.status === 'fulfilled') {
+    const summary = summaryRes.value || {};
+    const text = String(summary.digest_markdown || summary.latest_conclusion || '').trim();
+    setHistoryText('#historySummary', text || '（暂无过程摘要）');
+  } else {
+    setHistoryText('#historySummary', `加载失败：${summaryRes.reason?.message || summaryRes.reason}`, true);
+  }
+}
+
+function renderHistoryMeta(rec, final) {
+  const model = [
+    rec.effective_model ?? final?.effective_model,
+    rec.effective_thinking_level ?? final?.effective_thinking_level,
+  ].filter(Boolean).join(' · ');
+  const status = rec.status || final?.lifecycle_status;
+  const exitCode = rec.exit_code ?? final?.exit_code;
+  const start = rec.created_at || final?.created_at;
+  const end = rec.ended_at || final?.ended_at;
+  const rows = [
+    ['Profile', rec.profile_name || rec.profile_id || final?.profile_id || ''],
+    ['模型', model],
+    ['工作目录', rec.cwd || ''],
+    ['开始', formatWhen(start)],
+    ['结束', formatWhen(end)],
+    ['退出码', exitCode === null || exitCode === undefined ? '' : String(exitCode)],
+    ['状态', status ? statusLabel(status) : ''],
+  ].filter(([, value]) => value !== '' && value !== null && value !== undefined);
+  $('#historyMeta').innerHTML = `<dl class="kv-list">${rows
+    .map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${key === '工作目录' ? `<code>${escapeHtml(String(value))}</code>` : escapeHtml(String(value))}</dd>`)
+    .join('')}</dl>`;
+}
+
+function setHistoryText(selector, text, isError = false) {
+  const el = $(selector);
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('is-error', isError);
+}
+
+function onHistoryModalClick(ev) {
+  const btn = ev.target.closest('[data-action="copy-final"]');
+  if (!btn) return;
+  const text = $('#historyFinal')?.textContent || '';
+  if (!text || text === '加载中…' || text === '（暂无最终回复）') {
+    toast('没有可复制的最终回复', 'info', 2000);
+    return;
+  }
+  copyText(text, '已复制最终回复');
 }

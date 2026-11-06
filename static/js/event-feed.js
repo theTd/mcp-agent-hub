@@ -1,17 +1,14 @@
 // Sidebar feed of worker → parent events reported through the hub mailbox.
-import { state, prefs, savePrefs, on, setActiveSession } from './console-state.js';
+import { state, prefs, savePrefs, on, emit, setActiveSession } from './console-state.js';
 import { $, escapeHtml, formatClock } from './ui-kit.js';
+import { eventTypeLabel, eventTypeTone } from './session-status-text.js';
 
 const MAX_EVENTS = 30;
-const TYPE_TONES = {
-  completed: 'success',
-  turn_completed: 'success',
-  question: 'warning',
-  message: 'info',
-  message_to_parent: 'info',
-  exited: 'muted',
-};
 
+// Agent-facing "可调用 foo(...)" hints are noise for a human reading the feed.
+const CALL_HINT_RE = /[，,。；;]?\s*(?:可|请)?调用\s*`?[A-Za-z_]+\([^)]*\)`?[^。]*。?/g;
+
+const expanded = new Set();
 let lastSignature = '';
 
 export function initEventFeed() {
@@ -23,8 +20,17 @@ export function initEventFeed() {
   });
   $('#eventFeed').addEventListener('click', (ev) => {
     const item = ev.target.closest('.event-item');
-    const id = item?.dataset.sessionId;
-    if (id && state.sessions.some((s) => s.session_id === id)) setActiveSession(id);
+    if (!item) return;
+    const id = item.dataset.sessionId;
+    const key = item.dataset.key;
+    if (key) {
+      if (expanded.has(key)) expanded.delete(key);
+      else expanded.add(key);
+      item.classList.toggle('is-expanded', expanded.has(key));
+    }
+    if (!id) return;
+    if (state.sessions.some((s) => s.session_id === id)) setActiveSession(id);
+    else emit('history:open', id);
   });
   on('sessions:changed', render);
 }
@@ -36,30 +42,51 @@ function applyCollapsed(collapsed) {
 
 function toneOf(ev) {
   if (ev.status === 'error' || ev.status === 'failed') return 'danger';
-  return TYPE_TONES[ev.type] || 'muted';
+  return eventTypeTone(ev.type);
+}
+
+function cleanContent(text) {
+  return String(text ?? '').replace(CALL_HINT_RE, '').replace(/\s+$/g, '').trim();
+}
+
+function eventKey(ev) {
+  return String(ev.seq ?? `${ev.timestamp ?? ''}-${ev.type ?? ''}`);
+}
+
+function sourceNames() {
+  const names = new Map();
+  for (const rec of [...state.persistedSessions, ...state.sessions]) {
+    if (!names.has(rec.session_id)) names.set(rec.session_id, rec.profile_name || rec.profile_id || rec.session_id);
+  }
+  return names;
 }
 
 function render() {
   const events = [...state.recentEvents].reverse().slice(0, MAX_EVENTS);
-  const titles = new Map(state.sessions.map((s) => [s.session_id, s.title]));
-  const signature = `${state.globalSeq}|${events.length}|${[...titles].join()}`;
+  const names = sourceNames();
+  const signature = [
+    state.globalSeq, events.length, expanded.size,
+    [...names].map(([id, name]) => `${id}:${name}`).join(','),
+    [...expanded].join(','),
+  ].join('|');
   if (signature === lastSignature) return;
   lastSignature = signature;
 
-  $('#globalSeq').textContent = `#${state.globalSeq}`;
   const feed = $('#eventFeed');
   if (!events.length) {
     feed.innerHTML = '<div class="list-empty">暂无事件。Sub-Agent 向主 Agent 汇报进度、提问或完成任务时会显示在这里。</div>';
     return;
   }
   feed.innerHTML = events.map((ev) => {
-    const source = titles.get(ev.session_id) || ev.session_id;
+    const key = eventKey(ev);
+    const content = cleanContent(ev.content);
+    const isExpanded = expanded.has(key);
     return `
-      <div class="event-item" data-session-id="${escapeHtml(ev.session_id)}" title="${escapeHtml(ev.content || '')}">
-        <span class="event-type" data-tone="${toneOf(ev)}">${escapeHtml(ev.type)}</span>
-        <span class="event-source">${escapeHtml(source)}</span>
+      <div class="event-item${isExpanded ? ' is-expanded' : ''}" data-session-id="${escapeHtml(ev.session_id || '')}" data-key="${escapeHtml(key)}" title="${escapeHtml(content)}">
+        <span class="event-type" data-tone="${toneOf(ev)}">${escapeHtml(eventTypeLabel(ev.type))}</span>
+        <span class="event-source">${escapeHtml(names.get(ev.session_id) || ev.session_id || '')}</span>
         <span class="event-time">${escapeHtml(formatClock(ev.timestamp))}</span>
-        ${ev.content ? `<div class="event-content">${escapeHtml(ev.content)}</div>` : ''}
+        ${content ? `<div class="event-content">${escapeHtml(content)}</div>` : ''}
       </div>`;
   }).join('');
 }
