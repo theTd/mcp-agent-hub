@@ -6,6 +6,12 @@ import { $, escapeHtml, setBusy, toast } from './ui-kit.js';
 const MAX_RECENT_CWDS = 8;
 
 export function initSessionLauncher() {
+  applyCollapsed(prefs.launcherCollapsed !== false);
+  $('#launcherToggle').addEventListener('click', () => {
+    const collapsed = !$('#launcherSection').classList.contains('collapsed');
+    applyCollapsed(collapsed);
+    savePrefs({ launcherCollapsed: collapsed });
+  });
   $('#profileSelect').addEventListener('change', () => {
     savePrefs({ lastProfileId: $('#profileSelect').value });
     renderProfileDetails({ keepSelection: false });
@@ -20,6 +26,16 @@ export function initSessionLauncher() {
   $('#whenToUseHint').addEventListener('click', (ev) => ev.currentTarget.classList.toggle('expanded'));
   on('profiles:changed', renderProfileOptions);
   renderCwdHistory();
+}
+
+/** Opens the launcher for this visit only; the saved collapsed/expanded choice is left alone. */
+export function expandLauncher() {
+  applyCollapsed(false);
+}
+
+function applyCollapsed(collapsed) {
+  $('#launcherSection').classList.toggle('collapsed', collapsed);
+  $('#launcherToggle').setAttribute('aria-expanded', String(!collapsed));
 }
 
 function renderProfileOptions() {

@@ -2,7 +2,7 @@
 import { hubApi } from './hub-api.js';
 import { state, prefs, savePrefs, on, emit, reloadProfiles } from './console-state.js';
 import { $, $$, toast, copyText, openModal, initModalSystem } from './ui-kit.js';
-import { initSessionLauncher } from './session-launcher.js';
+import { initSessionLauncher, expandLauncher } from './session-launcher.js';
 import { initSessionWorkspace } from './session-workspace.js';
 import { initEventFeed } from './event-feed.js';
 import { initProfileManager, openProfileManager } from './profile-manager.js';
@@ -87,6 +87,7 @@ const COMMANDS = {
   'toggle-sidebar': () => setSidebarCollapsed(!document.body.classList.contains('sidebar-collapsed')),
   'focus-launcher': () => {
     setSidebarCollapsed(false);
+    expandLauncher();
     $('#taskInput').focus();
   },
   'refresh-sessions': () => requestRefresh(),

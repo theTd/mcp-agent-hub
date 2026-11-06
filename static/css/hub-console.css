@@ -504,7 +504,29 @@ body.sidebar-collapsed .sidebar { margin-left: calc(-1 * var(--sidebar-w)); visi
 .section-meta { font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
 .section-meta .warn { color: var(--warning-text); }
 
-.launcher { display: flex; flex-direction: column; gap: 10px; }
+.launcher-body { display: flex; flex-direction: column; gap: 10px; }
+.launcher .section-title { flex: 1; min-width: 0; }
+.section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.section-toggle:hover { color: var(--text-2); }
+.section-toggle .chev { flex: none; transition: transform 0.15s; }
+.launcher.collapsed { padding-block: 10px; }
+.launcher.collapsed .section-head { margin-bottom: 0; }
+.launcher.collapsed .chev { transform: rotate(-90deg); }
+.launcher.collapsed .launcher-body { display: none; }
 .launcher textarea { min-height: 58px; max-height: 200px; }
 .hint-box {
   padding: 7px 10px;

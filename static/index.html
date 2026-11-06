@@ -88,13 +88,18 @@
 
   <div class="app-body">
     <aside class="sidebar" id="sidebar">
-      <section class="sb-section launcher" aria-labelledby="launcherTitle">
-        <div class="section-head" style="margin-bottom:0">
-          <h2 class="section-title" id="launcherTitle">拉起 Sub-Agent</h2>
+      <section class="sb-section launcher collapsed" id="launcherSection" aria-labelledby="launcherTitle">
+        <div class="section-head">
+          <h2 class="section-title" id="launcherTitle">
+            <button type="button" class="section-toggle" id="launcherToggle" aria-expanded="false" aria-controls="launcherBody" title="展开 / 收起">
+              <svg class="icon icon-sm chev" aria-hidden="true"><use href="#i-chevron-down"></use></svg>拉起 Sub-Agent
+            </button>
+          </h2>
           <button class="btn btn-ghost btn-sm" data-cmd="open-profiles" title="编辑 Profile 与调用说明">
             <svg class="icon icon-sm" aria-hidden="true"><use href="#i-sliders"></use></svg>配置
           </button>
         </div>
+        <div class="launcher-body" id="launcherBody">
         <label class="field">
           <span class="field-label">Profile</span>
           <select id="profileSelect"></select>
@@ -122,6 +127,7 @@
         <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="Ctrl + Enter（在任务输入框内）">
           <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>拉起 Agent <kbd>Ctrl ↵</kbd>
         </button>
+        </div>
       </section>
 
       <section class="sessions-section" aria-labelledby="sessionsTitle">
