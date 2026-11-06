@@ -1,7 +1,7 @@
 // Sidebar feed of worker → parent events reported through the hub mailbox.
 import { state, prefs, savePrefs, on, emit, setActiveSession } from './console-state.js';
 import { $, escapeHtml, formatClock } from './ui-kit.js';
-import { activityLabel, eventTypeLabel, eventTypeTone } from './session-status-text.js';
+import { activityLabel, eventTypeLabel, eventTypeTone, isLifecycleSentence } from './session-status-text.js';
 
 const MAX_EVENTS = 30;
 
@@ -53,9 +53,17 @@ function toneOf(ev) {
   return eventTypeTone(ev.type);
 }
 
-function cleanContent(text) {
+// Q10: only lifecycle events (and a text that is entirely a lifecycle sentence) are translated.
+// A message body from a sub-agent is shown as written: it is not a status line, and clipping it to
+// 「任务已完成」 loses what the agent actually reported.
+const LIFECYCLE_EVENT_TYPES = new Set(['exited', 'terminated']);
+
+function cleanContent(ev) {
   // F2: the same status-text module the cards use, so an exit reads 进程已退出（退出码 N） here too.
-  return activityLabel(String(text ?? '').replace(CALL_HINT_RE, '')).replace(/\s+$/g, '').trim();
+  const text = String(ev?.content ?? '').replace(CALL_HINT_RE, '').replace(/\s+$/g, '').trim();
+  if (!text) return '';
+  if (LIFECYCLE_EVENT_TYPES.has(ev?.type) || isLifecycleSentence(text)) return activityLabel(text);
+  return text;
 }
 
 function eventKey(ev) {
@@ -88,7 +96,7 @@ function render() {
   }
   feed.innerHTML = events.map((ev) => {
     const key = eventKey(ev);
-    const content = cleanContent(ev.content);
+    const content = cleanContent(ev);
     const isExpanded = expanded.has(key);
     return `
       <div class="event-item${isExpanded ? ' is-expanded' : ''}" data-session-id="${escapeHtml(ev.session_id || '')}" data-key="${escapeHtml(key)}" title="${escapeHtml(content)}">

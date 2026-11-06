@@ -831,7 +831,7 @@ async def api_list_profiles(refresh: bool = Query(False)):
 async def api_save_profile(req: Request):
     body = await req.json()
     try:
-        saved = hub.save_or_update_profile(body)
+        saved = await asyncio.to_thread(hub.save_or_update_profile, body)
     except ValueError as e:
         # B8: a validation failure is the client's mistake, not a server fault.
         return bad_request(str(e))
@@ -848,7 +848,7 @@ async def api_save_routing_guide(req: Request):
     if not isinstance(text, str):
         return bad_request("global_routing_instructions 必须是字符串。")
     try:
-        hub.save_global_routing_instructions(text)
+        await asyncio.to_thread(hub.save_global_routing_instructions, text)
     except ValueError as e:
         return bad_request(str(e))
     payload = await profiles_payload()
@@ -860,7 +860,7 @@ async def api_save_routing_guide(req: Request):
 @app.delete("/api/profiles/{profile_id}")
 async def api_delete_profile(profile_id: str):
     try:
-        hub.delete_profile(profile_id)
+        await asyncio.to_thread(hub.delete_profile, profile_id)
     except ValueError as e:
         return bad_request(str(e))
     payload = await profiles_payload()
@@ -877,7 +877,9 @@ async def api_toggle_engine_model(engine: str, req: Request):
     # R6: a missing `enabled` is a note-only update; the model keeps its current state.
     enabled = None if enabled_field is None else bool(enabled_field)
     try:
-        eng_info = hub.toggle_engine_model(engine=engine, model_id=model_id, enabled=enabled, note=note)
+        eng_info = await asyncio.to_thread(
+            hub.toggle_engine_model, engine, model_id, enabled, note
+        )
     except ValueError as e:
         return bad_request(str(e))
     return {
@@ -1034,14 +1036,16 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
         await websocket.close(code=1008)
         return
 
-    if sess.raw_history:
-        await websocket.send_text("".join(sess.raw_history))
+    # Q11: snapshot the replay and register this socket's live queue in one atomic step, with the
+    # same lock the PTY reader uses for "append to history + snapshot the fan-out targets". A chunk
+    # is therefore either inside this replay or in the queue — never lost, never sent twice. The
+    # queue is registered first, so output produced while the replay is on the wire waits in order.
+    replay, q = sess.attach_ws_queue()
+    if replay:
+        await websocket.send_text(replay)
     # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal
     # query responses xterm generates while parsing this replay and keeps forwarding the live ones.
     await websocket.send_text(json.dumps({"type": "replay_end"}))
-
-    q: asyncio.Queue = asyncio.Queue(maxsize=500)
-    sess.ws_queues.add(q)
 
     async def sender():
         try:
@@ -1067,7 +1071,7 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
     except WebSocketDisconnect:
         pass
     finally:
-        sess.ws_queues.discard(q)
+        sess.detach_ws_queue(q)
         sender_task.cancel()
 
 

@@ -71,6 +71,25 @@ const ACTIVITY_RULES = [
   [/^Running initial task:\s*(.*)$/i, (m) => (m[1] ? `正在执行初始任务：${m[1]}` : '正在执行初始任务')],
 ];
 
+// Q10: the event feed translates only a WHOLE lifecycle sentence. A sub-agent message that merely
+// starts with "Task completed" is a body, not a status line, and must be shown as written.
+const WHOLE_LIFECYCLE_RULES = [
+  /^Interactive session running$/i,
+  /^Session exited \(exit_code=-?\d+\)$/i,
+  /^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=-?\d+\s*[)）]\s*。?$/i,
+  /^Task completed(?:\s*\([^()\n]*\))?$/i,
+  /^Terminated by[^\n]{0,40}$/i,
+  /^Waiting for parent answer:?[\s\S]{0,200}$/i,
+  /^Running initial task:[\s\S]{0,200}$/i,
+];
+
+/** True when the whole text is one of the hub's lifecycle sentences (not a message body). */
+export function isLifecycleSentence(text) {
+  const value = String(text ?? '').trim();
+  if (!value) return false;
+  return WHOLE_LIFECYCLE_RULES.some((pattern) => pattern.test(value));
+}
+
 export function activityLabel(text) {
   const value = String(text ?? '').trim();
   if (!value) return '';

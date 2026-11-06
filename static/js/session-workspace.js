@@ -31,6 +31,23 @@ function isReplayEndFrame(data) {
   }
 }
 
+/**
+ * Q1: writes the buffered replay and clears `replaying` in xterm's write callback, i.e. only after
+ * xterm has really parsed it. xterm's write callbacks fire in order, so the reply-drop window still
+ * covers every query inside the replay and is already closed by the time live output is parsed.
+ */
+function finishReplay(t) {
+  clearTimeout(t.replayTimer);
+  const pending = t.replayChunks.join('');
+  t.replayChunks = [];
+  t.replayPending = false;
+  if (!pending) {
+    t.replaying = false;
+    return;
+  }
+  t.term.write(pending, () => { t.replaying = false; });
+}
+
 const TERMINAL_THEME = {
   background: '#0b0e14',
   foreground: '#d7dce5',
@@ -627,7 +644,10 @@ function createTerminal(sessionId) {
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
 
-  const t = { term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0, wsOpen: false, replaying: false, replayTimer: 0 };
+  const t = {
+    term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0,
+    wsOpen: false, replaying: false, replayPending: false, replayChunks: [], replayTimer: 0,
+  };
   const sendResize = () => {
     if (t.opened && t.ws?.readyState === WebSocket.OPEN) {
       t.ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -644,17 +664,28 @@ function createTerminal(sessionId) {
       // V3: the replay arrives first, then a replay_end marker. While the terminal is parsing the
       // history, the query replies xterm generates (DA / DSR) must not be typed into the session.
       t.replaying = true;
+      t.replayPending = true;
+      t.replayChunks = [];
       clearTimeout(t.replayTimer);
-      // A hub that predates the marker never sends one; do not stay in replay mode forever.
-      t.replayTimer = setTimeout(() => { t.replaying = false; }, 1500);
+      // A hub that predates the marker never sends one; write what arrived and leave replay mode.
+      t.replayTimer = setTimeout(() => finishReplay(t), 1500);
       sendResize();
       refreshPaneHead(sessionId);
     };
     ws.onmessage = (ev) => {
       const data = ev.data;
-      if (t.replaying && isReplayEndFrame(data)) {
-        t.replaying = false;
-        clearTimeout(t.replayTimer);
+      // Q9: the end-of-replay marker is control data, never terminal output. Swallow it whatever the
+      // replay flag says; before this fix a marker that arrived after the flag dropped was typed
+      // into the terminal as JSON.
+      if (isReplayEndFrame(data)) {
+        finishReplay(t);
+        return;
+      }
+      if (t.replayPending) {
+        // Q1: hold the replay frames until the marker, so the terminal write and the end of the
+        // reply-drop window can be one write callback. xterm parses writes asynchronously, so
+        // clearing `replaying` when the marker frame arrives drops replies too early.
+        t.replayChunks.push(data);
         return;
       }
       term.write(data);

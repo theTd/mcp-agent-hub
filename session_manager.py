@@ -360,6 +360,29 @@ AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
 # A profile with an absurdly long argument list is a mistake, not a launch recipe.
 MAX_LAUNCH_ARGS = 4096
 
+# Q6: Windows refuses `os.replace` / an open-for-write while another process holds the file. A short
+# retry covers the millisecond window of a concurrent reader; a lock that survives it is reported as
+# a 400 (「配置文件被其他程序占用，请稍后重试」), never as a 500 and never as a parse error.
+PROFILE_FILE_RETRY_ATTEMPTS = 10
+PROFILE_FILE_RETRY_DELAY_SEC = 0.03
+PROFILE_FILE_LOCKED_MESSAGE = "配置文件被其他程序占用，请稍后重试"
+
+# Q8: keep looking for a session's own transcript for as long as its process lives, backing off to
+# one scan every 5 s after the first minute instead of giving up after 30/40/90 s.
+TRANSCRIPT_SCAN_FAST_WINDOW_SEC = 60.0
+TRANSCRIPT_SCAN_FAST_INTERVAL_SEC = 1.0
+TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC = 5.0
+# Q2: the hub session marker travels in the task text, i.e. near the beginning of the transcript.
+TRANSCRIPT_MARKER_SCAN_BYTES = 128 * 1024
+TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
+
+
+def _is_file_lock_error(exc: BaseException) -> bool:
+    """True for the Windows errors a held file raises: sharing/lock violations (32/33) and EACCES."""
+    if isinstance(exc, PermissionError):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) in (32, 33)
+
 
 def hub_port() -> int:
     """The port this hub really listens on (`HUB_PORT`, default 4444)."""
@@ -478,6 +501,9 @@ class AgentSession:
         self.cols = cols
         self.rows = rows
         self.created_at = time.time()
+        # Q2: the moment the child process really starts; transcript ownership is measured from here,
+        # not from the hub's bookkeeping time of create_session.
+        self.spawned_at: Optional[float] = None
         self.last_output_at = time.time()
         self.ended_at: Optional[float] = None
         self.status = "starting"  # starting | running | waiting_parent | completed | exited | terminated
@@ -561,6 +587,9 @@ class AgentSession:
             env.update(env_overrides)
 
         cmd_list = [self.command] + list(self.args)
+        # Q2: immediately before the process is spawned, so a transcript created at (or after) this
+        # instant can be this session's and nothing older can.
+        self.spawned_at = time.time()
         self.pty = PtyProcess.spawn(
             cmd_list,
             cwd=self.cwd,
@@ -633,13 +662,17 @@ class AgentSession:
             while self.raw_history_bytes > self.max_history_bytes and len(self.raw_history) > 1:
                 removed = self.raw_history.pop(0)
                 self.raw_history_bytes -= len(removed)
+            # Q11: the fan-out targets belong to the same critical section as the history append.
+            # A WebSocket registered afterwards gets this chunk inside its replay snapshot, never
+            # twice (append + live frame) and never zero times (the old snapshot/register gap).
+            ws_targets = list(self.ws_queues)
 
         if detected_tools and self.on_tui_tool_cb and self._loop:
             for t_name, t_arg in detected_tools:
                 self._loop.call_soon_threadsafe(self.on_tui_tool_cb, self.session_id, t_name, t_arg)
 
-        if self._loop and self.ws_queues:
-            for q in list(self.ws_queues):
+        if self._loop and ws_targets:
+            for q in ws_targets:
                 self._loop.call_soon_threadsafe(self._push_ws_safe, q, data)
 
     @staticmethod
@@ -648,6 +681,23 @@ class AgentSession:
             q.put_nowait(data)
         except Exception:
             pass
+
+    def attach_ws_queue(self) -> tuple:
+        """Q11: snapshot the replay and register the live queue in one atomic step.
+
+        The PTY reader appends to `raw_history` and snapshots its fan-out targets under the same
+        lock, so every output chunk is either inside the replay this socket receives or in its
+        queue — never both, never neither.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        with self._lock:
+            replay = "".join(self.raw_history)
+            self.ws_queues.add(q)
+        return replay, q
+
+    def detach_ws_queue(self, q: asyncio.Queue) -> None:
+        with self._lock:
+            self.ws_queues.discard(q)
 
     def write_input(self, text: str):
         if self.pty and self.pty.isalive():
@@ -968,7 +1018,15 @@ class HubSessionManager:
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
         # the same conversation, and a file that existed before a session started is not its own.
         self._claimed_transcripts: Dict[str, str] = {}
-        self._transcript_lock = threading.Lock()
+        self._transcript_lock = threading.RLock()
+        # Q3: marker-less conversations are assigned in launch order per engine, so "pick candidate
+        # + claim" has to be one step per engine, not one step per watcher.
+        self._engine_transcript_locks: Dict[str, threading.RLock] = {}
+        # Q2: a marker scan of the first TRANSCRIPT_MARKER_SCAN_BYTES, cached until the file grows.
+        self._marker_scan_cache: Dict[str, tuple] = {}
+        # Q5: profile mutations rebuild the in-memory state from the discovery already in hand. This
+        # snapshot is the only discovery they are allowed to use; they never run discovery themselves.
+        self._cached_discovery: Dict[str, Any] = {"engines": {}}
         # V-5: ids whose one lifecycle event is the terminated event, even if the PTY reader
         # reported its own exit just before close_session removed the session from the live list.
         self._user_terminated: Set[str] = set()
@@ -1002,13 +1060,16 @@ class HubSessionManager:
     # ---- V2: transcript ownership ---------------------------------------------------------
 
     @staticmethod
-    def _conversation_created_after(path: Path, session: AgentSession, levels_up: int = 0, slack: float = 2.0) -> bool:
-        """True when the conversation this file belongs to was created after the session started.
+    def _session_spawn_anchor(session: AgentSession) -> float:
+        """Q2: when the child process really started (falls back to the session's bookkeeping time)."""
+        return float(getattr(session, "spawned_at", None) or session.created_at)
 
-        A transcript that already existed before the launch belongs to another conversation; attaching
-        to it is the V2 bug (a second session reporting the first session's thoughts). Windows has a
-        real creation time: `st_birthtime` on Python 3.12+, and `st_ctime` is creation time there too.
-        `levels_up` walks from the transcript file to the conversation directory.
+    @staticmethod
+    def _conversation_creation_time(path: Path, levels_up: int = 0) -> tuple:
+        """(creation timestamp, is_a_real_birth_time) of the conversation a transcript belongs to.
+
+        Windows has a real creation time: `st_birthtime` on Python 3.12+. `levels_up` walks from the
+        transcript file to its conversation directory.
         """
         target = Path(path)
         for _ in range(max(0, int(levels_up))):
@@ -1016,11 +1077,28 @@ class HubSessionManager:
         try:
             st = target.stat()
         except OSError:
-            return False
-        created = getattr(st, "st_birthtime", None)
+            return None, False
+        birth = getattr(st, "st_birthtime", None)
+        if birth is not None:
+            return float(birth), True
+        return float(st.st_ctime), False
+
+    @classmethod
+    def _conversation_created_after(cls, path: Path, session: AgentSession, levels_up: int = 0) -> bool:
+        """True when the conversation this file belongs to was created after the process started.
+
+        A transcript that already existed before the launch belongs to another conversation; attaching
+        to it is the V2 bug (a second session reporting the first session's thoughts). Q2: with a real
+        creation time there is no negative slack; the 1 s slack only covers the fallback where
+        `st_ctime` is metadata-change time rather than creation time.
+        """
+        created, exact = cls._conversation_creation_time(path, levels_up)
         if created is None:
-            created = st.st_ctime
-        return created >= (session.created_at - slack)
+            return False
+        anchor = cls._session_spawn_anchor(session)
+        if exact:
+            return created >= anchor
+        return created >= (anchor - 1.0)
 
     @staticmethod
     def _transcript_key(path: Path) -> str:
@@ -1031,6 +1109,44 @@ class HubSessionManager:
         with self._transcript_lock:
             owner = self._claimed_transcripts.get(key)
         return bool(owner) and owner != session.session_id
+
+    def _transcript_marker_ids(self, path: Path) -> Set[str]:
+        """Q2: hub session ids named in the transcript's first chunk (the task carries session_id=<id>).
+
+        Only the head of the file is read, because the bridge hint travels with the initial task; the
+        answer is cached until the file grows, so a steady-state scan costs one stat.
+        """
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            return set()
+        key = self._transcript_key(path)
+        cached = self._marker_scan_cache.get(key)
+        if cached and cached[0] == size:
+            return set(cached[1])
+        try:
+            with open(path, "rb") as fh:
+                chunk = fh.read(TRANSCRIPT_MARKER_SCAN_BYTES)
+        except OSError:
+            return set()
+        ids = set(TRANSCRIPT_MARKER_RE.findall(chunk.decode("utf-8", "replace")))
+        self._marker_scan_cache[key] = (size, frozenset(ids))
+        return ids
+
+    def _engine_transcript_lock(self, engine: str) -> threading.RLock:
+        eng = (engine or "").strip().lower()
+        with self._transcript_lock:
+            lock = self._engine_transcript_locks.get(eng)
+            if lock is None:
+                lock = threading.RLock()
+                self._engine_transcript_locks[eng] = lock
+            return lock
+
+    def _session_has_transcript(self, session: AgentSession) -> bool:
+        if session.transcript_path:
+            return True
+        with self._transcript_lock:
+            return session.session_id in self._claimed_transcripts.values()
 
     def _claim_transcript(self, session: AgentSession, path: Path) -> bool:
         """Claims one transcript file for this session; False when another live session owns it."""
@@ -1049,6 +1165,72 @@ class HubSessionManager:
             for key, owner in list(self._claimed_transcripts.items()):
                 if owner == session_id:
                     del self._claimed_transcripts[key]
+
+    def _claim_conversation(self, session: AgentSession, candidates: List[Path], levels_up: int = 0) -> Optional[Path]:
+        """Q2/Q3: marker first, then FIFO in launch order, all under one lock per engine.
+
+        A transcript that names a hub session id belongs to that session, and no other session may
+        claim it. Without a marker the earliest-spawned session of the engine that has no transcript
+        yet takes the earliest-created unclaimed conversation; a later session waits its turn instead
+        of grabbing the newest file.
+        """
+        paths = [Path(p) for p in candidates]
+        if not paths:
+            return None
+        marked_for_me: List[Path] = []
+        unmarked: List[Path] = []
+        for path in paths:
+            ids = self._transcript_marker_ids(path)
+            if session.session_id in ids:
+                marked_for_me.append(path)
+            elif ids:
+                # It names another hub session: never claim it, whatever its timestamps say.
+                continue
+            else:
+                unmarked.append(path)
+
+        if marked_for_me:
+            with self._transcript_lock:
+                for path in sorted(
+                    marked_for_me,
+                    key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p)),
+                ):
+                    if self._transcript_claimed_by_other(path, session):
+                        continue
+                    if self._claim_transcript(session, path):
+                        return path
+
+        engine = (session.engine or "").strip().lower()
+        with self._engine_transcript_lock(engine):
+            live = [
+                s for s in list(self.sessions.values())
+                if (s.engine or "").strip().lower() == engine and s.is_process_alive()
+            ]
+            live.sort(key=lambda s: (self._session_spawn_anchor(s), s.session_id))
+            waiting = [s for s in live if not self._session_has_transcript(s)]
+            if not waiting or waiting[0].session_id != session.session_id:
+                # A session launched earlier has no conversation yet: this one waits its turn.
+                return None
+            ordered = [
+                p for p in unmarked
+                if self._conversation_created_after(p, session, levels_up)
+            ]
+            ordered.sort(
+                key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p))
+            )
+            for path in ordered:
+                if self._transcript_claimed_by_other(path, session):
+                    continue
+                if self._claim_transcript(session, path):
+                    return path
+        return None
+
+    @staticmethod
+    def _transcript_scan_interval(elapsed: float) -> float:
+        """Q8: look every second for the first minute, then every 5 s, for as long as the session lives."""
+        if elapsed < TRANSCRIPT_SCAN_FAST_WINDOW_SEC:
+            return TRANSCRIPT_SCAN_FAST_INTERVAL_SEC
+        return TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC
 
     def _infer_engine(self, profile_id: str, prof: Dict[str, Any]) -> str:
         if prof.get("engine"):
@@ -1148,15 +1330,40 @@ class HubSessionManager:
         return [m for m in result if m["enabled"]] + [m for m in result if not m["enabled"]]
 
     def load_profiles(self, refresh_discovery: bool = False, discovery: Optional[Dict[str, Any]] = None):
+        """Rebuilds profiles from disk + discovery. Only the explicit refresh paths may discover here.
+
+        Q5: profile-mutating methods never call this without a discovery snapshot, so they never run
+        a CLI on the event loop; `_reload_after_write` is their entry point.
+        """
         if discovery is None:
             discovery = self.model_discovery.discover_all(force_refresh=refresh_discovery)
-        raw_engines = discovery.get("engines", {})
-        data: Dict[str, Any] = {}
-        if self.profiles_path.exists():
-            try:
-                data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
+        self._cached_discovery = discovery or {"engines": {}}
+        data = self._read_profiles_for_load()
+        if data is None:
+            # Q6: the file is held by another program; keep the profiles already in memory instead of
+            # replacing them with {} (the console must never show an empty list because of a lock).
+            return
+        self._apply_profile_data(data, self._cached_discovery)
+
+    def _read_profiles_for_load(self) -> Optional[Dict[str, Any]]:
+        """Reads the profile file for the console; None means "locked, keep what is in memory"."""
+        if not self.profiles_path.exists():
+            return {"profiles": {}}
+        try:
+            text = self._read_text_with_retries(self.profiles_path)
+        except ValueError:
+            return None
+        except OSError:
+            return {}
+        try:
+            data = json.loads(text)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _apply_profile_data(self, data: Dict[str, Any], discovery: Dict[str, Any]):
+        """Rebuilds the in-memory catalog and profiles from one file document and one discovery snapshot."""
+        raw_engines = (discovery or {}).get("engines", {}) or {}
 
         self.engine_policies = data.get("engine_policies") or {}
         self.global_routing_instructions = data.get("global_routing_instructions") or (
@@ -1248,6 +1455,14 @@ class HubSessionManager:
 
         self.profiles = enriched
 
+    def _reload_after_write(self, data: Dict[str, Any]) -> None:
+        """Q5: the mutation already holds the document it just wrote — apply it with the cached discovery.
+
+        No discovery run, no disk re-read: the console stays responsive while a profile is saved, and
+        the catalog-dependent validation reports 「模型列表尚未就绪，请稍后再试」 when nothing is cached.
+        """
+        self._apply_profile_data(data, self._cached_discovery)
+
     def get_enabled_profiles(self) -> Dict[str, Dict[str, Any]]:
         """Returns only enabled profiles where the default model is not disabled (or dynamic base profiles)."""
         result: Dict[str, Dict[str, Any]] = {}
@@ -1331,16 +1546,31 @@ class HubSessionManager:
     # key is deleted, so `startup_delay_sec` falls back to 2.5 and `task_mode` to pty_input.
     PROFILE_REQUIRED_KEYS = ("name", "engine", "command")
 
+    def _read_text_with_retries(self, path: Path) -> str:
+        """Q6: a read retries a Windows file lock the same way a write does (30 ms, 10 attempts)."""
+        last: Optional[BaseException] = None
+        for _attempt in range(PROFILE_FILE_RETRY_ATTEMPTS):
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError as exc:
+                if not _is_file_lock_error(exc):
+                    raise
+                last = exc
+                time.sleep(PROFILE_FILE_RETRY_DELAY_SEC)
+        raise ValueError(PROFILE_FILE_LOCKED_MESSAGE) from last
+
     def _read_profiles_file(self) -> Dict[str, Any]:
         """Reads the profile file for a caller that is about to write it back.
 
-        R16: a parse error raises instead of returning an empty document. Returning `{"profiles": {}}`
-        here would make the following write silently destroy every Profile in the file.
+        R16: a parse error raises instead of returning an empty document. Q6: a file another program
+        holds open raises 「配置文件被其他程序占用，请稍后重试」 after the retry loop, never the
+        parse-error message and never a bare 500.
         """
         if not self.profiles_path.exists():
             return {"profiles": {}}
+        text = self._read_text_with_retries(self.profiles_path)
         try:
-            data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+            data = json.loads(text)
         except Exception as exc:
             raise ValueError(f"agent_profiles.json 解析失败，本次修改未写入：{exc}") from exc
         if not isinstance(data, dict):
@@ -1350,23 +1580,38 @@ class HubSessionManager:
     def _write_profiles_file(self, raw_data: Dict[str, Any]) -> None:
         """R16: write a temp file in the same folder and replace, so a crash never leaves a half file.
 
-        LF line endings, UTF-8, Chinese kept readable (`ensure_ascii=False`), indent 2.
+        LF line endings, UTF-8, Chinese kept readable (`ensure_ascii=False`), indent 2. Q6: the temp
+        open and the replace both retry a Windows lock (10 × 30 ms) before the save reports the
+        「配置文件被其他程序占用」 ValueError.
         """
         text = json.dumps(raw_data, ensure_ascii=False, indent=2) + "\n"
         target = self.profiles_path
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp_name, target)
-        except BaseException:
+        last: Optional[BaseException] = None
+        for _attempt in range(PROFILE_FILE_RETRY_ATTEMPTS):
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
             try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_name, target)
+                return
+            except OSError as exc:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                if not _is_file_lock_error(exc):
+                    raise
+                last = exc
+                time.sleep(PROFILE_FILE_RETRY_DELAY_SEC)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        raise ValueError(PROFILE_FILE_LOCKED_MESSAGE) from last
 
     def engine_model_options(self, engine: str) -> List[Dict[str, Any]]:
         info = self.engines_catalog.get((engine or "").strip().lower()) or {}
@@ -1445,7 +1690,7 @@ class HubSessionManager:
                 notes_map.pop(note_engine_key, None)
 
         self._write_profiles_file(raw_data)
-        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
+        self._reload_after_write(raw_data)
         return self.engines_catalog.get(eng, {})
 
     def save_global_routing_instructions(self, instructions: str) -> str:
@@ -1453,7 +1698,7 @@ class HubSessionManager:
         raw_data = self._read_profiles_file()
         raw_data["global_routing_instructions"] = instructions.strip()
         self._write_profiles_file(raw_data)
-        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
+        self._reload_after_write(raw_data)
         return self.global_routing_instructions
 
     # ---- B5: saving and deleting profiles ------------------------------------------------
@@ -1478,7 +1723,14 @@ class HubSessionManager:
 
         options = self.engine_model_options(eng)
         if not options:
-            # pwsh and engines without a catalog have no model / thinking choice at all.
+            if eng in ("pwsh", "generic") or self.engines_catalog.get(eng) is not None:
+                # pwsh really has no model choice; a discovered engine with zero models is a discovery
+                # gap (R4), and its profile defaults are accepted unvalidated.
+                return
+            if default_model or default_thinking:
+                # Q5: the catalog is not cached yet (startup discovery is still running). Say so
+                # instead of blocking the event loop on a discovery run just to validate this save.
+                raise ValueError("模型列表尚未就绪，请稍后再试")
             return
         ids = [str(m.get("id")) for m in options]
         enabled_ids = [str(m.get("id")) for m in options if m.get("enabled")]
@@ -1582,7 +1834,7 @@ class HubSessionManager:
 
         profiles_map[pid] = clean_entry
         self._write_profiles_file(raw_data)
-        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
+        self._reload_after_write(raw_data)
         return self.profiles.get(pid, {})
 
     def delete_profile(self, profile_id: str) -> bool:
@@ -1594,7 +1846,7 @@ class HubSessionManager:
             raise ValueError(f"找不到 Profile「{pid}」。")
         del profiles_map[pid]
         self._write_profiles_file(raw_data)
-        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
+        self._reload_after_write(raw_data)
         return True
 
 
@@ -2614,35 +2866,34 @@ class HubSessionManager:
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         return cfg_path
 
-    async def _watch_codex_rollout(self, session: AgentSession):
-        """Live tails C:\\Users\\cui\\.codex\\sessions\\YYYY\\MM\\DD\\rollout-*.jsonl for a spawned Codex session."""
-        codex_root = Path(os.path.expanduser("~")) / ".codex" / "sessions"
+    async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
+        """Live tails the Codex rollout jsonl files for a spawned Codex session.
+
+        `root` points the watcher at a synthetic copy of the layout for tests; production uses
+        ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
+        """
+        codex_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".codex" / "sessions"
         if not codex_root.exists():
             return
 
         target_file: Optional[Path] = None
-        seen_before = set(codex_root.rglob("rollout-*.jsonl"))
-        start_wait = time.time()
+        scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 30.0:
-            await asyncio.sleep(1.0)
-            now_files = set(codex_root.rglob("rollout-*.jsonl"))
+        while session.status in ("starting", "running", "waiting_parent"):
+            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+            if session.status not in ("starting", "running", "waiting_parent"):
+                break
             candidates = []
-            for candidate in now_files - seen_before:
+            for candidate in codex_root.rglob("rollout-*.jsonl"):
                 try:
-                    # V2: only a rollout created after this session started, and only one nobody else owns.
+                    # V2/Q2: only a rollout created after this session's process started. The marker
+                    # check and the launch-order fallback live in _claim_conversation.
                     if not self._conversation_created_after(candidate, session):
                         continue
-                    candidates.append((candidate.stat().st_mtime, candidate))
+                    candidates.append(candidate)
                 except OSError:
                     continue
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            for _mtime, candidate in candidates:
-                if self._transcript_claimed_by_other(candidate, session):
-                    continue
-                if self._claim_transcript(session, candidate):
-                    target_file = candidate
-                    break
+            target_file = self._claim_conversation(session, candidates, levels_up=0)
             if target_file:
                 break
 
@@ -2760,9 +3011,11 @@ class HubSessionManager:
     async def _watch_omp_session(self, session: AgentSession, omp_session_dir: Path):
         """Live tails OMP's dedicated session JSONL file inside omp_session_dir for tool calls, thoughts, and final responses."""
         target_file: Optional[Path] = None
-        start_wait = time.time()
-        while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 40.0:
-            await asyncio.sleep(0.8)
+        scan_start = time.time()
+        while session.status in ("starting", "running", "waiting_parent"):
+            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+            if session.status not in ("starting", "running", "waiting_parent"):
+                break
             # This directory is created by the hub for this one session (`--session-dir`), so a
             # cross-session attach is already impossible; claim it anyway so the rule is uniform.
             files = sorted(omp_session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -2903,18 +3156,23 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(0.8)
 
-    async def _watch_kimi_session(self, session: AgentSession):
-        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended."""
-        kimi_root = Path(os.path.expanduser("~")) / ".kimi-code" / "sessions"
+    async def _watch_kimi_session(self, session: AgentSession, root: Optional[Path] = None):
+        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended.
+
+        `root` points the watcher at a synthetic copy of the layout for tests; production uses
+        ~/.kimi-code/sessions/<session>/agents/main/wire.jsonl.
+        """
+        kimi_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".kimi-code" / "sessions"
         if not kimi_root.exists():
             return
 
         target_file: Optional[Path] = None
-        seen_before = {p: p.stat().st_mtime for p in kimi_root.rglob("wire.jsonl") if p.exists()}
-        start_wait = time.time()
+        scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 90.0:
-            await asyncio.sleep(1.0)
+        while session.status in ("starting", "running", "waiting_parent"):
+            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+            if session.status not in ("starting", "running", "waiting_parent"):
+                break
             # First try exact match via Kimi TUI banner: Session: session_<uuid>
             scr_txt = session.get_clean_screen_text(max_lines=35)
             m = re.search(r"(session_[0-9a-f\-]{20,})", scr_txt)
@@ -2930,23 +3188,14 @@ class HubSessionManager:
             candidates = []
             for p in kimi_root.rglob("wire.jsonl"):
                 try:
-                    mtime = p.stat().st_mtime
-                    if p in seen_before and mtime <= seen_before[p]:
-                        continue
-                    # V2: a wire.jsonl that was merely touched by another conversation (or that already
-                    # existed) is not this session's; only a session directory created after the launch.
+                    # V2/Q2: a wire.jsonl that already existed is not this session's; only a session
+                    # directory created after the launch. The marker check lives in _claim_conversation.
                     if not self._conversation_created_after(p, session, levels_up=2):
                         continue
-                    candidates.append((mtime, p))
+                    candidates.append(p)
                 except OSError:
                     pass
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            for _mtime, candidate in candidates:
-                if self._transcript_claimed_by_other(candidate, session):
-                    continue
-                if self._claim_transcript(session, candidate):
-                    target_file = candidate
-                    break
+            target_file = self._claim_conversation(session, candidates, levels_up=2)
             if target_file:
                 break
 
@@ -3146,35 +3395,34 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(0.8)
 
-    async def _watch_agy_transcript(self, session: AgentSession):
-        """Live tails AGY CLI's transcript.jsonl under ~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl."""
-        brain_root = Path(os.path.expanduser("~")) / ".gemini" / "antigravity" / "brain"
+    async def _watch_agy_transcript(self, session: AgentSession, root: Optional[Path] = None):
+        """Live tails AGY CLI's transcript.jsonl.
+
+        `root` points the watcher at a synthetic copy of the layout for tests; production uses
+        ~/.gemini/antigravity/brain/<uuid>/.system_generated/logs/transcript.jsonl.
+        """
+        brain_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".gemini" / "antigravity" / "brain"
         if not brain_root.exists():
             return
 
         target_file: Optional[Path] = None
-        start_wait = time.time()
+        scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 40.0:
-            await asyncio.sleep(1.0)
+        while session.status in ("starting", "running", "waiting_parent"):
+            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+            if session.status not in ("starting", "running", "waiting_parent"):
+                break
             candidates = []
             for p in brain_root.rglob("transcript.jsonl"):
                 try:
-                    # V2: the conversation directory (brain/<uuid>) must be younger than this session.
-                    # A transcript that already existed, or one another running agent just appended to,
-                    # belongs to somebody else; 2 s of slack covers process start vs. bookkeeping.
+                    # V2/Q2: the conversation directory (brain/<uuid>) must be younger than this
+                    # session's process. A transcript that already existed belongs to somebody else.
                     if not self._conversation_created_after(p, session, levels_up=2):
                         continue
-                    candidates.append((p.stat().st_mtime, p))
+                    candidates.append(p)
                 except OSError:
                     continue
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            for _mtime, candidate in candidates:
-                if self._transcript_claimed_by_other(candidate, session):
-                    continue
-                if self._claim_transcript(session, candidate):
-                    target_file = candidate
-                    break
+            target_file = self._claim_conversation(session, candidates, levels_up=2)
             if target_file:
                 break
 
@@ -3305,14 +3553,15 @@ class HubSessionManager:
                 break
 
     def _on_session_exit(self, session_id: str, exit_code: int):
-        if session_id in self._user_terminated:
-            # V-5: the user termination already emitted its one lifecycle event.
-            return
         sess = self.sessions.get(session_id)
+        if session_id in self._user_terminated or (sess and sess.terminated_by_user):
+            # V-5: the user termination already emitted its one lifecycle event.
+            # Q12: the process is gone; let go of its transcript and of the one-event marker.
+            self._release_transcripts(session_id)
+            self._user_terminated.discard(session_id)
+            return
         if sess:
             self.persist_session(sess)
-            if sess.terminated_by_user:
-                return
         self.record_worker_event(
             session_id,
             {
@@ -3325,9 +3574,16 @@ class HubSessionManager:
                 ),
             },
         )
+        # Q12: the exit event is out. The process ended on its own, so its conversation is nobody's
+        # live transcript any more and the one-lifecycle-event marker must not outlive it.
+        self._release_transcripts(session_id)
+        self._user_terminated.discard(session_id)
 
     async def _spawn_dsh_hub_job(self, session: AgentSession, task: Optional[str]):
         """Spawns a first-class in-host DSH session via http://127.0.0.1:3080/_dsh/dsh-crew/jobs."""
+        if session.terminated_by_user:
+            # Q4: the user terminated the session before this task got its first turn.
+            return
         spec = session.dsh_spec
         provider = spec.get("provider", "clay")
         model = spec.get("model", "deepseek-flash")
@@ -3367,6 +3623,9 @@ class HubSessionManager:
                 data = r.json()
                 if not r.is_success or not data.get("ok"):
                     err_msg = data.get("error") or f"HTTP {r.status_code}"
+                    if session.terminated_by_user:
+                        # Q4: a failed spawn must not rewrite a session the user already terminated.
+                        return
                     session.emit_virtual_ansi(f"\x1b[1;31m✖ DSH Spawn Error: {err_msg}\x1b[0m\r\n")
                     session.status = "exited"
                     self.persist_session(session)
@@ -3374,6 +3633,17 @@ class HubSessionManager:
                 job = data["job"]
                 job_id = job["id"]
                 dsh_sid = job.get("sessionId", "")
+                if session.terminated_by_user:
+                    # Q4: the termination raced the spawn request. Clean up the job that was created,
+                    # but leave the session's status, persistence and events exactly as terminate()
+                    # left them.
+                    threading.Thread(
+                        target=lambda: httpx.post(
+                            f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel", timeout=3.0
+                        ),
+                        daemon=True,
+                    ).start()
+                    return
                 session.dsh_job_id = job_id
                 session.dsh_session_id = dsh_sid
                 session.dsh_token = token
@@ -3387,6 +3657,9 @@ class HubSessionManager:
                 self.persist_session(session)
                 await self._watch_dsh_hub_job(session, job_id, token)
         except Exception as e:
+            if session.terminated_by_user:
+                # Q4: a spawn that fails after the user terminated must not resurrect the session.
+                return
             session.emit_virtual_ansi(f"\x1b[1;31m✖ Failed to reach DSH Host on 127.0.0.1:3080: {e}\x1b[0m\r\n")
             session.status = "exited"
             self.persist_session(session)
@@ -3396,6 +3669,9 @@ class HubSessionManager:
         Tails ~/.config/dsh-crew/logs/<job_id>.log for real-time steps/tools/thoughts AND
         polls /_dsh/dsh-crew/jobs/<job_id>/messages for bidirectional worker->parent messages & questions!
         """
+        if session.terminated_by_user:
+            # Q4: never attach, persist or emit for a session the user already terminated.
+            return
         log_file = Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
         session.transcript_path = log_file
         self.persist_session(session)
@@ -3467,7 +3743,11 @@ class HubSessionManager:
                 pass
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            while session.dsh_job_id == job_id and session.status in ("starting", "running", "waiting_parent"):
+            while (
+                session.dsh_job_id == job_id
+                and not session.terminated_by_user
+                and session.status in ("starting", "running", "waiting_parent")
+            ):
                 drain_log_lines()
 
                 # Poll DSH WorkerMailbox for worker->parent messages or blocking questions
@@ -3477,6 +3757,10 @@ class HubSessionManager:
                         params={"after": msg_cursor, "wait": 1},
                         headers={"x-dsh-crew-job-token": token},
                     )
+                    if session.terminated_by_user:
+                        # Q4: the user terminated while this poll was in flight; stop before any
+                        # status / persistence / event change.
+                        return
                     if m_resp.is_success:
                         m_res = m_resp.json().get("result") or {}
                         for m in m_res.get("messages") or []:
@@ -3541,6 +3825,9 @@ class HubSessionManager:
                 # Check job status & final result
                 try:
                     j_resp = await client.get(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0})
+                    if session.terminated_by_user:
+                        # Q4: same rule for the job-status poll.
+                        return
                     if j_resp.is_success:
                         jview = j_resp.json().get("job") or {}
                         jstatus = jview.get("status")
@@ -3575,6 +3862,10 @@ class HubSessionManager:
                                     },
                                 )
                         elif jstatus in ("done", "failed", "cancelled", "timeout"):
+                            if session.terminated_by_user:
+                                # Q4: the job ended, but the user's termination is the final word on
+                                # this session's status, persistence and events.
+                                return
                             drain_log_lines()
                             full_res = (jview.get("result") or jview.get("error") or "").strip()
                             if full_res:
@@ -4099,6 +4390,8 @@ class HubSessionManager:
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
+        # Q7: one reading of `kind` for the whole launch path; a stored null means tui, never None.
+        kind = str(prof.get("kind") or "tui")
         work_dir = launch['cwd']
         effective_model = launch['model']
         effective_thinking = launch['thinking_level']
@@ -4107,7 +4400,8 @@ class HubSessionManager:
         if engine == 'agy' and launch.get('cli_model'):
             effective_model = launch['cli_model']
 
-        session_id = f'{profile_id}-{uuid.uuid4().hex[:6]}'
+        # Q12: 8 hex characters, wide enough that a reused profile prefix never collides.
+        session_id = f'{profile_id}-{uuid.uuid4().hex[:8]}'
         effective_approval_mode = (approval_mode or prof.get('approval_mode') or 'auto').strip().lower()
         args = self._apply_approval_mode_args(engine=engine, base_args=args, approval_mode=effective_approval_mode)
         task_mode = str(prof.get("task_mode") or "pty_input")
@@ -4144,7 +4438,7 @@ class HubSessionManager:
             session_id=session_id,
             profile_id=profile_id,
             profile_name=prof.get("name", profile_id),
-            kind=prof.get("kind", "tui"),
+            kind=kind,
             title=title or f"{prof.get('name', profile_id)} ({session_id})",
             cwd=work_dir,
             command=prof["command"],
@@ -4158,7 +4452,7 @@ class HubSessionManager:
         sess.engine = engine
         sess.approval_mode = effective_approval_mode
 
-        if prof.get("kind") == "web_gui":
+        if kind == "web_gui":
             if task:
                 sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(task)}; pwsh -NoLogo"]
             else:
@@ -4195,15 +4489,21 @@ class HubSessionManager:
         elif engine == "agy":
             asyncio.create_task(self._watch_agy_transcript(sess))
 
-        if prof.get("kind") == "tui":
+        if kind == "tui":
             asyncio.create_task(self._watch_tui_interactive_prompts(sess))
             prompt_to_send: Optional[str] = None
             if task and task_mode == "pty_input":
                 prompt_to_send = task
-                if profile_id.startswith("kimi") and "hub_worker.py" not in task:
-                    python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve()).replace("\\", "/")
-                    worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
-                    prompt_to_send = f"{task} (When done run: {python_exe} {worker_cli} complete SUMMARY)"
+                if profile_id.startswith("kimi"):
+                    if "hub_worker.py" not in task:
+                        python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve()).replace("\\", "/")
+                        worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
+                        prompt_to_send = f"{task} (When done run: {python_exe} {worker_cli} complete SUMMARY)"
+                    # Q2: unlike codex/agy/omp, kimi carries no bridge hint in its task, so the hub
+                    # session marker that makes transcript ownership unambiguous travels right here.
+                    prompt_to_send = (
+                        f"{prompt_to_send}\n\n[Sub-Agent Bridge Info: session_id={session.session_id}]"
+                    )
             asyncio.create_task(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
