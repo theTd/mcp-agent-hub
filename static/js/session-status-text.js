@@ -8,7 +8,16 @@ export const STATUS_LABELS = {
   completed: '已完成',
   exited: '已退出',
   terminated: '已终止',
+  // Archive spec §7: end reasons the archive list and the record modal show.
+  crashed: '异常退出',
+  interrupted: '已中断',
+  resumed: '已恢复',
 };
+
+/** Archive end-reason label: 已退出 / 异常退出 / 已终止 / 已中断. */
+export function endReasonLabel(reason) {
+  return STATUS_LABELS[reason] || (reason ? String(reason) : '');
+}
 
 const STATUS_TONES = {
   starting: 'info',
@@ -17,6 +26,9 @@ const STATUS_TONES = {
   completed: 'violet',
   exited: 'muted',
   terminated: 'danger',
+  crashed: 'danger',
+  interrupted: 'warning',
+  resumed: 'success',
 };
 
 export function statusLabel(status) {
@@ -37,6 +49,8 @@ export const EVENT_TYPE_LABELS = {
   exited: '退出',
   terminated: '终止',
   error: '错误',
+  crashed: '异常退出',
+  resumed: '恢复',
 };
 
 const EVENT_TYPE_TONES = {
@@ -48,6 +62,8 @@ const EVENT_TYPE_TONES = {
   exited: 'muted',
   terminated: 'danger',
   error: 'danger',
+  crashed: 'danger',
+  resumed: 'success',
 };
 
 export function eventTypeLabel(type) {

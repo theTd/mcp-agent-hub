@@ -36,6 +36,26 @@ export const hubApi = {
   saveRoutingGuide: (text) => request('POST', '/api/routing-guide', { global_routing_instructions: text }),
 
   listSessions: () => request('GET', '/api/sessions', undefined, { timeoutMs: 10000 }),
+  // Archive spec §6: the 归档 list, one record, its raw scrollback, revive and delete.
+  listArchive: ({ limit = 50, offset = 0, q = '' } = {}) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (q) params.set('q', q);
+    return request('GET', `/api/archive?${params.toString()}`);
+  },
+  archiveRecord: (id) => request('GET', `/api/archive/${enc(id)}`),
+  archiveScrollback: async (id) => {
+    const res = await fetch(`/api/archive/${enc(id)}/scrollback`, { headers: { Accept: 'text/plain' } });
+    const text = await res.text();
+    if (!res.ok) {
+      let detail = `${res.status} ${res.statusText}`;
+      try { detail = JSON.parse(text).detail || detail; } catch { /* not JSON */ }
+      throw new Error(detail);
+    }
+    return text;
+  },
+  resumeSession: (id, text) =>
+    request('POST', `/api/sessions/${enc(id)}/resume`, text === undefined ? {} : { text }),
+  deleteArchive: (id) => request('DELETE', `/api/archive/${enc(id)}`),
   createSession: (body) => request('POST', '/api/sessions', body),
   launchPreview: (body) => request('POST', '/api/launch-preview', body),
   sendInput: (id, text) => request('POST', `/api/sessions/${enc(id)}/input`, { text }),

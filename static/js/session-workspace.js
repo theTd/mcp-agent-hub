@@ -1,13 +1,14 @@
 // Session list in the sidebar plus the terminal / web GUI / desktop panes in the workspace.
 import { hubApi } from './hub-api.js';
-import { state, on, emit, setActiveSession, removeSession } from './console-state.js';
+import { state, on, emit, setActiveSession, removeSession, upsertSession } from './console-state.js';
 import {
   $, $$, escapeHtml, icon, formatDuration, shortPath, toast, confirmDialog, setBusy,
-  openModal, copyText, firstLine, formatWhen,
+  openModal, closeModal, registerModal, copyText, firstLine, formatWhen,
 } from './ui-kit.js';
-import { statusLabel, statusTone, activityLabel } from './session-status-text.js';
+import { statusLabel, statusTone, activityLabel, endReasonLabel } from './session-status-text.js';
 
 const HISTORY_MODAL = 'historyModal';
+const ARCHIVE_PAGE_SIZE = 50;
 const LIVE_STATUSES = new Set(['starting', 'running', 'waiting_parent']);
 const QUICK_KEYS = {
   enter: { text: '\r', label: '⏎', title: '发送 Enter' },
@@ -73,13 +74,25 @@ const TERMINAL_THEME = {
 };
 
 const cards = new Map(); // session_id -> { el, sig }
-const historyRows = new Map(); // session_id -> { el, sig } for the 历史 list (R7 keeps scroll + focus)
+const archiveRows = new Map(); // session_id -> { el, sig } for the 归档 list (R7 keeps scroll + focus)
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
 const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
 const streams = new Map(); // session_id -> { stopped, timer }
 
 let sessionsMode = 'live'; // 'live' | 'history'
 let historyRecordId = null;
+let historyRec = null;
+
+// 归档 (archive spec §7): paged 50 at a time, filtered by the search box, newest first.
+let archiveItems = [];
+let archiveTotal = 0; // total matching the current query (paging needs it)
+let archiveGrandTotal = 0; // unfiltered archive size, mirrors state.archiveTotal when known
+let archiveQuery = '';
+let archiveLoading = false;
+let archiveLoaded = false;
+let archiveSearchTimer = 0;
+let historyScrollbackText = null;
+let historyTerm = null; // { term, host } read-only xterm inside the record modal
 
 export function initSessionWorkspace() {
   $('#sessionList').addEventListener('click', onSessionListClick);
@@ -88,8 +101,43 @@ export function initSessionWorkspace() {
   $('#gridContainer').addEventListener('dblclick', onWorkspaceDblClick);
   $$('[data-session-tab]').forEach((tab) => tab.addEventListener('click', () => setSessionsMode(tab.dataset.sessionTab)));
   $('#historyModal').addEventListener('click', onHistoryModalClick);
+  $('#archiveSearch').addEventListener('input', (ev) => {
+    clearTimeout(archiveSearchTimer);
+    archiveSearchTimer = setTimeout(() => {
+      archiveQuery = ev.target.value.trim();
+      loadArchive(true);
+    }, 250);
+  });
+  $('#archiveSearch').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    clearTimeout(archiveSearchTimer);
+    archiveQuery = ev.target.value.trim();
+    loadArchive(true);
+  });
+  // 终端记录 is collapsed by default and loads its scrollback on first open.
+  $('#historyTermBox').addEventListener('toggle', () => {
+    if ($('#historyTermBox').open) loadHistoryScrollback();
+  });
+  registerModal(HISTORY_MODAL, {
+    afterClose: () => {
+      historyRecordId = null;
+      historyScrollbackText = null;
+      $('#historyTermBox').open = false;
+      disposeHistoryTerminal();
+      $('#historyTermHost').innerHTML = '';
+    },
+  });
 
-  on('sessions:changed', renderAll);
+  on('sessions:changed', () => {
+    renderAll();
+    // A poll that reports a different archive size (a session was archived, resumed or deleted)
+    // refreshes page one; paging itself is never reset by a poll.
+    if (sessionsMode === 'history' && !archiveLoading && !archiveQuery
+        && state.archiveTotal !== archiveGrandTotal) {
+      loadArchive(true, { quiet: true });
+    }
+  });
   on('session:activated', () => {
     renderAll();
     focusActiveSession();
@@ -105,6 +153,10 @@ export function initSessionWorkspace() {
 
 export function setSessionsMode(mode) {
   sessionsMode = mode === 'history' ? 'history' : 'live';
+  if (sessionsMode === 'history') {
+    archiveQuery = $('#archiveSearch').value.trim();
+    loadArchive(true);
+  }
   renderSessionList();
 }
 
@@ -133,11 +185,30 @@ function orderedSessions() {
   return [...state.sessions].reverse(); // newest first
 }
 
-function historyEntries() {
-  const live = new Set(state.sessions.map((s) => s.session_id));
-  return state.persistedSessions
-    .filter((rec) => !live.has(rec.session_id))
-    .sort((a, b) => (b.ended_at || b.updated_at || b.created_at || 0) - (a.ended_at || a.updated_at || a.created_at || 0));
+function archiveEntries() {
+  return archiveItems;
+}
+
+/** Archive spec §6: one page of the hub's archive, newest first, optionally filtered by q. */
+async function loadArchive(reset = true, { quiet = false } = {}) {
+  if (archiveLoading) return;
+  archiveLoading = true;
+  const offset = reset ? 0 : archiveItems.length;
+  try {
+    const data = await hubApi.listArchive({ limit: ARCHIVE_PAGE_SIZE, offset, q: archiveQuery });
+    const items = Array.isArray(data.sessions) ? data.sessions : [];
+    archiveItems = reset ? items : archiveItems.concat(items);
+    archiveTotal = Number(data.total) || 0;
+    // The badge shows the unfiltered archive size; only an unfiltered load may update it here,
+    // otherwise a running search would fight the 2.5 s poll over the same number.
+    if (!archiveQuery) archiveGrandTotal = archiveTotal;
+    archiveLoaded = true;
+    renderSessionList();
+  } catch (err) {
+    if (!quiet) toast(`加载归档失败：${err.message}`, 'error');
+  } finally {
+    archiveLoading = false;
+  }
 }
 
 function modelLine(s) {
@@ -148,14 +219,15 @@ function modelLine(s) {
 function renderSessionList() {
   const list = $('#sessionList');
   $('#liveCount').textContent = String(state.sessions.length);
-  $('#historyCount').textContent = String(historyEntries().length);
+  $('#historyCount').textContent = String(state.archiveTotal || 0);
+  $('#archiveSearch').hidden = sessionsMode !== 'history';
   $$('[data-session-tab]').forEach((tab) =>
     tab.setAttribute('aria-pressed', String(tab.dataset.sessionTab === sessionsMode)));
   const waiting = state.sessions.filter((s) => s.status === 'waiting_parent').length;
   $('#sessionSummary').innerHTML = waiting ? `<span class="warn">${waiting} 个待回复</span>` : '';
 
   if (sessionsMode === 'history') {
-    renderHistoryList(list);
+    renderArchiveList(list);
     return;
   }
 
@@ -166,10 +238,10 @@ function renderSessionList() {
     return;
   }
   list.querySelector('.list-empty')?.remove();
-  // Coming back from 历史: the list holds history rows, not cards.
+  // Coming back from 归档: the list holds archive rows, not cards.
   if (list.querySelector('.history-item')) {
     list.innerHTML = '';
-    historyRows.clear();
+    archiveRows.clear();
   }
 
   ordered.forEach((s, index) => {
@@ -243,71 +315,101 @@ function idleText(s) {
   return s.exit_code !== null && s.exit_code !== undefined ? `退出码 ${s.exit_code}` : '';
 }
 
-function historySignature(entries) {
+function archiveSignature(entries) {
   return entries.map((rec) => [
-    rec.session_id, sessionTitle(rec), rec.status, rec.exit_code,
-    rec.ended_at || rec.updated_at || rec.created_at,
-    rec.effective_model, rec.effective_thinking_level,
+    rec.session_id, sessionTitle(rec), rec.status, rec.end_reason, rec.exit_code,
+    rec.ended_at || rec.archived_at || rec.created_at,
+    rec.effective_model, rec.effective_thinking_level, rec.resumable, rec.resume_block_reason,
   ].join('|')).join('\n');
 }
 
-let historySig = '';
+let archiveSig = '';
 
-function renderHistoryList(list) {
-  const entries = historyEntries();
-  const sig = historySignature(entries);
+function renderArchiveList(list) {
+  const entries = archiveEntries();
+  const sig = archiveSignature(entries) + `#${archiveTotal}#${archiveQuery}#${archiveLoaded}`;
   // R7: a poll that renders the same records must not rebuild the list — that is what threw away
   // the scroll position and the focused row every 2.5 s.
-  if (sig === historySig && list.querySelector('.history-item, .list-empty')) return;
-  historySig = sig;
+  if (sig === archiveSig && list.querySelector('.history-item, .list-empty')) {
+    syncArchiveMore(list);
+    return;
+  }
+  archiveSig = sig;
   if (!entries.length) {
-    list.innerHTML = '<div class="list-empty">暂无历史会话</div>';
-    historyRows.clear();
+    list.innerHTML = archiveLoaded
+      ? `<div class="list-empty">${archiveQuery ? '没有匹配的归档会话' : '暂无归档会话'}</div>`
+      : '<div class="list-empty">加载中…</div>';
+    archiveRows.clear();
     return;
   }
   list.querySelector('.list-empty')?.remove();
   if (list.querySelector('.session-card')) {
     list.innerHTML = '';
-    historyRows.clear();
+    archiveRows.clear();
   }
   entries.forEach((rec, index) => {
-    let row = historyRows.get(rec.session_id);
+    let row = archiveRows.get(rec.session_id);
     if (!row) {
       const el = document.createElement('div');
       el.className = 'history-item';
       el.dataset.id = rec.session_id;
       el.tabIndex = 0;
       el.setAttribute('role', 'option');
-      el.innerHTML = historyItemHtml(rec);
-      row = { el, sig: historySignature([rec]) };
-      historyRows.set(rec.session_id, row);
+      el.innerHTML = archiveItemHtml(rec);
+      row = { el, sig: archiveSignature([rec]) };
+      archiveRows.set(rec.session_id, row);
     } else {
-      const rowSig = historySignature([rec]);
+      const rowSig = archiveSignature([rec]);
       if (row.sig !== rowSig) {
-        row.el.innerHTML = historyItemHtml(rec);
+        row.el.innerHTML = archiveItemHtml(rec);
         row.sig = rowSig;
       }
     }
     if (list.children[index] !== row.el) list.insertBefore(row.el, list.children[index] || null);
   });
   const keep = new Set(entries.map((rec) => rec.session_id));
-  for (const [id, row] of historyRows) {
+  for (const [id, row] of archiveRows) {
     if (keep.has(id)) continue;
     row.el.remove();
-    historyRows.delete(id);
+    archiveRows.delete(id);
+  }
+  syncArchiveMore(list);
+}
+
+/** The 「加载更多」 button is part of the list, after the last rendered record. */
+function syncArchiveMore(list) {
+  let more = list.querySelector('.archive-more');
+  if (archiveItems.length >= archiveTotal) {
+    more?.remove();
+    return;
+  }
+  if (!more) {
+    more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'btn archive-more';
+    more.dataset.action = 'archive-more';
+    more.textContent = '加载更多';
+    list.appendChild(more);
+  } else if (more !== list.lastElementChild) {
+    list.appendChild(more);
   }
 }
 
-function historyItemHtml(rec) {
-  const model = [rec.effective_model, rec.effective_thinking_level].filter(Boolean).join(' · ');
-  const when = formatWhen(rec.ended_at || rec.updated_at || rec.created_at);
+function archiveItemHtml(rec) {
+  const model = rec.model_line
+    || [rec.effective_model, rec.effective_thinking_level].filter(Boolean).join(' · ');
+  const when = formatWhen(rec.ended_at || rec.archived_at || rec.created_at);
+  const reason = endReasonLabel(rec.end_reason) || statusLabel(rec.status);
+  const resumable = rec.resumable === true;
+  const tagTitle = resumable ? '可恢复：恢复后沿用同一个会话 ID 与原来的对话' : (rec.resume_block_reason || '该会话不可恢复');
   return `
       <div class="hi-row">
-        <span class="status-dot" data-status="${escapeHtml(rec.status || '')}"></span>
+        <span class="status-dot" data-status="${escapeHtml(rec.end_reason || rec.status || '')}"></span>
         <span class="hi-title" title="${escapeHtml(sessionTitle(rec))}">${escapeHtml(sessionTitle(rec))}</span>
+        <span class="hi-tag ${resumable ? 'is-ok' : 'is-no'}" title="${escapeHtml(tagTitle)}">${resumable ? '可恢复' : '不可恢复'}</span>
       </div>
       <div class="hi-meta">
-        <span class="status-text" data-tone="${statusTone(rec.status)}">${escapeHtml(statusLabel(rec.status))}</span>
+        <span class="status-text" data-tone="${statusTone(rec.end_reason || rec.status)}">${escapeHtml(reason || '已结束')}</span>
         ${when ? `<span class="dot-sep"></span><span>结束 ${escapeHtml(when)}</span>` : ''}
         ${model ? `<span class="dot-sep"></span><span class="hi-model" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` : ''}
       </div>`;
@@ -315,6 +417,10 @@ function historyItemHtml(rec) {
 
 async function onSessionListClick(ev) {
   if (sessionsMode === 'history') {
+    if (ev.target.closest('.archive-more')) {
+      loadArchive(false);
+      return;
+    }
     const item = ev.target.closest('.history-item');
     if (item) openHistoryRecord(item.dataset.id);
     return;
@@ -501,6 +607,7 @@ function paneHeadHtml(s) {
       ${state.layoutMode === 'matrix'
         ? `<button type="button" class="icon-btn sm" data-action="focus-single" title="在单窗口视图中打开（或双击标题栏）" aria-label="在单窗口视图中打开">${icon('maximize')}</button>`
         : ''}
+      ${live ? '' : `<button type="button" class="btn btn-sm" data-action="resume" title="恢复这个会话（沿用同一个会话 ID）">${icon('play', 'icon-sm')}<span class="btn-label">恢复</span></button>`}
       <button type="button" class="icon-btn sm danger" data-action="close" title="${live ? '终止会话' : '移除'}" aria-label="${live ? '终止会话' : '移除'}">${icon('x')}</button>
     </div>`;
 }
@@ -848,6 +955,9 @@ async function onWorkspaceClick(ev) {
     case 'key':
       sendKey(id, action.dataset.key);
       break;
+    case 'resume':
+      await resumeSession(id, action);
+      break;
     case 'close':
       await closeSession(id);
       break;
@@ -923,6 +1033,8 @@ async function closeSession(id) {
     await hubApi.terminateSession(id);
     removeSession(id);
     emit('sessions:refresh-request');
+    // Removing an ended session archives it (spec §5); refresh the archive so it appears there.
+    if (sessionsMode === 'history') setTimeout(() => loadArchive(true, { quiet: true }), 250);
     toast(live ? `已终止 ${label}` : `已移除 ${label}`, 'success', 2000);
   } catch (err) {
     toast(`关闭失败：${err.message}`, 'error');
@@ -932,40 +1044,60 @@ async function closeSession(id) {
 // ------------------------------------------------------------ history record
 function openSessionOrHistory(id) {
   if (!id) return;
-  if (state.sessions.some((s) => s.session_id === id)) {
+  const session = state.sessions.find((s) => s.session_id === id);
+  // S1: a session still in the live list but with no live process opens its record, not a dead pane.
+  if (session && isLive(session)) {
     setActiveSession(id);
     return;
   }
   openHistoryRecord(id);
 }
 
+function findHistoryRecord(id) {
+  return archiveItems.find((r) => r.session_id === id)
+    || state.persistedSessions.find((r) => r.session_id === id)
+    || state.sessions.find((s) => s.session_id === id)
+    || { session_id: id };
+}
+
 function openHistoryRecord(id) {
   if (!id) return;
   historyRecordId = id;
-  const rec = state.persistedSessions.find((r) => r.session_id === id)
-    || state.sessions.find((s) => s.session_id === id)
-    || { session_id: id };
-  renderHistoryMeta(rec, null);
+  historyScrollbackText = null;
+  historyRec = findHistoryRecord(id);
+  disposeHistoryTerminal();
+  $('#historyTermHost').innerHTML = '';
+  $('#historyTermBox').open = false;
+  renderHistoryMeta(historyRec, null);
+  updateHistoryActions(historyRec);
   setHistoryText('#historyFinal', '加载中…');
   setHistoryText('#historySummary', '加载中…');
   openModal(HISTORY_MODAL);
-  loadHistoryRecord(id, rec);
+  loadHistoryRecord(id, historyRec);
 }
 
 async function loadHistoryRecord(id, rec) {
-  const [finalRes, summaryRes] = await Promise.allSettled([
+  const [finalRes, summaryRes, recRes] = await Promise.allSettled([
     hubApi.sessionFinal(id),
     hubApi.transcriptSummary(id),
+    hubApi.archiveRecord(id),
   ]);
   if (historyRecordId !== id) return;
 
+  let final = {};
   if (finalRes.status === 'fulfilled') {
-    const final = finalRes.value || {};
-    renderHistoryMeta(rec, final);
+    final = finalRes.value || {};
     setHistoryText('#historyFinal', String(final.final_response || '').trim() || '（暂无最终回复）');
   } else {
     setHistoryText('#historyFinal', `加载失败：${finalRes.reason?.message || finalRes.reason}`, true);
   }
+
+  // The archive record carries 结束原因 / 可恢复 / 不可恢复原因; a live ended session has them too.
+  historyRec = recRes.status === 'fulfilled'
+    ? { ...(rec || {}), ...(recRes.value || {}) }
+    : { ...(rec || {}) };
+  renderHistoryMeta(historyRec, final);
+  updateHistoryActions(historyRec);
 
   if (summaryRes.status === 'fulfilled') {
     const summary = summaryRes.value || {};
@@ -974,6 +1106,9 @@ async function loadHistoryRecord(id, rec) {
   } else {
     setHistoryText('#historySummary', `加载失败：${summaryRes.reason?.message || summaryRes.reason}`, true);
   }
+
+  // 终端记录 was opened while the record was still loading: fetch its scrollback now.
+  if ($('#historyTermBox').open) loadHistoryScrollback();
 }
 
 function renderHistoryMeta(rec, final) {
@@ -982,6 +1117,7 @@ function renderHistoryMeta(rec, final) {
     rec.effective_thinking_level ?? final?.effective_thinking_level,
   ].filter(Boolean).join(' · ');
   const status = rec.status || final?.lifecycle_status;
+  const endReason = rec.end_reason || '';
   const exitCode = rec.exit_code ?? final?.exit_code;
   const start = rec.created_at || final?.created_at;
   const end = rec.ended_at || final?.ended_at;
@@ -991,12 +1127,26 @@ function renderHistoryMeta(rec, final) {
     ['工作目录', rec.cwd || ''],
     ['开始', formatWhen(start)],
     ['结束', formatWhen(end)],
+    ['结束原因', endReasonLabel(endReason) || (status ? statusLabel(status) : '')],
     ['退出码', exitCode === null || exitCode === undefined ? '' : String(exitCode)],
+    ['恢复次数', rec.resume_count ? `${rec.resume_count} 次` : ''],
     ['状态', status ? statusLabel(status) : ''],
   ].filter(([, value]) => value !== '' && value !== null && value !== undefined);
   $('#historyMeta').innerHTML = `<dl class="kv-list">${rows
     .map(([key, value]) => `<dt>${escapeHtml(key)}</dt><dd>${key === '工作目录' ? `<code>${escapeHtml(String(value))}</code>` : escapeHtml(String(value))}</dd>`)
     .join('')}</dl>`;
+}
+
+/** 恢复会话 is disabled with the 不可恢复 reason; 删除记录 exists only for an archived record. */
+function updateHistoryActions(rec) {
+  const resumeBtn = $('#historyResumeBtn');
+  const deleteBtn = $('#historyDeleteBtn');
+  if (!resumeBtn || !deleteBtn) return;
+  const resumable = rec?.resumable === true;
+  const reason = rec?.resume_block_reason || '该会话不可恢复';
+  resumeBtn.disabled = !resumable;
+  resumeBtn.title = resumable ? '恢复该会话（沿用同一个会话 ID）' : reason;
+  deleteBtn.hidden = rec?.archived !== true;
 }
 
 function setHistoryText(selector, text, isError = false) {
@@ -1006,7 +1156,126 @@ function setHistoryText(selector, text, isError = false) {
   el.classList.toggle('is-error', isError);
 }
 
+// ------------------------------------------------------------ 终端记录 (archive)
+async function loadHistoryScrollback() {
+  const id = historyRecordId;
+  if (!id) return;
+  if (historyScrollbackText !== null) {
+    renderHistoryScrollback(historyScrollbackText);
+    return;
+  }
+  const host = $('#historyTermHost');
+  host.innerHTML = '<div class="term-loading"><span class="spinner"></span>正在加载终端记录…</div>';
+  try {
+    const text = await hubApi.archiveScrollback(id);
+    if (historyRecordId !== id) return;
+    historyScrollbackText = text;
+    renderHistoryScrollback(text);
+  } catch (err) {
+    if (historyRecordId !== id) return;
+    host.innerHTML = `<div class="history-pre is-error">加载失败：${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function disposeHistoryTerminal() {
+  try { historyTerm?.term.dispose(); } catch { /* already disposed */ }
+  historyTerm = null;
+}
+
+/** A read-only xterm (no onData forwarding) so the archived stream renders exactly as it ran. */
+function ensureHistoryTerminal() {
+  if (!window.Terminal) return null;
+  if (historyTerm) return historyTerm;
+  const host = $('#historyTermHost');
+  host.innerHTML = '';
+  const term = new window.Terminal({
+    cursorBlink: false,
+    disableStdin: true,
+    fontSize: 12,
+    fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, monospace',
+    scrollback: 5000,
+    theme: TERMINAL_THEME,
+  });
+  const fit = window.FitAddon ? new window.FitAddon.FitAddon() : null;
+  if (fit) term.loadAddon(fit);
+  term.open(host);
+  historyTerm = { term, fit, host };
+  requestAnimationFrame(() => { try { fit?.fit(); } catch { /* not measurable yet */ } });
+  return historyTerm;
+}
+
+function renderHistoryScrollback(text) {
+  const t = ensureHistoryTerminal();
+  if (!t) {
+    // xterm is a CDN script; without it the raw text is still readable.
+    $('#historyTermHost').innerHTML = `<pre class="history-pre">${escapeHtml(text || '（没有终端记录）')}</pre>`;
+    return;
+  }
+  t.term.reset();
+  t.term.write(text || '\r\n\x1b[90m（没有终端记录）\x1b[0m\r\n');
+  requestAnimationFrame(() => { try { t.fit?.fit(); } catch { /* not measurable yet */ } });
+}
+
+// ------------------------------------------------------------- record actions
+async function resumeSession(id, button) {
+  if (!id) return;
+  setBusy(button, true);
+  try {
+    const res = await hubApi.resumeSession(id);
+    if (res.session) upsertSession(res.session);
+    if (historyRecordId === id) closeModal(HISTORY_MODAL, { force: true });
+    emit('sessions:refresh-request');
+    setActiveSession(id);
+    toast(`会话已恢复（第 ${res.resume_count || 1} 次）`, 'success');
+    if (sessionsMode === 'history') setTimeout(() => loadArchive(true, { quiet: true }), 400);
+  } catch (err) {
+    toast(`恢复失败：${err.message}`, 'error', 6000);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deleteHistoryRecord(id, button) {
+  if (!id) return;
+  const rec = historyRec || {};
+  const engine = rec.engine || rec.profile_id || 'Sub-Agent';
+  const ok = await confirmDialog({
+    title: '删除归档记录？',
+    message: `只删除 Hub 的归档记录，不会删除 ${engine} 自己的会话文件。继续？`,
+    confirmText: '删除记录',
+    danger: true,
+  });
+  if (!ok) return;
+  setBusy(button, true);
+  try {
+    await hubApi.deleteArchive(id);
+    closeModal(HISTORY_MODAL, { force: true });
+    archiveItems = archiveItems.filter((item) => item.session_id !== id);
+    archiveTotal = Math.max(0, archiveTotal - 1);
+    archiveGrandTotal = Math.max(0, archiveGrandTotal - 1);
+    state.archiveTotal = Math.max(0, (state.archiveTotal || 0) - 1);
+    archiveSig = '';
+    renderSessionList();
+    toast('已删除归档记录', 'success');
+    if (sessionsMode === 'history') loadArchive(true, { quiet: true });
+  } catch (err) {
+    toast(`删除失败：${err.message}`, 'error', 6000);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function onHistoryModalClick(ev) {
+  const resumeBtn = ev.target.closest('[data-action="resume-record"]');
+  if (resumeBtn) {
+    resumeSession(historyRecordId, resumeBtn);
+    return;
+  }
+  const deleteBtn = ev.target.closest('[data-action="delete-record"]');
+  if (deleteBtn) {
+    deleteHistoryRecord(historyRecordId, deleteBtn);
+    return;
+  }
   const btn = ev.target.closest('[data-action="copy-final"]');
   if (!btn) return;
   const text = $('#historyFinal')?.textContent || '';

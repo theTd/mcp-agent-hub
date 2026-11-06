@@ -140,8 +140,11 @@
         </div>
         <div class="sessions-switch" role="group" aria-label="会话列表视图">
           <button type="button" data-session-tab="live" aria-pressed="true">进行中 <span class="count-badge" id="liveCount">0</span></button>
-          <button type="button" data-session-tab="history" aria-pressed="false">历史 <span class="count-badge" id="historyCount">0</span></button>
+          <button type="button" data-session-tab="history" aria-pressed="false">归档 <span class="count-badge" id="historyCount">0</span></button>
         </div>
+        <input id="archiveSearch" type="search" class="archive-search" hidden
+          placeholder="搜索会话 ID、任务、目录或 Profile" spellcheck="false" autocomplete="off"
+          aria-label="搜索归档会话" />
         <div class="session-list" id="sessionList" role="listbox" aria-label="会话列表"></div>
       </section>
 
@@ -441,6 +444,8 @@
             <div class="tool-row"><code>summarize_subagent_transcript</code><span>解析引擎原生日志，返回高信噪比的执行摘要。</span></div>
             <div class="tool-row"><code>read_subagent_screen</code><span>读取 Sub-Agent 的终端画面，可选择附带原始 TUI 文本。</span></div>
             <div class="tool-row"><code>list_active_sessions</code><span>列出正在运行的会话，以及持久化的历史会话。</span></div>
+            <div class="tool-row"><code>resume_subagent</code><span>恢复已结束或已归档的会话（沿用同一个 session_id），可顺带送入一条消息。</span></div>
+            <div class="tool-row"><code>list_archived_sessions</code><span>列出归档会话：结束原因、结束时间、是否可恢复与不可恢复的原因。</span></div>
             <div class="tool-row"><code>terminate_subagent</code><span>终止指定会话，并持久化它的最终回复。</span></div>
             <div class="tool-row"><code>attach_desktop_gui_window</code><span>按窗口标题把本机桌面窗口纳入总控台投屏。</span></div>
           </div>
@@ -506,7 +511,18 @@
           <div class="hb-head"><h4>过程摘要</h4></div>
           <pre class="history-pre" id="historySummary"></pre>
         </section>
+        <section class="history-block">
+          <details class="history-term" id="historyTermBox">
+            <summary>终端记录</summary>
+            <div class="history-term-host" id="historyTermHost"></div>
+          </details>
+        </section>
       </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-ghost btn-sm" data-action="delete-record" id="historyDeleteBtn" hidden>删除记录</button>
+        <div class="grow"></div>
+        <button type="button" class="btn btn-primary" data-action="resume-record" id="historyResumeBtn">恢复会话</button>
+      </footer>
     </div>
   </div>
 

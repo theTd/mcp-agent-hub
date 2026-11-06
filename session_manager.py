@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -144,11 +145,25 @@ class HubDatabase:
                 """
             )
             # B9: persisted history must say which engine/model really ran, and which process status ended.
+            # Archive spec §3: an ended session keeps everything needed to view and revive it. Old rows
+            # get NULLs; every ALTER that already ran fails harmlessly, so a second start is a no-op.
             for ddl in (
                 "ALTER TABLE sessions ADD COLUMN transcript_path TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN engine TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN effective_model TEXT",
                 "ALTER TABLE sessions ADD COLUMN effective_thinking_level TEXT",
+                "ALTER TABLE sessions ADD COLUMN end_reason TEXT",
+                "ALTER TABLE sessions ADD COLUMN archived_at REAL",
+                "ALTER TABLE sessions ADD COLUMN spawned_at REAL",
+                "ALTER TABLE sessions ADD COLUMN profile_snapshot TEXT",
+                "ALTER TABLE sessions ADD COLUMN conversation_ref TEXT",
+                "ALTER TABLE sessions ADD COLUMN scrollback BLOB",
+                "ALTER TABLE sessions ADD COLUMN last_screen TEXT DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN parent_messages TEXT",
+                "ALTER TABLE sessions ADD COLUMN resume_count INTEGER DEFAULT 0",
+                "ALTER TABLE sessions ADD COLUMN last_resumed_at REAL",
+                "ALTER TABLE sessions ADD COLUMN resumable INTEGER",
+                "ALTER TABLE sessions ADD COLUMN resume_block_reason TEXT",
             ):
                 try:
                     conn.execute(ddl)
@@ -160,58 +175,102 @@ class HubDatabase:
             row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM worker_events").fetchone()
             return int(row["m"]) if row else 0
 
-    def upsert_session(self, s_dict: Dict[str, Any], scrollback_text: str = ""):
+    def upsert_session(
+        self,
+        s_dict: Dict[str, Any],
+        scrollback_text: str = "",
+        archive: Optional[Dict[str, Any]] = None,
+    ):
+        """Inserts or refreshes one session row; `archive` carries the archive-spec columns (§3).
+
+        Every archive column is COALESCEd, so a plain telemetry persist never erases what the final
+        record already wrote. `resumable` is written whenever it is not None (0 must beat a stale 1),
+        and its block reason is replaced in the same step so it can be cleared again.
+        """
+        arc = archive or {}
+        values: Dict[str, Any] = {
+            "session_id": s_dict["session_id"],
+            "profile_id": s_dict["profile_id"],
+            "profile_name": s_dict["profile_name"],
+            "kind": s_dict["kind"],
+            "title": s_dict["title"],
+            "cwd": s_dict["cwd"],
+            "status": s_dict["status"],
+            "created_at": s_dict["created_at"],
+            "updated_at": time.time(),
+            "ended_at": s_dict.get("ended_at"),
+            "exit_code": s_dict.get("exit_code"),
+            "step_count": s_dict.get("step_count", 0),
+            "current_activity": s_dict.get("current_activity", ""),
+            "last_task": s_dict.get("last_task", ""),
+            "engine": s_dict.get("engine") or "",
+            "effective_model": s_dict.get("effective_model"),
+            "effective_thinking_level": s_dict.get("effective_thinking_level"),
+            "final_response": s_dict.get("final_response"),
+            "final_response_source": s_dict.get("final_response_source"),
+            "files_changed_json": json.dumps(s_dict.get("files_changed", []), ensure_ascii=False),
+            "scrollback_text": scrollback_text,
+            "transcript_path": s_dict.get("transcript_path") or "",
+            "end_reason": arc.get("end_reason"),
+            "archived_at": arc.get("archived_at"),
+            "spawned_at": arc.get("spawned_at"),
+            "profile_snapshot": arc.get("profile_snapshot") or "",
+            "conversation_ref": arc.get("conversation_ref") or "",
+            "scrollback": arc.get("scrollback"),
+            "last_screen": arc.get("last_screen") or "",
+            "parent_messages": arc.get("parent_messages") or "",
+            "resume_count": int(arc.get("resume_count") or 0),
+            "last_resumed_at": arc.get("last_resumed_at"),
+            "resumable": arc.get("resumable"),
+            "resume_block_reason": arc.get("resume_block_reason"),
+        }
+        columns = list(values.keys())
+        placeholders = ", ".join(f":{c}" for c in columns)
+        updates = []
+        for col in columns:
+            if col == "session_id":
+                continue
+            if col in ("ended_at", "exit_code", "archived_at", "spawned_at",
+                       "profile_snapshot", "conversation_ref", "parent_messages",
+                       "last_resumed_at"):
+                updates.append(f"{col}=COALESCE(NULLIF(excluded.{col}, ''), sessions.{col})")
+            elif col == "scrollback_text":
+                updates.append(
+                    "scrollback_text=CASE WHEN length(excluded.scrollback_text) > 0 "
+                    "THEN excluded.scrollback_text ELSE sessions.scrollback_text END"
+                )
+            elif col == "scrollback":
+                updates.append(
+                    "scrollback=CASE WHEN excluded.scrollback IS NOT NULL "
+                    "AND length(excluded.scrollback) > 0 THEN excluded.scrollback ELSE sessions.scrollback END"
+                )
+            elif col == "last_screen":
+                updates.append(
+                    "last_screen=CASE WHEN length(excluded.last_screen) > 0 "
+                    "THEN excluded.last_screen ELSE sessions.last_screen END"
+                )
+            elif col == "transcript_path":
+                updates.append(
+                    "transcript_path=CASE WHEN length(excluded.transcript_path) > 0 "
+                    "THEN excluded.transcript_path ELSE sessions.transcript_path END"
+                )
+            elif col == "engine":
+                updates.append("engine=COALESCE(NULLIF(excluded.engine, ''), sessions.engine)")
+            elif col == "resume_block_reason":
+                updates.append(
+                    "resume_block_reason=CASE WHEN excluded.resumable IS NOT NULL "
+                    "THEN excluded.resume_block_reason "
+                    "ELSE COALESCE(excluded.resume_block_reason, sessions.resume_block_reason) END"
+                )
+            elif col == "resumable":
+                updates.append("resumable=COALESCE(excluded.resumable, sessions.resumable)")
+            else:
+                updates.append(f"{col}=excluded.{col}")
         with self._lock, self._conn() as conn:
             conn.execute(
-                """
-                INSERT INTO sessions (
-                    session_id, profile_id, profile_name, kind, title, cwd, status,
-                    created_at, updated_at, ended_at, exit_code, step_count,
-                    current_activity, last_task, engine, effective_model, effective_thinking_level,
-                    final_response, final_response_source,
-                    files_changed_json, scrollback_text, transcript_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=excluded.updated_at,
-                    ended_at=COALESCE(excluded.ended_at, sessions.ended_at),
-                    exit_code=COALESCE(excluded.exit_code, sessions.exit_code),
-                    step_count=excluded.step_count,
-                    current_activity=excluded.current_activity,
-                    last_task=excluded.last_task,
-                    engine=COALESCE(NULLIF(excluded.engine, ''), sessions.engine),
-                    effective_model=COALESCE(excluded.effective_model, sessions.effective_model),
-                    effective_thinking_level=COALESCE(excluded.effective_thinking_level, sessions.effective_thinking_level),
-                    final_response=COALESCE(excluded.final_response, sessions.final_response),
-                    final_response_source=COALESCE(excluded.final_response_source, sessions.final_response_source),
-                    files_changed_json=excluded.files_changed_json,
-                    scrollback_text=CASE WHEN length(excluded.scrollback_text) > 0 THEN excluded.scrollback_text ELSE sessions.scrollback_text END,
-                    transcript_path=CASE WHEN length(excluded.transcript_path) > 0 THEN excluded.transcript_path ELSE sessions.transcript_path END
-                """,
-                (
-                    s_dict["session_id"],
-                    s_dict["profile_id"],
-                    s_dict["profile_name"],
-                    s_dict["kind"],
-                    s_dict["title"],
-                    s_dict["cwd"],
-                    s_dict["status"],
-                    s_dict["created_at"],
-                    time.time(),
-                    s_dict.get("ended_at"),
-                    s_dict.get("exit_code"),
-                    s_dict.get("step_count", 0),
-                    s_dict.get("current_activity", ""),
-                    s_dict.get("last_task", ""),
-                    s_dict.get("engine") or "",
-                    s_dict.get("effective_model"),
-                    s_dict.get("effective_thinking_level"),
-                    s_dict.get("final_response"),
-                    s_dict.get("final_response_source"),
-                    json.dumps(s_dict.get("files_changed", []), ensure_ascii=False),
-                    scrollback_text,
-                    s_dict.get("transcript_path") or "",
-                ),
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders}) "
+                f"ON CONFLICT(session_id) DO UPDATE SET {', '.join(updates)}",
+                values,
             )
 
     def add_tool_call(
@@ -290,16 +349,29 @@ class HubDatabase:
             )
             return int(cur.lastrowid)
 
+    @staticmethod
+    def _decode_json_column(raw: Any, default: Any) -> Any:
+        if raw is None or raw == "":
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+
     def get_session_record(self, session_id: str) -> Optional[Dict[str, Any]]:
         with self._lock, self._conn() as conn:
             row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
             if not row:
                 return None
             d = dict(row)
-            try:
-                d["files_changed"] = json.loads(d.pop("files_changed_json", "[]"))
-            except Exception:
-                d["files_changed"] = []
+            d["files_changed"] = self._decode_json_column(d.pop("files_changed_json", None), [])
+            # Archive spec §3: the JSON columns come back parsed; the compressed scrollback stays out
+            # of the record (the scrollback endpoint reads it through get_scrollback_blob).
+            d["profile_snapshot"] = self._decode_json_column(d.pop("profile_snapshot", None), None)
+            d["conversation_ref"] = self._decode_json_column(d.pop("conversation_ref", None), None)
+            d["parent_messages"] = self._decode_json_column(d.pop("parent_messages", None), [])
+            d.pop("scrollback", None)
+            d["archived"] = bool(d.get("archived_at"))
             return d
 
     def get_recent_tool_calls(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
@@ -318,22 +390,154 @@ class HubDatabase:
             ).fetchall()
             return [dict(r) for r in reversed(rows)]
 
-    def list_persisted_sessions(self, limit: int = 30) -> List[Dict[str, Any]]:
+    def list_persisted_sessions(self, limit: int = 30, include_archived: bool = True) -> List[Dict[str, Any]]:
+        """Session summary rows; `include_archived=False` is "live + ended-in-memory" (spec §6)."""
+        where = "" if include_archived else "WHERE archived_at IS NULL"
         with self._lock, self._conn() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT session_id, profile_id, profile_name, kind, title, cwd, status,
                        created_at, updated_at, ended_at, exit_code, step_count,
                        current_activity, last_task, engine, effective_model, effective_thinking_level,
                        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
                        final_response_source
                 FROM sessions
+                {where}
                 ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
                 LIMIT ?
                 """,
                 (limit,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---- Archive & resume storage (spec archive-spec.md §3, §6) ----------------------------
+
+    ARCHIVE_SUMMARY_COLUMNS = """
+        session_id, profile_id, profile_name, kind, title, cwd, status, engine,
+        created_at, updated_at, ended_at, exit_code, step_count, last_task,
+        effective_model, effective_thinking_level, end_reason, archived_at,
+        resume_count, last_resumed_at, resumable, resume_block_reason
+    """
+
+    def list_archived(self, limit: int = 50, offset: int = 0, query: str = "") -> List[Dict[str, Any]]:
+        """Archive rows, newest first; `query` matches session id, task, cwd and profile (§6)."""
+        limit = max(1, min(int(limit or 50), 200))
+        offset = max(0, int(offset or 0))
+        clauses = ["archived_at IS NOT NULL"]
+        params: List[Any] = []
+        q = (query or "").strip()
+        if q:
+            like = f"%{q}%"
+            clauses.append(
+                "(session_id LIKE ? OR last_task LIKE ? OR cwd LIKE ? "
+                "OR profile_id LIKE ? OR profile_name LIKE ?)"
+            )
+            params.extend([like, like, like, like, like])
+        sql = (
+            f"SELECT {self.ARCHIVE_SUMMARY_COLUMNS} FROM sessions WHERE {' AND '.join(clauses)} "
+            "ORDER BY COALESCE(ended_at, archived_at, updated_at) DESC, archived_at DESC LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+        with self._lock, self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["resumable"] = bool(d.get("resumable"))
+                d["archived"] = True
+                d["end_reason_label"] = END_REASON_LABELS.get(str(d.get("end_reason") or ""), "")
+                out.append(d)
+            return out
+
+    def count_archived(self, query: str = "") -> int:
+        clauses = ["archived_at IS NOT NULL"]
+        params: List[Any] = []
+        q = (query or "").strip()
+        if q:
+            like = f"%{q}%"
+            clauses.append(
+                "(session_id LIKE ? OR last_task LIKE ? OR cwd LIKE ? "
+                "OR profile_id LIKE ? OR profile_name LIKE ?)"
+            )
+            params.extend([like, like, like, like, like])
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM sessions WHERE {' AND '.join(clauses)}", params
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
+    def get_scrollback_blob(self, session_id: str) -> Optional[bytes]:
+        with self._lock, self._conn() as conn:
+            row = conn.execute(
+                "SELECT scrollback FROM sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            if not row or row["scrollback"] is None:
+                return None
+            raw = row["scrollback"]
+            return bytes(raw) if not isinstance(raw, bytes) else raw
+
+    def delete_session_record(self, session_id: str) -> bool:
+        """Deletes the hub's row only; the CLI's own conversation files are never touched."""
+        with self._lock, self._conn() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+            return cur.rowcount > 0
+
+    def prune_archived(self, cutoff: float, keep_newest: Optional[int] = None) -> int:
+        """Deletes archived rows older than `cutoff` that are not among the newest `keep_newest` (§1.6)."""
+        if keep_newest is None:
+            keep_newest = ARCHIVE_RETENTION_KEEP_NEWEST
+        with self._lock, self._conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM sessions
+                WHERE archived_at IS NOT NULL
+                  AND archived_at < ?
+                  AND session_id NOT IN (
+                    SELECT session_id FROM sessions
+                    WHERE archived_at IS NOT NULL
+                    ORDER BY archived_at DESC
+                    LIMIT ?
+                  )
+                """,
+                (float(cutoff), max(0, int(keep_newest))),
+            )
+            return int(cur.rowcount or 0)
+
+    def update_archive_fields(self, session_id: str, **fields: Any) -> None:
+        """Writes a few session columns directly (startup normalisation, retention, resume blocks)."""
+        # The startup normalisation also rewrites the live status it found in the row, and the
+        # resume-block updates rewrite nothing else; both sets must be allowed here.
+        allowed = set(ARCHIVE_COLUMNS) | {"status", "ended_at", "current_activity"}
+        sets = []
+        params: List[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            sets.append(f"{key}=?")
+            params.append(value)
+        if not sets:
+            return
+        params.append(session_id)
+        with self._lock, self._conn() as conn:
+            conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
+
+    def reset_session_after_resume(self, session_id: str) -> None:
+        """A revived session is live again: it leaves the archive and its end state (§5.3)."""
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET archived_at=NULL, end_reason=NULL, ended_at=NULL, exit_code=NULL,
+                    resumable=NULL, resume_block_reason=NULL, status='starting',
+                    final_response=NULL, final_response_source=NULL
+                WHERE session_id=?
+                """,
+                (session_id,),
+            )
+
+    def list_session_ids(self) -> List[str]:
+        with self._lock, self._conn() as conn:
+            return [str(r["session_id"]) for r in conn.execute("SELECT session_id FROM sessions").fetchall()]
 
 
 # Priority levels for final_response sources so explicit MCP or native transcript never gets overwritten by raw screen text
@@ -375,6 +579,76 @@ TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC = 5.0
 # Q2: the hub session marker travels in the task text, i.e. near the beginning of the transcript.
 TRANSCRIPT_MARKER_SCAN_BYTES = 128 * 1024
 TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
+
+# ---- Archive & resume (spec archive-spec.md §1-§5) ------------------------------------------
+# Live statuses keep their meaning; an ended session carries one of these end reasons.
+LIVE_STATUSES = ("starting", "running", "waiting_parent", "completed")
+END_REASONS = ("exited", "crashed", "terminated", "interrupted")
+END_REASON_LABELS = {
+    "exited": "已退出",
+    "crashed": "异常退出",
+    "terminated": "已终止",
+    "interrupted": "已中断",
+}
+# Engines with a revive recipe (spec §4). Anything else cannot be resumed.
+RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "dsh")
+ENGINE_RESUME_BLOCK_REASONS = {
+    "pwsh": "PowerShell 会话结束后无法找回上下文",
+    "desktop_gui": "桌面窗口会话结束后无法找回上下文",
+}
+DEFAULT_RESUME_BLOCK_REASON = "该引擎的会话结束后无法恢复上下文"
+RESUME_SCROLLBACK_MAX_BYTES = 512 * 1024
+RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
+ARCHIVE_RETENTION_DAYS = 30
+ARCHIVE_RETENTION_KEEP_NEWEST = 500
+ARCHIVE_PRUNE_INTERVAL_SEC = 6 * 60 * 60
+AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
+CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
+KIMI_LOCKED_MESSAGE = "该 Kimi 会话正被另一个进程使用"
+DSH_UNKNOWN_JOB_MESSAGE = "DSH 服务已不认识这个任务（可能重启过）"
+ARCHIVE_COLUMNS = (
+    "end_reason", "archived_at", "spawned_at", "profile_snapshot", "conversation_ref",
+    "scrollback", "last_screen", "parent_messages", "resume_count", "last_resumed_at",
+    "resumable", "resume_block_reason",
+)
+
+
+def resume_banner(resume_count: int) -> str:
+    """The separator a revived pane shows between the archived output and the new one (spec §5.3)."""
+    return f"\r\n\x1b[90m── 已恢复（第 {int(resume_count)} 次）──\x1b[0m\r\n"
+
+
+def _store_root(env_name: str, default: Path) -> Path:
+    """A CLI store root; the HUB_* override lets tests point at a synthetic copy (never the real store)."""
+    raw = os.environ.get(env_name)
+    if raw and raw.strip():
+        return Path(os.path.expanduser(raw.strip()))
+    return default
+
+
+def codex_sessions_root() -> Path:
+    return _store_root("HUB_CODEX_SESSIONS_ROOT", Path(os.path.expanduser("~")) / ".codex" / "sessions")
+
+
+def kimi_store_root() -> Path:
+    return _store_root("HUB_KIMI_STORE_ROOT", Path(os.path.expanduser("~")) / ".kimi-code")
+
+
+def agy_brain_root() -> Path:
+    return _store_root("HUB_AGY_BRAIN_ROOT", Path(os.path.expanduser("~")) / ".gemini" / "antigravity" / "brain")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while a process with this pid exists (used for the kimi per-session lock)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
 
 
 def _is_file_lock_error(exc: BaseException) -> bool:
@@ -526,6 +800,23 @@ class AgentSession:
         self.transcript_path: Optional[Path] = None
         self.effective_model: Optional[str] = None
         self.effective_thinking_level: Optional[str] = None
+
+        # Archive spec §3: everything the final record needs in order to view and revive this session.
+        self.end_reason: Optional[str] = None
+        self.archived_at: Optional[float] = None
+        self.last_screen: str = ""
+        self.profile_snapshot: Dict[str, Any] = {}
+        self.conversation_ref: Dict[str, Any] = {}
+        self.resume_count: int = 0
+        self.last_resumed_at: Optional[float] = None
+        self.resumable: Optional[bool] = None
+        self.resume_block_reason: Optional[str] = None
+        # Resume (§5.3): attach the watcher to the known conversation and tail only what is new.
+        self.resume_attach: bool = False
+        self.attach_offset: Optional[int] = None
+        self.completion_reported: bool = False
+        self._scrollback_written_at: float = 0.0
+        self._scrollback_rev_written: int = -1
         self._seen_tui_tool_lines: Set[str] = set()
         self._seen_tui_prompt_signatures: Set[str] = set()
 
@@ -536,7 +827,10 @@ class AgentSession:
         # Raw ANSI history buffer for Web Console xterm.js replay
         self.raw_history: List[str] = []
         self.raw_history_bytes = 0
-        self.max_history_bytes = 512 * 1024
+        # Archive spec §3: bumped on every append, so the 60 s scrollback write can tell "changed"
+        # even when the capped buffer's byte count happens to be the same.
+        self.raw_history_rev = 0
+        self.max_history_bytes = RESUME_SCROLLBACK_MAX_BYTES
 
         # Connected WebSocket queues for live browser xterm.js streaming
         self.ws_queues: Set[asyncio.Queue] = set()
@@ -575,6 +869,9 @@ class AgentSession:
         if new_prio >= cur_prio:
             self.final_response = text
             self.final_response_source = source
+        # Spec §1.4: "reported completion" is what separates a clean exit from an abnormal one.
+        if str(source) in ("report_complete_mcp", "codex_task_complete", "dsh_hub_completion"):
+            self.completion_reported = True
 
     def start_pty(self, loop: asyncio.AbstractEventLoop, env_overrides: Optional[Dict[str, str]] = None):
         self._loop = loop
@@ -617,8 +914,6 @@ class AgentSession:
                 break
 
         self.ended_at = time.time()
-        if self.status not in ("completed", "terminated"):
-            self.status = "exited"
         try:
             self.exit_code = self.pty.exitstatus if self.pty else 0
         except Exception:
@@ -630,6 +925,13 @@ class AgentSession:
         if clean_lines:
             self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
 
+        # Archive spec §1.4/§2: the process's end gets a named reason. A user termination already
+        # decided its status in terminate(); the reader thread must not overwrite it.
+        if self.terminated_by_user:
+            self.end_reason = "terminated"
+        else:
+            self.end_reason = self.classify_end_reason(self.exit_code)
+            self.status = self.end_reason
         self.current_activity = f"Session {self.status} (exit_code={self.exit_code})"
 
         if self.on_exit_cb and self._loop and not self.terminated_by_user:
@@ -659,6 +961,7 @@ class AgentSession:
 
             self.raw_history.append(data)
             self.raw_history_bytes += len(data)
+            self.raw_history_rev += 1
             while self.raw_history_bytes > self.max_history_bytes and len(self.raw_history) > 1:
                 removed = self.raw_history.pop(0)
                 self.raw_history_bytes -= len(removed)
@@ -762,6 +1065,23 @@ class AgentSession:
                 all_lines = all_lines[-max_lines:]
             return "\n".join(all_lines)
 
+    def classify_end_reason(self, exit_code: Optional[int]) -> str:
+        """Spec §1.4/§2: name an abnormal end instead of calling everything "exited".
+
+        A non-zero code is always a crash. Code 0 after the agent reported completion is a clean exit;
+        a plain shell's 0 is a clean quit; an agent TUI that dies with 0 before ever reporting
+        completion is the "exit before completion" case the spec calls 异常退出.
+        """
+        if self.terminated_by_user:
+            return "terminated"
+        if exit_code is not None and int(exit_code) != 0:
+            return "crashed"
+        if self.completion_reported:
+            return "exited"
+        if (self.engine or "").strip().lower() in ("pwsh", "generic") or self.kind == "desktop_gui":
+            return "exited"
+        return "crashed"
+
     def is_process_alive(self) -> bool:
         """B9: "live" means the process is alive (PTY alive; dsh virtual sessions by status), never the status alone."""
         if self.pty is not None:
@@ -789,6 +1109,7 @@ class AgentSession:
             # completed. V-5: remember the cause so the PTY reader does not also emit an `exited` event.
             self.terminated_by_user = True
             self.status = "terminated"
+            self.end_reason = "terminated"
             self.current_activity = "Terminated by parent/user"
         if self.pty and was_alive:
             try:
@@ -808,7 +1129,9 @@ class AgentSession:
 
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
-        if not alive and self.pty is not None and self.status not in ("completed", "exited", "terminated"):
+        if not alive and self.pty is not None and self.status not in (
+            "completed", "exited", "crashed", "terminated", "interrupted"
+        ):
             self.status = "exited"
         return {
             "session_id": self.session_id,
@@ -845,6 +1168,12 @@ class AgentSession:
             "effective_model": self.effective_model,
             "effective_thinking_level": self.effective_thinking_level,
             "transcript_path": str(self.transcript_path) if self.transcript_path else "",
+            "end_reason": self.end_reason,
+            "archived_at": self.archived_at,
+            "resume_count": self.resume_count,
+            "last_resumed_at": self.last_resumed_at,
+            "resumable": self.resumable,
+            "resume_block_reason": self.resume_block_reason,
         }
 
 
@@ -1030,6 +1359,9 @@ class HubSessionManager:
         # V-5: ids whose one lifecycle event is the terminated event, even if the PTY reader
         # reported its own exit just before close_session removed the session from the live list.
         self._user_terminated: Set[str] = set()
+        # Archive spec §5: only one resume per session at a time; the second call waits for the first
+        # and then behaves as "already live".
+        self._resume_locks: Dict[str, asyncio.Lock] = {}
 
         # Bidirectional Mailbox & Sequenced Event Bus
         self.global_seq: int = self.db.get_max_seq()
@@ -1043,6 +1375,18 @@ class HubSessionManager:
         # the very first /api/sessions poll answers immediately.
         self._discovery_ready = threading.Event()
         self.load_profiles(discovery=self.model_discovery.peek_cache() or {"engines": {}})
+        # Archive spec §1.5/§5: rows a stopped hub left live become interrupted + archived, ended rows
+        # get their final record, then retention prunes (start, then every 6 hours). Profiles are loaded
+        # first, because "still resumable" depends on the profile still existing and being enabled.
+        try:
+            self._normalize_archive_on_startup()
+            self.prune_archive()
+        except Exception:
+            pass
+        threading.Thread(target=self._prune_loop, name="hub-archive-prune", daemon=True).start()
+        # Spec §3: while a session is live its scrollback is written at most once every 60 s, only
+        # when it changed — a timer, not a side effect of some other persist that may never come.
+        threading.Thread(target=self._scrollback_flush_loop, name="hub-scrollback-flush", daemon=True).start()
         threading.Thread(target=self._initial_discovery, name="hub-initial-discovery", daemon=True).start()
 
     def _initial_discovery(self) -> None:
@@ -1148,6 +1492,57 @@ class HubSessionManager:
         with self._transcript_lock:
             return session.session_id in self._claimed_transcripts.values()
 
+    _CODEX_ROLLOUT_UUID_RE = re.compile(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", re.IGNORECASE
+    )
+
+    @classmethod
+    def _codex_session_id_from_rollout(cls, path: Path) -> Optional[str]:
+        """The uuid of a codex rollout: filename tail, else session_meta.payload.id (research report)."""
+        match = cls._CODEX_ROLLOUT_UUID_RE.search(Path(path).name)
+        if match:
+            return match.group(1)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(20):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("type") == "session_meta":
+                        value = (obj.get("payload") or {}).get("id")
+                        return str(value) if value else None
+        except OSError:
+            return None
+        return None
+
+    @classmethod
+    def _conversation_ref_for(cls, engine: str, path: Path) -> Dict[str, Any]:
+        """The engine conversation reference the watcher just claimed (spec §4), or {} when unknown."""
+        eng = (engine or "").strip().lower()
+        p = Path(path)
+        try:
+            if eng == "omp":
+                # The hub-private omp_sess_<session> dir and its <ts>_<uuid>.jsonl.
+                return {"session_dir": str(p.parent), "session_file": str(p)}
+            if eng == "kimi":
+                # .../sessions/wd_*/session_<uuid>/agents/main/wire.jsonl
+                session_dir = p.parent.parent.parent
+                return {"session_id": session_dir.name, "session_dir": str(session_dir)}
+            if eng == "agy":
+                # .../brain/<uuid>/.system_generated/logs/transcript.jsonl
+                brain_dir = p.parent.parent.parent
+                return {"conversation_id": brain_dir.name, "brain_dir": str(brain_dir)}
+            if eng == "codex":
+                sid = cls._codex_session_id_from_rollout(p)
+                return {"session_id": sid or "", "rollout_path": str(p)}
+        except Exception:
+            return {}
+        return {}
+
     def _claim_transcript(self, session: AgentSession, path: Path) -> bool:
         """Claims one transcript file for this session; False when another live session owns it."""
         key = self._transcript_key(path)
@@ -1157,6 +1552,10 @@ class HubSessionManager:
                 return False
             self._claimed_transcripts[key] = session.session_id
         session.transcript_path = Path(path)
+        ref = self._conversation_ref_for(session.engine, Path(path))
+        if ref:
+            # Spec §3: filled as soon as the watcher claims a conversation.
+            session.conversation_ref = ref
         self.persist_session(session)
         return True
 
@@ -1854,15 +2253,687 @@ class HubSessionManager:
         for ev in list(self._event_waiters):
             ev.set()
 
-    def persist_session(self, session: AgentSession):
+    def persist_session(self, session: AgentSession, force_scrollback: bool = False):
         scrollback = session.get_full_scrollback_text(max_lines=250)
-        self.db.upsert_session(session.to_dict(), scrollback_text=scrollback)
+        self.db.upsert_session(
+            session.to_dict(),
+            scrollback_text=scrollback,
+            archive=self._archive_payload(session, force_scrollback=force_scrollback),
+        )
+
+    # ---- Archive & resume (spec archive-spec.md §2-§5) --------------------------------------
+
+    @staticmethod
+    def _last_screen_text(session: AgentSession) -> str:
+        """The last 20 non-empty screen lines, as the final record keeps them (spec §3)."""
+        try:
+            lines = [ln for ln in session.get_clean_screen_text(max_lines=80).splitlines() if ln.strip()]
+        except Exception:
+            lines = []
+        return "\n".join(lines[-20:])
+
+    @staticmethod
+    def _first_line_text(text: Any) -> str:
+        for line in str(text or "").splitlines():
+            if line.strip():
+                return line.strip()
+        return ""
+
+    def _mailbox_thread(self, session_id: str) -> List[Dict[str, Any]]:
+        """The mailbox thread in both directions, as the archive record stores it (spec §3)."""
+        thread: List[Dict[str, Any]] = []
+        for msg in self.parent_messages.get(session_id, []):
+            thread.append({
+                "direction": "parent",
+                "timestamp": msg.get("timestamp"),
+                "content": msg.get("content", ""),
+                "message_id": msg.get("id"),
+                "resolved_question_id": msg.get("resolved_question_id"),
+            })
+        mailbox_types = {"message", "message_to_parent", "question", "approval_request",
+                         "completed", "turn_completed"}
+        for ev in self.worker_events:
+            if ev.get("session_id") != session_id or ev.get("type") not in mailbox_types:
+                continue
+            thread.append({
+                "direction": "worker",
+                "timestamp": ev.get("timestamp"),
+                "content": ev.get("content", ""),
+                "type": ev.get("type"),
+                "seq": ev.get("seq"),
+            })
+        thread.sort(key=lambda item: float(item.get("timestamp") or 0))
+        return thread
+
+    def _scrollback_blob(self, session: AgentSession, force: bool = False) -> Optional[bytes]:
+        """zlib-compressed newest ≤512 KB of the raw terminal stream (spec §1.6/§3).
+
+        While the session is live it is written at most once every 60 s and only when the stream
+        changed; the final record always writes it.
+        """
+        now = time.time()
+        if not force:
+            if now - session._scrollback_written_at < RESUME_SCROLLBACK_INTERVAL_SEC:
+                return None
+            if session.raw_history_rev == session._scrollback_rev_written:
+                return None
+        text = "".join(session.raw_history)
+        raw = text.encode("utf-8", "replace")[-RESUME_SCROLLBACK_MAX_BYTES:]
+        session._scrollback_written_at = now
+        session._scrollback_rev_written = session.raw_history_rev
+        return zlib.compress(raw, 6)
+
+    def _archive_payload(self, session: AgentSession, force_scrollback: bool = False) -> Dict[str, Any]:
+        thread = self._mailbox_thread(session.session_id)
+        return {
+            "end_reason": session.end_reason,
+            "archived_at": session.archived_at,
+            "spawned_at": session.spawned_at,
+            "profile_snapshot": (
+                json.dumps(session.profile_snapshot, ensure_ascii=False) if session.profile_snapshot else ""
+            ),
+            "conversation_ref": (
+                json.dumps(session.conversation_ref, ensure_ascii=False) if session.conversation_ref else ""
+            ),
+            "scrollback": self._scrollback_blob(session, force=force_scrollback),
+            "last_screen": session.last_screen or "",
+            "parent_messages": json.dumps(thread, ensure_ascii=False) if thread else "",
+            "resume_count": session.resume_count,
+            "last_resumed_at": session.last_resumed_at,
+            "resumable": None if session.resumable is None else (1 if session.resumable else 0),
+            "resume_block_reason": session.resume_block_reason,
+        }
+
+    @staticmethod
+    def _record_from_session(session: AgentSession) -> Dict[str, Any]:
+        rec = session.to_dict()
+        rec["profile_snapshot"] = session.profile_snapshot
+        rec["conversation_ref"] = session.conversation_ref
+        return rec
+
+    def _finalize_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
+        """Writes the parts of the final record that only exist once the session has stopped."""
+        if end_reason:
+            session.end_reason = end_reason
+        if session.ended_at is None:
+            session.ended_at = time.time()
+        if not session.end_reason:
+            session.end_reason = session.classify_end_reason(session.exit_code)
+        session.last_screen = self._last_screen_text(session)
+        ok, reason = self.compute_resumable(self._record_from_session(session))
+        session.resumable = ok
+        session.resume_block_reason = None if ok else reason
+        return session
+
+    def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
+        """The final record, written when a session leaves the live list or at hub shutdown/start."""
+        session.archived_at = time.time()
+        self._finalize_session(session, end_reason=end_reason)
+        self.persist_session(session, force_scrollback=True)
+        return session
+
+    def compute_resumable(self, record: Dict[str, Any]) -> tuple:
+        """(can_resume, Chinese reason) for one hub record — the §4 pre-checks, re-checked on demand."""
+        engine = str(record.get("engine") or "").strip().lower()
+        snapshot = record.get("profile_snapshot") or {}
+        ref = record.get("conversation_ref") or {}
+        session_id = str(record.get("session_id") or "")
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, "未记录启动参数，无法恢复"
+        if engine not in RESUME_ENGINES:
+            return False, ENGINE_RESUME_BLOCK_REASONS.get(engine, DEFAULT_RESUME_BLOCK_REASON)
+        cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
+        if not cwd or not os.path.isdir(cwd):
+            return False, f"工作目录已不存在：{cwd}"
+        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
+        prof = self.profiles.get(profile_id)
+        if not prof or not prof.get("enabled", True):
+            return False, f"Profile「{profile_id}」不存在或已停用"
+        if not isinstance(ref, dict) or not ref:
+            return False, "未记录到该会话的对话位置，无法恢复"
+        if engine == "omp":
+            path = str(ref.get("session_file") or "")
+            if not path or not os.path.isfile(path):
+                return False, f"omp 会话文件已不存在：{path}"
+            with self._transcript_lock:
+                owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            if owner and owner != session_id:
+                live = self.sessions.get(owner)
+                if live is not None and live.is_process_alive():
+                    return False, "该 omp 会话正被另一个运行中的会话使用"
+        elif engine == "kimi":
+            sid = str(ref.get("session_id") or "")
+            sdir = str(ref.get("session_dir") or "")
+            if not sid or not sdir or not os.path.isdir(sdir):
+                return False, f"Kimi 会话目录已不存在：{sdir or sid}"
+            lock_path = kimi_store_root() / "locks" / "sessions" / f"{sid}.lock"
+            if lock_path.exists():
+                holder = 0
+                try:
+                    holder = int((lock_path.read_text(encoding="utf-8", errors="replace").split(":", 1)[0] or "0").strip())
+                except Exception:
+                    holder = 0
+                if holder and holder != os.getpid() and _pid_alive(holder):
+                    return False, KIMI_LOCKED_MESSAGE
+        elif engine == "agy":
+            brain = str(ref.get("brain_dir") or "")
+            if not brain or not os.path.isdir(brain):
+                return False, f"AGY 会话目录已不存在：{brain}"
+        elif engine == "codex":
+            sid = str(ref.get("session_id") or "")
+            path = str(ref.get("rollout_path") or "")
+            if not sid:
+                return False, "未记录到 codex 会话 ID，无法恢复"
+            if not path or not os.path.isfile(path):
+                return False, f"codex 会话记录已不存在：{path}"
+        elif engine == "dsh":
+            if not ref.get("dsh_job_id"):
+                return False, "DSH 任务 ID 缺失，无法恢复"
+        return True, ""
+
+    def build_resume_launch(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """The revive command for one record (spec §4), built from profile_snapshot + conversation_ref.
+
+        Pure: it never spawns anything and never touches the engine's store beyond what the caller
+        already checked. The message is appended later by resume_subagent, per the engine's task mode.
+        """
+        engine = str(record.get("engine") or "").strip().lower()
+        snapshot = record.get("profile_snapshot") or {}
+        ref = record.get("conversation_ref") or {}
+        cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
+        command = str(snapshot.get("command") or "")
+        base_args = [str(a) for a in (snapshot.get("args") or [])]
+        env = {str(k): str(v) for k, v in (snapshot.get("env") or {}).items()}
+        built: Dict[str, Any] = {
+            "command": command, "args": [], "env": env, "cwd": cwd,
+            "message_mode": "none", "attach_offset": 0,
+        }
+        if engine == "omp":
+            built["args"] = [
+                f"--session-dir={ref.get('session_dir')}",
+                f"--resume={ref.get('session_file')}",
+            ] + base_args
+            built["message_mode"] = "positional"
+        elif engine == "kimi":
+            # Research: --agent / --agent-file / --environment are rejected together with -S.
+            cleaned = [a for a in base_args if a not in ("--agent", "--agent-file", "--environment")]
+            built["args"] = ["-S", str(ref.get("session_id"))] + cleaned
+            built["message_mode"] = "pty_input"
+        elif engine == "agy":
+            built["args"] = [f"--conversation={ref.get('conversation_id')}"] + base_args
+            built["message_mode"] = "agy_interactive_flag"
+        elif engine == "codex":
+            built["args"] = ["resume", str(ref.get("session_id")), "-C", cwd] + base_args
+            built["message_mode"] = "positional"
+        elif engine == "dsh":
+            built["args"] = []
+            built["message_mode"] = "dsh_continue"
+        else:
+            raise ValueError(ENGINE_RESUME_BLOCK_REASONS.get(engine, DEFAULT_RESUME_BLOCK_REASON))
+        return built
+
+    @staticmethod
+    def _resume_attach_offset(engine: str, ref: Dict[str, Any]) -> int:
+        """Byte offset the resumed watcher starts at, so the old turns are not re-read (spec §4)."""
+        path = ""
+        if engine == "omp":
+            path = str(ref.get("session_file") or "")
+        elif engine == "kimi":
+            sdir = str(ref.get("session_dir") or "")
+            path = os.path.join(sdir, "agents", "main", "wire.jsonl") if sdir else ""
+        elif engine == "agy":
+            brain = str(ref.get("brain_dir") or "")
+            path = os.path.join(brain, ".system_generated", "logs", "transcript.jsonl") if brain else ""
+        elif engine == "codex":
+            path = str(ref.get("rollout_path") or "")
+        try:
+            return os.path.getsize(path) if path else 0
+        except OSError:
+            return 0
+
+    def _load_scrollback_text(self, session_id: str) -> str:
+        blob = self.db.get_scrollback_blob(session_id)
+        if blob:
+            try:
+                return zlib.decompress(blob).decode("utf-8", "replace")
+            except Exception:
+                pass
+        # A row written before this feature has only the plain text tail; better than an empty pane.
+        rec = self.db.get_session_record(session_id) or {}
+        return str(rec.get("scrollback_text") or "")
+
+    def _load_record_for_resume(self, session_id: str) -> Optional[Dict[str, Any]]:
+        rec = self.db.get_session_record(session_id)
+        sess = self.sessions.get(session_id)
+        if sess is None:
+            return rec
+        live_rec = self._record_from_session(sess)
+        if not rec:
+            return live_rec
+        for key in ("profile_snapshot", "conversation_ref", "last_task", "title", "kind", "cwd", "engine"):
+            if not rec.get(key) and live_rec.get(key):
+                rec[key] = live_rec[key]
+        return rec
+
+    def _mark_resumable(self, session_id: str, ok: bool, reason: str = "") -> None:
+        sess = self.sessions.get(session_id)
+        if sess is not None:
+            sess.resumable = ok
+            sess.resume_block_reason = None if ok else reason
+        self.db.update_archive_fields(
+            session_id,
+            resumable=1 if ok else 0,
+            resume_block_reason=None if ok else reason,
+        )
+
+    def _resume_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._resume_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._resume_locks[session_id] = lock
+        return lock
+
+    def _make_resumed_session(
+        self,
+        session_id: str,
+        record: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        ref: Dict[str, Any],
+        built: Dict[str, Any],
+    ) -> AgentSession:
+        engine = str(snapshot.get("engine") or record.get("engine") or "").strip().lower()
+        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
+        prof = self.profiles.get(profile_id) or {}
+        count = int(record.get("resume_count") or 0) + 1
+        sess = AgentSession(
+            session_id=session_id,
+            profile_id=profile_id,
+            profile_name=str(record.get("profile_name") or prof.get("name") or profile_id),
+            kind=str(snapshot.get("kind") or record.get("kind") or "tui"),
+            title=str(record.get("title") or f"{prof.get('name', profile_id)} ({session_id})"),
+            cwd=str(built.get("cwd") or snapshot.get("cwd") or record.get("cwd") or self.hub_default_cwd()),
+            command=str(built.get("command") or snapshot.get("command") or ""),
+            args=list(built.get("args") or []),
+            gui_url=prof.get("gui_url"),
+            on_exit_cb=self._on_session_exit,
+            on_tui_tool_cb=self._on_tui_tool_detected,
+        )
+        sess.engine = engine
+        sess.effective_model = snapshot.get("model") or record.get("effective_model")
+        sess.effective_thinking_level = snapshot.get("thinking_level") or record.get("effective_thinking_level")
+        sess.approval_mode = str(prof.get("approval_mode") or "auto")
+        sess.last_task = str(record.get("last_task") or "")
+        sess.created_at = float(record.get("created_at") or time.time())
+        sess.profile_snapshot = dict(snapshot)
+        sess.conversation_ref = dict(ref)
+        sess.resume_attach = True
+        sess.attach_offset = int(built.get("attach_offset") or 0)
+        sess.resume_count = count
+        sess.last_resumed_at = time.time()
+        # Deliberately no final_response carry-over: it belongs to the ended turn, and its high
+        # source priority would block the revived turn's own (lower-priority) answer from being
+        # recorded. The old reply stays in the archive record / the pane's scrollback.
+        # Spec §5.3: the pane starts with the archived output, then the resume separator.
+        archived = self._load_scrollback_text(session_id)
+        seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
+        sess.raw_history = [seed]
+        sess.raw_history_bytes = len(seed)
+        sess.raw_history_rev = 1
+        if engine == "dsh":
+            sess.dsh_spec = dict(snapshot.get("dsh_spec") or {})
+            sess.dsh_job_id = ref.get("dsh_job_id")
+            sess.dsh_session_id = ref.get("dsh_session_id")
+        self._restore_parent_mailbox(session_id, record)
+        return sess
+
+    def _restore_parent_mailbox(self, session_id: str, record: Dict[str, Any]) -> None:
+        if session_id in self.parent_messages:
+            return
+        thread = record.get("parent_messages") or []
+        restored = []
+        for item in thread:
+            if not isinstance(item, dict) or item.get("direction") != "parent":
+                continue
+            restored.append({
+                "id": item.get("message_id") or f"pmsg-{uuid.uuid4().hex[:8]}",
+                "session_id": session_id,
+                "timestamp": item.get("timestamp"),
+                "content": item.get("content", ""),
+                "resolved_question_id": item.get("resolved_question_id"),
+                "read_by_worker": True,
+            })
+        if restored:
+            self.parent_messages[session_id] = restored
+
+    async def resume_subagent(self, session_id: str, text: Optional[str] = None) -> AgentSession:
+        """Revive an ended session under the same id (spec §5). Returns the live session.
+
+        Raises ValueError with the Chinese `resume_block_reason` when the record cannot be revived.
+        """
+        sid = (session_id or "").strip()
+        if not sid:
+            raise ValueError("找不到会话 ")
+        lock = self._resume_lock(sid)
+        async with lock:
+            existing = self.sessions.get(sid)
+            if existing is not None and existing.is_process_alive():
+                return existing
+            record = self._load_record_for_resume(sid)
+            if record is None:
+                raise ValueError(f"找不到会话 {sid}")
+            engine = str(record.get("engine") or "").strip().lower()
+            ok, reason = self.compute_resumable(record)
+            if ok and engine == "dsh":
+                job_id = str((record.get("conversation_ref") or {}).get("dsh_job_id") or "")
+                if not await self._dsh_job_exists(job_id):
+                    ok, reason = False, DSH_UNKNOWN_JOB_MESSAGE
+            if not ok:
+                self._mark_resumable(sid, False, reason)
+                raise ValueError(reason)
+            if engine == "dsh":
+                return await self._resume_dsh_session(sid, record, text)
+            return await self._resume_process_session(sid, record, text)
+
+    def _resume_task_text(self, session_id: str, text: str, engine: str) -> str:
+        clean = str(text).replace("\r", " ").strip()
+        if engine == "kimi":
+            # Spec §4: the kimi task is typed into the TUI with the session-id marker.
+            return f"{clean}\n\n[Sub-Agent Bridge Info: session_id={session_id}]"
+        return clean
+
+    async def _resume_process_session(
+        self, session_id: str, record: Dict[str, Any], text: Optional[str]
+    ) -> AgentSession:
+        loop = asyncio.get_running_loop()
+        snapshot = record.get("profile_snapshot") or {}
+        ref = record.get("conversation_ref") or {}
+        engine = str(snapshot.get("engine") or record.get("engine") or "").strip().lower()
+        built = self.build_resume_launch(record)
+        built["attach_offset"] = self._resume_attach_offset(engine, ref)
+        prompt_for_tui: Optional[str] = None
+        if text and str(text).strip():
+            if built["message_mode"] == "positional":
+                built["args"].append(self._resume_task_text(session_id, str(text), engine))
+            elif built["message_mode"] == "agy_interactive_flag":
+                built["args"].extend(["-i", self._resume_task_text(session_id, str(text), engine)])
+            elif built["message_mode"] == "pty_input":
+                prompt_for_tui = self._resume_task_text(session_id, str(text), engine)
+
+        sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
+        startup_delay = 2.5
+        try:
+            startup_delay = float(snapshot.get("startup_delay_sec") or 2.5)
+        except (TypeError, ValueError):
+            startup_delay = 2.5
+        submit_key = str(snapshot.get("submit_key") or "\r")
+
+        # Spawn first: a failed spawn (bad command, missing binary) must leave the archived record
+        # exactly as it was — no zombie row with its archive flag cleared and no old session dropped.
+        sess.start_pty(loop, env_overrides=dict(built.get("env") or {}) or None)
+        old = self.sessions.pop(session_id, None)
+        if old is not None:
+            self._release_transcripts(session_id)
+        self.db.reset_session_after_resume(session_id)
+        self.sessions[session_id] = sess
+        self.persist_session(sess)
+
+        if engine == "codex":
+            asyncio.create_task(self._watch_codex_rollout(sess))
+        elif engine == "omp":
+            session_dir = Path(str(ref.get("session_dir") or self.runtime_configs_dir / f"omp_sess_{session_id}"))
+            asyncio.create_task(self._watch_omp_session(sess, session_dir))
+        elif engine == "kimi":
+            asyncio.create_task(self._watch_kimi_session(sess))
+        elif engine == "agy":
+            asyncio.create_task(self._watch_agy_transcript(sess))
+
+        if sess.kind == "tui":
+            asyncio.create_task(self._watch_tui_interactive_prompts(sess))
+            asyncio.create_task(
+                self._auto_handle_tui_startup_and_trust(
+                    sess,
+                    task_to_inject=prompt_for_tui,
+                    startup_delay=startup_delay,
+                    submit_key=submit_key,
+                )
+            )
+
+        self.record_worker_event(
+            session_id,
+            {
+                "type": "resumed",
+                "category": "lifecycle",
+                "status": "resumed",
+                "content": f"会话已恢复（第 {sess.resume_count} 次）",
+            },
+        )
+        return sess
+
+    async def _dsh_job_exists(self, job_id: str) -> bool:
+        if not job_id:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0})
+                if resp.status_code == 404:
+                    return False
+                data = resp.json()
+                return bool(resp.is_success and isinstance(data, dict) and (data.get("job") or data.get("ok")))
+        except Exception:
+            return False
+
+    async def _resume_dsh_session(
+        self, session_id: str, record: Dict[str, Any], text: Optional[str]
+    ) -> AgentSession:
+        """DSH has no process: continue the recorded job, or only re-attach the virtual terminal (§4)."""
+        loop = asyncio.get_running_loop()
+        snapshot = record.get("profile_snapshot") or {}
+        ref = dict(record.get("conversation_ref") or {})
+        job_id = str(ref.get("dsh_job_id") or "")
+        built = self.build_resume_launch(record)
+        sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
+        token = str(uuid.uuid4())
+        clean = str(text or "").strip()
+        new_job = ""
+        cjob: Dict[str, Any] = {}
+        jstatus: Optional[str] = None
+
+        # Talk to DSH first: a failed continue must not leave a session that looks live but has no job.
+        if clean:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/continue",
+                    json={"text": clean, "messaging_token": token},
+                )
+                data = resp.json()
+                if not resp.is_success or not data.get("ok"):
+                    err = data.get("error") or f"HTTP {resp.status_code}"
+                    raise ValueError(f"DSH 恢复失败：{err}")
+                cjob = data.get("job") or {}
+            new_job = str(cjob.get("id") or "")
+            if not new_job:
+                raise ValueError("DSH 恢复失败：continue 没有返回新的任务 ID")
+        else:
+            # No text: nothing is sent; only the virtual terminal is re-attached (§4).
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.get(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0})
+                    jview = (resp.json() or {}).get("job") or {}
+                    jstatus = jview.get("status")
+            except Exception:
+                jstatus = None
+
+        old = self.sessions.pop(session_id, None)
+        if old is not None:
+            self._release_transcripts(session_id)
+        self.db.reset_session_after_resume(session_id)
+        sess.dsh_token = token
+        if clean:
+            sess.dsh_job_id = new_job
+            sess.conversation_ref = {
+                "dsh_job_id": new_job,
+                "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
+            }
+            sess.status = "running"
+            sess.current_activity = f"Continuing DSH session ({new_job}): {clean[:60]}"
+        elif jstatus in ("running", "needs_input"):
+            sess.status = "running"
+            sess.current_activity = f"Re-attached DSH job {job_id}"
+        elif jstatus == "done":
+            sess.status = "completed"
+            sess.current_activity = f"Re-attached DSH job {job_id}"
+        self.sessions[session_id] = sess
+        self.persist_session(sess)
+        self.record_worker_event(
+            session_id,
+            {
+                "type": "resumed",
+                "category": "lifecycle",
+                "status": "resumed",
+                "content": f"会话已恢复（第 {sess.resume_count} 次）",
+            },
+        )
+        if clean:
+            loop.create_task(self._watch_dsh_hub_job(sess, new_job, token))
+        elif jstatus in ("running", "needs_input"):
+            loop.create_task(self._watch_dsh_hub_job(sess, job_id, token))
+        return sess
+
+    def list_archive(self, limit: int = 50, offset: int = 0, query: str = "") -> Dict[str, Any]:
+        """The console's and the parent agent's archive view (spec §6)."""
+        rows = self.db.list_archived(limit=limit, offset=offset, query=query)
+        return {
+            "sessions": [self._archive_summary(rec) for rec in rows],
+            "total": self.db.count_archived(query),
+            "limit": max(1, min(int(limit or 50), 200)),
+            "offset": max(0, int(offset or 0)),
+        }
+
+    def _archive_summary(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+        model = " · ".join([x for x in (rec.get("effective_model"), rec.get("effective_thinking_level")) if x])
+        return {
+            "session_id": rec.get("session_id"),
+            "profile_id": rec.get("profile_id"),
+            "profile_name": rec.get("profile_name"),
+            "engine": rec.get("engine"),
+            "kind": rec.get("kind"),
+            "title": rec.get("title"),
+            "cwd": rec.get("cwd"),
+            "last_task": rec.get("last_task") or "",
+            "task_first_line": self._first_line_text(rec.get("last_task")),
+            "effective_model": rec.get("effective_model"),
+            "effective_thinking_level": rec.get("effective_thinking_level"),
+            "model_line": model,
+            "status": rec.get("status"),
+            "end_reason": rec.get("end_reason"),
+            "end_reason_label": END_REASON_LABELS.get(str(rec.get("end_reason") or ""), ""),
+            "ended_at": rec.get("ended_at"),
+            "archived_at": rec.get("archived_at"),
+            "created_at": rec.get("created_at"),
+            "exit_code": rec.get("exit_code"),
+            "step_count": rec.get("step_count") or 0,
+            "resume_count": rec.get("resume_count") or 0,
+            "resumable": bool(rec.get("resumable")),
+            "resume_block_reason": rec.get("resume_block_reason") or "",
+            "archived": bool(rec.get("archived_at")),
+            "has_final_response": bool(rec.get("final_response")),
+        }
+
+    def get_archive_record(self, session_id: str) -> Optional[Dict[str, Any]]:
+        rec = self.db.get_session_record(session_id)
+        if not rec:
+            return None
+        return self._archive_summary(rec)
+
+    def get_archive_scrollback(self, session_id: str) -> Optional[str]:
+        rec = self.db.get_session_record(session_id)
+        if not rec:
+            return None
+        return self._load_scrollback_text(session_id)
+
+    def delete_archive_record(self, session_id: str) -> bool:
+        """Deletes the hub's archived row only; the engine's own conversation files stay (§6)."""
+        rec = self.db.get_session_record(session_id)
+        if not rec:
+            raise ValueError(f"找不到会话 {session_id}")
+        if session_id in self.sessions:
+            raise ValueError("会话仍在列表中，请先移除再删除归档记录")
+        if not rec.get("archived_at"):
+            raise ValueError("会话仍在列表中，请先移除再删除归档记录")
+        return self.db.delete_session_record(session_id)
+
+    def prune_archive(self) -> int:
+        """Spec §1.6: keep 30 days or the newest 500 records, whichever keeps more."""
+        cutoff = time.time() - ARCHIVE_RETENTION_DAYS * 86400
+        return self.db.prune_archived(cutoff, ARCHIVE_RETENTION_KEEP_NEWEST)
+
+    def _prune_loop(self) -> None:
+        while True:
+            time.sleep(ARCHIVE_PRUNE_INTERVAL_SEC)
+            try:
+                self.prune_archive()
+            except Exception:
+                pass
+
+    def _scrollback_flush_loop(self) -> None:
+        """Write each live session's scrollback once it is 60 s old (spec §1.6/§3).
+
+        The tick is short and the 60 s throttle lives in _scrollback_blob, so the first write lands
+        a few seconds after the session's first minute instead of drifting one further minute.
+        """
+        while True:
+            time.sleep(5.0)
+            try:
+                now = time.time()
+                for sess in list(self.sessions.values()):
+                    if not sess.is_process_alive():
+                        continue
+                    if now - sess._scrollback_written_at < RESUME_SCROLLBACK_INTERVAL_SEC:
+                        continue
+                    self.persist_session(sess)
+            except Exception:
+                pass
+
+    def _normalize_archive_on_startup(self) -> None:
+        """Spec §1.5/§5: a stopped hub's live rows become interrupted + archived at the next start."""
+        now = time.time()
+        status_to_reason = {
+            "exited": "exited", "crashed": "crashed", "terminated": "terminated",
+            "completed": "exited", "interrupted": "interrupted",
+        }
+        for sid in self.db.list_session_ids():
+            rec = self.db.get_session_record(sid)
+            if not rec:
+                continue
+            if rec.get("archived_at") and rec.get("resumable") is not None:
+                continue
+            fields: Dict[str, Any] = {}
+            status = str(rec.get("status") or "")
+            if not rec.get("archived_at"):
+                fields["archived_at"] = now
+                fields["ended_at"] = rec.get("ended_at") or now
+                if status in LIVE_STATUSES:
+                    fields["status"] = "interrupted"
+                    fields["end_reason"] = "interrupted"
+                    fields["current_activity"] = "Hub 停止时会话仍在运行（已中断）"
+                else:
+                    fields["end_reason"] = rec.get("end_reason") or status_to_reason.get(status, "crashed")
+                if not rec.get("last_screen"):
+                    lines = [ln for ln in str(rec.get("scrollback_text") or "").splitlines() if ln.strip()]
+                    fields["last_screen"] = "\n".join(lines[-20:])
+            merged = dict(rec)
+            merged.update(fields)
+            ok, reason = self.compute_resumable(merged)
+            fields["resumable"] = 1 if ok else 0
+            fields["resume_block_reason"] = None if ok else reason
+            self.db.update_archive_fields(sid, **fields)
 
     def close_session(self, session_id: str) -> Dict[str, Any]:
         """B9: removes a session from the live list without rewriting the status an ended process already earned.
 
         A session whose process was alive is terminated (and emits a `terminated` worker event,
         message 「用户在总控台终止了会话」); one that had already ended keeps its own final status and activity.
+        Either way the session leaves the live list as an archived record (spec §5).
         Returns {"found": bool, "was_alive": bool, "status": str}.
         """
         sess = self.sessions.get(session_id)
@@ -1870,7 +2941,9 @@ class HubSessionManager:
             return {"found": False, "was_alive": False, "status": None}
         was_alive = sess.is_process_alive()
         terminated = sess.terminate()
-        self.persist_session(sess)
+        if terminated:
+            sess.end_reason = "terminated"
+        self._archive_session(sess)
         del self.sessions[session_id]
         if terminated:
             self._user_terminated.add(session_id)
@@ -2006,6 +3079,9 @@ class HubSessionManager:
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
                 self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
+            if ev_type in ("completed", "turn_completed"):
+                # Spec §1.4: the agent reported completion, so a later exit is a clean one.
+                sess.completion_reported = True
 
         record = {
             "session_id": session_id,
@@ -2730,6 +3806,10 @@ class HubSessionManager:
                         if cjob.get("id"):
                             sess.dsh_job_id = cjob["id"]
                             sess.dsh_token = new_token
+                            sess.conversation_ref = {
+                                "dsh_job_id": cjob["id"],
+                                "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
+                            }
                             sess.status = "running"
                             # B9: last_task stays the initial task; follow-ups live in current_activity.
                             if not sess.last_task:
@@ -2872,36 +3952,51 @@ class HubSessionManager:
         `root` points the watcher at a synthetic copy of the layout for tests; production uses
         ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
         """
-        codex_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".codex" / "sessions"
+        codex_root = Path(root) if root is not None else codex_sessions_root()
         if not codex_root.exists():
             return
 
         target_file: Optional[Path] = None
+        offset = 0
         scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent"):
-            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-            if session.status not in ("starting", "running", "waiting_parent"):
-                break
-            candidates = []
-            for candidate in codex_root.rglob("rollout-*.jsonl"):
-                try:
-                    # V2/Q2: only a rollout created after this session's process started. The marker
-                    # check and the launch-order fallback live in _claim_conversation.
-                    if not self._conversation_created_after(candidate, session):
+        if session.resume_attach and session.conversation_ref:
+            # Spec §4: attach directly to the known rollout (no discovery heuristic), tail from its end.
+            ref_path = str(session.conversation_ref.get("rollout_path") or "")
+            if ref_path and os.path.isfile(ref_path):
+                target_file = Path(ref_path)
+                offset = int(session.attach_offset or 0)
+                self._claim_transcript(session, target_file)
+        else:
+            while session.status in ("starting", "running", "waiting_parent"):
+                await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+                if session.status not in ("starting", "running", "waiting_parent"):
+                    break
+                candidates = []
+                for candidate in codex_root.rglob("rollout-*.jsonl"):
+                    try:
+                        # V2/Q2: only a rollout created after this session's process started. The marker
+                        # check and the launch-order fallback live in _claim_conversation.
+                        if not self._conversation_created_after(candidate, session):
+                            continue
+                        candidates.append(candidate)
+                    except OSError:
                         continue
-                    candidates.append(candidate)
-                except OSError:
-                    continue
-            target_file = self._claim_conversation(session, candidates, levels_up=0)
-            if target_file:
-                break
+                target_file = self._claim_conversation(session, candidates, levels_up=0)
+                if target_file:
+                    break
 
         if not target_file:
             return
 
-        offset = 0
         while session.status in ("starting", "running", "waiting_parent"):
+            if session.resume_attach:
+                # A resumed codex may start a new rollout for the same session id; accept it when it
+                # appears and tail it from the beginning (everything in it is new).
+                switched = self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
+                if switched is not None:
+                    target_file = switched
+                    offset = 0
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
@@ -3008,29 +4103,81 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(1.0)
 
+        if session.resume_attach and session.status in ("exited", "crashed"):
+            # Research: an archived codex session refuses to resume; surface its own instruction.
+            screen = session.get_clean_screen_text(max_lines=40).lower()
+            if "is archived" in screen or "unarchive" in screen:
+                self._mark_codex_archived(session)
+
+    def _codex_resume_new_rollout(
+        self, session: AgentSession, root: Path, current: Path, scan_start: float
+    ) -> Optional[Path]:
+        ref = session.conversation_ref or {}
+        sid = str(ref.get("session_id") or "")
+        if not sid or (time.time() - scan_start) > 60.0:
+            return None
+        candidates: List[Path] = []
+        for candidate in Path(root).rglob("rollout-*.jsonl"):
+            try:
+                if candidate == Path(current) or not self._conversation_created_after(candidate, session):
+                    continue
+                if self._codex_session_id_from_rollout(candidate) != sid:
+                    continue
+                candidates.append(candidate)
+            except OSError:
+                continue
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
+        chosen = candidates[-1]
+        if not self._claim_transcript(session, chosen):
+            return None
+        session.conversation_ref = {"session_id": sid, "rollout_path": str(chosen)}
+        self.persist_session(session)
+        return chosen
+
+    def _mark_codex_archived(self, session: AgentSession) -> None:
+        reason = CODEX_ARCHIVED_MESSAGE.format(sid=(session.conversation_ref or {}).get("session_id") or "")
+        session.resumable = False
+        session.resume_block_reason = reason
+        self.db.update_archive_fields(session.session_id, resumable=0, resume_block_reason=reason)
+        session.emit_virtual_ansi(f"\r\n\x1b[1;31m✖ {reason}\x1b[0m\r\n")
+        self.record_worker_event(
+            session.session_id,
+            {"type": "error", "category": "lifecycle", "status": "failed", "content": reason},
+        )
+
     async def _watch_omp_session(self, session: AgentSession, omp_session_dir: Path):
         """Live tails OMP's dedicated session JSONL file inside omp_session_dir for tool calls, thoughts, and final responses."""
         target_file: Optional[Path] = None
+        offset = 0
         scan_start = time.time()
-        while session.status in ("starting", "running", "waiting_parent"):
-            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-            if session.status not in ("starting", "running", "waiting_parent"):
-                break
-            # This directory is created by the hub for this one session (`--session-dir`), so a
-            # cross-session attach is already impossible; claim it anyway so the rule is uniform.
-            files = sorted(omp_session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for candidate in files:
-                if not self._conversation_created_after(candidate, session):
-                    continue
-                if self._claim_transcript(session, candidate):
-                    target_file = candidate
+        if session.resume_attach and session.conversation_ref:
+            # Spec §4: omp appends to the same session file, so attach to it and tail from the end.
+            ref_path = str(session.conversation_ref.get("session_file") or "")
+            if ref_path and os.path.isfile(ref_path):
+                target_file = Path(ref_path)
+                offset = int(session.attach_offset or 0)
+                self._claim_transcript(session, target_file)
+        else:
+            while session.status in ("starting", "running", "waiting_parent"):
+                await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+                if session.status not in ("starting", "running", "waiting_parent"):
                     break
-            if target_file:
-                break
+                # This directory is created by the hub for this one session (`--session-dir`), so a
+                # cross-session attach is already impossible; claim it anyway so the rule is uniform.
+                files = sorted(omp_session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for candidate in files:
+                    if not self._conversation_created_after(candidate, session):
+                        continue
+                    if self._claim_transcript(session, candidate):
+                        target_file = candidate
+                        break
+                if target_file:
+                    break
         if not target_file:
             return
 
-        offset = 0
         while session.status in ("starting", "running", "waiting_parent"):
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -3162,14 +4309,26 @@ class HubSessionManager:
         `root` points the watcher at a synthetic copy of the layout for tests; production uses
         ~/.kimi-code/sessions/<session>/agents/main/wire.jsonl.
         """
-        kimi_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".kimi-code" / "sessions"
+        kimi_root = (
+            Path(root) if root is not None else kimi_store_root() / "sessions"
+        )
         if not kimi_root.exists():
             return
 
         target_file: Optional[Path] = None
+        offset = 0
         scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent"):
+        if session.resume_attach and session.conversation_ref:
+            # Spec §4: kimi appends to the same wire.jsonl; attach and tail from the end.
+            session_dir = str(session.conversation_ref.get("session_dir") or "")
+            ref_path = os.path.join(session_dir, "agents", "main", "wire.jsonl") if session_dir else ""
+            if ref_path and os.path.isfile(ref_path):
+                target_file = Path(ref_path)
+                offset = int(session.attach_offset or 0)
+                self._claim_transcript(session, target_file)
+
+        while target_file is None and session.status in ("starting", "running", "waiting_parent"):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
             if session.status not in ("starting", "running", "waiting_parent"):
                 break
@@ -3204,7 +4363,6 @@ class HubSessionManager:
         session.transcript_path = target_file
         self.persist_session(session)
 
-        offset = 0
         latest_assistant_text: Optional[str] = None
         while session.status in ("starting", "running", "waiting_parent"):
             try:
@@ -3401,14 +4559,25 @@ class HubSessionManager:
         `root` points the watcher at a synthetic copy of the layout for tests; production uses
         ~/.gemini/antigravity/brain/<uuid>/.system_generated/logs/transcript.jsonl.
         """
-        brain_root = Path(root) if root is not None else Path(os.path.expanduser("~")) / ".gemini" / "antigravity" / "brain"
+        brain_root = Path(root) if root is not None else agy_brain_root()
         if not brain_root.exists():
             return
 
         target_file: Optional[Path] = None
+        offset = 0
         scan_start = time.time()
 
-        while session.status in ("starting", "running", "waiting_parent"):
+        if session.resume_attach and session.conversation_ref:
+            # Spec §4: attach directly to the archived brain dir. agy silently starts an EMPTY
+            # conversation for an unknown id, so a new conversation dir here means the resume failed.
+            brain_dir = str(session.conversation_ref.get("brain_dir") or "")
+            ref_path = os.path.join(brain_dir, ".system_generated", "logs", "transcript.jsonl") if brain_dir else ""
+            if ref_path and os.path.isfile(ref_path):
+                target_file = Path(ref_path)
+                offset = int(session.attach_offset or 0)
+                self._claim_transcript(session, target_file)
+
+        while target_file is None and session.status in ("starting", "running", "waiting_parent"):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
             if session.status not in ("starting", "running", "waiting_parent"):
                 break
@@ -3429,8 +4598,20 @@ class HubSessionManager:
         if not target_file:
             return
 
-        offset = 0
+        attach_size = int(session.attach_offset or 0)
+        resume_confirmed = not session.resume_attach
         while session.status in ("starting", "running", "waiting_parent"):
+            if session.resume_attach and not resume_confirmed:
+                try:
+                    if os.path.getsize(target_file) > attach_size:
+                        resume_confirmed = True
+                except OSError:
+                    pass
+                if not resume_confirmed:
+                    stray = self._agy_new_conversation_dir(session, brain_root)
+                    if stray is not None:
+                        self._mark_agy_resume_failed(session)
+                        return
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
@@ -3500,6 +4681,60 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(0.8)
 
+    def _agy_new_conversation_dir(self, session: AgentSession, brain_root: Path) -> Optional[Path]:
+        """A conversation dir created after the resume spawn that is not the archived one (spec §4).
+
+        Only a dir born after this resume could be the empty conversation agy opens for an unknown id;
+        a dir another live hub session already claims is that session's, not this one's.
+        """
+        ref = session.conversation_ref or {}
+        ref_id = str(ref.get("conversation_id") or "")
+        anchor = self._session_spawn_anchor(session)
+        other_dirs = {
+            str((s.conversation_ref or {}).get("brain_dir") or "")
+            for s in list(self.sessions.values())
+            if s is not session
+        }
+        try:
+            children = list(Path(brain_root).iterdir())
+        except OSError:
+            return None
+        for child in children:
+            try:
+                if not child.is_dir() or child.name == ref_id or str(child) in other_dirs:
+                    continue
+                created, exact = self._conversation_creation_time(child, levels_up=0)
+                if created is None:
+                    continue
+                if exact and created < anchor:
+                    continue
+                if not exact and created < (anchor - 1.0):
+                    continue
+                transcript = child / ".system_generated" / "logs" / "transcript.jsonl"
+                if not transcript.exists() or self._transcript_claimed_by_other(transcript, session):
+                    continue
+                return child
+            except OSError:
+                continue
+        return None
+
+    def _mark_agy_resume_failed(self, session: AgentSession) -> None:
+        session.resumable = False
+        session.resume_block_reason = AGY_RESUME_FAILURE_MESSAGE
+        self.db.update_archive_fields(
+            session.session_id, resumable=0, resume_block_reason=AGY_RESUME_FAILURE_MESSAGE
+        )
+        session.emit_virtual_ansi(f"\r\n\x1b[1;31m✖ {AGY_RESUME_FAILURE_MESSAGE}\x1b[0m\r\n")
+        self.record_worker_event(
+            session.session_id,
+            {
+                "type": "error",
+                "category": "lifecycle",
+                "status": "failed",
+                "content": AGY_RESUME_FAILURE_MESSAGE,
+            },
+        )
+
     async def _auto_handle_tui_startup_and_trust(
         self,
         session: AgentSession,
@@ -3552,6 +4787,24 @@ class HubSessionManager:
             if trust_dismissed and task_sent:
                 break
 
+    def _crash_tail(self, sess: AgentSession) -> str:
+        """The last ≤15 lines / ≤1500 chars of output, as the crash event carries them (spec §5)."""
+        text = sess.last_screen or self._last_screen_text(sess)
+        lines = [ln for ln in text.splitlines() if ln.strip()][-15:]
+        tail = "\n".join(lines)
+        if not tail:
+            return "（无输出）"
+        return tail[-1500:]
+
+    def _exit_event_content(self, session_id: str, exit_code: int, sess: Optional[AgentSession]) -> str:
+        resumable = bool(sess.resumable) if sess is not None else False
+        hint = f"可调用 get_subagent_final_response('{session_id}') 获取持久化的最终输出与执行轨迹"
+        if resumable:
+            hint += f"；可调用 resume_subagent('{session_id}') 恢复该会话"
+        if sess is not None and sess.end_reason == "crashed":
+            return f"异常退出（退出码 {exit_code}）。最后输出：\n{self._crash_tail(sess)}\n{hint}。"
+        return f"进程已退出（退出码 {exit_code}）。{hint}。"
+
     def _on_session_exit(self, session_id: str, exit_code: int):
         sess = self.sessions.get(session_id)
         if session_id in self._user_terminated or (sess and sess.terminated_by_user):
@@ -3560,18 +4813,28 @@ class HubSessionManager:
             self._release_transcripts(session_id)
             self._user_terminated.discard(session_id)
             return
-        if sess:
-            self.persist_session(sess)
+        if sess is None:
+            rec = self.db.get_session_record(session_id)
+            if rec and rec.get("archived_at"):
+                # close_session already wrote the final record and emitted its one event.
+                self._release_transcripts(session_id)
+                self._user_terminated.discard(session_id)
+                return
+        end_reason = "exited"
+        if sess is not None:
+            sess.exit_code = exit_code
+            self._finalize_session(sess)
+            # The final record writes the scrollback once, here (spec §3).
+            self.persist_session(sess, force_scrollback=True)
+            end_reason = sess.end_reason or "exited"
+        ev_type = "crashed" if end_reason == "crashed" else "exited"
         self.record_worker_event(
             session_id,
             {
-                "type": "exited",
+                "type": ev_type,
                 "category": "lifecycle",
-                "status": "exited",
-                "content": (
-                    f"Sub-Agent 进程已退出 (exit_code={exit_code})。"
-                    f"可调用 get_subagent_final_response('{session_id}') 获取持久化的最终输出与执行轨迹。"
-                ),
+                "status": end_reason,
+                "content": self._exit_event_content(session_id, exit_code, sess),
             },
         )
         # Q12: the exit event is out. The process ended on its own, so its conversation is nobody's
@@ -3647,6 +4910,8 @@ class HubSessionManager:
                 session.dsh_job_id = job_id
                 session.dsh_session_id = dsh_sid
                 session.dsh_token = token
+                # Spec §3/§4: the dsh conversation reference is the job handle the continue API takes.
+                session.conversation_ref = {"dsh_job_id": job_id, "dsh_session_id": dsh_sid}
                 session.status = "running"
                 session.current_activity = f"DSH Job {job_id} running in {dsh_sid}"
                 session.emit_virtual_ansi(
@@ -3879,7 +5144,20 @@ class HubSessionManager:
                                         "final_assistant_text": full_res,
                                     },
                                 )
-                            session.status = "completed" if jstatus == "done" else "exited"
+                            if jstatus == "done":
+                                session.status = "completed"
+                                session.end_reason = "exited"
+                                session.exit_code = 0
+                                session.completion_reported = True
+                            else:
+                                # Spec §2: a failed/cancelled/timeout DSH job is an abnormal end.
+                                session.status = "crashed"
+                                session.end_reason = "crashed"
+                                session.exit_code = 1
+                            session.conversation_ref = {
+                                "dsh_job_id": job_id,
+                                "dsh_session_id": session.dsh_session_id or "",
+                            }
                             tokens_info = jview.get("tokens") or {}
                             session.current_activity = (
                                 f"DSH {jstatus} (steps={session.step_count}, tools={jview.get('toolCalls', 0)}, "
@@ -4382,6 +5660,15 @@ class HubSessionManager:
                 on_tui_tool_cb=self._on_tui_tool_detected,
             )
             sess.status = "running"
+            sess.engine = "desktop_gui"
+            # Spec §3: even a non-resumable session keeps the launch it ran with, so the archive can
+            # say why it cannot be revived instead of "no launch recorded".
+            sess.profile_snapshot = {
+                "profile_id": "desktop-gui", "engine": "desktop_gui", "kind": "desktop_gui",
+                "command": "", "args": [], "env": {}, "model": None, "thinking_level": None,
+                "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
+                "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
+            }
             self.sessions[session_id] = sess
             self.persist_session(sess)
             return sess
@@ -4404,6 +5691,9 @@ class HubSessionManager:
         session_id = f'{profile_id}-{uuid.uuid4().hex[:8]}'
         effective_approval_mode = (approval_mode or prof.get('approval_mode') or 'auto').strip().lower()
         args = self._apply_approval_mode_args(engine=engine, base_args=args, approval_mode=effective_approval_mode)
+        # Archive spec §3: the resolved launch, as it will really run. The task itself is added below
+        # by the task mode and is deliberately NOT part of the snapshot (a resume adds its own message).
+        launch_args = list(args)
         task_mode = str(prof.get("task_mode") or "pty_input")
         # R1: everything that can raise runs before the PTY starts and before the session is stored,
         # so a bad profile value leaves no orphan session behind.
@@ -4451,12 +5741,30 @@ class HubSessionManager:
         sess.effective_thinking_level = effective_thinking
         sess.engine = engine
         sess.approval_mode = effective_approval_mode
+        sess.profile_snapshot = {
+            "profile_id": profile_id,
+            "engine": engine,
+            "kind": kind,
+            "command": prof["command"],
+            "args": launch_args,
+            "env": dict(launch.get("env") or {}),
+            "model": launch.get("model"),
+            "thinking_level": launch.get("thinking_level"),
+            "cli_model": launch.get("cli_model"),
+            "cwd": work_dir,
+            "task_mode": task_mode,
+            "startup_delay_sec": startup_delay,
+            "submit_key": submit_key,
+            "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
+        }
 
         if kind == "web_gui":
             if task:
                 sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(task)}; pwsh -NoLogo"]
             else:
                 sess.args = ["-NoLogo", "-NoProfile"]
+            # "args (as launched)": web_gui really runs the dsh headless command, not the profile args.
+            sess.profile_snapshot["args"] = list(sess.args)
 
         if task:
             # B9: last_task is the initial task and is never overwritten afterwards.

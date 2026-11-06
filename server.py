@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import Context, FastMCP
 import uvicorn
@@ -96,6 +96,13 @@ def bad_request(detail: str):
 
 def not_found(detail: str):
     return JSONResponse({"detail": detail}, status_code=404)
+
+
+def _session_can_receive(session) -> bool:
+    """A live process, or a warm DSH job that its continue API can still take."""
+    if session.is_process_alive():
+        return True
+    return session.status == "completed" and str(session.engine or "").lower() == "dsh"
 
 
 # ============================================================================
@@ -270,22 +277,34 @@ async def send_to_subagent(
     1. 如果该 Sub-Agent 当前正阻塞在 `ask_parent` 等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
     2. 否则，会将 `text` 写入 Sub-Agent 的交互式虚拟终端（ConPTY）及主从邮箱，实现实时中途干预（Steering）或多轮对话。
     """
-    session = hub.sessions.get(session_id)
-    if not session:
-        raise ValueError(f"Session '{session_id}' is not active in memory. Use get_subagent_final_response('{session_id}') to read its persisted result.")
-
-    # B9: last_task is the initial task only; a steering message is activity, not history.
-    if not session.last_task:
-        session.last_task = text
-    session.current_activity = f"Steering message from parent: {text[:80]}"
+    await ensure_profiles_loaded()
     start_seq = hub.global_seq
-
-    delivery = hub.deliver_parent_message(
-        session_id=session_id,
-        text=text,
-        also_write_pty=True,
-        press_enter=press_enter,
-    )
+    session = hub.sessions.get(session_id)
+    resumed = False
+    if session is None or not _session_can_receive(session):
+        # Archive spec §5: an ended or archived session is revived automatically, then the message
+        # is delivered the way an initial task would be. A non-resumable record raises its Chinese
+        # reason instead of a silent `pty_written:false`.
+        session = await hub.resume_subagent(session_id, text=text)
+        resumed = True
+        delivery = {
+            "delivered": True,
+            "session_id": session_id,
+            "resumed": True,
+            "resume_count": session.resume_count,
+            "pty_written": session.kind == "tui",
+        }
+    else:
+        # B9: last_task is the initial task only; a steering message is activity, not history.
+        if not session.last_task:
+            session.last_task = text
+        session.current_activity = f"Steering message from parent: {text[:80]}"
+        delivery = hub.deliver_parent_message(
+            session_id=session_id,
+            text=text,
+            also_write_pty=True,
+            press_enter=press_enter,
+        )
 
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
     if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
@@ -311,6 +330,8 @@ async def send_to_subagent(
     return {
         "session_id": session.session_id,
         "status": session.status,
+        "resumed": resumed,
+        "resume_count": session.resume_count,
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
@@ -320,6 +341,95 @@ async def send_to_subagent(
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
+
+
+@mcp.tool()
+async def resume_subagent(
+    session_id: str,
+    text: Optional[str] = None,
+    wait_seconds: float = 10.0,
+    ctx: Optional[Context] = None,
+) -> Dict[str, Any]:
+    """
+    [会话恢复工具] 恢复一个已经结束或已归档的 Sub-Agent 会话，沿用同一个 `session_id`（主 Agent 的引用继续有效）：
+    - 按引擎的恢复配方重新启动 CLI 并接上原来的对话（omp / kimi / agy / codex / dsh），工作目录、模型与思考等级沿用归档记录；
+    - 传入 `text` 时，恢复后按该引擎的初始任务方式把消息交给它；不传则只恢复会话；
+    - 会话仍在运行时不重复启动，直接返回当前状态；
+    - 不可恢复时会抛出中文原因（例如 `PowerShell 会话结束后无法找回上下文`）。
+    """
+    await ensure_profiles_loaded()
+    start_seq = hub.global_seq
+    was_live = hub.sessions.get(session_id) is not None and hub.sessions[session_id].is_process_alive()
+    session = await hub.resume_subagent(session_id, text=text)
+    delivery = {
+        "delivered": bool(text) and not was_live,
+        "resumed": not was_live,
+        "already_live": was_live,
+        "resume_count": session.resume_count,
+    }
+
+    settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
+    if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
+        async def _progress(elapsed: float, snippet: str):
+            if ctx:
+                await ctx.report_progress(
+                    progress=min(elapsed, wait_seconds),
+                    total=wait_seconds,
+                    message=f"正在等待 Sub-Agent [{session_id}] 恢复并处理消息 (step={session.step_count}, {int(elapsed)}s)...",
+                )
+
+        settle_info = await hub.wait_for_output_settle(
+            session,
+            timeout_sec=float(wait_seconds),
+            quiet_window_sec=2.5,
+            progress_cb=_progress,
+        )
+
+    events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
+    next_seq = events[-1]["seq"] if events else start_seq
+    transcript_summary = hub.summarize_transcript(session_id)
+
+    return {
+        "session_id": session.session_id,
+        "status": session.status,
+        "resumed": not was_live,
+        "resume_count": session.resume_count,
+        "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
+        "current_activity": session.current_activity,
+        "delivery": delivery,
+        "worker_events": events,
+        "next_seq": next_seq,
+        "background_poll_command": hub.build_poll_command(session_id, next_seq),
+        "wait_result": settle_info,
+        "transcript_summary": transcript_summary,
+    }
+
+
+@mcp.tool()
+async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+    """
+    [归档列表工具] 列出已结束并归档的 Sub-Agent 会话（最新在前），可按会话 ID、任务、工作目录或 Profile 过滤。
+    每条记录返回：`session_id`、Profile、模型 · 思考等级、工作目录、任务首行、结束原因、结束时间，
+    以及是否可恢复 (`resumable`) 与不可恢复的原因 (`resume_block_reason`)；用 `resume_subagent` 恢复。
+    """
+    payload = hub.list_archive(limit=limit, offset=0, query=query or "")
+    sessions = [
+        {
+            "session_id": rec.get("session_id"),
+            "profile": rec.get("profile_name") or rec.get("profile_id"),
+            "profile_id": rec.get("profile_id"),
+            "model": rec.get("model_line") or "",
+            "cwd": rec.get("cwd"),
+            "task": rec.get("task_first_line") or "",
+            "end_reason": rec.get("end_reason"),
+            "end_reason_label": rec.get("end_reason_label"),
+            "ended_at": rec.get("ended_at"),
+            "resumable": bool(rec.get("resumable")),
+            "resume_block_reason": rec.get("resume_block_reason") or "",
+        }
+        for rec in payload.get("sessions") or []
+    ]
+    return {"total": payload.get("total", len(sessions)), "sessions": sessions}
 
 
 @mcp.tool()
@@ -484,17 +594,27 @@ async def read_subagent_screen(
 
     persisted = hub.db.get_session_record(session_id)
     if not persisted:
-        raise ValueError(f"Session '{session_id}' not found.")
-    raw_txt = "\n".join((persisted.get("scrollback_text") or "").splitlines()[-max_lines:])
+        raise ValueError(f"找不到会话 {session_id}")
+    # Archive spec §5: an archived session's screen is the last_screen the final record kept.
+    last_screen = persisted.get("last_screen") or ""
+    if last_screen:
+        raw_txt = last_screen
+        sanitized_lines = last_screen.splitlines()[-25:]
+    else:
+        raw_txt = "\n".join((persisted.get("scrollback_text") or "").splitlines()[-max_lines:])
+        sanitized_lines = sanitize_tui_screen_text(raw_txt, max_lines=25)
     res = {
         "session_id": session_id,
         "profile_id": persisted.get("profile_id"),
         "status": persisted.get("status"),
+        "end_reason": persisted.get("end_reason"),
+        "resumable": bool(persisted.get("resumable")),
+        "resume_block_reason": persisted.get("resume_block_reason") or "",
         "step_count": max(persisted.get("step_count", 0), transcript_summary.get("step_count", 0)),
         "current_activity": persisted.get("current_activity", ""),
         "final_response": persisted.get("final_response") or transcript_summary.get("latest_conclusion"),
         "transcript_summary": transcript_summary,
-        "sanitized_screen_lines": sanitize_tui_screen_text(raw_txt, max_lines=25),
+        "sanitized_screen_lines": sanitized_lines,
     }
     if include_raw_tui:
         res["raw_screen_text"] = raw_txt
@@ -511,7 +631,9 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
         "active_sessions": active,
     }
     if include_historical:
-        result["persisted_sessions"] = hub.db.list_persisted_sessions(limit=limit)
+        # Spec §6: list_active_sessions stays "live + ended-in-memory"; archived records are listed
+        # by list_archived_sessions.
+        result["persisted_sessions"] = hub.db.list_persisted_sessions(limit=limit, include_archived=False)
     return result
 
 
@@ -900,9 +1022,70 @@ async def api_list_sessions():
         "global_seq": hub.global_seq,
         "sessions": [s.to_dict() for s in hub.sessions.values()],
         "persisted_sessions": hub.db.list_persisted_sessions(limit=50),
+        "archive_total": hub.db.count_archived(),
         "recent_events": hub.worker_events[-30:],
         "default_cwd": hub.hub_default_cwd(),
         "hub_port": hub_port(),
+    }
+
+
+# Archive spec §6: the console's archive list, one record, its raw scrollback, revive and delete.
+@app.get("/api/archive")
+async def api_list_archive(limit: int = Query(50), offset: int = Query(0), q: str = Query("")):
+    return hub.list_archive(limit=limit, offset=offset, query=q)
+
+
+@app.get("/api/archive/{session_id}")
+async def api_get_archive(session_id: str):
+    rec = hub.get_archive_record(session_id)
+    if not rec:
+        return not_found(f"找不到会话 {session_id}")
+    return rec
+
+
+@app.get("/api/archive/{session_id}/scrollback")
+async def api_get_archive_scrollback(session_id: str):
+    if hub.db.get_session_record(session_id) is None:
+        return not_found(f"找不到会话 {session_id}")
+    return PlainTextResponse(hub.get_archive_scrollback(session_id) or "")
+
+
+@app.delete("/api/archive/{session_id}")
+async def api_delete_archive(session_id: str):
+    try:
+        hub.delete_archive_record(session_id)
+    except ValueError as e:
+        message = str(e)
+        if message.startswith("找不到会话"):
+            return not_found(message)
+        return bad_request(message)
+    return {"ok": True, "session_id": session_id}
+
+
+@app.post("/api/sessions/{session_id}/resume")
+async def api_resume_session(session_id: str, req: Request):
+    body: Dict[str, Any] = {}
+    try:
+        raw = await req.body()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                body = parsed
+    except Exception:
+        body = {}
+    text = body.get("text")
+    try:
+        session = await hub.resume_subagent(session_id, text=(str(text) if text is not None else None))
+    except ValueError as e:
+        message = str(e)
+        if message.startswith("找不到会话"):
+            return not_found(message)
+        return bad_request(message)
+    return {
+        "ok": True,
+        "resumed": True,
+        "resume_count": session.resume_count,
+        "session": session.to_dict(),
     }
 
 

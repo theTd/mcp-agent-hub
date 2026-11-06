@@ -34,6 +34,7 @@ async function refreshSessions() {
     }
     state.sessions = data.sessions || [];
     state.persistedSessions = data.persisted_sessions || [];
+    state.archiveTotal = Number.isFinite(data.archive_total) ? data.archive_total : state.archiveTotal;
     state.recentEvents = data.recent_events || [];
     state.globalSeq = data.global_seq || 0;
     state.sessionsLoaded = true;

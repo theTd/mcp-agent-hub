@@ -12,6 +12,9 @@ export const state = {
 
   sessions: [],
   persistedSessions: [],
+  // Archive spec §7: the 归档 tab's count comes from /api/sessions (archive_total), so it stays fresh
+  // with the normal poll without a second request.
+  archiveTotal: 0,
   sessionsLoaded: false,
   activeSessionId: null,
   recentEvents: [],
