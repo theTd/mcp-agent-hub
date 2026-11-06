@@ -189,25 +189,33 @@ function archiveEntries() {
   return archiveItems;
 }
 
+// A14: every archive load carries a sequence number. A page or a query that started earlier must
+// never paint its rows over a newer query - the newest request wins and the rest are dropped.
+// (The old code returned early while a load was in flight, so a query typed during one was lost.)
+let archiveReqSeq = 0;
+
 /** Archive spec §6: one page of the hub's archive, newest first, optionally filtered by q. */
 async function loadArchive(reset = true, { quiet = false } = {}) {
-  if (archiveLoading) return;
-  archiveLoading = true;
+  const seq = ++archiveReqSeq;
+  const query = archiveQuery;
   const offset = reset ? 0 : archiveItems.length;
+  archiveLoading = true;
   try {
-    const data = await hubApi.listArchive({ limit: ARCHIVE_PAGE_SIZE, offset, q: archiveQuery });
+    const data = await hubApi.listArchive({ limit: ARCHIVE_PAGE_SIZE, offset, q: query });
+    if (seq !== archiveReqSeq) return; // a newer query or page already won
     const items = Array.isArray(data.sessions) ? data.sessions : [];
     archiveItems = reset ? items : archiveItems.concat(items);
     archiveTotal = Number(data.total) || 0;
     // The badge shows the unfiltered archive size; only an unfiltered load may update it here,
     // otherwise a running search would fight the 2.5 s poll over the same number.
-    if (!archiveQuery) archiveGrandTotal = archiveTotal;
+    if (!query) archiveGrandTotal = archiveTotal;
     archiveLoaded = true;
     renderSessionList();
   } catch (err) {
+    if (seq !== archiveReqSeq) return;
     if (!quiet) toast(`加载归档失败：${err.message}`, 'error');
   } finally {
-    archiveLoading = false;
+    if (seq === archiveReqSeq) archiveLoading = false;
   }
 }
 

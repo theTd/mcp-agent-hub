@@ -526,7 +526,8 @@ class CodexTranscriptSummarizer(BaseTranscriptSummarizer):
 class AGYTranscriptSummarizer(BaseTranscriptSummarizer):
     """
     Summarizer for Antigravity CLI (`agy`, `agy-flash`).
-    Parses `~/.gemini/antigravity/brain/<conv_id>/.system_generated/logs/transcript.jsonl`.
+    Parses `~/.gemini/antigravity-cli/brain/<conv_id>/.system_generated/logs/transcript.jsonl`
+    (the pre-1.5 `~/.gemini/antigravity/brain` is only a fallback in session_manager).
     """
 
     cli_type = "agy"

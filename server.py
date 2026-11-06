@@ -224,6 +224,8 @@ async def spawn_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
+        # A10: the real outcome of typing an initial pty_input task, when the wait covered it.
+        "last_injection": session.last_injection,
         "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
@@ -285,15 +287,24 @@ async def send_to_subagent(
         # Archive spec §5: an ended or archived session is revived automatically, then the message
         # is delivered the way an initial task would be. A non-resumable record raises its Chinese
         # reason instead of a silent `pty_written:false`.
-        session = await hub.resume_subagent(session_id, text=text)
-        resumed = True
-        delivery = {
-            "delivered": True,
+        # A2: the resume reports whether IT really resumed and whether the text was delivered; a
+        # caller that lost the race gets its text delivered to the now-live session instead of a
+        # canned `delivered: true`.
+        result = await hub.resume_subagent(session_id, text=text)
+        session = result["session"]
+        resumed = bool(result.get("resumed"))
+        delivery = result.get("delivery") or {
+            "delivered": bool(result.get("delivered")),
             "session_id": session_id,
-            "resumed": True,
+            "resumed": resumed,
             "resume_count": session.resume_count,
-            "pty_written": session.kind == "tui",
+            "pty_written": False,
+            "injection": result.get("injection") or "none",
         }
+        if result.get("already_live"):
+            if not session.last_task:
+                session.last_task = text
+            session.current_activity = f"Steering message from parent: {text[:80]}"
     else:
         # B9: last_task is the initial task only; a steering message is activity, not history.
         if not session.last_task:
@@ -335,6 +346,7 @@ async def send_to_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
+        "last_injection": session.last_injection,
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
@@ -359,13 +371,14 @@ async def resume_subagent(
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
-    was_live = hub.sessions.get(session_id) is not None and hub.sessions[session_id].is_process_alive()
-    session = await hub.resume_subagent(session_id, text=text)
-    delivery = {
-        "delivered": bool(text) and not was_live,
-        "resumed": not was_live,
-        "already_live": was_live,
+    result = await hub.resume_subagent(session_id, text=text)
+    session = result["session"]
+    delivery = result.get("delivery") or {
+        "delivered": bool(result.get("delivered")),
+        "resumed": bool(result.get("resumed")),
+        "already_live": bool(result.get("already_live")),
         "resume_count": session.resume_count,
+        "injection": result.get("injection") or "none",
     }
 
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
@@ -392,11 +405,13 @@ async def resume_subagent(
     return {
         "session_id": session.session_id,
         "status": session.status,
-        "resumed": not was_live,
+        "resumed": bool(result.get("resumed")),
+        "already_live": bool(result.get("already_live")),
         "resume_count": session.resume_count,
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
+        "last_injection": session.last_injection,
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
@@ -805,6 +820,13 @@ async def combined_lifespan(app_instance: FastAPI):
         await stack.enter_async_context(mcp_parent_app.lifespan(app_instance))
         await stack.enter_async_context(mcp_worker_app.lifespan(app_instance))
         yield
+        # A6: a graceful hub stop archives every in-memory session — live ones become interrupted
+        # (spec §1.5) and stay resumable, ended ones keep their own reason. The manager archives
+        # each session in its own try/except, and a failure here never blocks the shutdown.
+        try:
+            hub.archive_all_sessions_on_shutdown()
+        except Exception:
+            pass
 
 
 app = FastAPI(
@@ -1075,16 +1097,21 @@ async def api_resume_session(session_id: str, req: Request):
         body = {}
     text = body.get("text")
     try:
-        session = await hub.resume_subagent(session_id, text=(str(text) if text is not None else None))
+        result = await hub.resume_subagent(session_id, text=(str(text) if text is not None else None))
     except ValueError as e:
+        # A9: every resume failure is a Chinese 400 (or a 404 for an unknown id), never a 500.
         message = str(e)
         if message.startswith("找不到会话"):
             return not_found(message)
         return bad_request(message)
+    session = result["session"]
     return {
         "ok": True,
-        "resumed": True,
+        "resumed": bool(result.get("resumed")),
+        "already_live": bool(result.get("already_live")),
         "resume_count": session.resume_count,
+        "delivery": result.get("delivery"),
+        "last_injection": session.last_injection,
         "session": session.to_dict(),
     }
 
@@ -1242,15 +1269,20 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
     try:
         while True:
             raw_msg = await websocket.receive_text()
+            # A1: a resume replaces the AgentSession object under the same session id (the sockets
+            # are handed over to the new object), so every input frame must go to the session that
+            # is live under this id now, not to the object this socket connected to.
+            live = hub.sessions.get(session_id)
             try:
                 msg = json.loads(raw_msg)
                 mtype = msg.get("type")
-                if mtype == "input":
-                    sess.write_input(msg.get("data", ""))
-                elif mtype == "resize":
-                    sess.resize(int(msg.get("cols", 120)), int(msg.get("rows", 36)))
+                if mtype == "input" and live is not None:
+                    live.write_input(msg.get("data", ""))
+                elif mtype == "resize" and live is not None:
+                    live.resize(int(msg.get("cols", 120)), int(msg.get("rows", 36)))
             except Exception:
-                sess.write_input(raw_msg)
+                if live is not None:
+                    live.write_input(raw_msg)
     except WebSocketDisconnect:
         pass
     finally:
