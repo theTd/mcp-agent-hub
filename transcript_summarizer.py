@@ -8,6 +8,29 @@ from typing import Any, Dict, List, Optional
 # Patterns of TUI chrome, ASCII borders, spinners, and status bars that distract the Parent Agent
 BOX_AND_BORDER_RE = re.compile(r"^[\s╭╮╯╰┌┐┘└├┤┬┴┼─━│┃═║╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓·•∙⋅◦▪▫◊◆◇❖✦✧★☆⚡⚙❯›»>]+$")
 BRAILLE_SPINNER_RE = re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⣾⣽⣻⢿⡿⣟⣯⣷]")
+# K1/F3: the startup/busy indicators, keyed by engine. One list serves two readers: the hub's
+# readiness gate (session_manager) refuses to type while one is on screen, and the screen filter
+# below refuses to treat one as an answer. Read off the real captures: kimi draws its empty box
+# under "⠋ Preparing Kimi Code…" and "⠋ Restoring session…"; omp shows "Connecting to MCP servers:" /
+# "Still connecting:" / "⎋ Working…" while its MCP servers start; codex prints a bare "loading" line
+# and "Starting MCP servers (n/m)"; agy shows "Signing in…", "⣷ Generating..." and
+# "Accessing workspace:".
+ENGINE_BUSY_PHRASES = {
+    "kimi": ("Preparing Kimi Code", "Restoring session"),
+    "omp": ("Connecting to MCP servers", "Still connecting", "Working…", "Working..."),
+    "codex": ("Starting MCP servers", "esc to interrupt"),
+    "agy": ("Signing in", "Generating", "Accessing workspace:"),
+}
+# K1/F3: a spinner glyph at the START of a status line is a busy indicator for the engines whose
+# captures show one, plus codex's bare "loading" line. A braille glyph anywhere else (a box border,
+# a logo) is not: the rule is anchored to the start of the line. No box bar is allowed in front of
+# the glyph: a glyph INSIDE a box row is the box's own content (kimi's composer can hold one as
+# text), while every spinner in the captures starts the row.
+ENGINE_BUSY_LINE_RES = {
+    "kimi": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
+    "agy": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
+    "codex": re.compile(r"^\s*loading\s*$", re.IGNORECASE),
+}
 TUI_NOISE_PATTERNS = [
     re.compile(r"Welcome to Kimi Code!", re.IGNORECASE),
     re.compile(r"Send /help for help information", re.IGNORECASE),
@@ -19,6 +42,24 @@ TUI_NOISE_PATTERNS = [
     re.compile(r"^\s*│.*│\s*$"),
     re.compile(r"^\s*\d+%\s+context\b", re.IGNORECASE),
     re.compile(r"Trust this folder\?|Yes, I trust this folder", re.IGNORECASE),
+    # F3: the hub's own banners and notes are not the agent's answer.
+    re.compile(r"──\s*已恢复"),
+    re.compile(r"启动文本注入"),
+    re.compile(r"\[较早的输出已截断\]"),
+    re.compile(r"\[Sub-Agent Bridge Info:"),
+    re.compile(r"\(When done run:"),
+    re.compile(r"可调用\s+get_subagent_final_response"),
+    # F3: TUI chrome and status lines. The round-4 kimi crash recorded "Preparing Kimi Code…" as the
+    # final response; the same screen also carried these rows, which must never be read as an answer.
+    re.compile(r"^\s*MCP server\b.*(?:connecting|connected|failed|error)", re.IGNORECASE),
+    re.compile(r"^\s*context:\s*\d+%", re.IGNORECASE),
+    re.compile(r"^\s*Never Ask\b", re.IGNORECASE),
+    re.compile(r"\bctrl\+o\b", re.IGNORECASE),
+    re.compile(r"·\s*Tip:", re.IGNORECASE),
+    re.compile(r"\bis ready\s*-\s*use the model\b", re.IGNORECASE),
+    re.compile(r"^Standard: .*Plus/Moderato", re.IGNORECASE),
+    re.compile(r"^No session yet\b", re.IGNORECASE),
+    re.compile(r"^\s*[>❯›»]\s"),
 ]
 
 
@@ -81,10 +122,35 @@ def _strip_bridge_hint(text: str) -> str:
     return text.strip()
 
 
-def sanitize_tui_screen_text(raw_text: str, max_lines: int = 20) -> List[str]:
+def _screen_engine_keys(engine: str) -> tuple:
+    """F3: the engine whose K1 indicators apply to this screen; unknown means every engine's."""
+    eng = (engine or "").strip().lower()
+    if not eng:
+        return tuple(ENGINE_BUSY_PHRASES)
+    for known in ENGINE_BUSY_PHRASES:
+        if eng == known or eng.startswith(known):
+            return (known,)
+    return tuple(ENGINE_BUSY_PHRASES)
+
+
+def _screen_busy_line(line: str, engine: str) -> bool:
+    """F3: True when a screen row is one of the engine's startup/busy indicators."""
+    for key in _screen_engine_keys(engine):
+        line_re = ENGINE_BUSY_LINE_RES.get(key)
+        if line_re is not None and line_re.match(line):
+            return True
+        if any(phrase in line for phrase in ENGINE_BUSY_PHRASES.get(key, ())):
+            return True
+    return False
+
+
+def sanitize_tui_screen_text(raw_text: str, max_lines: int = 20, engine: str = "") -> List[str]:
     """
     Filters out TUI box-drawing frames, spinners, welcome banners, and status bars
     from raw terminal text, returning only meaningful content lines.
+
+    `engine` selects the K1 startup/busy indicators to drop (F3); when it is empty or unknown,
+    every engine's indicators are dropped, because "no answer" is the safe reading for a fallback.
     """
     if not raw_text:
         return []
@@ -92,6 +158,8 @@ def sanitize_tui_screen_text(raw_text: str, max_lines: int = 20) -> List[str]:
     for line in raw_text.splitlines():
         s = line.strip()
         if not s:
+            continue
+        if _screen_busy_line(s, engine):
             continue
         s = BRAILLE_SPINNER_RE.sub("", s).strip()
         if not s or BOX_AND_BORDER_RE.match(s):
@@ -576,7 +644,9 @@ class AGYTranscriptSummarizer(BaseTranscriptSummarizer):
         sanitized_fallback = None
         fallback_src = raw_screen_fallback or str(session_meta.get("final_response") or "")
         if fallback_src:
-            clean_lines = sanitize_tui_screen_text(fallback_src, max_lines=12)
+            clean_lines = sanitize_tui_screen_text(
+                fallback_src, max_lines=12, engine=session_meta.get("engine") or "agy"
+            )
             if clean_lines:
                 sanitized_fallback = "\n".join(clean_lines)
         non_proxy_msgs = [
@@ -719,7 +789,9 @@ class GenericTelemetrySummarizer(BaseTranscriptSummarizer):
         if not latest_conclusion and thoughts:
             latest_conclusion = thoughts[-1]
         if not latest_conclusion and raw_screen_fallback:
-            clean_lines = sanitize_tui_screen_text(raw_screen_fallback, max_lines=8)
+            clean_lines = sanitize_tui_screen_text(
+                raw_screen_fallback, max_lines=8, engine=session_meta.get("engine") or ""
+            )
             if clean_lines:
                 latest_conclusion = "\n".join(clean_lines)
 
@@ -786,7 +858,11 @@ class TranscriptSummarizerRegistry:
             if not res.get("latest_conclusion") and db_messages:
                 res["latest_conclusion"] = db_messages[-1]["content"]
             if not res.get("latest_conclusion") and raw_screen_fallback:
-                clean_lines = sanitize_tui_screen_text(raw_screen_fallback, max_lines=10)
+                clean_lines = sanitize_tui_screen_text(
+                    raw_screen_fallback,
+                    max_lines=10,
+                    engine=session_meta.get("engine") or profile_id or "",
+                )
                 if clean_lines:
                     res["latest_conclusion"] = "\n".join(clean_lines)
         return res

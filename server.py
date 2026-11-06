@@ -642,7 +642,7 @@ async def read_subagent_screen(
             "final_response": session.final_response or transcript_summary.get("latest_conclusion"),
             "recent_events": hub.get_worker_events(session_id=session_id, after_seq=0)[-10:],
             "transcript_summary": transcript_summary,
-            "sanitized_screen_lines": sanitize_tui_screen_text(raw_txt, max_lines=25),
+            "sanitized_screen_lines": sanitize_tui_screen_text(raw_txt, max_lines=25, engine=session.engine),
             # K6: the noisy line filter strips the composer, so a parent could not see text that was
             # typed but never sent. Report that one row separately; the sanitising stays as it was.
             "input_line": HubSessionManager._tui_input_line(raw_txt, session.engine),
@@ -664,7 +664,9 @@ async def read_subagent_screen(
         sanitized_lines = last_screen.splitlines()[-25:]
     else:
         raw_txt = "\n".join((persisted.get("scrollback_text") or "").splitlines()[-max_lines:])
-        sanitized_lines = sanitize_tui_screen_text(raw_txt, max_lines=25)
+        sanitized_lines = sanitize_tui_screen_text(
+            raw_txt, max_lines=25, engine=persisted.get("engine") or ""
+        )
     res = {
         "session_id": session_id,
         "profile_id": persisted.get("profile_id"),

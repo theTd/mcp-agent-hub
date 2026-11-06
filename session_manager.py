@@ -29,7 +29,12 @@ from winpty import PtyProcess
 REAL_PTY_PROCESS = PtyProcess
 
 from model_discovery import AgentModelDiscovery
-from transcript_summarizer import TranscriptSummarizerRegistry, sanitize_tui_screen_text
+from transcript_summarizer import (
+    ENGINE_BUSY_LINE_RES,
+    ENGINE_BUSY_PHRASES,
+    TranscriptSummarizerRegistry,
+    sanitize_tui_screen_text,
+)
 
 logger = logging.getLogger("mcp-agent-hub.session_manager")
 
@@ -594,6 +599,31 @@ FINAL_SOURCE_PRIORITY = {
     "report_complete_mcp": 6,
 }
 
+# F1: the completion hint tells an engine to run `complete "<用一句话写出你的结果>"`. A literal copy of
+# that placeholder (or of the old "SUMMARY") is not a result: the round-4 kimi run archived
+# final_response="SUMMARY". One constant is used by the hint and by the completion handler, so the
+# two cannot drift apart again.
+COMPLETION_SUMMARY_PLACEHOLDER = "<用一句话写出你的结果>"
+PLACEHOLDER_SUMMARY_TEXTS = frozenset({
+    "summary",
+    "your final summary",
+    "your one-sentence result",
+    "用一句话写出你的结果",
+})
+PLACEHOLDER_SUMMARY_RE = re.compile(r"^<[^<>]{0,80}>$")
+SUMMARY_QUOTE_CHARS = "\"'“”‘’「」"
+
+
+def is_placeholder_summary(text: Optional[str]) -> bool:
+    """F1: True when a completion summary is only the hint's placeholder, never a result."""
+    s = str(text or "").strip()
+    if not s:
+        return True
+    s = s.strip(SUMMARY_QUOTE_CHARS).strip()
+    if s.lower() in PLACEHOLDER_SUMMARY_TEXTS:
+        return True
+    return bool(PLACEHOLDER_SUMMARY_RE.match(s))
+
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
     r"^\s*[●•✦⚡▶]\s*(Bash|Read|Edit|Write|Grep|Glob|LS|WebSearch|Fetch|Task|MultiEdit|NotebookEdit|cmd|powershell)\s*(?:\((.+?)\)|:\s*(.+))?$",
@@ -725,31 +755,13 @@ TUI_AGENT_ACTIVE_RE = re.compile(
     r"|thinking…|thinking\.\.\.)",
     re.IGNORECASE,
 )
-# K1: a visible composer does not mean the engine can take input yet. Every engine below draws its
+# K1: a visible composer does not mean the engine can take input yet. Every engine draws its
 # prompt while it is still starting up and swallows the first Enter until that startup ends, so the
-# readiness gate also waits for these indicators to leave the screen. The lists are read off the
-# real captures: kimi draws its empty box under "⠋ Preparing Kimi Code…" (replay_kimi-*_spawn.txt)
-# and under "⠋ Restoring session…" on a resume (replay_kimi-810161c1_r2.txt); omp shows
-# "Connecting to MCP servers:" / "Still connecting:" / "⎋ Working…" while its MCP servers start
-# (replay_omp-*.txt); codex prints a bare "loading" line and "Starting MCP servers (n/m)"
-# (replay_codex-*.txt); agy shows "Signing in…", "⣷ Generating..." and "Accessing workspace:"
-# (replay_agy-7017a593_spawn.txt).
-TUI_BUSY_PHRASES = {
-    "kimi": ("Preparing Kimi Code", "Restoring session"),
-    "omp": ("Connecting to MCP servers", "Still connecting", "Working…", "Working..."),
-    "codex": ("Starting MCP servers", "esc to interrupt"),
-    "agy": ("Signing in", "Generating", "Accessing workspace:"),
-}
-# K1: a spinner glyph at the START of a status line is a busy indicator for the engines whose
-# captures show one, plus codex's bare "loading" line. A braille glyph anywhere else (a box border,
-# a logo) is not: the rule is anchored to the start of the line.
-# No box bar is allowed in front of the glyph: a glyph INSIDE a box row is the box's own content
-# (kimi's composer can hold one as text), while every spinner in the captures starts the row.
-TUI_BUSY_LINE_RES = {
-    "kimi": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
-    "agy": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
-    "codex": re.compile(r"^\s*loading\s*$", re.IGNORECASE),
-}
+# readiness gate also waits for these indicators to leave the screen. F3: the lists live in
+# transcript_summarizer, beside the screen filter that must ignore the same rows, so readiness and
+# final-response extraction can never disagree about what "busy" or "still starting" looks like.
+TUI_BUSY_PHRASES = ENGINE_BUSY_PHRASES
+TUI_BUSY_LINE_RES = ENGINE_BUSY_LINE_RES
 # K2: how long a submit whose text was never seen on the composer keeps waiting for evidence. The
 # kimi spawn in evidence round 3 typed into a box that was still booting, so the first look proved
 # nothing; a redraw can also clear the bottom rows and put the text back a moment later.
@@ -1141,7 +1153,7 @@ class AgentSession:
 
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
         scrollback = self.get_full_scrollback_text(max_lines=80)
-        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10)
+        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
         if clean_lines:
             self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
 
@@ -1387,7 +1399,7 @@ class AgentSession:
         was_alive = self.is_process_alive()
         self.ended_at = time.time()
         scrollback = self.get_full_scrollback_text(max_lines=80)
-        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10)
+        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
         if clean_lines:
             self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
         if was_alive:
@@ -3783,6 +3795,11 @@ class HubSessionManager:
         sess = self.sessions.get(session_id)
         ev_type = payload.get("type", "message")
         content = (payload.get("content") or "").strip()
+        if ev_type == "completed" and is_placeholder_summary(content):
+            # F1: the hint's own placeholder (or the old literal "SUMMARY") is not a result. The
+            # completion itself still counts -- status and event below -- but an empty summary must
+            # never become final_response, an intermediate message, or a stored event body.
+            content = ""
 
         if sess:
             if ev_type == "completed":
@@ -4727,6 +4744,21 @@ class HubSessionManager:
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         return cfg_path
 
+    def _transcript_watch_alive(self, session: AgentSession) -> bool:
+        """F2: a transcript watcher follows the process, not the status label.
+
+        `completed` is a live status (archive-spec §2): the process is still running, and kimi
+        writes its real reply and `agent.turn.ended` to the transcript only after it reported
+        completion. The watcher therefore stops when the process ends, when the session leaves the
+        live list, or at its own deadline -- never merely because the report said `completed`.
+        """
+        if self.sessions.get(session.session_id) is not session:
+            return False
+        try:
+            return bool(session.is_process_alive())
+        except Exception:
+            return False
+
     async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails the Codex rollout jsonl files for a spawned Codex session.
 
@@ -4749,9 +4781,9 @@ class HubSessionManager:
                 offset = int(session.attach_offset or 0)
                 self._claim_transcript(session, target_file)
         else:
-            while session.status in ("starting", "running", "waiting_parent"):
+            while self._transcript_watch_alive(session):
                 await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-                if session.status not in ("starting", "running", "waiting_parent"):
+                if not self._transcript_watch_alive(session):
                     break
                 candidates = []
                 for candidate in codex_root.rglob("rollout-*.jsonl"):
@@ -4770,7 +4802,7 @@ class HubSessionManager:
         if not target_file:
             return
 
-        while session.status in ("starting", "running", "waiting_parent"):
+        while self._transcript_watch_alive(session):
             if session.resume_attach:
                 # A resumed codex may start a new rollout for the same session id; accept it when it
                 # appears and tail it from the beginning (everything in it is new).
@@ -4968,9 +5000,9 @@ class HubSessionManager:
                 offset = int(session.attach_offset or 0)
                 self._claim_transcript(session, target_file)
         else:
-            while session.status in ("starting", "running", "waiting_parent"):
+            while self._transcript_watch_alive(session):
                 await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-                if session.status not in ("starting", "running", "waiting_parent"):
+                if not self._transcript_watch_alive(session):
                     break
                 # This directory is created by the hub for this one session (`--session-dir`), so a
                 # cross-session attach is already impossible; claim it anyway so the rule is uniform.
@@ -4986,7 +5018,7 @@ class HubSessionManager:
         if not target_file:
             return
 
-        while session.status in ("starting", "running", "waiting_parent"):
+        while self._transcript_watch_alive(session):
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
@@ -5136,9 +5168,9 @@ class HubSessionManager:
                 offset = int(session.attach_offset or 0)
                 self._claim_transcript(session, target_file)
 
-        while target_file is None and session.status in ("starting", "running", "waiting_parent"):
+        while target_file is None and self._transcript_watch_alive(session):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-            if session.status not in ("starting", "running", "waiting_parent"):
+            if not self._transcript_watch_alive(session):
                 break
             # First try exact match via Kimi TUI banner: Session: session_<uuid>
             scr_txt = session.get_clean_screen_text(max_lines=35)
@@ -5172,7 +5204,7 @@ class HubSessionManager:
         self.persist_session(session)
 
         latest_assistant_text: Optional[str] = None
-        while session.status in ("starting", "running", "waiting_parent"):
+        while self._transcript_watch_alive(session):
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
@@ -5396,7 +5428,7 @@ class HubSessionManager:
             # window is only about stray conversations; the old loop spun for the session's whole
             # life when the file never appeared, and gave up at the first failed claim.
             transcript_deadline = time.time() + AGY_RESUME_TRANSCRIPT_WAIT_SEC
-            while target_file is None and session.status in ("starting", "running", "waiting_parent"):
+            while target_file is None and self._transcript_watch_alive(session):
                 if time.time() > transcript_deadline:
                     logger.warning(
                         "agy 恢复：%.0f 秒内未能接管 transcript %s，停止监听会话 %s",
@@ -5420,11 +5452,9 @@ class HubSessionManager:
             if target_file is None:
                 return
 
-        while target_file is None and not session.resume_attach and session.status in (
-            "starting", "running", "waiting_parent"
-        ):
+        while target_file is None and not session.resume_attach and self._transcript_watch_alive(session):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
-            if session.status not in ("starting", "running", "waiting_parent"):
+            if not self._transcript_watch_alive(session):
                 break
             candidates = []
             for p in brain_root.rglob("transcript.jsonl"):
@@ -5447,7 +5477,7 @@ class HubSessionManager:
         resume_confirmed = not session.resume_attach
         # A3: the stray scan is bounded to the first 30 s after the resume spawn; past that it stops.
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
-        while session.status in ("starting", "running", "waiting_parent"):
+        while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
                 try:
                     if os.path.getsize(target_file) > attach_size:
@@ -6413,7 +6443,21 @@ class HubSessionManager:
             f'- Report step: `{python_exe} "{worker_cli}" step "step description" --tool "tool_name"`\n'
             f'- Send message to parent: `{python_exe} "{worker_cli}" message "your progress message"`\n'
             f'- Ask parent & wait for answer: `{python_exe} "{worker_cli}" ask "your question"`\n'
-            f'- Report task complete: `{python_exe} "{worker_cli}" complete "your final summary"`\n'
+            f'- Report task complete: `{python_exe} "{worker_cli}" complete "{COMPLETION_SUMMARY_PLACEHOLDER}"`'
+            f' (replace the placeholder with your own one-sentence result)\n'
+        )
+
+    def _build_kimi_completion_hint(self, task: str) -> str:
+        """F1: kimi has no bridge system hint, so its task carries the completion command.
+
+        The argument is the agent's own one-sentence result, quoted. A literal copy of the
+        placeholder is dropped by is_placeholder_summary, never archived as final_response.
+        """
+        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
+        worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
+        return (
+            f'{task} (When done run: {python_exe} "{worker_cli}" '
+            f'complete "{COMPLETION_SUMMARY_PLACEHOLDER}")'
         )
 
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
@@ -7022,10 +7066,8 @@ class HubSessionManager:
                 prompt_to_send = task
                 if profile_id.startswith("kimi"):
                     if "hub_worker.py" not in task:
-                        # W10: same interpreter rule as the bridge hint.
-                        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
-                        worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
-                        prompt_to_send = f"{task} (When done run: {python_exe} {worker_cli} complete SUMMARY)"
+                        # W10: same interpreter rule as the bridge hint; F1 lives in the helper.
+                        prompt_to_send = self._build_kimi_completion_hint(task)
                     # Q2: unlike codex/agy/omp, kimi carries no bridge hint in its task, so the hub
                     # session marker that makes transcript ownership unambiguous travels right here.
                     # V1: this scope has no `session` variable (the object is `sess`); using it made
