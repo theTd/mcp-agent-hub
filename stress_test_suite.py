@@ -12,7 +12,8 @@ from fastmcp import Client
 sys.stdout.reconfigure(encoding="utf-8")
 
 HUB_DIR = Path(__file__).parent.resolve()
-PYTHON_EXE = str(HUB_DIR / ".venv" / "Scripts" / "python.exe")
+# K3: the interpreter this suite runs on, not a guessed <repo>/.venv (a worktree has none).
+PYTHON_EXE = sys.executable
 HUB_POLL_SCRIPT = str(HUB_DIR / "hub_poll.py")
 HUB_WORKER_SCRIPT = str(HUB_DIR / "hub_worker.py")
 MCP_PARENT_URL = "http://127.0.0.1:4444/mcp"

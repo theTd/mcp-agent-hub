@@ -87,9 +87,18 @@ const ACTIVITY_RULES = [
   [/^Running initial task:\s*(.*)$/i, (m) => (m[1] ? `正在执行初始任务：${m[1]}` : '正在执行初始任务')],
 ];
 
+// K5: the two termination sentences the hub writes, one per actor, so the console never turns the
+// parent agent's own terminate into "the user did it". They map to themselves, exactly as written.
+const TERMINATED_SENTENCES = {
+  '用户在总控台终止了会话': '用户在总控台终止了会话',
+  '主 Agent 终止了会话': '主 Agent 终止了会话',
+};
+
 // Q10: the event feed translates only a WHOLE lifecycle sentence. A sub-agent message that merely
 // starts with "Task completed" is a body, not a status line, and must be shown as written.
 const WHOLE_LIFECYCLE_RULES = [
+  /^用户在总控台终止了会话$/,
+  /^主 Agent 终止了会话$/,
   /^Interactive session running$/i,
   /^Session exited \(exit_code=-?\d+\)$/i,
   /^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=-?\d+\s*[)）]\s*。?$/i,
@@ -109,6 +118,8 @@ export function isLifecycleSentence(text) {
 export function activityLabel(text) {
   const value = String(text ?? '').trim();
   if (!value) return '';
+  // K5: the hub's own termination sentences already say who ended the session; keep them as written.
+  if (TERMINATED_SENTENCES[value]) return TERMINATED_SENTENCES[value];
   for (const [pattern, format] of ACTIVITY_RULES) {
     const match = value.match(pattern);
     if (match) return format(match);

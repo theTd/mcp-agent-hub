@@ -582,10 +582,16 @@ FINAL_SOURCE_PRIORITY = {
     None: 0,
     "terminal_turn_snapshot": 1,
     "transcript_summarizer": 2,
-    "native_transcript": 3,
-    "codex_task_complete": 4,
-    "dsh_hub_completion": 4,
-    "report_complete_mcp": 5,
+    # K4: the content of a turn_completed worker event is the engine's own end-of-turn answer. It has
+    # to beat a screen snapshot and the summariser, and it has to lose to the sources that are
+    # strictly better evidence for the same turn: the engine's own transcript, a codex/dsh completion
+    # and the worker's report_complete. So it sits between them, and a transcript that already named
+    # the answer keeps its own source label instead of being relabelled by the event.
+    "turn_completed": 3,
+    "native_transcript": 4,
+    "codex_task_complete": 5,
+    "dsh_hub_completion": 5,
+    "report_complete_mcp": 6,
 }
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
@@ -626,6 +632,12 @@ END_REASON_LABELS = {
     "crashed": "异常退出",
     "terminated": "已终止",
     "interrupted": "已中断",
+}
+# K5: the `terminated` event says who ended the session. The console pane and an MCP caller are two
+# different actors and must not share one sentence.
+TERMINATED_MESSAGES = {
+    "console": "用户在总控台终止了会话",
+    "mcp": "主 Agent 终止了会话",
 }
 # Engines with a revive recipe (spec §4). Anything else cannot be resumed.
 RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "dsh")
@@ -700,12 +712,48 @@ TUI_TRUST_DIALOG_PHRASES = (
     "Do you trust the files in this folder?",
     "Yes, I trust this folder",
 )
-# W3: the screen proves the agent is working or answering when one of these is visible.
+# W3/K2: the screen proves the agent is working or answering when one of these is visible.
+# K2 removed the words that are NOT evidence, and every one of them came from a real capture:
+#   - a bare "thinking": kimi's status bar permanently reads "K3.1 Pro thinking: low";
+#   - a bare braille glyph: omp's status bar opens with one (" ⠧ 0s · ◒ DeepSeek Flash …"), so a
+#     spinner-shaped rule would call omp busy forever.
+# The phrases below were checked against the round-3 replays; each is only drawn while working.
+# kimi "⠋ Working…" / "⠋ thinking…", omp "⎋ Working…", agy "⣷  Generating...",
+# codex "Worked for 35s" / "esc to interrupt".
 TUI_AGENT_ACTIVE_RE = re.compile(
-    r"(?:Working…|Working \(|\bthinking\b|Running a command|esc to interrupt|Worked for"
-    r"|[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f])",
+    r"(?:Working…|Working \(|Generating|Running a command|esc to interrupt|Worked for"
+    r"|thinking…|thinking\.\.\.)",
     re.IGNORECASE,
 )
+# K1: a visible composer does not mean the engine can take input yet. Every engine below draws its
+# prompt while it is still starting up and swallows the first Enter until that startup ends, so the
+# readiness gate also waits for these indicators to leave the screen. The lists are read off the
+# real captures: kimi draws its empty box under "⠋ Preparing Kimi Code…" (replay_kimi-*_spawn.txt)
+# and under "⠋ Restoring session…" on a resume (replay_kimi-810161c1_r2.txt); omp shows
+# "Connecting to MCP servers:" / "Still connecting:" / "⎋ Working…" while its MCP servers start
+# (replay_omp-*.txt); codex prints a bare "loading" line and "Starting MCP servers (n/m)"
+# (replay_codex-*.txt); agy shows "Signing in…", "⣷ Generating..." and "Accessing workspace:"
+# (replay_agy-7017a593_spawn.txt).
+TUI_BUSY_PHRASES = {
+    "kimi": ("Preparing Kimi Code", "Restoring session"),
+    "omp": ("Connecting to MCP servers", "Still connecting", "Working…", "Working..."),
+    "codex": ("Starting MCP servers", "esc to interrupt"),
+    "agy": ("Signing in", "Generating", "Accessing workspace:"),
+}
+# K1: a spinner glyph at the START of a status line is a busy indicator for the engines whose
+# captures show one, plus codex's bare "loading" line. A braille glyph anywhere else (a box border,
+# a logo) is not: the rule is anchored to the start of the line.
+# No box bar is allowed in front of the glyph: a glyph INSIDE a box row is the box's own content
+# (kimi's composer can hold one as text), while every spinner in the captures starts the row.
+TUI_BUSY_LINE_RES = {
+    "kimi": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
+    "agy": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
+    "codex": re.compile(r"^\s*loading\s*$", re.IGNORECASE),
+}
+# K2: how long a submit whose text was never seen on the composer keeps waiting for evidence. The
+# kimi spawn in evidence round 3 typed into a box that was still booting, so the first look proved
+# nothing; a redraw can also clear the bottom rows and put the text back a moment later.
+TUI_SUBMIT_EVIDENCE_SEC = 15.0
 # W9: the raw history is a bounded 512 KB window. Trimming rebuilds the joined text, so it runs
 # with a little slack instead of on every 4 KB PTY chunk (the cap is still enforced on the tail).
 HISTORY_TRIM_SLACK_BYTES = 64 * 1024
@@ -3527,12 +3575,15 @@ class HubSessionManager:
             fields["resume_block_reason"] = None if ok else reason
             self.db.update_archive_fields(sid, **fields)
 
-    def close_session(self, session_id: str) -> Dict[str, Any]:
+    def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
         """B9: removes a session from the live list without rewriting the status an ended process already earned.
 
-        A session whose process was alive is terminated (and emits a `terminated` worker event,
-        message 「用户在总控台终止了会话」); one that had already ended keeps its own final status and activity.
-        Either way the session leaves the live list as an archived record (spec §5).
+        A session whose process was alive is terminated and emits a `terminated` worker event; one
+        that had already ended keeps its own final status and activity. Either way the session leaves
+        the live list as an archived record (spec §5).
+        K5: `source` says who did it -- "console" (the 总控台 pane) or "mcp" (the parent agent through
+        terminate_subagent), because the event text used to claim the user did it even when the parent
+        had. Any other value is treated as the console, the only other caller there is.
         Returns {"found": bool, "was_alive": bool, "status": str}.
         """
         sess = self.sessions.get(session_id)
@@ -3557,7 +3608,10 @@ class HubSessionManager:
                     "type": "terminated",
                     "category": "lifecycle",
                     "status": "terminated",
-                    "content": "用户在总控台终止了会话",
+                    "content": TERMINATED_MESSAGES.get(
+                        "mcp" if str(source or "").lower() == "mcp" else "console",
+                        TERMINATED_MESSAGES["console"],
+                    ),
                 },
             )
         return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
@@ -3754,6 +3808,12 @@ class HubSessionManager:
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
                 self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
+            if ev_type == "turn_completed" and content:
+                # K4: every engine's turn_completed carries the end-of-turn answer (agy "OK", kimi
+                # "PELICAN-7", codex/omp task_complete, dsh's result). It is this turn's final
+                # response unless a better source already wrote one: set_final_response keeps the
+                # higher-priority source, so report_complete / codex_task_complete are never lost.
+                sess.set_final_response(content, "turn_completed")
             if ev_type in ("completed", "turn_completed"):
                 # Spec §1.4: the agent reported completion, so a later exit is a clean one.
                 sess.completion_reported = True
@@ -4636,7 +4696,10 @@ class HubSessionManager:
         }
 
     def build_poll_command(self, session_id: str, after_seq: int = 0, timeout: int = 1800) -> str:
-        python_exe = self.base_dir / ".venv" / "Scripts" / "python.exe"
+        # K3: the interpreter the hub itself runs on, exactly as the bridge hint already does. A
+        # worktree (or any checkout without a local .venv) has no <repo>/.venv, and the parent was
+        # handed a path that did not exist.
+        python_exe = Path(sys.executable)
         poll_script = self.base_dir / "hub_poll.py"
         # R9: the poll command must reach the hub that issued it, not a hard-coded default port.
         return (
@@ -4645,7 +4708,8 @@ class HubSessionManager:
         )
 
     def _build_session_mcp_config(self, session_id: str) -> Path:
-        python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve())
+        # K3: same rule as build_poll_command -- the hub's own interpreter, never a guessed .venv.
+        python_exe = str(Path(sys.executable).resolve())
         bridge_script = str((self.base_dir / "worker_bridge_mcp.py").resolve())
         cfg = {
             "mcpServers": {
@@ -5638,8 +5702,44 @@ class HubSessionManager:
         return cls._tui_input_line(screen_text, engine) is not None
 
     @staticmethod
+    def _tui_busy_indicator(screen_text: str, engine: str = "") -> str:
+        """K1: the startup/busy indicator currently on screen, or "" when the engine is settled.
+
+        Only the bottom rows are read: a startup banner still visible far above the composer (kimi's
+        welcome box, omp's MCP list) does not mean the engine is still starting, and a transcript row
+        that merely quotes "Working…" must not hold readiness back forever.
+        """
+        eng = (engine or "").strip().lower()
+        lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
+        rows = lines[-TUI_PROMPT_SCAN_ROWS:]
+        for phrase in TUI_BUSY_PHRASES.get(eng, ()):
+            if any(phrase in ln for ln in rows):
+                return phrase
+        line_re = TUI_BUSY_LINE_RES.get(eng)
+        if line_re is not None:
+            for ln in rows:
+                if line_re.match(ln):
+                    return "spinner"
+        return ""
+
+    @classmethod
+    def _tui_ready(cls, screen_text: str, engine: str = "") -> tuple:
+        """V2(a)/W2/K1: (ready, reason) for the composer AND against the startup indicators.
+
+        K1 is the second half of readiness: every engine draws its composer before it accepts input,
+        so a visible composer is necessary but never sufficient. The caller still owns the "screen
+        did not change for TUI_READY_STABLE_SEC" half.
+        """
+        if cls._tui_input_line(screen_text, engine) is None:
+            return False, "no_prompt"
+        busy = cls._tui_busy_indicator(screen_text, engine)
+        if busy:
+            return False, f"busy:{busy}"
+        return True, "stable_prompt"
+
+    @staticmethod
     def _tui_agent_active(screen_text: str) -> bool:
-        """W3: the screen shows the agent working or answering, which confirms a submit."""
+        """W3/K2: the screen shows the agent working or answering, which confirms a submit."""
         return bool(TUI_AGENT_ACTIVE_RE.search(str(screen_text or "")))
 
     @staticmethod
@@ -5654,22 +5754,40 @@ class HubSessionManager:
         return bool((probe and probe in line) or (tail and tail in line))
 
     async def _confirm_tui_submit(
-        self, session: AgentSession, probe: str, tail: str, size_before: int, engine: str = ""
+        self,
+        session: AgentSession,
+        probe: str,
+        tail: str,
+        size_before: int,
+        engine: str = "",
+        echoed: bool = True,
+        deadline: Optional[float] = None,
     ) -> tuple:
-        """V2(b)/W3: tri-state confirmation of one Enter.
+        """V2(b)/W3/K2: tri-state confirmation of one Enter, on positive evidence only.
 
-        ("confirmed", reason) when the input row no longer holds the text, a transcript grew, or the
-        screen shows the agent at work. ("unsubmitted", reason) only when the text is POSITIVELY
-        still on the located input row. ("unknown", reason) when nothing proves either, so the
-        caller must not press Enter again.
+        ("confirmed", reason) needs one of K2's three proofs:
+          (a) the text was SEEN on the composer after typing (echoed) and that composer is now
+              located and no longer holds it -- an empty composer proves nothing on its own when
+              the text was never seen there, which is exactly how round 3 reported success while
+              the whole task still sat in kimi's box;
+          (b) the transcript grew; or
+          (c) the engine's working indicator is on screen.
+        ("unsubmitted", reason) only when the text is POSITIVELY still on the located input row.
+        ("unknown", reason) when nothing decides it yet, so the caller presses nothing more.
         """
-        deadline = time.time() + TUI_SUBMIT_CONFIRM_SEC
+        # K2: when the text was never seen on the composer, an empty composer proves nothing, so the
+        # look keeps watching for ~15 s instead of deciding. A seen echo keeps the shorter W3 window.
+        # The caller may pass a deadline, so retrying cannot stack one full window on top of another.
+        window = TUI_SUBMIT_CONFIRM_SEC if echoed else TUI_SUBMIT_EVIDENCE_SEC
+        limit = time.time() + window
+        if deadline is not None:
+            limit = min(limit, deadline)
         last_line: Optional[str] = None
-        while time.time() < deadline:
+        while time.time() < limit:
             await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
             screen = session.get_clean_screen_text(max_lines=40)
             last_line = self._tui_input_line(screen, engine)
-            if last_line is not None and not self._composer_holds(last_line, probe, tail):
+            if echoed and last_line is not None and not self._composer_holds(last_line, probe, tail):
                 return "confirmed", "input_line_cleared"
             if session.transcript_path:
                 try:
@@ -5682,6 +5800,11 @@ class HubSessionManager:
                     pass
             if self._tui_agent_active(screen):
                 return "confirmed", "agent_active"
+            if not echoed and self._composer_holds(last_line, probe, tail):
+                # K2: the text the hub typed is visibly sitting on the composer while nothing
+                # indicates work -- "seen still unsent", so the caller may press Enter again (the
+                # first Enter was swallowed because the engine was still starting up).
+                return "unsubmitted", "still_in_input_line"
         if last_line is None:
             last_line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
         if self._composer_holds(last_line, probe, tail):
@@ -5691,7 +5814,15 @@ class HubSessionManager:
     async def _submit_text_to_tui(
         self, session: AgentSession, text: str, submit_key: str
     ) -> Dict[str, Any]:
-        """V2(b)(c)/W3: type the text, press Enter once, and retry only on positive evidence."""
+        """V2(b)(c)/W3/K2: type the text, press Enter, and accept the submit only on evidence.
+
+        K2: the first look at the composer after typing is not allowed to decide anything on its own.
+        `echoed` records whether the text was really SEEN on the located composer; an empty composer
+        with echoed=False (kimi's box was still booting, then the screen redrew) proves nothing, so
+        the check keeps watching for TUI_SUBMIT_EVIDENCE_SEC. If the text then appears on the
+        composer with nothing indicating work, one more Enter is pressed (within the same retry
+        budget); if nothing decides it, the honest outcome is ok:null / "unconfirmed".
+        """
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
             return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
@@ -5709,10 +5840,20 @@ class HubSessionManager:
         line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
         echoed = self._composer_holds(line, probe, tail)
         attempts = 0
+        # K2: echoed is the FIRST look, right after typing, and it is what the result reports. The
+        # later presses may additionally be judged by (a) once the text has really been seen sitting
+        # on the composer -- that is what turns "the box looked empty while kimi was still booting"
+        # into one more Enter and a real success instead of a success that was never earned.
+        seen = echoed
+        # K2: one evidence budget for the whole submit, not one per Enter.
+        evidence_deadline = time.time() + TUI_SUBMIT_EVIDENCE_SEC
         while attempts < TUI_SUBMIT_MAX_TRIES:
             attempts += 1
             session.write_input(submit_key)
-            state, reason = await self._confirm_tui_submit(session, probe, tail, size_before, engine)
+            state, reason = await self._confirm_tui_submit(
+                session, probe, tail, size_before, engine, echoed=seen,
+                deadline=evidence_deadline,
+            )
             if state == "confirmed":
                 return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed, "label": "成功"}
             if state == "unknown":
@@ -5720,6 +5861,7 @@ class HubSessionManager:
                 # more here, and one of those Enters selected "Trust and continue" on a dialog.
                 return {"ok": None, "reason": "unconfirmed", "attempts": attempts, "echoed": echoed, "label": "未确认"}
             # "unsubmitted": the text is visibly still on the input row, so one more Enter is safe.
+            seen = True
             await asyncio.sleep(TUI_SUBMIT_RETRY_STEP_SEC * attempts)
         return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts, "echoed": echoed, "label": "失败"}
 
@@ -5771,10 +5913,14 @@ class HubSessionManager:
                 stable_since = now
             input_line = self._tui_input_line(screen_txt, session.engine)
             stable = (now - stable_since) >= TUI_READY_STABLE_SEC
+            prompted, prompt_reason = self._tui_ready(screen_txt, session.engine)
             if not screen_txt.strip():
                 ready = {"ready": False, "reason": "no_screen"}
-            elif input_line is None:
-                ready = {"ready": False, "reason": "no_prompt"}
+            elif not prompted:
+                # K1: a composer alone is not readiness. The engine draws it while still booting
+                # ("⠋ Preparing Kimi Code…", "Connecting to MCP servers:", "Starting MCP servers")
+                # and swallows the Enter typed then, so the reason names the indicator that is up.
+                ready = {"ready": False, "reason": prompt_reason}
             elif not stable:
                 ready = {"ready": False, "reason": "waiting_stable"}
             else:

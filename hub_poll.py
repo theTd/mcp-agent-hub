@@ -3,8 +3,11 @@
 主 Agent 后台阻塞监听器 (Parent Agent Blocking Poll CLI).
 
 用法示例（主 Agent 在后台运行此命令，当 Sub-Agent 发来消息、提问或完成任务时，此命令会立即打印 JSON 并退出，从而第一时间唤醒主 Agent）：
-  .venv\\Scripts\\python.exe hub_poll.py --session <session_id> --after-seq 0 --timeout 1800
-  .venv\\Scripts\\python.exe hub_poll.py --session all --after-seq 0 --timeout 1800
+  python hub_poll.py --session <session_id> --after-seq 0 --timeout 1800
+  python hub_poll.py --session all --after-seq 0 --timeout 1800
+
+K3: 这里不要再写死 <repo>/.venv 的解释器路径。后台轮询命令由 session_manager.build_poll_command()
+用 sys.executable（Hub 自己运行时用的那个解释器）拼出来，工作树里没有 .venv 也能用。
 """
 import argparse
 import json

@@ -643,6 +643,12 @@ async def read_subagent_screen(
             "recent_events": hub.get_worker_events(session_id=session_id, after_seq=0)[-10:],
             "transcript_summary": transcript_summary,
             "sanitized_screen_lines": sanitize_tui_screen_text(raw_txt, max_lines=25),
+            # K6: the noisy line filter strips the composer, so a parent could not see text that was
+            # typed but never sent. Report that one row separately; the sanitising stays as it was.
+            "input_line": HubSessionManager._tui_input_line(raw_txt, session.engine),
+            # K1: whether the engine is still starting up, so "the text is in the box and Enter did
+            # nothing" can be read as the known boot race instead of a broken session.
+            "busy_indicator": HubSessionManager._tui_busy_indicator(raw_txt, session.engine),
         }
         if include_raw_tui:
             res["raw_screen_text"] = raw_txt
@@ -669,8 +675,12 @@ async def read_subagent_screen(
         "step_count": max(persisted.get("step_count", 0), transcript_summary.get("step_count", 0)),
         "current_activity": persisted.get("current_activity", ""),
         "final_response": persisted.get("final_response") or transcript_summary.get("latest_conclusion"),
+        "final_response_source": persisted.get("final_response_source"),
         "transcript_summary": transcript_summary,
         "sanitized_screen_lines": sanitized_lines,
+        # K6: an ended record has no live composer to report; the field stays null so a caller can
+        # read it the same way on both paths, and the archived final answer is named as its source.
+        "input_line": None,
     }
     if include_raw_tui:
         res["raw_screen_text"] = raw_txt
@@ -712,7 +722,8 @@ async def terminate_subagent(session_id: str) -> Dict[str, Any]:
             }
         raise ValueError(f"Session '{session_id}' not found.")
 
-    result = hub.close_session(session_id)
+    # K5: the parent agent ended it, so the lifecycle event says 主 Agent, not 用户.
+    result = hub.close_session(session_id, source="mcp")
     final_info = hub.get_subagent_final_response(session_id)
     return {
         "terminated": True,
@@ -1230,8 +1241,12 @@ async def api_send_input(session_id: str, req: Request):
 
 @app.delete("/api/sessions/{session_id}")
 async def api_delete_session(session_id: str):
-    """B9: removal never rewrites the final status an ended process already earned."""
-    result = hub.close_session(session_id)
+    """B9: removal never rewrites the final status an ended process already earned.
+
+    K5: this is the console’s own removal (the pane’s 终止 button), so the lifecycle event says the
+    user did it; only the MCP terminate_subagent tool passes source="mcp".
+    """
+    result = hub.close_session(session_id, source="console")
     if not result.get("found"):
         return not_found(f"找不到会话 {session_id}")
     return {
