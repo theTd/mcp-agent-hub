@@ -5,9 +5,12 @@ from ctypes import wintypes
 import datetime
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,8 +24,14 @@ import pyte
 from PIL import Image
 from winpty import PtyProcess
 
+# R6: the real class is kept apart from the module-level name so a test can replace
+# session_manager.PtyProcess with a fake without making the shutdown tree-kill touch a fake PID.
+REAL_PTY_PROCESS = PtyProcess
+
 from model_discovery import AgentModelDiscovery
 from transcript_summarizer import TranscriptSummarizerRegistry, sanitize_tui_screen_text
+
+logger = logging.getLogger("mcp-agent-hub.session_manager")
 
 # Win32 API constants for Desktop GUI window capture & off-screen tucking
 user32 = ctypes.windll.user32
@@ -419,7 +428,7 @@ class HubDatabase:
         created_at, updated_at, ended_at, exit_code, step_count, last_task,
         effective_model, effective_thinking_level, end_reason, archived_at,
         resume_count, last_resumed_at, resumable, resume_block_reason,
-        conversation_ref,
+        profile_snapshot, conversation_ref,
         CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END
             AS has_final_response
     """
@@ -451,6 +460,10 @@ class HubDatabase:
                 d["resumable"] = bool(d.get("resumable"))
                 d["archived"] = True
                 d["end_reason_label"] = END_REASON_LABELS.get(str(d.get("end_reason") or ""), "")
+                # W1: the list row must carry the same inputs the single-record path has, or
+                # compute_resumable sees no snapshot / a JSON string and condemns every record.
+                d["profile_snapshot"] = self._decode_json_column(d.get("profile_snapshot"), None)
+                d["conversation_ref"] = self._decode_json_column(d.get("conversation_ref"), {})
                 out.append(d)
             return out
 
@@ -525,6 +538,25 @@ class HubDatabase:
         params.append(session_id)
         with self._lock, self._conn() as conn:
             conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
+
+    def update_archive_fields_bulk(self, updates: List[tuple]) -> None:
+        """R8: writes many rows' archive fields in ONE transaction (one commit per archive page)."""
+        if not updates:
+            return
+        allowed = set(ARCHIVE_COLUMNS) | {"status", "ended_at", "current_activity"}
+        with self._lock, self._conn() as conn:
+            for session_id, fields in updates:
+                sets: List[str] = []
+                params: List[Any] = []
+                for key, value in (fields or {}).items():
+                    if key not in allowed:
+                        continue
+                    sets.append(f"{key}=?")
+                    params.append(value)
+                if not sets:
+                    continue
+                params.append(session_id)
+                conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
 
     def reset_session_after_resume(self, session_id: str) -> None:
         """A revived session is live again: it leaves the archive and its end state (§5.3)."""
@@ -607,11 +639,18 @@ RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
 ARCHIVE_RETENTION_DAYS = 30
 ARCHIVE_RETENTION_KEEP_NEWEST = 500
 ARCHIVE_PRUNE_INTERVAL_SEC = 6 * 60 * 60
+# R5/R6: a graceful stop must not hang on a CLI that ignores the first signal or a DSH host that
+# takes its time; each session is bounded and so is the whole loop.
+SHUTDOWN_MAX_SEC = 15.0
+SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC = 2.0
 AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
 CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
 KIMI_LOCKED_MESSAGE = "该 Kimi 会话正被另一个进程使用"
 DSH_UNKNOWN_JOB_MESSAGE = "DSH 服务已不认识这个任务（可能重启过）"
 DSH_STATE_UNAVAILABLE_MESSAGE = "DSH 任务状态不可用：{reason}"
+# R3: these are ENDED jobs. Re-attaching one as "completed" lets the next message /continue it;
+# refusing them made the archive say 可恢复 while 恢复 without text failed.
+DSH_ENDED_JOB_STATUSES = ("done", "failed", "timeout", "cancelled")
 RESUME_FAILED_PREFIX = "恢复失败："
 # A4: a resume failure that no re-check can undo is sticky. agy opened a different conversation
 # (only a real resume can fix it) and codex archived the conversation (only codex unarchive can);
@@ -633,15 +672,47 @@ WORKER_MESSAGE_LOG_CAP = 2000
 # V2: the startup injection waits for a settled TUI with a visible prompt instead of a fixed delay,
 # then proves the Enter really submitted the text.
 TUI_READY_STABLE_SEC = 1.5
-TUI_READY_TIMEOUT_SEC = 20.0
 TUI_STARTUP_WINDOW_SEC = 90.0
-TUI_PROMPT_MAX_LINES = 2
-TUI_PROMPT_LINE_RE = re.compile(r"(?:^|[\s\u2502\u2503])(?:[>\u276f\u203a\u00bb$%#\u039b]|[0-9]+[)>.\u276f])(?:\s|$)")
+# W2: the composer rows found in the real captures. kimi draws a boxed row; omp and codex (and
+# agy, which uses the same Go TUI shape) draw a bare prompt glyph with status lines below it.
+TUI_INPUT_BOX_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*[│┃|]\s*$")
+TUI_INPUT_BOX_OPEN_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*$")
+TUI_INPUT_GLYPH_RE = re.compile(r"^\s*(?:[│┃|]\s*)?(?:[>❯›»])\s?(.*)$")
 TUI_SUBMIT_CONFIRM_SEC = 3.0
 TUI_SUBMIT_CONFIRM_POLL_SEC = 0.25
 TUI_SUBMIT_MAX_TRIES = 3
 TUI_SUBMIT_RETRY_STEP_SEC = 1.0
 TUI_TYPE_SETTLE_SEC = 0.8
+# W2: engine input boxes do not live on the last line (kimi draws two status lines under its
+# composer), so the prompt is searched in the bottom rows of the screen, per engine.
+TUI_PROMPT_SCAN_ROWS = 10
+# R1/W4: the dialog watcher ticks at this interval for the whole startup window.
+TUI_DIALOG_POLL_SEC = 0.5
+TUI_TRUST_CONFIRM_SETTLE_SEC = 0.5
+# The trust dialogs seen in the real captures (agy, codex, omp, kimi). Enter confirms the
+# highlighted "Yes, I trust this folder"-style option; the same handler must be alive for the
+# whole startup window, not only for the first half second (R1/W4).
+TUI_TRUST_DIALOG_PHRASES = (
+    "Trust this folder?",
+    "Trust and continue",
+    "Do you trust the contents of this project?",
+    "Do you trust the authors of the files in this folder?",
+    "Do you trust the files in this folder?",
+    "Yes, I trust this folder",
+)
+# W3: the screen proves the agent is working or answering when one of these is visible.
+TUI_AGENT_ACTIVE_RE = re.compile(
+    r"(?:Working…|Working \(|\bthinking\b|Running a command|esc to interrupt|Worked for"
+    r"|[\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f])",
+    re.IGNORECASE,
+)
+# W9: the raw history is a bounded 512 KB window. Trimming rebuilds the joined text, so it runs
+# with a little slack instead of on every 4 KB PTY chunk (the cap is still enforced on the tail).
+HISTORY_TRIM_SLACK_BYTES = 64 * 1024
+HISTORY_TRUNCATED_PREFIX = "\x1b[90m[较早的输出已截断]\x1b[0m\r\n"
+# R7: an agy resume whose archived transcript is still locked by another watcher gets this long
+# to become claimable, then the watcher stops instead of spinning for the session's lifetime.
+AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
 ARCHIVE_COLUMNS = (
     "end_reason", "archived_at", "spawned_at", "profile_snapshot", "conversation_ref",
     "scrollback", "last_screen", "parent_messages", "resume_count", "last_resumed_at",
@@ -652,6 +723,40 @@ ARCHIVE_COLUMNS = (
 def resume_banner(resume_count: int) -> str:
     """The separator a revived pane shows between the archived output and the new one (spec §5.3)."""
     return f"\r\n\x1b[90m── 已恢复（第 {int(resume_count)} 次）──\x1b[0m\r\n"
+
+
+def trim_history_text(text: str, max_bytes: int) -> str:
+    """W9: cap a raw terminal history at max_bytes without cutting a line or the newest banner.
+
+    The old buffer dropped whole PTY chunks, so the archived scrollback and every resume banner
+    left in one step. This cuts bytes from the front, moves to the next line break, prefixes a
+    grey notice, and never eats the newest "── 已恢复（第 N 次）──" line (nor what follows it)
+    unless that part alone is larger than the whole budget.
+    """
+    if max_bytes <= 0:
+        return ""
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= max_bytes:
+        return text
+    prefix = HISTORY_TRUNCATED_PREFIX
+    budget = max_bytes - len(prefix.encode("utf-8"))
+    if budget <= 0:
+        return prefix
+    start = len(raw) - budget
+    next_break = raw.find(b"\n", start)
+    if next_break >= 0:
+        start = next_break + 1
+    # Keep the newest banner and everything after it when that tail alone fits.
+    marker = "\x1b[90m── 已恢复（"
+    idx = text.rfind(marker)
+    if idx >= 0:
+        banner_start = len(text[:idx].encode("utf-8", "replace"))
+        if banner_start >= 2 and text[:idx].endswith("\r\n"):
+            banner_start -= 2
+        if len(raw) - banner_start <= budget and banner_start < start:
+            start = banner_start
+    body = raw[start:].decode("utf-8", "replace")
+    return prefix + body
 
 
 def _store_root(env_name: str, default: Path) -> Path:
@@ -885,6 +990,12 @@ class AgentSession:
 
         # Connected WebSocket queues for live browser xterm.js streaming
         self.ws_queues: Set[asyncio.Queue] = set()
+        # W7: one closer per browser socket, so removing the session from the live list also ends
+        # the sockets with a normal close code instead of leaving them open and silent forever.
+        self.ws_close_hooks: Dict[asyncio.Queue, Callable[[], Any]] = {}
+        # W8: a resumed omp session clears saved lines with ESC[3J; a split sequence must not slip
+        # through between two PTY chunks.
+        self._esc3j_carry: str = ""
         self.pty: Optional[PtyProcess] = None
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1002,6 +1113,11 @@ class AgentSession:
 
     def _on_pty_output(self, data: str):
         detected_tools = []
+        # W8: omp clears the screen AND its saved lines when it starts (ESC[2J + ESC[3J). On a
+        # resumed session the saved lines are the archived output and the resume banner, so the
+        # erase-saved-lines half never reaches the history or a client.
+        if self.resume_count:
+            data = self._strip_saved_lines_erase(data)
         with self._lock:
             self.last_output_at = time.time()
             try:
@@ -1022,11 +1138,17 @@ class AgentSession:
                     detected_tools.append((t_name, t_arg))
 
             self.raw_history.append(data)
-            self.raw_history_bytes += len(data)
+            # W9: count UTF-8 bytes (the cap is 512 KB, not 512k characters) and trim the JOINED
+            # history at a line break instead of dropping whole chunks; the slack keeps the
+            # 512 KB rebuild off every PTY read once the buffer is full.
+            self.raw_history_bytes += len(data.encode("utf-8", "replace"))
             self.raw_history_rev += 1
-            while self.raw_history_bytes > self.max_history_bytes and len(self.raw_history) > 1:
-                removed = self.raw_history.pop(0)
-                self.raw_history_bytes -= len(removed)
+            if self.raw_history_bytes > self.max_history_bytes + HISTORY_TRIM_SLACK_BYTES:
+                joined = "".join(self.raw_history)
+                trimmed = trim_history_text(joined, self.max_history_bytes)
+                if trimmed != joined:
+                    self.raw_history = [trimmed]
+                    self.raw_history_bytes = len(trimmed.encode("utf-8", "replace"))
             # Q11: the fan-out targets belong to the same critical section as the history append.
             # A WebSocket registered afterwards gets this chunk inside its replay snapshot, never
             # twice (append + live frame) and never zero times (the old snapshot/register gap).
@@ -1047,6 +1169,42 @@ class AgentSession:
         except Exception:
             pass
 
+    def _strip_saved_lines_erase(self, data: str) -> str:
+        """W8: removes ESC[3J (erase saved lines) from a resumed session's output.
+
+        The sequence can be split across two PTY reads, so up to three trailing bytes are carried
+        into the next call. ESC[2J (erase display) is deliberately left alone: it only clears the
+        viewport, and the bundled xterm.js 5.5.0 has no scrollOnEraseInDisplay option.
+        """
+        if not data:
+            return data
+        buf = self._esc3j_carry + data
+        self._esc3j_carry = ""
+        out = buf.replace("\x1b[3J", "")
+        for size in (3, 2, 1):
+            suffix = "\x1b[3J"[:size]
+            if out.endswith(suffix):
+                self._esc3j_carry = suffix
+                out = out[:-size]
+                break
+        return out
+
+    def register_ws_closer(self, q: asyncio.Queue, closer: Callable[[], Any]) -> None:
+        """W7: the server registers how to close the browser socket that owns this queue."""
+        with self._lock:
+            self.ws_close_hooks[q] = closer
+
+    def close_ws_frontends(self) -> None:
+        """W7: normal-close every browser socket still attached to this session (normal code 1000)."""
+        with self._lock:
+            hooks = list(self.ws_close_hooks.values())
+            self.ws_close_hooks.clear()
+        for closer in hooks:
+            try:
+                closer()
+            except Exception:
+                pass
+
     def attach_ws_queue(self) -> tuple:
         """Q11: snapshot the replay and register the live queue in one atomic step.
 
@@ -1063,6 +1221,7 @@ class AgentSession:
     def detach_ws_queue(self, q: asyncio.Queue) -> None:
         with self._lock:
             self.ws_queues.discard(q)
+            self.ws_close_hooks.pop(q, None)
 
     def adopt_ws_frontends(self, previous: "AgentSession") -> None:
         """A1: an open browser socket keeps streaming after a resume replaces the session object.
@@ -1072,6 +1231,9 @@ class AgentSession:
         is pushed separately (push_ws_frame) because the seed in raw_history is replay-only.
         """
         self.ws_queues = previous.ws_queues
+        # W7: the closers travel with the sockets, or a terminate after the resume could no longer
+        # close them.
+        self.ws_close_hooks = previous.ws_close_hooks
 
     def push_ws_frame(self, frame: str) -> None:
         """A1: writes one frame to every browser socket already attached to this session id."""
@@ -2418,8 +2580,10 @@ class HubSessionManager:
                 return None
             if session.raw_history_rev == session._scrollback_rev_written:
                 return None
-        text = "".join(session.raw_history)
-        raw = text.encode("utf-8", "replace")[-RESUME_SCROLLBACK_MAX_BYTES:]
+        # W9: cut at a line break and keep the newest resume banner (a raw byte slice can split an
+        # escape sequence or drop the banner the pane is supposed to show above the new output).
+        text = trim_history_text("".join(session.raw_history), RESUME_SCROLLBACK_MAX_BYTES)
+        raw = text.encode("utf-8", "replace")
         session._scrollback_written_at = now
         session._scrollback_rev_written = session.raw_history_rev
         return zlib.compress(raw, 6)
@@ -2723,14 +2887,15 @@ class HubSessionManager:
         sess.attach_offset = int(built.get("attach_offset") or 0)
         sess.resume_count = count
         sess.last_resumed_at = time.time()
-        # Deliberately no final_response carry-over: it belongs to the ended turn, and its high
+        # R10: deliberately no final_response carry-over. It belongs to the ended turn, and its high
         # source priority would block the revived turn's own (lower-priority) answer from being
-        # recorded. The old reply stays in the archive record / the pane's scrollback.
+        # recorded. reset_session_after_resume clears it on purpose; the previous reply survives only
+        # in the scrollback (the archived pane replay), never as this session's final_response.
         # Spec §5.3: the pane starts with the archived output, then the resume separator.
         archived = self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
         sess.raw_history = [seed]
-        sess.raw_history_bytes = len(seed)
+        sess.raw_history_bytes = len(seed.encode("utf-8", "replace"))
         sess.raw_history_rev = 1
         if engine == "dsh":
             sess.dsh_spec = dict(snapshot.get("dsh_spec") or {})
@@ -2887,6 +3052,13 @@ class HubSessionManager:
                 ws_prefix=resume_banner(sess.resume_count) if old is not None else None,
             )
         except Exception as e:
+            # R9: a spawn that raised after the PTY had already started must not leave that process
+            # behind while the old (archived) object is put back in the live list.
+            if sess.pty is not None:
+                try:
+                    sess.pty.terminate(force=True)
+                except Exception:
+                    pass
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -2962,6 +3134,31 @@ class HubSessionManager:
         job = data.get("job")
         return isinstance(job, dict) and bool(job.get("id"))
 
+    @staticmethod
+    def _dsh_continue_says_running(reason: str) -> bool:
+        """R5: the /continue refusal that means "this job is running, steer it instead"."""
+        text = str(reason or "").lower()
+        return any(marker in text for marker in (
+            "worker is running", "already running", "is running", "正在运行", "运行中",
+        ))
+
+    async def _dsh_post_message(
+        self, job_id: str, token: str, text: str, timeout: float = 10.0
+    ):
+        """R5: posts text to a RUNNING dsh job through /messages (returns the response or None)."""
+        clean = str(text or "").strip()
+        if not job_id or not token or not clean:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=max(1.0, float(timeout))) as client:
+                return await client.post(
+                    f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/messages",
+                    headers={"x-dsh-crew-job-token": token},
+                    json={"message": clean},
+                )
+        except Exception:
+            return None
+
     async def _resume_dsh_session(
         self, session_id: str, record: Dict[str, Any], text: Optional[str]
     ) -> Dict[str, Any]:
@@ -2971,11 +3168,15 @@ class HubSessionManager:
         ref = dict(record.get("conversation_ref") or {})
         job_id = str(ref.get("dsh_job_id") or "")
         built = self.build_resume_launch(record)
+        # R5: the job's own messaging token is kept in the conversation reference so the
+        # /messages fallback (and a later steering message) still works after a hub restart.
+        old_token = str(ref.get("dsh_token") or "")
         token = str(uuid.uuid4())
         clean = str(text or "").strip()
         new_job = ""
         cjob: Dict[str, Any] = {}
         jstatus: Optional[str] = None
+        dsh_send_mode = "attach"
 
         # Talk to DSH first: a failed continue/re-attach must not replace the archived record.
         if clean:
@@ -2993,11 +3194,25 @@ class HubSessionManager:
                 raise ValueError("DSH 恢复失败：DSH 返回了非 JSON 内容") from None
             if not resp.is_success or not isinstance(data, dict) or not data.get("ok"):
                 err = data.get("error") if isinstance(data, dict) else None
-                raise ValueError(f"DSH 恢复失败：{err or f'HTTP {resp.status_code}'}")
-            cjob = data.get("job") or {}
-            new_job = str(cjob.get("id") or "")
-            if not new_job:
-                raise ValueError("DSH 恢复失败：continue 没有返回新的任务 ID")
+                err_text = str(err or f"HTTP {resp.status_code}")
+                # R5: a running job refuses /continue ("worker is running"); a message reaches it.
+                if old_token and self._dsh_continue_says_running(err_text):
+                    fallback = await self._dsh_post_message(job_id, old_token, clean)
+                    if fallback is None or not fallback.is_success:
+                        raise ValueError(
+                            f"DSH 恢复失败：{err_text}（改用 /messages 发送也失败）"
+                        )
+                    jstatus = "running"
+                    new_job = job_id
+                    dsh_send_mode = "message"
+                else:
+                    raise ValueError(f"DSH 恢复失败：{err_text}")
+            else:
+                cjob = data.get("job") or {}
+                new_job = str(cjob.get("id") or "")
+                if not new_job:
+                    raise ValueError("DSH 恢复失败：continue 没有返回新的任务 ID")
+                dsh_send_mode = "continue"
         else:
             # No text: nothing is sent, only the virtual terminal is re-attached (§4). A8: an
             # unreadable / failed / cancelled / unknown job fails the resume with a Chinese reason
@@ -3019,7 +3234,9 @@ class HubSessionManager:
             if not isinstance(jview, dict) or not jview.get("id"):
                 raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason="DSH 返回的任务信息无法识别"))
             jstatus = str(jview.get("status") or "")
-            if jstatus not in ("running", "needs_input", "done"):
+            # R3: running / needs_input / every ended status re-attach; only a missing or
+            # unreadable status refuses (A8's message).
+            if jstatus not in ("running", "needs_input") + DSH_ENDED_JOB_STATUSES:
                 raise ValueError(
                     DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=f"任务状态为 {jstatus or '未知'}")
                 )
@@ -3040,21 +3257,40 @@ class HubSessionManager:
         if old is not None:
             self._release_transcripts(session_id)
         self.db.reset_session_after_resume(session_id)
-        sess.dsh_token = token
         if clean:
-            sess.dsh_job_id = new_job
+            # R5: a /messages delivery keeps the job and its original token; a /continue delivery
+            # gets the new job and the new token. Both are persisted with the conversation ref.
+            active_job = new_job
+            active_token = token if dsh_send_mode == "continue" else old_token
+            sess.dsh_job_id = active_job
+            sess.dsh_token = active_token
             sess.conversation_ref = {
-                "dsh_job_id": new_job,
+                "dsh_job_id": active_job,
                 "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
+                "dsh_token": active_token,
             }
             sess.status = "running"
-            sess.current_activity = f"Continuing DSH session ({new_job}): {clean[:60]}"
+            if dsh_send_mode == "message":
+                sess.current_activity = f"Messaged running DSH job ({active_job}): {clean[:60]}"
+                sess.emit_virtual_ansi(
+                    "\r\n\x1b[1;36m➤ [Parent Steer Injected into running DSH job " + str(active_job) + "]: " + str(clean[:120]) + "\x1b[0m\r\n"
+                )
+            else:
+                sess.current_activity = f"Continuing DSH session ({active_job}): {clean[:60]}"
         elif jstatus in ("running", "needs_input"):
+            sess.dsh_token = old_token or token
             sess.status = "running"
             sess.current_activity = f"Re-attached DSH job {job_id}"
-        elif jstatus == "done":
+            if old_token:
+                sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
+        elif jstatus in DSH_ENDED_JOB_STATUSES:
+            # R3: ended-but-live. The next message goes through /continue, exactly like the
+            # send_to_subagent path that always accepted a done/failed/cancelled job.
+            sess.dsh_token = old_token or ""
             sess.status = "completed"
-            sess.current_activity = f"Re-attached DSH job {job_id}"
+            sess.current_activity = f"Re-attached ended DSH job {job_id} ({jstatus})"
+            if old_token:
+                sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
         self.persist_session(sess)
         self.record_worker_event(
             session_id,
@@ -3066,9 +3302,11 @@ class HubSessionManager:
             },
         )
         if clean:
-            loop.create_task(self._watch_dsh_hub_job(sess, new_job, token))
+            loop.create_task(self._watch_dsh_hub_job(
+                sess, new_job, sess.dsh_token or token
+            ))
         elif jstatus in ("running", "needs_input"):
-            loop.create_task(self._watch_dsh_hub_job(sess, job_id, token))
+            loop.create_task(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token))
         injection = "dsh_continue" if clean else "dsh_attach"
         delivery = {
             "delivered": bool(clean),
@@ -3089,37 +3327,64 @@ class HubSessionManager:
         }
 
     def list_archive(self, limit: int = 50, offset: int = 0, query: str = "") -> Dict[str, Any]:
-        """The console's and the parent agent's archive view (spec §6)."""
+        """The console's and the parent agent's archive view (spec §6).
+
+        W1/R8: the page is refreshed from the same complete rows the single-record path uses, and
+        all changed rows are written in one transaction instead of one commit per row.
+        """
         rows = self.db.list_archived(limit=limit, offset=offset, query=query)
+        changed: List[tuple] = []
+        for rec in rows:
+            if not self._recheck_resumable(rec):
+                continue
+            changed.append((
+                str(rec.get("session_id") or ""),
+                {
+                    "resumable": 1 if rec.get("resumable") else 0,
+                    "resume_block_reason": rec.get("resume_block_reason") or None,
+                },
+            ))
+        try:
+            self.db.update_archive_fields_bulk(changed)
+        except Exception:
+            # A failed refresh write must not take the archive page down; the next read retries.
+            pass
         return {
-            "sessions": [self._archive_summary(self._refresh_resumable(rec)) for rec in rows],
+            "sessions": [self._archive_summary(rec) for rec in rows],
             "total": self.db.count_archived(query),
             "limit": max(1, min(int(limit or 50), 200)),
             "offset": max(0, int(offset or 0)),
         }
 
-    def _refresh_resumable(self, rec: Dict[str, Any]) -> Dict[str, Any]:
-        """A5: the archive endpoints re-check the cheap filesystem facts and persist a change.
+    def _recheck_resumable(self, rec: Dict[str, Any]) -> bool:
+        """A5/W1: re-checks the cheap filesystem facts and updates the record in place.
 
-        compute_resumable keeps A4's sticky reasons itself, so an agy/codex failure can never come
-        back as "resumable" just because its files reappeared. A record with no end state at all is
-        still live and is left to the exit path.
+        Returns True when the stored verdict must be written. A record that never selected the
+        snapshot and the conversation reference (a partial list row, or an older caller) is left
+        exactly as stored: a "not resumable" verdict computed from missing columns is a lie that
+        W1 showed will be persisted for every row.
         """
+        if "profile_snapshot" not in rec or "conversation_ref" not in rec:
+            return False
         end_reason = str(rec.get("end_reason") or "")
         if not rec.get("archived_at") and not end_reason:
-            return rec
+            return False
         ok, reason = self.compute_resumable(rec)
-        reason_text = "" if ok else reason
         stored_ok = bool(rec.get("resumable"))
         stored_reason = str(rec.get("resume_block_reason") or "")
         rec["resumable"] = ok
         rec["resume_block_reason"] = None if ok else reason
-        if stored_ok != ok or stored_reason != reason_text:
+        return stored_ok != ok or stored_reason != ("" if ok else reason)
+
+    def _refresh_resumable(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+        """A5: the single-record archive endpoint re-checks and persists a change."""
+        session_id = str(rec.get("session_id") or "")
+        if self._recheck_resumable(rec):
             try:
                 self.db.update_archive_fields(
-                    str(rec.get("session_id") or ""),
-                    resumable=1 if ok else 0,
-                    resume_block_reason=None if ok else reason,
+                    session_id,
+                    resumable=1 if rec.get("resumable") else 0,
+                    resume_block_reason=rec.get("resume_block_reason") or None,
                 )
             except Exception:
                 pass
@@ -3279,6 +3544,9 @@ class HubSessionManager:
             sess.end_reason = "terminated"
         self._archive_session(sess)
         del self.sessions[session_id]
+        # W7: the pane the console is about to remove still owns a socket; end it normally instead
+        # of leaving the server side open and silent for the rest of the hub's life.
+        sess.close_ws_frontends()
         if terminated:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
@@ -3294,22 +3562,71 @@ class HubSessionManager:
             )
         return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
 
+    @staticmethod
+    def _cancel_dsh_job(job_id: str, timeout: float = SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC) -> bool:
+        """R5: stops a live DSH job at hub shutdown so a restart can /continue it, not meet /cancel."""
+        if not job_id:
+            return False
+        try:
+            resp = httpx.post(
+                f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel",
+                timeout=max(0.2, float(timeout)),
+            )
+            return bool(resp.is_success)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _terminate_pty_tree(sess: AgentSession, budget: float = 2.0) -> None:
+        """R6: kills a live PTY's process tree (not just the root) within a bounded time.
+
+        A Windows PTY's children (MCP servers, shells) survive a plain terminate of the root; a
+        surviving kimi keeps its per-session lock, which makes the archived row refuse to resume.
+        The taskkill is only used for a real winpty process, never in tests with a fake PID.
+        """
+        pty = sess.pty
+        if pty is None:
+            return
+        pid = getattr(pty, "pid", None)
+        if pid and isinstance(pty, REAL_PTY_PROCESS):
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=max(0.2, min(2.0, float(budget))),
+                )
+            except Exception:
+                pass
+        try:
+            pty.terminate(force=True)
+        except Exception:
+            pass
+
     def archive_all_sessions_on_shutdown(self) -> int:
-        """A6: a graceful hub stop archives every in-memory session, flushing scrollback + screen.
+        """A6/R5/R6/W7: a graceful hub stop archives every in-memory session, flushing scrollback + screen.
 
         A live one becomes interrupted (spec §1.5) and is resumable afterwards; an already-ended one
-        keeps its own reason. Each session is best effort — one failure must not stop the others.
+        keeps its own reason. R6 terminates a live PTY's process tree, R5 cancels a live DSH job, and
+        W7 closes the browser sockets. Each session is best effort and the whole loop is bounded.
         """
         archived = 0
+        deadline = time.time() + SHUTDOWN_MAX_SEC
         for session_id, sess in list(self.sessions.items()):
             try:
                 if sess.is_process_alive():
                     end_reason = "interrupted"
                     sess.status = "interrupted"
                     sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
+                    remaining = min(2.0, deadline - time.time())
+                    if remaining > 0:
+                        if sess.dsh_job_id:
+                            self._cancel_dsh_job(str(sess.dsh_job_id), timeout=remaining)
+                        elif sess.pty is not None:
+                            self._terminate_pty_tree(sess, budget=remaining)
                 else:
                     end_reason = sess.end_reason or sess.classify_end_reason(sess.exit_code)
                 self._archive_session(sess, end_reason=end_reason)
+                sess.close_ws_frontends()
                 archived += 1
             except Exception:
                 continue
@@ -4178,6 +4495,7 @@ class HubSessionManager:
                             sess.conversation_ref = {
                                 "dsh_job_id": cjob["id"],
                                 "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
+                                "dsh_token": new_token,
                             }
                             sess.status = "running"
                             # B9: last_task stays the initial task; follow-ups live in current_activity.
@@ -4207,6 +4525,17 @@ class HubSessionManager:
             else:
                 clean_txt = text.rstrip("\r\n") if press_enter else text
                 pty_written = sess.write_input(clean_txt)
+                if pty_written and clean_txt:
+                    # W11: a live steering write is the last injection too, so the tool result no
+                    # longer shows last_injection:null after a send_to_subagent.
+                    sess.last_injection = {
+                        "at": round(time.time(), 3),
+                        "ok": True,
+                        "reason": "live_write",
+                        "attempts": 1,
+                        "mode": "parent_message",
+                        "label": "已写入",
+                    }
                 if press_enter:
                     try:
                         loop = asyncio.get_running_loop()
@@ -4999,13 +5328,25 @@ class HubSessionManager:
             # same dir — and keep looking for a different new conversation, which is the failure.
             resume_attach_offset = int(session.attach_offset or 0)
             verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
+            # R7: the wait for the transcript file gets its own 120 s deadline. The 30 s verify
+            # window is only about stray conversations; the old loop spun for the session's whole
+            # life when the file never appeared, and gave up at the first failed claim.
+            transcript_deadline = time.time() + AGY_RESUME_TRANSCRIPT_WAIT_SEC
             while target_file is None and session.status in ("starting", "running", "waiting_parent"):
+                if time.time() > transcript_deadline:
+                    logger.warning(
+                        "agy 恢复：%.0f 秒内未能接管 transcript %s，停止监听会话 %s",
+                        AGY_RESUME_TRANSCRIPT_WAIT_SEC, ref_path, session.session_id,
+                    )
+                    return
                 if os.path.isfile(ref_path):
                     candidate = Path(ref_path)
                     if self._claim_transcript(session, candidate):
                         target_file = candidate
                         offset = resume_attach_offset
-                    break
+                        break
+                    # R7: a failed claim means another watcher still owns the file; keep waiting
+                    # (until the deadline above) instead of abandoning the resume.
                 if time.time() <= verify_deadline:
                     stray = self._agy_new_conversation_dir(session, brain_root)
                     if stray is not None:
@@ -5071,6 +5412,15 @@ class HubSessionManager:
                         thinking = (obj.get("thinking") or "").strip()
                         content = (obj.get("content") or "").strip()
                         tcalls = obj.get("tool_calls") or []
+                        # The real store writes tool_calls as a JSON string; an empty list (or an
+                        # absent key) is the end-of-turn marker W6 needs.
+                        if isinstance(tcalls, str):
+                            try:
+                                tcalls = json.loads(tcalls) if tcalls.strip() else []
+                            except Exception:
+                                tcalls = []
+                        if not isinstance(tcalls, list):
+                            tcalls = []
                         inter = [x for x in (thinking, content) if x]
                         if inter:
                             self.record_telemetry(
@@ -5119,6 +5469,23 @@ class HubSessionManager:
                                             "multi_select": bool(q0.get("is_multi_select", False)),
                                         },
                                     )
+                        if not tcalls:
+                            # W6: a planner response with no pending tool calls is AGY's end of
+                            # turn; the next transcript row is a new USER_INPUT (or the file ends).
+                            # On a resume the watcher attaches at the old file size, so every event
+                            # here belongs to a new turn and only one is emitted per turn.
+                            final_text = content or thinking
+                            if final_text:
+                                session.set_final_response(final_text, "native_transcript")
+                                self.record_worker_event(
+                                    session.session_id,
+                                    {
+                                        "type": "turn_completed",
+                                        "category": "turn_completed",
+                                        "status": "turn_idle",
+                                        "content": final_text,
+                                    },
+                                )
             except Exception:
                 pass
             await asyncio.sleep(0.8)
@@ -5216,82 +5583,118 @@ class HubSessionManager:
             },
         )
 
+    @classmethod
+    def _tui_input_line(cls, screen_text: str, engine: str = "") -> Optional[str]:
+        """W2: the row the engine takes input on, searched in the bottom rows, or None.
+
+        The real captures show three different composers:
+          kimi   a boxed row     │ > …                                  │
+          omp    a bare ❯ row under a rule, with status lines below it
+          codex  a bare › row (placeholder "Ask Codex to do anything") above its status line
+        Looking only at the last non-empty line (the old code) always found a status line instead.
+        """
+        lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
+        rows = lines[-TUI_PROMPT_SCAN_ROWS:]
+        eng = (engine or "").strip().lower()
+        if eng == "kimi":
+            # Only the boxed composer is kimi's input row; a ❯ row above it is submitted history.
+            for line in reversed(rows):
+                match = TUI_INPUT_BOX_RE.match(line) or TUI_INPUT_BOX_OPEN_RE.match(line)
+                if match:
+                    return match.group(1).rstrip()
+            # A synthetic/early screen may show only a bare ❯ row. Accept the LAST ❯ row when
+            # every non-empty row below it is wrapped text (a long task wraps onto the following
+            # screen rows); never accept it when chrome follows, because then the ❯ is restored
+            # history in the middle of the transcript.
+            for i in range(len(rows) - 1, -1, -1):
+                if not rows[i].strip():
+                    continue
+                match = TUI_INPUT_GLYPH_RE.match(rows[i])
+                if match is None:
+                    # Possibly a wrapped continuation row of a ❯ above it: keep scanning upward.
+                    continue
+                below = [ln.strip() for ln in rows[i + 1:] if ln.strip()]
+                if any(not cls._tui_plain_continuation(ln) for ln in below):
+                    return None
+                return match.group(1).rstrip()
+            return None
+        for line in reversed(rows):
+            match = TUI_INPUT_GLYPH_RE.match(line)
+            if match:
+                return match.group(1).rstrip()
+        return None
+
     @staticmethod
-    def _tui_input_line(screen_text: str) -> str:
-        """The line the TUI currently takes input on: the last non-empty screen line."""
-        for line in reversed(str(screen_text or "").splitlines()):
-            if line.strip():
-                return line.rstrip()
-        return ""
+    def _tui_plain_continuation(line: str) -> bool:
+        """True for a wrapped continuation row, False for chrome (response bullet, box, status)."""
+        return not line.startswith((
+            "●", "✗", "•", "╭", "╰", "│", "┃", "|", "Never Ask", "context:",
+            "MCP server", "Working", "thinking", "? for shortcuts",
+        ))
 
     @classmethod
-    def _tui_prompt_visible(cls, screen_text: str) -> bool:
-        """V2(a): the engine's input prompt is on screen, so typing lands in its composer."""
-        lines = [ln.rstrip() for ln in str(screen_text or "").splitlines() if ln.strip()]
-        if not lines:
-            return False
-        for line in lines[-TUI_PROMPT_MAX_LINES:]:
-            if TUI_PROMPT_LINE_RE.search(line):
-                return True
-            # A boxed composer often ends in a bare prompt glyph with no trailing space.
-            if line.strip().endswith((">", "\u276f", "\u203a", "\u00bb", "\u03bb", ":")):
-                return True
-        return False
+    def _tui_prompt_visible(cls, screen_text: str, engine: str = "") -> bool:
+        """V2(a)/W2: the engine's input row is on screen, so typing lands in its composer."""
+        return cls._tui_input_line(screen_text, engine) is not None
 
-    async def _wait_tui_ready(self, session: AgentSession, require_text: str = "") -> Dict[str, Any]:
-        """V2(a): a screen that has been stable for ~1.5 s with the input prompt visible, or a timeout."""
-        start = time.time()
-        last_text: Optional[str] = None
-        stable_since = time.time()
-        why = "no_screen"
-        while session.status in ("starting", "running") and (time.time() - start) < TUI_READY_TIMEOUT_SEC:
-            await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
-            text = session.get_clean_screen_text(max_lines=35)
-            if text != last_text:
-                last_text = text
-                stable_since = time.time()
-                continue
-            if not text.strip():
-                why = "no_screen"
-                continue
-            welcome = not require_text or require_text in text
-            prompt = self._tui_prompt_visible(text)
-            if (time.time() - stable_since) >= TUI_READY_STABLE_SEC and prompt and welcome:
-                return {"ready": True, "reason": "stable_prompt", "elapsed_sec": round(time.time() - start, 1)}
-            if not prompt:
-                why = "no_prompt"
-            elif not welcome:
-                why = "waiting_welcome"
-            else:
-                why = "waiting_stable"
-        return {"ready": False, "reason": why, "elapsed_sec": round(time.time() - start, 1)}
+    @staticmethod
+    def _tui_agent_active(screen_text: str) -> bool:
+        """W3: the screen shows the agent working or answering, which confirms a submit."""
+        return bool(TUI_AGENT_ACTIVE_RE.search(str(screen_text or "")))
+
+    @staticmethod
+    def _composer_holds(line: Optional[str], probe: str, tail: str) -> bool:
+        """True when the located composer row still shows part of the typed text.
+
+        A long task wraps: its START sits on the composer's first row, while a horizontally
+        scrolled composer (codex) may instead show its END. Either proves the text is still there.
+        """
+        if line is None:
+            return False
+        return bool((probe and probe in line) or (tail and tail in line))
 
     async def _confirm_tui_submit(
-        self, session: AgentSession, tail: str, size_before: int, check_line: bool
+        self, session: AgentSession, probe: str, tail: str, size_before: int, engine: str = ""
     ) -> tuple:
-        """V2(b): the Enter really submitted when the tail left the input line or the transcript grew."""
+        """V2(b)/W3: tri-state confirmation of one Enter.
+
+        ("confirmed", reason) when the input row no longer holds the text, a transcript grew, or the
+        screen shows the agent at work. ("unsubmitted", reason) only when the text is POSITIVELY
+        still on the located input row. ("unknown", reason) when nothing proves either, so the
+        caller must not press Enter again.
+        """
         deadline = time.time() + TUI_SUBMIT_CONFIRM_SEC
+        last_line: Optional[str] = None
         while time.time() < deadline:
             await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
-            if check_line and tail:
-                input_line = self._tui_input_line(session.get_clean_screen_text(max_lines=35))
-                if tail not in input_line:
-                    return True, "input_line_cleared"
+            screen = session.get_clean_screen_text(max_lines=40)
+            last_line = self._tui_input_line(screen, engine)
+            if last_line is not None and not self._composer_holds(last_line, probe, tail):
+                return "confirmed", "input_line_cleared"
             if session.transcript_path:
                 try:
+                    # transcript_grew also covers "the claimed conversation gained the user turn":
+                    # on a resume the conversation was claimed before the text was typed, so only
+                    # bytes appended after this Enter prove this turn arrived.
                     if Path(session.transcript_path).stat().st_size > size_before:
-                        return True, "transcript_grew"
+                        return "confirmed", "transcript_grew"
                 except OSError:
                     pass
-        return False, "still_in_input_line"
+            if self._tui_agent_active(screen):
+                return "confirmed", "agent_active"
+        if last_line is None:
+            last_line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
+        if self._composer_holds(last_line, probe, tail):
+            return "unsubmitted", "still_in_input_line"
+        return "unknown", "unconfirmed"
 
     async def _submit_text_to_tui(
         self, session: AgentSession, text: str, submit_key: str
     ) -> Dict[str, Any]:
-        """V2(b)(c): type the text, press Enter, prove it took, and press Enter again up to 3 times."""
+        """V2(b)(c)/W3: type the text, press Enter once, and retry only on positive evidence."""
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
-            return {"ok": False, "reason": "empty_text", "attempts": 0}
+            return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
         size_before = 0
         if session.transcript_path:
             try:
@@ -5300,19 +5703,25 @@ class HubSessionManager:
                 size_before = 0
         session.write_input(clean)
         await asyncio.sleep(TUI_TYPE_SETTLE_SEC)
-        tail = clean[-40:].strip()
-        # Only a text the composer really echoed can be confirmed by "its tail left the input line".
-        echoed = bool(tail) and tail in self._tui_input_line(session.get_clean_screen_text(max_lines=35))
+        probe = clean[:30].strip()
+        tail = clean[-30:].strip()
+        engine = session.engine
+        line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
+        echoed = self._composer_holds(line, probe, tail)
         attempts = 0
-        for attempt in range(TUI_SUBMIT_MAX_TRIES):
-            attempts = attempt + 1
+        while attempts < TUI_SUBMIT_MAX_TRIES:
+            attempts += 1
             session.write_input(submit_key)
-            ok, reason = await self._confirm_tui_submit(session, tail, size_before, echoed)
-            if ok:
-                return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed}
-            # V2(c): growing delay before the next Enter.
+            state, reason = await self._confirm_tui_submit(session, probe, tail, size_before, engine)
+            if state == "confirmed":
+                return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed, "label": "成功"}
+            if state == "unknown":
+                # W3: nothing proves the text is still waiting -- the old code pressed Enter twice
+                # more here, and one of those Enters selected "Trust and continue" on a dialog.
+                return {"ok": None, "reason": "unconfirmed", "attempts": attempts, "echoed": echoed, "label": "未确认"}
+            # "unsubmitted": the text is visibly still on the input row, so one more Enter is safe.
             await asyncio.sleep(TUI_SUBMIT_RETRY_STEP_SEC * attempts)
-        return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts, "echoed": echoed}
+        return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts, "echoed": echoed, "label": "失败"}
 
     async def _auto_handle_tui_startup_and_trust(
         self,
@@ -5321,53 +5730,98 @@ class HubSessionManager:
         startup_delay: float = 2.5,
         submit_key: str = "\r",
     ):
-        """Clicks through a 'Trust this folder?' dialog and injects the pty_input task into the TUI.
+        """R1/W4: one dialog watcher for every TUI engine for the whole startup window.
 
-        V2: readiness is a settled screen with a visible prompt (not a fixed delay alone), and the
-        Enter is verified. A10: the real outcome lands in session.last_injection — never a faked write.
+        R1 restored the pre-04dee6f behaviour: an engine with nothing to type (agy/codex/omp argv
+        tasks) still watches the trust dialog instead of returning after 500 ms (agy then processed
+        its -i prompt behind the dialog forever). W4: the same watcher runs during the readiness
+        wait, so a dialog that appears later is answered, and the task text is never typed while a
+        known dialog is on screen. W3: the injection outcome is recorded honestly in last_injection.
         """
-        trust_phrases = (
-            "Trust this folder?",
-            "Trust and continue",
-            "Do you trust the contents of this project?",
-            "Yes, I trust this folder",
-            "Do you trust the files in this folder?",
-        )
         start = time.time()
-        trust_dismissed = False
-        is_kimi = session.profile_id.startswith("kimi")
-        require_text = "Welcome to Kimi Code!" if is_kimi else ""
+        deadline = start + TUI_STARTUP_WINDOW_SEC
+        typed = not task_to_inject
+        trust_dismissed = 0
+        # The same dialog is often redrawn (resize, spinner); press Enter once per distinct
+        # dialog text, not once per poll, so a slow redraw can never receive a second Enter.
+        last_dialog: Optional[str] = None
+        last_text: Optional[str] = None
+        stable_since = time.time()
+        ready: Dict[str, Any] = {"ready": False, "reason": "no_screen"}
 
-        while session.status in ("starting", "running") and (time.time() - start) < TUI_STARTUP_WINDOW_SEC:
-            await asyncio.sleep(0.5)
-            screen_txt = session.get_clean_screen_text(max_lines=35)
-            if not trust_dismissed and any(p in screen_txt for p in trust_phrases):
-                trust_dismissed = True
-                session.write_input("\r")
-                await asyncio.sleep(2.0)
-                continue
-            if not task_to_inject:
-                return
-            if (time.time() - start) < startup_delay:
-                continue
-            ready = await self._wait_tui_ready(session, require_text=require_text)
+        while session.status in ("starting", "running"):
+            await asyncio.sleep(TUI_DIALOG_POLL_SEC)
             if session.status not in ("starting", "running"):
                 return
-            result = await self._submit_text_to_tui(session, task_to_inject, submit_key)
-            result["ready"] = ready
-            result["trust_dismissed"] = trust_dismissed
-            result["at"] = round(time.time(), 3)
-            result["mode"] = "startup_task"
-            session.last_injection = result
-            if not result.get("ok"):
-                session.emit_virtual_ansi(
-                    f"\r\n\x1b[1;31m\u2716 启动文本注入失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
-                )
-            try:
-                self.persist_session(session)
-            except Exception:
-                pass
-            return
+            now = time.time()
+            screen_txt = session.get_clean_screen_text(max_lines=40)
+            if any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES):
+                # R1/W4: answer it wherever it appears in the window; never type behind it.
+                if screen_txt != last_dialog:
+                    session.write_input("\r")
+                    last_dialog = screen_txt
+                    trust_dismissed += 1
+                last_text = None
+                stable_since = time.time()
+                await asyncio.sleep(TUI_TRUST_CONFIRM_SETTLE_SEC)
+                continue
+            last_dialog = None
+            if screen_txt != last_text:
+                last_text = screen_txt
+                stable_since = now
+            input_line = self._tui_input_line(screen_txt, session.engine)
+            stable = (now - stable_since) >= TUI_READY_STABLE_SEC
+            if not screen_txt.strip():
+                ready = {"ready": False, "reason": "no_screen"}
+            elif input_line is None:
+                ready = {"ready": False, "reason": "no_prompt"}
+            elif not stable:
+                ready = {"ready": False, "reason": "waiting_stable"}
+            else:
+                ready = {"ready": True, "reason": "stable_prompt", "elapsed_sec": round(now - start, 1)}
+
+            if not typed and ready["ready"] and (now - start) >= startup_delay:
+                result = await self._submit_text_to_tui(session, task_to_inject, submit_key)
+                result["ready"] = ready
+                result["trust_dismissed"] = trust_dismissed
+                result["at"] = round(time.time(), 3)
+                result["mode"] = "startup_task"
+                session.last_injection = result
+                if result.get("ok") is False:
+                    # W3: the red line is for a CONFIRMED failure only.
+                    session.emit_virtual_ansi(
+                        f"\r\n\x1b[1;31m✖ 启动文本注入失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
+                    )
+                elif result.get("ok") is None:
+                    session.emit_virtual_ansi(
+                        "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
+                    )
+                try:
+                    self.persist_session(session)
+                except Exception:
+                    pass
+                # W4: the text is typed; the readiness wait it could have been lost in is over.
+                return
+
+            # R1: stop early only once the agent is clearly past the dialogs (prompt visible or
+            # conversation claimed). With text still to type the ready branch above owns the exit.
+            if typed and (input_line is not None or session.conversation_ref):
+                return
+            if now >= deadline:
+                if not typed:
+                    session.last_injection = {
+                        "ok": None, "reason": "unconfirmed", "attempts": 0,
+                        "mode": "startup_task", "at": round(time.time(), 3),
+                        "label": "未确认", "ready": ready, "trust_dismissed": trust_dismissed,
+                    }
+                    session.emit_virtual_ansi(
+                        "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
+                    )
+                    try:
+                        self.persist_session(session)
+                    except Exception:
+                        pass
+                return
 
     def _crash_tail(self, sess: AgentSession) -> str:
         """The last ≤15 lines / ≤1500 chars of output, as the crash event carries them (spec §5)."""
@@ -5513,8 +5967,14 @@ class HubSessionManager:
                 session.dsh_job_id = job_id
                 session.dsh_session_id = dsh_sid
                 session.dsh_token = token
-                # Spec §3/§4: the dsh conversation reference is the job handle the continue API takes.
-                session.conversation_ref = {"dsh_job_id": job_id, "dsh_session_id": dsh_sid}
+                # Spec §3/§4: the dsh conversation reference is the job handle the continue API
+                # takes; R5 also keeps the job's messaging token so /messages still works after a
+                # hub restart.
+                session.conversation_ref = {
+                    "dsh_job_id": job_id,
+                    "dsh_session_id": dsh_sid,
+                    "dsh_token": token,
+                }
                 session.status = "running"
                 session.current_activity = f"DSH Job {job_id} running in {dsh_sid}"
                 session.emit_virtual_ansi(
@@ -5797,7 +6257,9 @@ class HubSessionManager:
                 await asyncio.sleep(0.4)
 
     def _build_worker_bridge_system_hint(self, session_id: str) -> str:
-        python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve()).replace("\\", "/")
+        # W10: the hub may run on an interpreter that has no <repo>/.venv (this worktree does not);
+        # the hint must name the interpreter the hub itself runs on, or every bridge command fails.
+        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
         worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
         return (
             f"\n[Sub-Agent Bridge Info: session_id={session_id}]\n"
@@ -6414,7 +6876,8 @@ class HubSessionManager:
                 prompt_to_send = task
                 if profile_id.startswith("kimi"):
                     if "hub_worker.py" not in task:
-                        python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve()).replace("\\", "/")
+                        # W10: same interpreter rule as the bridge hint.
+                        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
                         worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
                         prompt_to_send = f"{task} (When done run: {python_exe} {worker_cli} complete SUMMARY)"
                     # Q2: unlike codex/agy/omp, kimi carries no bridge hint in its task, so the hub

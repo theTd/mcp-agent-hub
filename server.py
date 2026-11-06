@@ -105,6 +105,32 @@ def _session_can_receive(session) -> bool:
     return session.status == "completed" and str(session.engine or "").lower() == "dsh"
 
 
+INJECTION_PENDING_HINT = (
+    "文本将在 TUI 就绪后输入，调用尚未等到结果；"
+    "最终结果可用 get_subagent_status_and_trace 查看 last_injection。"
+)
+
+
+def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
+    """W11: spawn/resume/send report the real injection, or say honestly that it is still pending.
+
+    The call waits up to wait_seconds; a TUI that needs longer to become ready has not typed the
+    text yet, so last_injection is still null. The CALLER knows whether text was sent in this call
+    and whether it is still waiting (delivery.injection == "pending"), so it passes that in; this
+    helper must not guess it from task_mode, or a resume without text would claim a pending typing.
+    """
+    injection = getattr(session, "last_injection", None)
+    if isinstance(injection, dict) and injection:
+        return {"injection": "recorded", "last_injection": injection}
+    if pending:
+        return {
+            "injection": "pending",
+            "last_injection": None,
+            "injection_hint": INJECTION_PENDING_HINT,
+        }
+    return {"injection": "none", "last_injection": None}
+
+
 # ============================================================================
 # 1. 北向 MCP Server (/mcp) —— 暴露给【主 Agent / Parent Agent】的调度、遥测与双向通信接口
 # ============================================================================
@@ -211,6 +237,14 @@ async def spawn_subagent(
     events = hub.get_worker_events(session_id=session.session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
     transcript_summary = hub.summarize_transcript(session.session_id)
+    # W11: the initial task travels through the TUI only for task_mode=pty_input, and only if the
+    # wait did not see it typed yet.
+    injection_pending = (
+        bool(task)
+        and session.last_injection is None
+        and session.status in ("starting", "running")
+        and str((session.profile_snapshot or {}).get("task_mode") or "") == "pty_input"
+    )
 
     return {
         "session_id": session.session_id,
@@ -224,8 +258,9 @@ async def spawn_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
-        # A10: the real outcome of typing an initial pty_input task, when the wait covered it.
-        "last_injection": session.last_injection,
+        # A10/W11: the real outcome of typing an initial pty_input task when the wait covered it,
+        # otherwise an honest "pending" plus a hint (never a bare last_injection:null).
+        **_injection_report(session, injection_pending),
         "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
@@ -346,7 +381,10 @@ async def send_to_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
-        "last_injection": session.last_injection,
+        **_injection_report(
+            session,
+            bool(delivery.get("injection") == "pending" and session.last_injection is None),
+        ),
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
@@ -411,7 +449,10 @@ async def resume_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
-        "last_injection": session.last_injection,
+        **_injection_report(
+            session,
+            bool(delivery.get("injection") == "pending" and session.last_injection is None),
+        ),
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
@@ -1054,7 +1095,8 @@ async def api_list_sessions():
 # Archive spec §6: the console's archive list, one record, its raw scrollback, revive and delete.
 @app.get("/api/archive")
 async def api_list_archive(limit: int = Query(50), offset: int = Query(0), q: str = Query("")):
-    return hub.list_archive(limit=limit, offset=offset, query=q)
+    # R8: a page refreshes up to 200 records with filesystem probes; that must not run on the loop.
+    return await asyncio.to_thread(hub.list_archive, limit, offset, q)
 
 
 @app.get("/api/archive/{session_id}")
@@ -1111,7 +1153,11 @@ async def api_resume_session(session_id: str, req: Request):
         "already_live": bool(result.get("already_live")),
         "resume_count": session.resume_count,
         "delivery": result.get("delivery"),
-        "last_injection": session.last_injection,
+        **_injection_report(
+            session,
+            bool((result.get("delivery") or {}).get("injection") == "pending"
+                 and session.last_injection is None),
+        ),
         "session": session.to_dict(),
     }
 
@@ -1251,6 +1297,17 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
     # is therefore either inside this replay or in the queue — never lost, never sent twice. The
     # queue is registered first, so output produced while the replay is on the wire waits in order.
     replay, q = sess.attach_ws_queue()
+
+    # W7: removing a session from the live list closes its sockets with a normal code instead of
+    # leaving the server side open and silent. The hook travels with the queue when a resume
+    # replaces the session object (AgentSession.adopt_ws_frontends).
+    def _close_on_archive() -> None:
+        try:
+            asyncio.create_task(websocket.close(code=1000))
+        except Exception:
+            pass
+
+    sess.register_ws_closer(q, _close_on_archive)
     if replay:
         await websocket.send_text(replay)
     # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal

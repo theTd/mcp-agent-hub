@@ -37,6 +37,22 @@ function isReplayEndFrame(data) {
  * xterm has really parsed it. xterm's write callbacks fire in order, so the reply-drop window still
  * covers every query inside the replay and is already closed by the time live output is parsed.
  */
+// W7: a resumed session's replay is the archived output, the banner, then the CLI's own stream.
+// The CLI starts that stream from row 1 of ITS screen, so appending it as-is paints the new
+// output on top of the archived text. Put the pre-banner part into the scrollback first (a full
+// screen of newlines), leaving the banner just above the viewport and a blank screen for the
+// CLI's row-1 addresses. No banner means an ordinary replay, untouched.
+function withResumeGap(text, rows) {
+  const marker = '── 已恢复（';
+  const at = text.lastIndexOf(marker);
+  if (at < 0) return text;
+  const lineEnd = text.indexOf('\r\n', at);
+  if (lineEnd < 0) return text;
+  const split = lineEnd + 2;
+  const gap = '\r\n'.repeat(Math.max(1, Number(rows) || 24));
+  return text.slice(0, split) + gap + text.slice(split);
+}
+
 function finishReplay(t) {
   clearTimeout(t.replayTimer);
   const pending = t.replayChunks.join('');
@@ -46,7 +62,7 @@ function finishReplay(t) {
     t.replaying = false;
     return;
   }
-  t.term.write(pending, () => { t.replaying = false; });
+  t.term.write(withResumeGap(pending, t.term.rows), () => { t.replaying = false; });
 }
 
 const TERMINAL_THEME = {
@@ -1220,7 +1236,7 @@ function renderHistoryScrollback(text) {
     return;
   }
   t.term.reset();
-  t.term.write(text || '\r\n\x1b[90m（没有终端记录）\x1b[0m\r\n');
+  t.term.write(withResumeGap(text || '\r\n\x1b[90m（没有终端记录）\x1b[0m\r\n', t.term.rows));
   requestAnimationFrame(() => { try { t.fit?.fit(); } catch { /* not measurable yet */ } });
 }
 
