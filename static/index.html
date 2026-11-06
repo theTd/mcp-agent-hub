@@ -3,1508 +3,445 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MCP Sub-Agent 聚合网关 & 非无头终端总控台</title>
+  <title>Sub-Agent Hub · MCP 聚合网关与非无头终端总控台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%234d8dff'/%3E%3Cstop offset='1' stop-color='%238b6cff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M8 8h6v6H8zM18 8h6v6h-6zM13 18h6v6h-6z' fill='white'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+  <link rel="stylesheet" href="/static/css/hub-console.css" />
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-  <style>
-    :root {
-      --bg-dark: #0d1117;
-      --bg-panel: #161b22;
-      --bg-card: #21262d;
-      --border: #30363d;
-      --text: #e6edf3;
-      --text-muted: #8b949e;
-      --accent: #2f81f7;
-      --green: #3fb950;
-      --amber: #d29922;
-      --red: #f85149;
-      --purple: #a371f7;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg-dark);
-      color: var(--text);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    header {
-      height: 54px;
-      background: var(--bg-panel);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 16px;
-      flex-shrink: 0;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-weight: 600;
-      font-size: 15px;
-    }
-    .badge-mcp {
-      background: rgba(47, 129, 247, 0.16);
-      color: #58a6ff;
-      border: 1px solid rgba(47, 129, 247, 0.4);
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-family: Consolas, monospace;
-      cursor: pointer;
-    }
-    .header-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    button, select, input, textarea {
-      background: var(--bg-card);
-      color: var(--text);
-      border: 1px solid var(--border);
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-size: 12.5px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    input, textarea { cursor: text; }
-    button:hover { border-color: #6e7681; background: #292e36; }
-    button.primary {
-      background: #238636;
-      border-color: rgba(240, 246, 252, 0.1);
-      font-weight: 500;
-    }
-    button.primary:hover { background: #2ea043; }
-    button.accent-btn {
-      background: rgba(47, 129, 247, 0.2);
-      border-color: var(--accent);
-      color: #79c0ff;
-      font-weight: 500;
-    }
-    button.accent-btn:hover { background: rgba(47, 129, 247, 0.32); }
-    button.danger-btn {
-      background: rgba(248, 81, 73, 0.15);
-      border-color: rgba(248, 81, 73, 0.45);
-      color: #ff7b72;
-    }
-    button.danger-btn:hover { background: rgba(248, 81, 73, 0.28); }
-    button.active-mode {
-      background: rgba(47, 129, 247, 0.22);
-      border-color: var(--accent);
-      color: #79c0ff;
-    }
-    .main-layout {
-      display: flex;
-      flex: 1;
-      overflow: hidden;
-    }
-    aside {
-      width: 300px;
-      background: var(--bg-panel);
-      border-right: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      flex-shrink: 0;
-    }
-    .sidebar-section {
-      padding: 12px;
-      border-bottom: 1px solid var(--border);
-    }
-    .sidebar-title {
-      font-size: 11.5px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 8px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .form-row-2 {
-      display: grid;
-      grid-template-columns: 1.4fr 1fr;
-      gap: 6px;
-    }
-    .field-label {
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-bottom: 3px;
-      display: block;
-    }
-    .session-list {
-      flex: 1;
-      overflow-y: auto;
-      padding: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .session-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px;
-      cursor: pointer;
-      transition: all 0.12s;
-      position: relative;
-    }
-    .session-card:hover { border-color: #58a6ff; }
-    .session-card.active {
-      border-color: var(--accent);
-      background: rgba(47, 129, 247, 0.1);
-    }
-    .session-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 13px;
-      font-weight: 600;
-      margin-bottom: 4px;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      display: inline-block;
-      margin-right: 6px;
-    }
-    .status-running { background: var(--green); box-shadow: 0 0 6px var(--green); }
-    .status-exited { background: var(--text-muted); }
-    .session-meta {
-      font-size: 11px;
-      color: var(--text-muted);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .kind-badge {
-      padding: 1px 5px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: 600;
-      background: rgba(163, 113, 247, 0.16);
-      color: #d2a8ff;
-    }
-    .model-pill {
-      display: inline-block;
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-size: 10.5px;
-      font-family: Consolas, monospace;
-      background: rgba(47, 129, 247, 0.14);
-      color: #79c0ff;
-      border: 1px solid rgba(47, 129, 247, 0.3);
-    }
-    .thinking-pill {
-      display: inline-block;
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-size: 10.5px;
-      font-family: Consolas, monospace;
-      background: rgba(210, 153, 34, 0.16);
-      color: #e3b341;
-      border: 1px solid rgba(210, 153, 34, 0.35);
-    }
-    .workspace {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      background: #05070a;
-      overflow: hidden;
-    }
-    .grid-container {
-      flex: 1;
-      display: grid;
-      gap: 6px;
-      padding: 6px;
-      overflow: hidden;
-    }
-    .grid-single { grid-template-columns: 1fr; grid-template-rows: 1fr; }
-    .grid-matrix {
-      grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-      grid-auto-rows: minmax(300px, 1fr);
-    }
-    .pane {
-      background: #0a0d12;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .pane.focused { border-color: var(--accent); }
-    .pane-toolbar {
-      height: 36px;
-      background: var(--bg-panel);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 10px;
-      font-size: 12px;
-      flex-shrink: 0;
-    }
-    .pane-actions {
-      display: flex;
-      gap: 4px;
-      align-items: center;
-    }
-    .pane-actions button {
-      padding: 2px 7px;
-      font-size: 11px;
-    }
-    .pane-body {
-      flex: 1;
-      position: relative;
-      overflow: hidden;
-      display: flex;
-    }
-    .term-mount {
-      width: 100%;
-      height: 100%;
-      padding: 4px;
-    }
-    .web-gui-split {
-      display: flex;
-      width: 100%;
-      height: 100%;
-    }
-    .web-gui-iframe {
-      flex: 6;
-      border: none;
-      background: #fff;
-      height: 100%;
-    }
-    .web-gui-term {
-      flex: 4;
-      border-left: 1px solid var(--border);
-      height: 100%;
-      position: relative;
-    }
-    .desktop-canvas-wrap {
-      width: 100%;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #000;
-      overflow: auto;
-    }
-    .desktop-canvas-wrap img {
-      max-width: 100%;
-      max-height: 100%;
-      cursor: crosshair;
-      border: 1px solid #333;
-    }
-    .empty-state {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      color: var(--text-muted);
-      gap: 12px;
-    }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.7);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 999;
-    }
-    .modal {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      width: 580px;
-      max-width: 94vw;
-      max-height: 90vh;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      overflow: hidden;
-    }
-    .modal-large {
-      width: 980px;
-      height: 82vh;
-    }
-    pre.code-box {
-      background: #090c10;
-      border: 1px solid var(--border);
-      padding: 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      overflow-x: auto;
-      color: #a5d6ff;
-    }
-    .profile-manager-body {
-      display: grid;
-      grid-template-columns: 270px 1fr;
-      gap: 14px;
-      flex: 1;
-      overflow: hidden;
-    }
-    .profile-list-col {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #0d1117;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .profile-list-items {
-      flex: 1;
-      overflow-y: auto;
-      padding: 6px;
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .profile-item-btn {
-      text-align: left;
-      padding: 8px 10px;
-      border-radius: 6px;
-      border: 1px solid transparent;
-      background: var(--bg-card);
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-    }
-    .profile-item-btn.selected {
-      border-color: var(--accent);
-      background: rgba(47, 129, 247, 0.15);
-    }
-    .profile-editor-col {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: #0d1117;
-      padding: 14px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-    .form-field {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .form-field.full {
-      grid-column: 1 / -1;
-    }
-    .engine-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .tag-wrap {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .model-toggle-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 4px 9px;
-      border-radius: 6px;
-      font-size: 11.5px;
-      font-family: Consolas, monospace;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.14s;
-      background: rgba(63, 185, 80, 0.14);
-      color: #56d364;
-      border: 1px solid rgba(63, 185, 80, 0.45);
-    }
-    .model-toggle-btn:hover {
-      background: rgba(63, 185, 80, 0.25);
-      transform: translateY(-1px);
-    }
-    .model-toggle-btn.disabled-model {
-      background: rgba(248, 81, 73, 0.1);
-      color: #8b949e;
-      border: 1px dashed rgba(248, 81, 73, 0.4);
-      text-decoration: line-through;
-      opacity: 0.72;
-    }
-    .model-toggle-btn.disabled-model:hover {
-      opacity: 1;
-      color: #ff7b72;
-      background: rgba(248, 81, 73, 0.2);
-    }
-    .when-to-use-box {
-      background: rgba(47, 129, 247, 0.08);
-      border: 1px solid rgba(47, 129, 247, 0.35);
-      border-radius: 7px;
-      padding: 9px 11px;
-    }
-  </style>
+  <script type="module" src="/static/js/hub-console.js"></script>
 </head>
 <body>
-  <header>
+  <!-- Icon sprite (stroke icons, 24x24 grid) -->
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+    <symbol id="i-panel-left" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></symbol>
+    <symbol id="i-hub" viewBox="0 0 24 24"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="3" width="6" height="6" rx="1.5"/><rect x="9" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v1a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V9M12 12v3"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m8.5 12.5 2.5 2.5 5-5"/></symbol>
+    <symbol id="i-window" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M2 9h20"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></symbol>
+    <symbol id="i-maximize" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m4 17 6-6-6-6M12 19h8"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-archive" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/></symbol>
+    <symbol id="i-compass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.4-6.4 2.1 2.1-6.4z"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="m12 14 4-4"/><path d="M3.3 19a10 10 0 1 1 17.4 0"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
+    <symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <button class="icon-btn" data-cmd="toggle-sidebar" title="显示/隐藏侧边栏" aria-label="显示或隐藏侧边栏">
+      <svg class="icon" aria-hidden="true"><use href="#i-panel-left"></use></svg>
+    </button>
     <div class="brand">
-      <span>⚡ MCP Agent 聚合网关 & 非无头终端总控台</span>
-      <span class="badge-mcp" onclick="showMcpConfigModal()" title="点击查看 MCP 接入配置">
-        MCP Endpoint: http://127.0.0.1:4444/mcp
-      </span>
+      <div class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#i-hub"></use></svg></div>
+      <div>
+        <div class="brand-title">Sub-Agent Hub</div>
+        <div class="brand-sub">MCP 聚合网关 · 非无头终端总控台</div>
+      </div>
     </div>
-    <div class="header-actions">
-      <button id="btnSingleMode" class="active-mode" onclick="setLayoutMode('single')">🗂️ 单窗口标签视图</button>
-      <button id="btnMatrixMode" onclick="setLayoutMode('matrix')">🎛️ 多终端平铺监控墙 (Grid)</button>
-      <button class="accent-btn" onclick="openProfileConfigModal()">⚙️ Profile / 模型开关 / 调用注释配置</button>
-      <button onclick="openWin32Modal()">🪟 纳管桌面 GUI 窗口</button>
-      <button onclick="showMcpConfigModal()">🔌 MCP 接入指南</button>
+    <button class="endpoint-chip" data-cmd="copy-endpoint" id="endpointChip" title="点击复制 MCP 接入地址">
+      <span class="conn-dot" id="connDot" data-state="pending"></span>
+      <span class="chip-tag">MCP</span>
+      <code id="endpointUrl"></code>
+      <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>
+    </button>
+
+    <div class="topbar-spacer"></div>
+
+    <div class="segmented" role="group" aria-label="工作区布局">
+      <button type="button" data-layout="single" aria-pressed="true" title="单窗口：只显示当前选中的会话">
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-window"></use></svg><span class="btn-label">单窗口</span>
+      </button>
+      <button type="button" data-layout="matrix" aria-pressed="false" title="平铺：同时监控所有会话">
+        <svg class="icon icon-sm" aria-hidden="true"><use href="#i-grid"></use></svg><span class="btn-label">平铺</span>
+      </button>
     </div>
+    <div class="topbar-divider"></div>
+    <button class="btn btn-ghost" data-cmd="open-win32" title="把本机桌面 GUI 窗口纳入总控台">
+      <svg class="icon" aria-hidden="true"><use href="#i-monitor"></use></svg><span class="btn-label">纳管窗口</span>
+    </button>
+    <button class="btn btn-ghost" data-cmd="open-mcp-guide" title="MCP 客户端接入配置">
+      <svg class="icon" aria-hidden="true"><use href="#i-plug"></use></svg><span class="btn-label">接入指南</span>
+    </button>
+    <button class="btn" data-cmd="open-profiles" title="管理 Profile、模型开关与路由总则">
+      <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span class="btn-label">Profile 与模型</span>
+    </button>
   </header>
 
-  <div class="main-layout">
-    <aside>
-      <div class="sidebar-section">
-        <div class="sidebar-title">
-          <span>🚀 拉起非无头 Sub-Agent</span>
-          <button style="padding:2px 7px; font-size:11px;" class="accent-btn" onclick="openProfileConfigModal()">⚙️ 配置与注释</button>
+  <div class="app-body">
+    <aside class="sidebar" id="sidebar">
+      <section class="sb-section launcher" aria-labelledby="launcherTitle">
+        <div class="section-head" style="margin-bottom:0">
+          <h2 class="section-title" id="launcherTitle">拉起 Sub-Agent</h2>
+          <button class="btn btn-ghost btn-sm" data-cmd="open-profiles" title="编辑 Profile 与调用说明">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-sliders"></use></svg>配置
+          </button>
         </div>
-        <div style="display:flex; flex-direction:column; gap:7px;">
-          <div>
-            <span class="field-label">选择已启用 Profile (或引擎):</span>
-            <select id="profileSelect" style="width:100%;" onchange="onSidebarProfileChange()"></select>
-          </div>
-          <div class="form-row-2">
-            <div>
-              <span class="field-label">已启用模型 (可覆盖):</span>
-              <select id="modelSelect" style="width:100%;"></select>
-            </div>
-            <div>
-              <span class="field-label">思考等级 (Effort):</span>
-              <select id="thinkingSelect" style="width:100%;"></select>
-            </div>
-          </div>
-          <div id="sidebarWhenToUseHint" style="font-size:11px; color:#8b949e; background:#0d1117; border:1px solid var(--border); border-radius:5px; padding:5px 7px; line-height:1.4;"></div>
-          <input id="taskInput" type="text" placeholder="初始任务指令 (可留空直接进交互界面)..." />
-          <input id="cwdInput" type="text" placeholder="工作目录 (留空默认当前目录)" />
-          <button class="primary" onclick="spawnSessionFromUI()">+ 在总控台拉起该 Agent</button>
+        <label class="field">
+          <span class="field-label">Profile</span>
+          <select id="profileSelect"></select>
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span class="field-label">模型</span>
+            <select id="modelSelect"></select>
+          </label>
+          <label class="field">
+            <span class="field-label">思考等级</span>
+            <select id="thinkingSelect"></select>
+          </label>
         </div>
-      </div>
+        <div class="hint-box" id="whenToUseHint" title="点击展开 / 收起"></div>
+        <label class="field">
+          <span class="field-label">初始任务 <span class="opt">可选</span></span>
+          <textarea id="taskInput" rows="2" placeholder="留空则直接进入交互界面"></textarea>
+        </label>
+        <label class="field">
+          <span class="field-label">工作目录 <span class="opt">可选</span></span>
+          <input id="cwdInput" type="text" class="mono-input" list="cwdHistory" placeholder="默认使用 Hub 当前目录" spellcheck="false" />
+          <datalist id="cwdHistory"></datalist>
+        </label>
+        <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="Ctrl + Enter（在任务输入框内）">
+          <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>拉起 Agent <kbd>Ctrl ↵</kbd>
+        </button>
+      </section>
 
-      <div class="sidebar-title" style="padding: 10px 12px 2px;">
-        <span>受控 Sub-Agent 会话列表 (<span id="sessionCount">0</span>)</span>
-        <button style="padding:2px 6px; font-size:11px;" onclick="refreshSessions()">刷新</button>
-      </div>
-      <div class="session-list" id="sessionList"></div>
-
-      <div class="sidebar-section" style="border-top:1px solid var(--border); border-bottom:none; max-height:220px; display:flex; flex-direction:column;">
-        <div class="sidebar-title" style="margin-bottom:6px;">
-          <span>📨 Sub-Agent ➔ 主 Agent 事件流</span>
-          <span id="globalSeqBadge" style="font-family:monospace; color:#58a6ff;">seq: 0</span>
+      <section class="sessions-section" aria-labelledby="sessionsTitle">
+        <div class="section-head">
+          <h2 class="section-title" id="sessionsTitle">会话 <span class="count-badge" id="sessionCount">0</span></h2>
+          <span class="section-meta grow" id="sessionSummary" style="text-align:right"></span>
+          <button class="icon-btn sm" data-cmd="refresh-sessions" title="立即刷新会话列表" aria-label="刷新会话列表">
+            <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+          </button>
         </div>
-        <div id="eventFeed" style="overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:5px; font-size:11.5px;"></div>
-      </div>
+        <div class="session-list" id="sessionList" role="listbox" aria-label="会话列表"></div>
+      </section>
+
+      <section class="events-section" id="eventsSection">
+        <button type="button" class="events-toggle" id="eventsToggle" aria-expanded="true" aria-controls="eventFeed">
+          <svg class="icon icon-sm chev" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+          <span class="section-title">事件流</span>
+          <span class="seq" id="globalSeq" title="全局事件序号">#0</span>
+        </button>
+        <div class="event-feed" id="eventFeed"></div>
+      </section>
     </aside>
 
     <main class="workspace">
-      <div id="gridContainer" class="grid-container grid-single"></div>
+      <div id="gridContainer" class="grid grid-single"></div>
     </main>
   </div>
 
-  <!-- Profile & Model Auto-Discovery Configuration Modal -->
-  <div class="modal-backdrop" id="profileConfigModal">
-    <div class="modal modal-large">
-      <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:10px;">
-        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-          <h3>⚙️ Profile & 模型管理中心</h3>
-          <button id="tabBtnProfiles" class="active-mode" onclick="switchProfileModalTab('profiles')">📝 Profile 与「何时调用」注释</button>
-          <button id="tabBtnCatalog" onclick="switchProfileModalTab('catalog')">🔘 模型启用/禁用开关 (按引擎)</button>
-          <button id="tabBtnRouting" onclick="switchProfileModalTab('routing')">🧭 全局主 Agent 路由总则 & MCP 预览</button>
+  <!-- Profile & model settings -->
+  <div class="modal-backdrop" id="profileModal" hidden>
+    <div class="modal modal-xl" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle" tabindex="-1">
+      <header class="modal-head">
+        <h3 class="modal-title" id="profileModalTitle">
+          <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg>Profile 与模型
+        </h3>
+        <div class="tabs" role="tablist" aria-label="设置分区">
+          <button type="button" class="tab" role="tab" data-tab="profiles" aria-selected="true">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-layers"></use></svg>Profiles
+          </button>
+          <button type="button" class="tab" role="tab" data-tab="catalog" aria-selected="false">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-cpu"></use></svg>模型开关
+          </button>
+          <button type="button" class="tab" role="tab" data-tab="routing" aria-selected="false">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-compass"></use></svg>路由总则
+          </button>
         </div>
-        <div style="display:flex; gap:8px;">
-          <button class="accent-btn" onclick="rescanModelsAndProfiles()">🔄 重新扫描本机 CLI 模型</button>
-          <button onclick="closeModal('profileConfigModal')">关闭</button>
-        </div>
-      </div>
+        <div class="grow"></div>
+        <button class="btn btn-ghost btn-sm" id="btnRescan" title="重新扫描本机已安装的 CLI 及其模型">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#i-refresh"></use></svg>重新扫描模型
+        </button>
+        <button class="icon-btn" data-close-modal aria-label="关闭" title="关闭 (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </header>
 
-      <!-- Tab 1: Profile CRUD Editor & When-To-Use Annotations -->
-      <div id="profileTabProfiles" class="profile-manager-body">
-        <div class="profile-list-col">
-          <div style="padding:8px 10px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:12px; font-weight:600; color:var(--text-muted);">全部 Profiles</span>
-            <button class="primary" style="padding:3px 8px; font-size:11.5px;" onclick="startNewProfile()">+ 新建 Profile</button>
+      <div class="modal-body flush">
+        <!-- Tab: profiles -->
+        <div class="tab-panel" role="tabpanel" data-panel="profiles">
+          <div class="pm-list-col">
+            <div class="pm-list-tools">
+              <label class="search-input">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-search"></use></svg>
+                <input id="profileSearch" type="search" placeholder="搜索名称、ID、模型…" aria-label="搜索 Profile" />
+              </label>
+              <button class="btn btn-primary" id="btnNewProfile" title="新建 Profile">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-plus"></use></svg>新建
+              </button>
+            </div>
+            <div class="pm-list-meta">共 <span id="profileListCount">0</span> 个 Profile</div>
+            <div class="pm-list" id="profileList" role="listbox" aria-label="Profile 列表"></div>
           </div>
-          <div id="profileConfigList" class="profile-list-items"></div>
-        </div>
 
-        <div class="profile-editor-col">
-          <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); padding-bottom:8px;">
-            <div style="display:flex; align-items:center; gap:12px;">
-              <strong id="editorTitle" style="font-size:14px;">编辑 Profile</strong>
-              <label style="display:inline-flex; align-items:center; gap:5px; font-size:12.5px; cursor:pointer; background:var(--bg-card); padding:3px 9px; border-radius:6px; border:1px solid var(--border);">
-                <input id="editProfileEnabled" type="checkbox" checked style="cursor:pointer;" />
-                <span>启用此 Profile (向 MCP 暴露)</span>
+          <div class="pm-editor" id="profileEditorPane">
+            <div class="pm-editor-head">
+              <div class="pm-editor-title">
+                <h4 id="editorTitle">编辑 Profile</h4>
+                <div class="pm-editor-sub" id="editorSubtitle"></div>
+              </div>
+              <label class="switch" title="启用后才会出现在启动面板，并通过 MCP 暴露给主 Agent">
+                <input type="checkbox" id="editEnabled" checked />
+                <span class="switch-track"></span>
+                <span>启用</span>
               </label>
             </div>
-            <div style="display:flex; gap:8px;">
-              <button class="danger-btn" id="btnDeleteProfile" onclick="deleteCurrentProfile()">🗑️ 删除此 Profile</button>
-              <button class="primary" onclick="saveCurrentProfile()">💾 保存 Profile 与注释</button>
+
+            <div class="pm-editor-scroll" id="profileEditor">
+              <section class="callout">
+                <div class="callout-title">
+                  <svg class="icon icon-sm" aria-hidden="true"><use href="#i-compass"></use></svg>何时调用 <code>when_to_use</code>
+                </div>
+                <p class="callout-desc">写给主 Agent 的调用时机说明：在什么任务、什么情况下应选择这个 Profile。</p>
+                <textarea id="editWhenToUse" rows="3" placeholder="例如：需要低延迟、高并发地执行简单代码搜索、日志分析或单文件小改动时优先调用；跨多文件的复杂架构设计请改用 codex-gpt-6.1-sol-high。"></textarea>
+              </section>
+
+              <section class="form-section">
+                <h5 class="form-section-title">基本信息</h5>
+                <div class="form-grid">
+                  <label class="field">
+                    <span class="field-label">Profile ID <code>agent_type</code></span>
+                    <input id="editId" type="text" class="mono-input" placeholder="例如 omp-dsflash-max" spellcheck="false" />
+                    <span class="field-help" id="editIdHelp"></span>
+                    <span class="field-error" id="editIdError" hidden></span>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">显示名称 <code>name</code></span>
+                    <input id="editName" type="text" placeholder="例如 OMP (deepseek-flash · max)" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Agent 引擎 <code>engine</code></span>
+                    <select id="editEngine">
+                      <option value="omp">omp · Oh-My-Pi CLI</option>
+                      <option value="kimi">kimi · Kimi Code CLI</option>
+                      <option value="agy">agy · Antigravity CLI</option>
+                      <option value="codex">codex · OpenAI Codex CLI</option>
+                      <option value="dsh">dsh · DeepSeek Harness</option>
+                      <option value="pwsh">pwsh · PowerShell 终端</option>
+                    </select>
+                    <span class="field-help">决定可选模型列表与参数注入方式</span>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">终端类型 <code>kind</code></span>
+                    <select id="editKind">
+                      <option value="tui">tui · ConPTY 伪终端</option>
+                      <option value="web_gui">web_gui · 内嵌 Web GUI + 终端</option>
+                      <option value="desktop_gui">desktop_gui · Win32 桌面窗口</option>
+                    </select>
+                  </label>
+                </div>
+              </section>
+
+              <section class="form-section">
+                <h5 class="form-section-title">模型与思考等级</h5>
+                <div class="form-grid">
+                  <div class="field">
+                    <label class="field-label" for="editModelSelect">默认模型 <code>default_model</code></label>
+                    <select id="editModelSelect"></select>
+                    <input id="editModelCustom" type="text" class="mono-input" placeholder="输入模型 ID" spellcheck="false" hidden />
+                    <span class="field-help warn" id="editModelWarn" hidden></span>
+                  </div>
+                  <label class="field">
+                    <span class="field-label">默认思考等级 <code>default_thinking_level</code></span>
+                    <select id="editThinking"></select>
+                  </label>
+                </div>
+              </section>
+
+              <section class="form-section">
+                <h5 class="form-section-title">启动方式</h5>
+                <div class="form-grid">
+                  <label class="field full">
+                    <span class="field-label">可执行文件 <code>command</code></span>
+                    <input id="editCommand" type="text" class="mono-input" placeholder="例如 C:\Users\me\.local\bin\omp.exe" spellcheck="false" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">任务下发模式 <code>task_mode</code></span>
+                    <select id="editTaskMode">
+                      <option value="">未设置 · 使用服务端默认（pty_input）</option>
+                      <option value="omp_positional">omp_positional · OMP 位置参数 + 会话目录</option>
+                      <option value="codex_positional">codex_positional · Codex 位置参数</option>
+                      <option value="agy_interactive_flag">agy_interactive_flag · AGY -i 交互参数</option>
+                      <option value="pty_input">pty_input · 进入 TUI 后自动注入</option>
+                      <option value="dsh_hub_api">dsh_hub_api · DSH Crew 原生会话</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">启动等待（秒） <code>startup_delay_sec</code></span>
+                    <input id="editDelay" type="number" step="0.5" min="0" />
+                  </label>
+                  <label class="field full">
+                    <span class="field-label">附加启动参数 <code>args</code></span>
+                    <input id="editArgs" type="text" class="mono-input" placeholder='例如 [] 或 ["--auto-approve"]' spellcheck="false" />
+                    <span class="field-help">JSON 数组。模型与思考等级参数由 Hub 自动注入，无需在此重复。</span>
+                    <span class="field-error" id="editArgsError" hidden></span>
+                  </label>
+                  <label class="field full">
+                    <span class="field-label">技术备注 <code>description</code></span>
+                    <input id="editDesc" type="text" placeholder="描述该 Profile 的技术配置" />
+                  </label>
+                </div>
+              </section>
+
+              <section class="info-card" id="engineInfo" aria-label="引擎识别信息"></section>
+            </div>
+
+            <div class="pm-editor-foot">
+              <button class="btn btn-ghost btn-danger-text" id="btnDeleteProfile">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-trash"></use></svg>删除
+              </button>
+              <button class="btn btn-ghost" id="btnDuplicateProfile" title="以当前内容为模板新建 Profile">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>复制为新 Profile
+              </button>
+              <div class="grow"></div>
+              <span class="dirty-flag" id="editorDirty" hidden>有未保存的修改</span>
+              <button class="btn btn-primary" id="btnSaveProfile" title="保存 (Ctrl + S)">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-save"></use></svg>保存 <kbd>Ctrl S</kbd>
+              </button>
             </div>
           </div>
-
-          <div class="when-to-use-box">
-            <label class="field-label" style="color:#79c0ff; font-weight:600; font-size:12px; margin-bottom:5px;">
-              🧭 写给主 Agent 的调用时机注释 (`when_to_use`) —— 教会调用它的主 Agent 在什么情况下应该调用此 Agent：
-            </label>
-            <textarea id="editProfileWhenToUse" rows="2" style="width:100%; border-color:rgba(47,129,247,0.45);" placeholder="例如：当需要极低延迟、高并发执行简单代码搜索、日志分析或单文件小改动时优先调用；若涉及跨多文件复杂架构设计，请改用 codex-gpt-6.1-sol-high。"></textarea>
-          </div>
-
-          <div class="form-grid">
-            <div class="form-field">
-              <label class="field-label">Profile ID (MCP `agent_type` 唯一标识)</label>
-              <input id="editProfileId" type="text" placeholder="例如: omp-dsflash-max" />
-            </div>
-            <div class="form-field">
-              <label class="field-label">显示名称 (`name`)</label>
-              <input id="editProfileName" type="text" placeholder="例如: OMP (deepseek-flash [max])" />
-            </div>
-            <div class="form-field">
-              <label class="field-label">所属 Agent 引擎 (`engine` - 决定自动模型列表与参数语法)</label>
-              <select id="editProfileEngine" onchange="onEditorEngineChange()">
-                <option value="omp">omp (Oh-My-Pi CLI)</option>
-                <option value="kimi">kimi (Kimi Code CLI)</option>
-                <option value="agy">agy (Antigravity CLI)</option>
-                <option value="codex">codex (OpenAI Codex CLI)</option>
-                <option value="dsh">dsh (DeepSeek Harness)</option>
-                <option value="pwsh">pwsh (PowerShell 通用终端)</option>
-              </select>
-            </div>
-            <div class="form-field">
-              <label class="field-label">终端类型 (`kind`)</label>
-              <select id="editProfileKind">
-                <option value="tui">tui (ConPTY 伪终端)</option>
-                <option value="web_gui">web_gui (内嵌 Web GUI + 终端)</option>
-                <option value="desktop_gui">desktop_gui (Win32 桌面窗口收纳)</option>
-              </select>
-            </div>
-            <div class="form-field">
-              <label class="field-label">默认模型 (`default_model` - 仅展示当前已启用的模型)</label>
-              <select id="editProfileModelSelect" onchange="onEditorModelSelectChange()"></select>
-              <input id="editProfileModelCustom" type="text" placeholder="或手动输入已启用的模型 ID..." style="margin-top:4px;" />
-            </div>
-            <div class="form-field">
-              <label class="field-label">默认思考等级 (`default_thinking_level`)</label>
-              <select id="editProfileThinkingSelect"></select>
-            </div>
-            <div class="form-field">
-              <label class="field-label">启动可执行文件 (`command`)</label>
-              <input id="editProfileCommand" type="text" placeholder="例如: C:\Users\cui\.local\bin\omp.exe" />
-            </div>
-            <div class="form-field">
-              <label class="field-label">任务下发模式 (`task_mode`) & 启动等待秒数</label>
-              <div style="display:flex; gap:6px;">
-                <select id="editProfileTaskMode" style="flex:1;">
-                  <option value="omp_positional">omp_positional (OMP 位置参数 + 会话目录)</option>
-                  <option value="codex_positional">codex_positional (Codex 位置参数)</option>
-                  <option value="agy_interactive_flag">agy_interactive_flag (AGY -i 交互标志)</option>
-                  <option value="pty_input">pty_input (进入 TUI 后自动注入)</option>
-                  <option value="dsh_hub_api">dsh_hub_api (DSH Crew 原生热会话)</option>
-                </select>
-                <input id="editProfileDelay" type="number" step="0.5" value="2.5" style="width:75px;" title="startup_delay_sec" />
-              </div>
-            </div>
-            <div class="form-field full">
-              <label class="field-label">附加启动参数 (`args` JSON 数组，模型和思考等级由桥接器自动注入无需重复手写)</label>
-              <input id="editProfileArgs" type="text" placeholder='例如: [] 或 ["--auto-approve"]' />
-            </div>
-            <div class="form-field full">
-              <label class="field-label">技术规格备注 (`description`)</label>
-              <input id="editProfileDesc" type="text" placeholder="描述该 Profile 的技术配置详情..." />
-            </div>
-          </div>
-
-          <div id="editorEngineHint" style="font-size:12px; color:var(--text-muted); background:#161b22; padding:10px; border-radius:6px; border:1px solid var(--border);"></div>
         </div>
-      </div>
 
-      <!-- Tab 2: Live Auto-Discovered Engine Catalog with Model Enable/Disable Switches -->
-      <div id="profileTabCatalog" style="display:none; flex:1; overflow-y:auto; flex-direction:column; gap:10px; padding-right:4px;"></div>
-
-      <!-- Tab 3: Global Routing Guide & Live MCP Markdown Preview -->
-      <div id="profileTabRouting" style="display:none; flex:1; overflow-y:auto; flex-direction:column; gap:12px; padding-right:4px;">
-        <div class="engine-card">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <strong style="font-size:14px; color:#79c0ff;">🧭 全局主 Agent 调度总则 (`global_routing_instructions`)</strong>
-            <button class="primary" onclick="saveGlobalRoutingGuide()">💾 保存全局调度总则</button>
-          </div>
-          <p style="font-size:12px; color:var(--text-muted);">
-            在此编写全局多 Agent 协同策略。当任何主 Agent 调用 MCP <code>list_agent_profiles</code> 或 <code>discover_agent_models_and_thinking_levels</code> 时，这段总则将与下方各 Profile 的 <code>when_to_use</code> 注释一起置顶返回给主 Agent：
-          </p>
-          <textarea id="globalRoutingTextarea" rows="5" style="width:100%; font-family:Consolas, monospace; font-size:12.5px;"></textarea>
+        <!-- Tab: model catalog -->
+        <div class="tab-panel" role="tabpanel" data-panel="catalog" hidden>
+          <div class="catalog" id="engineCatalog"></div>
         </div>
 
-        <div class="engine-card" style="flex:1; display:flex; flex-direction:column;">
-          <strong style="font-size:13.5px; color:var(--green);">👀 主 Agent 实际收到的完整路由指南预览 (`routing_guide_markdown`)</strong>
-          <pre id="routingGuidePreview" class="code-box" style="flex:1; white-space:pre-wrap; overflow-y:auto; max-height:360px; color:#e6edf3;"></pre>
+        <!-- Tab: routing guide -->
+        <div class="tab-panel routing" role="tabpanel" data-panel="routing" hidden>
+          <div class="routing-col">
+            <div class="col-head">
+              <h4>全局调度总则</h4>
+              <code>global_routing_instructions</code>
+              <div class="grow"></div>
+              <span class="dirty-flag" id="routingDirty" hidden>未保存</span>
+            </div>
+            <p class="col-desc">主 Agent 调用 <code>list_agent_profiles</code> 或 <code>discover_agent_models_and_thinking_levels</code> 时，这段总则会与各 Profile 的 <code>when_to_use</code> 一起置顶返回。</p>
+            <textarea id="routingInput" spellcheck="false" placeholder="在此编写多 Agent 协同与路由策略…"></textarea>
+            <div class="col-foot">
+              <button class="btn btn-primary" id="btnSaveRouting" title="保存 (Ctrl + S)">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-save"></use></svg>保存总则
+              </button>
+            </div>
+          </div>
+          <div class="routing-col">
+            <div class="col-head">
+              <h4>主 Agent 实际收到的路由指南</h4>
+              <div class="grow"></div>
+              <button class="btn btn-ghost btn-sm" id="btnCopyRoutingPreview">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>复制
+              </button>
+            </div>
+            <p class="col-desc"><code>routing_guide_markdown</code> 预览，保存总则或修改 Profile 后自动更新。</p>
+            <pre class="code-box" id="routingPreview"></pre>
+          </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- MCP Config Modal -->
-  <div class="modal-backdrop" id="mcpModal">
-    <div class="modal">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h3>🔌 任意 MCP 客户端接入配置</h3>
-        <button onclick="closeModal('mcpModal')">关闭</button>
-      </div>
-      <p style="font-size:13px; color:var(--text-muted);">
-        任何支持 MCP 协议的宿主 Agent 接入以下地址后，即可调用网关内的所有 Sub-Agent，且支持动态指定任意已识别的 <code>model</code> 与 <code>thinking_level</code>：
-      </p>
-      <div style="font-size:12px; font-weight:600;">1. Streamable HTTP 模式 (推荐):</div>
-      <pre class="code-box">{
-  "mcpServers": {
-    "subagent-hub": {
-      "type": "http",
-      "url": "http://127.0.0.1:4444/mcp"
-    }
-  }
-}</pre>
-      <div style="font-size:12px; font-weight:600;">2. MCP 动态指定模型与思考等级调用示例:</div>
-      <pre class="code-box">spawn_subagent(
+  <!-- MCP integration guide -->
+  <div class="modal-backdrop" id="mcpModal" hidden>
+    <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="mcpModalTitle" tabindex="-1">
+      <header class="modal-head">
+        <h3 class="modal-title" id="mcpModalTitle">
+          <svg class="icon" aria-hidden="true"><use href="#i-plug"></use></svg>MCP 接入指南
+        </h3>
+        <div class="grow"></div>
+        <button class="icon-btn" data-close-modal aria-label="关闭" title="关闭 (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="lead">任何支持 MCP 协议的宿主 Agent 接入下方地址后，即可调用 Hub 中的全部 Sub-Agent，并可按次指定任意已识别的 <code>model</code> 与 <code>thinking_level</code>。</p>
+        <div class="guide-step">
+          <div class="step-title"><span class="step-num">1</span>添加 MCP 服务器（Streamable HTTP，推荐）</div>
+          <div class="code-block">
+            <pre id="mcpConfigSnippet"></pre>
+            <button class="icon-btn sm" data-cmd="copy-target" data-target="#mcpConfigSnippet" title="复制" aria-label="复制配置">
+              <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+            </button>
+          </div>
+        </div>
+        <div class="guide-step">
+          <div class="step-title"><span class="step-num">2</span>在主 Agent 中调用，可动态指定模型与思考等级</div>
+          <div class="code-block">
+            <pre id="mcpCallSnippet">spawn_subagent(
   agent_type="omp",
   task="分析并重构模块",
   model="kimi-code/k3.1-pro",
   thinking_level="max"
 )</pre>
-      <div style="font-size:12px; color:var(--text-muted);">
-        暴露的 MCP 工具：<code>discover_agent_models_and_thinking_levels</code>、<code>list_agent_profiles</code>、<code>spawn_subagent</code>、<code>send_to_subagent</code>、<code>get_subagent_status_and_trace</code>、<code>summarize_subagent_transcript</code>、<code>get_subagent_final_response</code>
+            <button class="icon-btn sm" data-cmd="copy-target" data-target="#mcpCallSnippet" title="复制" aria-label="复制示例">
+              <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
+            </button>
+          </div>
+        </div>
+        <div class="guide-step">
+          <div class="step-title"><span class="step-num">3</span>暴露的 MCP 工具</div>
+          <div class="tool-chips">
+            <code>discover_agent_models_and_thinking_levels</code>
+            <code>list_agent_profiles</code>
+            <code>spawn_subagent</code>
+            <code>send_to_subagent</code>
+            <code>get_subagent_status_and_trace</code>
+            <code>summarize_subagent_transcript</code>
+            <code>get_subagent_final_response</code>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Win32 GUI Window Manager Modal -->
-  <div class="modal-backdrop" id="win32Modal">
-    <div class="modal">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h3>🪟 纳管本地桌面 GUI Agent 窗口</h3>
-        <button onclick="closeModal('win32Modal')">关闭</button>
+  <!-- Attach a desktop GUI window -->
+  <div class="modal-backdrop" id="win32Modal" hidden>
+    <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="win32ModalTitle" tabindex="-1">
+      <header class="modal-head">
+        <h3 class="modal-title" id="win32ModalTitle">
+          <svg class="icon" aria-hidden="true"><use href="#i-monitor"></use></svg>纳管桌面 GUI 窗口
+        </h3>
+        <div class="grow"></div>
+        <button class="icon-btn" data-close-modal aria-label="关闭" title="关闭 (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+      <div class="modal-body">
+        <p class="lead">选择一个桌面窗口纳入总控台实时投屏。纳管后可在窗格中一键把原窗口收纳到屏幕外（后台渲染），避免桌面窗口乱跳。</p>
+        <div class="win-tools">
+          <label class="search-input">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-search"></use></svg>
+            <input id="win32Search" type="search" placeholder="按标题或 PID 筛选" aria-label="筛选窗口" data-autofocus />
+          </label>
+          <span class="win-count" id="win32Count"></span>
+          <button class="btn btn-sm" id="btnWin32Refresh">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新
+          </button>
+        </div>
+        <div class="win-list" id="win32List"></div>
       </div>
-      <p style="font-size:12.5px; color:var(--text-muted);">
-        选择一个桌面 GUI 窗口纳入本总控台实时投屏，并可一键将其“收纳隐藏至屏幕外（后台渲染）”，避免桌面窗口乱跳：
-      </p>
-      <div id="win32List" style="max-height:300px; overflow-y:auto; display:flex; flex-direction:column; gap:6px;"></div>
     </div>
   </div>
 
-  <script>
-    let profiles = {};
-    let enginesCatalog = {};
-    let selectedEditorProfileId = null;
-    let sessions = [];
-    let activeSessionId = null;
-    let layoutMode = 'single'; // 'single' | 'matrix'
-    const termInstances = {}; // session_id -> { term, fitAddon, ws, mountEl, guiTimer }
-
-    async function loadProfilesAndCatalog(refresh = false) {
-      const url = refresh ? '/api/profiles?refresh=true' : '/api/profiles';
-      const res = await fetch(url);
-      const data = await res.json();
-      profiles = data.profiles || {};
-      enginesCatalog = data.engines_catalog || {};
-      const gTextarea = document.getElementById('globalRoutingTextarea');
-      if (gTextarea) {
-        gTextarea.value = data.global_routing_instructions || '';
-      }
-      const gPreview = document.getElementById('routingGuidePreview');
-      if (gPreview) {
-        gPreview.textContent = data.routing_guide_markdown || '';
-      }
-      populateSidebarProfileSelect();
-      renderProfileModalList();
-      renderCatalogTab();
-    }
-
-    function populateSidebarProfileSelect() {
-      const sel = document.getElementById('profileSelect');
-      const prevVal = sel.value;
-      sel.innerHTML = '';
-      for (const [id, p] of Object.entries(profiles)) {
-        if (p.enabled === false) continue;
-        const opt = document.createElement('option');
-        opt.value = id;
-        opt.textContent = `${p.name} (${id})`;
-        sel.appendChild(opt);
-      }
-      if (prevVal && profiles[prevVal] && profiles[prevVal].enabled !== false) {
-        sel.value = prevVal;
-      }
-      onSidebarProfileChange();
-    }
-
-    function onSidebarProfileChange() {
-      const profileId = document.getElementById('profileSelect').value;
-      const p = profiles[profileId] || {};
-      const modelSel = document.getElementById('modelSelect');
-      const thinkSel = document.getElementById('thinkingSelect');
-      const hintBox = document.getElementById('sidebarWhenToUseHint');
-
-      const availModels = p.available_models || [];
-      const defModel = p.default_model || '';
-      modelSel.innerHTML = '';
-
-      const defOpt = document.createElement('option');
-      defOpt.value = '';
-      defOpt.textContent = defModel ? `默认 (${defModel})` : '默认 (不覆盖)';
-      modelSel.appendChild(defOpt);
-
-      for (const m of availModels) {
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = m === defModel ? `${m} ★` : m;
-        modelSel.appendChild(opt);
-      }
-
-      const availThinking = p.available_thinking_levels || [];
-      const defThinking = p.default_thinking_level || '';
-      thinkSel.innerHTML = '';
-
-      const defThinkOpt = document.createElement('option');
-      defThinkOpt.value = '';
-      defThinkOpt.textContent = defThinking ? `默认 (${defThinking})` : '默认 (不覆盖)';
-      thinkSel.appendChild(defThinkOpt);
-
-      for (const lv of availThinking) {
-        const opt = document.createElement('option');
-        opt.value = lv;
-        opt.textContent = lv === defThinking ? `${lv} ★` : lv;
-        thinkSel.appendChild(opt);
-      }
-
-      if (hintBox) {
-        const whenTxt = p.when_to_use || p.description || '可在「⚙️ 配置与注释」中为此 Profile 编写何时调用说明';
-        hintBox.innerHTML = `<strong style="color:#79c0ff;">🧭 何时调用:</strong> ${escapeHtml(whenTxt)}`;
-      }
-    }
-
-    async function init() {
-      await loadProfilesAndCatalog(false);
-      await refreshSessions();
-      setInterval(refreshSessions, 2500);
-      window.addEventListener('resize', () => {
-        for (const inst of Object.values(termInstances)) {
-          if (inst.fitAddon) {
-            try { inst.fitAddon.fit(); } catch (e) {}
-          }
-        }
-      });
-    }
-
-    async function refreshSessions() {
-      try {
-        const res = await fetch('/api/sessions');
-        const data = await res.json();
-        const newSessions = data.sessions || [];
-        const prevIds = sessions.map(s => s.session_id).join(',');
-        const nextIds = newSessions.map(s => s.session_id).join(',');
-        sessions = newSessions;
-        document.getElementById('sessionCount').textContent = sessions.length;
-
-        if (!activeSessionId && sessions.length > 0) {
-          activeSessionId = sessions[sessions.length - 1].session_id;
-        } else if (activeSessionId && !sessions.find(s => s.session_id === activeSessionId)) {
-          activeSessionId = sessions.length > 0 ? sessions[sessions.length - 1].session_id : null;
-        }
-
-        renderSidebar();
-        renderEventFeed(data.recent_events || [], data.global_seq || 0);
-        if (prevIds !== nextIds) {
-          renderWorkspace();
-        }
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    function renderEventFeed(events, globalSeq) {
-      const seqEl = document.getElementById('globalSeqBadge');
-      if (seqEl) seqEl.textContent = 'seq: ' + globalSeq;
-      const feed = document.getElementById('eventFeed');
-      if (!feed) return;
-      feed.innerHTML = '';
-      for (const ev of [...events].reverse().slice(0, 15)) {
-        const div = document.createElement('div');
-        div.style.cssText = 'padding:5px 7px; background:var(--bg-card); border-radius:5px; border-left:3px solid #58a6ff;';
-        div.innerHTML = `<div><strong>[${escapeHtml(ev.type)}]</strong> <span style="color:var(--text-muted);">${escapeHtml(ev.session_id)} (#${ev.seq})</span></div><div style="color:#c9d1d9; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(ev.content)}</div>`;
-        feed.appendChild(div);
-      }
-    }
-
-    function renderSidebar() {
-      const list = document.getElementById('sessionList');
-      list.innerHTML = '';
-      for (const s of [...sessions].reverse()) {
-        const card = document.createElement('div');
-        card.className = 'session-card' + (s.session_id === activeSessionId ? ' active' : '');
-        card.onclick = () => {
-          activeSessionId = s.session_id;
-          renderSidebar();
-          renderWorkspace();
-        };
-        const dotClass = s.status === 'running' ? 'status-running' : 'status-exited';
-        const modelBadge = s.effective_model ? `<span class="model-pill">${escapeHtml(s.effective_model)}</span>` : '';
-        const thinkBadge = s.effective_thinking_level ? `<span class="thinking-pill">🧠 ${escapeHtml(s.effective_thinking_level)}</span>` : '';
-        card.innerHTML = `
-          <div class="session-header">
-            <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              <span class="status-dot ${dotClass}"></span>${escapeHtml(s.title)}
-            </div>
-            <span class="kind-badge">${s.kind.toUpperCase()}</span>
-          </div>
-          ${(modelBadge || thinkBadge) ? `<div style="display:flex; gap:4px; flex-wrap:wrap; margin:4px 0;">${modelBadge}${thinkBadge}</div>` : ''}
-          <div class="session-meta">
-            <span>ID: ${s.session_id}</span>
-            <span>空闲: ${s.idle_seconds}s</span>
-          </div>
-          ${s.last_task ? `<div style="font-size:11px; color:#58a6ff; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">任务: ${escapeHtml(s.last_task)}</div>` : ''}
-        `;
-        list.appendChild(card);
-      }
-    }
-
-    function setLayoutMode(mode) {
-      layoutMode = mode;
-      document.getElementById('btnSingleMode').className = mode === 'single' ? 'active-mode' : '';
-      document.getElementById('btnMatrixMode').className = mode === 'matrix' ? 'active-mode' : '';
-      const grid = document.getElementById('gridContainer');
-      grid.className = 'grid-container ' + (mode === 'single' ? 'grid-single' : 'grid-matrix');
-      renderWorkspace();
-    }
-
-    function renderWorkspace() {
-      const grid = document.getElementById('gridContainer');
-      const visibleSessions = layoutMode === 'single'
-        ? sessions.filter(s => s.session_id === activeSessionId)
-        : sessions;
-
-      if (visibleSessions.length === 0) {
-        grid.innerHTML = `
-          <div class="empty-state">
-            <div style="font-size:36px;">🖥️</div>
-            <div>当前暂无运行中的非无头 Sub-Agent 会话</div>
-            <div style="font-size:12.5px;">当外部 MCP 客户端调用 <code>spawn_subagent</code>，或你在左侧选择模型与思考等级后点击“拉起该 Agent”时，所有命令行与 GUI 窗口将在此处集中呈现。</div>
-          </div>
-        `;
-        return;
-      }
-
-      grid.innerHTML = '';
-
-      for (const s of visibleSessions) {
-        const pane = document.createElement('div');
-        pane.className = 'pane' + (s.session_id === activeSessionId ? ' focused' : '');
-        pane.onclick = () => { activeSessionId = s.session_id; renderSidebar(); };
-
-        const toolbar = document.createElement('div');
-        toolbar.className = 'pane-toolbar';
-        const modelBadge = s.effective_model ? `<span class="model-pill">${escapeHtml(s.effective_model)}</span>` : '';
-        const thinkBadge = s.effective_thinking_level ? `<span class="thinking-pill">🧠 ${escapeHtml(s.effective_thinking_level)}</span>` : '';
-        toolbar.innerHTML = `
-          <div style="display:flex; align-items:center; gap:8px;">
-            <span class="status-dot ${s.status === 'running' ? 'status-running' : 'status-exited'}"></span>
-            <strong>${escapeHtml(s.title)}</strong>
-            ${modelBadge}
-            ${thinkBadge}
-            <span style="color:var(--text-muted); font-size:11px;">(${escapeHtml(s.cwd)})</span>
-          </div>
-          <div class="pane-actions">
-            ${s.kind === 'desktop_gui' ? `
-              <button onclick="toggleTuckWindow('${s.session_id}', ${!s.tucked_offscreen})">
-                ${s.tucked_offscreen ? '👁️ 恢复桌面显示' : '📥 收纳隐藏桌面原窗口'}
-              </button>
-            ` : `
-              <button onclick="sendQuickKey('${s.session_id}', '\\r')">⏎ Enter</button>
-              <button onclick="sendQuickKey('${s.session_id}', 'y\\r')">✅ y + Enter</button>
-              <button onclick="sendQuickKey('${s.session_id}', '\\x1b')">Esc</button>
-              <button onclick="sendQuickKey('${s.session_id}', '\\x03')">Ctrl+C</button>
-            `}
-            <button style="color:var(--red);" onclick="terminateSession('${s.session_id}', event)">✖ 关闭</button>
-          </div>
-        `;
-        pane.appendChild(toolbar);
-
-        const body = document.createElement('div');
-        body.className = 'pane-body';
-
-        if (s.kind === 'web_gui' && s.gui_url) {
-          body.innerHTML = `
-            <div class="web-gui-split">
-              <iframe class="web-gui-iframe" src="${s.gui_url}"></iframe>
-              <div class="web-gui-term" id="mount-${s.session_id}"></div>
-            </div>
-          `;
-          pane.appendChild(body);
-          grid.appendChild(pane);
-          attachXterm(s.session_id, document.getElementById(`mount-${s.session_id}`));
-        } else if (s.kind === 'desktop_gui') {
-          body.innerHTML = `
-            <div class="desktop-canvas-wrap">
-              <img id="winimg-${s.session_id}" alt="Desktop GUI Stream" onclick="onDesktopImgClick(event, '${s.session_id}')" />
-            </div>
-          `;
-          pane.appendChild(body);
-          grid.appendChild(pane);
-          startDesktopStream(s.session_id);
-        } else {
-          const termDiv = document.createElement('div');
-          termDiv.className = 'term-mount';
-          termDiv.id = `mount-${s.session_id}`;
-          body.appendChild(termDiv);
-          pane.appendChild(body);
-          grid.appendChild(pane);
-          attachXterm(s.session_id, termDiv);
-        }
-      }
-    }
-
-    function attachXterm(sessionId, containerEl) {
-      if (!containerEl) return;
-      let inst = termInstances[sessionId];
-      if (!inst) {
-        const term = new Terminal({
-          cursorBlink: true,
-          fontSize: 13,
-          fontFamily: 'Consolas, "Cascadia Mono", monospace',
-          theme: {
-            background: '#0a0d12',
-            foreground: '#e6edf3',
-            cursor: '#58a6ff',
-          }
-        });
-        const fitAddon = new FitAddon.FitAddon();
-        term.loadAddon(fitAddon);
-
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${proto}//${location.host}/ws/pty/${sessionId}`);
-
-        ws.onmessage = (ev) => {
-          term.write(ev.data);
-        };
-
-        term.onData((data) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'input', data }));
-          }
-        });
-
-        term.onResize(({ cols, rows }) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-          }
-        });
-
-        inst = { term, fitAddon, ws };
-        termInstances[sessionId] = inst;
-      }
-
-      containerEl.innerHTML = '';
-      inst.term.open(containerEl);
-      setTimeout(() => {
-        try {
-          inst.fitAddon.fit();
-          inst.term.focus();
-        } catch (e) {}
-      }, 60);
-    }
-
-    function startDesktopStream(sessionId) {
-      if (termInstances[sessionId]?.guiTimer) {
-        clearInterval(termInstances[sessionId].guiTimer);
-      }
-      const updateFrame = async () => {
-        const imgEl = document.getElementById(`winimg-${sessionId}`);
-        if (!imgEl) return;
-        try {
-          const res = await fetch(`/api/sessions/${sessionId}/frame`);
-          if (!res.ok) return;
-          const data = await res.json();
-          if (data.jpeg_b64) {
-            imgEl.src = 'data:image/jpeg;base64,' + data.jpeg_b64;
-            imgEl.dataset.winWidth = data.width;
-            imgEl.dataset.winHeight = data.height;
-          }
-        } catch (e) {}
-      };
-      updateFrame();
-      const timer = setInterval(updateFrame, 600);
-      termInstances[sessionId] = { guiTimer: timer };
-    }
-
-    async function onDesktopImgClick(ev, sessionId) {
-      const img = ev.target;
-      const rect = img.getBoundingClientRect();
-      const winW = parseFloat(img.dataset.winWidth || img.naturalWidth || rect.width);
-      const winH = parseFloat(img.dataset.winHeight || img.naturalHeight || rect.height);
-      const x = Math.round(((ev.clientX - rect.left) / rect.width) * winW);
-      const y = Math.round(((ev.clientY - rect.top) / rect.height) * winH);
-      await fetch(`/api/sessions/${sessionId}/click`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ x, y })
-      });
-    }
-
-    async function toggleTuckWindow(sessionId, tuck) {
-      await fetch(`/api/sessions/${sessionId}/tuck`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tuck })
-      });
-      await refreshSessions();
-      renderWorkspace();
-    }
-
-    async function spawnSessionFromUI() {
-      const profile_id = document.getElementById('profileSelect').value;
-      const model = document.getElementById('modelSelect').value || null;
-      const thinking_level = document.getElementById('thinkingSelect').value || null;
-      const task = document.getElementById('taskInput').value.trim();
-      const cwd = document.getElementById('cwdInput').value.trim();
-      const res = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          profile_id,
-          model,
-          thinking_level,
-          task: task || null,
-          cwd: cwd || null
-        })
-      });
-      const data = await res.json();
-      if (data.session) {
-        document.getElementById('taskInput').value = '';
-        activeSessionId = data.session.session_id;
-        await refreshSessions();
-        renderWorkspace();
-      }
-    }
-
-    async function sendQuickKey(sessionId, text) {
-      await fetch(`/api/sessions/${sessionId}/input`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
-      });
-    }
-
-    async function terminateSession(sessionId, ev) {
-      if (ev) ev.stopPropagation();
-      await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
-      if (termInstances[sessionId]) {
-        if (termInstances[sessionId].ws) termInstances[sessionId].ws.close();
-        if (termInstances[sessionId].guiTimer) clearInterval(termInstances[sessionId].guiTimer);
-        delete termInstances[sessionId];
-      }
-      await refreshSessions();
-      renderWorkspace();
-    }
-
-    // ==================== Profile & Model Config Modal Logic ====================
-    function openProfileConfigModal() {
-      document.getElementById('profileConfigModal').style.display = 'flex';
-      if (!selectedEditorProfileId || !profiles[selectedEditorProfileId]) {
-        const firstId = Object.keys(profiles)[0];
-        if (firstId) selectProfileForEdit(firstId);
-      } else {
-        selectProfileForEdit(selectedEditorProfileId);
-      }
-      renderProfileModalList();
-      renderCatalogTab();
-    }
-
-    function switchProfileModalTab(tab) {
-      document.getElementById('tabBtnProfiles').className = tab === 'profiles' ? 'active-mode' : '';
-      document.getElementById('tabBtnCatalog').className = tab === 'catalog' ? 'active-mode' : '';
-      document.getElementById('tabBtnRouting').className = tab === 'routing' ? 'active-mode' : '';
-      document.getElementById('profileTabProfiles').style.display = tab === 'profiles' ? 'grid' : 'none';
-      document.getElementById('profileTabCatalog').style.display = tab === 'catalog' ? 'flex' : 'none';
-      document.getElementById('profileTabRouting').style.display = tab === 'routing' ? 'flex' : 'none';
-    }
-
-    async function rescanModelsAndProfiles() {
-      await loadProfilesAndCatalog(true);
-      if (selectedEditorProfileId && profiles[selectedEditorProfileId]) {
-        selectProfileForEdit(selectedEditorProfileId);
-      }
-    }
-
-    function renderProfileModalList() {
-      const container = document.getElementById('profileConfigList');
-      if (!container) return;
-      container.innerHTML = '';
-      for (const [id, p] of Object.entries(profiles)) {
-        const isEnabled = p.enabled !== false;
-        const btn = document.createElement('button');
-        btn.className = 'profile-item-btn' + (id === selectedEditorProfileId ? ' selected' : '');
-        if (!isEnabled) {
-          btn.style.opacity = '0.58';
-        }
-        btn.onclick = () => selectProfileForEdit(id);
-        const modBadge = p.default_model ? `<span class="model-pill">${escapeHtml(p.default_model)}</span>` : '';
-        const thkBadge = p.default_thinking_level ? `<span class="thinking-pill">🧠 ${escapeHtml(p.default_thinking_level)}</span>` : '';
-        const statusIcon = isEnabled ? '✅' : '🚫';
-        const whenSnippet = (p.when_to_use || '').trim();
-        btn.innerHTML = `
-          <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
-            <strong style="font-size:12.5px;">${statusIcon} ${escapeHtml(p.name || id)}</strong>
-            <span class="kind-badge">${escapeHtml(p.engine || p.kind || 'tui')}</span>
-          </div>
-          <div style="font-size:11px; color:var(--text-muted); font-family:monospace;">ID: ${escapeHtml(id)}</div>
-          <div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:2px;">${modBadge}${thkBadge}</div>
-          ${whenSnippet ? `<div style="font-size:10.5px; color:#79c0ff; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🧭 ${escapeHtml(whenSnippet)}</div>` : ''}
-        `;
-        container.appendChild(btn);
-      }
-    }
-
-    function selectProfileForEdit(id) {
-      selectedEditorProfileId = id;
-      renderProfileModalList();
-      const p = profiles[id];
-      if (!p) return;
-
-      document.getElementById('editorTitle').textContent = `编辑 Profile: ${id}`;
-      document.getElementById('editProfileEnabled').checked = p.enabled !== false;
-      document.getElementById('editProfileWhenToUse').value = p.when_to_use || '';
-      document.getElementById('editProfileId').value = id;
-      document.getElementById('editProfileName').value = p.name || '';
-      document.getElementById('editProfileEngine').value = p.engine || 'omp';
-      document.getElementById('editProfileKind').value = p.kind || 'tui';
-      document.getElementById('editProfileCommand').value = p.command || '';
-      document.getElementById('editProfileTaskMode').value = p.task_mode || 'omp_positional';
-      document.getElementById('editProfileDelay').value = p.startup_delay_sec ?? 2.5;
-      document.getElementById('editProfileArgs').value = JSON.stringify(p.args || []);
-      document.getElementById('editProfileDesc').value = p.description || '';
-
-      populateEditorEngineDropdowns(p.engine || 'omp', p.default_model || '', p.default_thinking_level || '');
-    }
-
-    function startNewProfile() {
-      selectedEditorProfileId = null;
-      renderProfileModalList();
-      document.getElementById('editorTitle').textContent = '新建自定义 Profile';
-      document.getElementById('editProfileEnabled').checked = true;
-      document.getElementById('editProfileWhenToUse').value = '当需要调用此自定义 Agent 处理特定任务时使用。';
-      document.getElementById('editProfileId').value = 'custom-agent-1';
-      document.getElementById('editProfileName').value = '自定义 Agent Profile';
-      document.getElementById('editProfileEngine').value = 'omp';
-      document.getElementById('editProfileKind').value = 'tui';
-      document.getElementById('editProfileCommand').value = 'C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe';
-      document.getElementById('editProfileTaskMode').value = 'omp_positional';
-      document.getElementById('editProfileDelay').value = 2.0;
-      document.getElementById('editProfileArgs').value = '["--auto-approve"]';
-      document.getElementById('editProfileDesc').value = '';
-      populateEditorEngineDropdowns('omp', '', 'high');
-    }
-
-    function onEditorEngineChange() {
-      const engine = document.getElementById('editProfileEngine').value;
-      const defaultCmdMap = {
-        omp: 'C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe',
-        kimi: 'C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe',
-        agy: 'C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE',
-        codex: 'C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd',
-        dsh: 'pwsh.exe',
-        pwsh: 'pwsh.exe'
-      };
-      if (!selectedEditorProfileId && defaultCmdMap[engine]) {
-        document.getElementById('editProfileCommand').value = defaultCmdMap[engine];
-      }
-      populateEditorEngineDropdowns(engine, '', '');
-    }
-
-    function populateEditorEngineDropdowns(engine, currentModel, currentThinking) {
-      const cat = enginesCatalog[engine] || {};
-      const enabledModels = cat.available_models || [];
-      const allModels = cat.all_discovered_models || enabledModels;
-      const disabledModels = cat.disabled_models || [];
-      const levels = cat.available_thinking_levels || [];
-      const flags = cat.cli_flags_template || {};
-
-      const modelSel = document.getElementById('editProfileModelSelect');
-      modelSel.innerHTML = '';
-      const emptyOpt = document.createElement('option');
-      emptyOpt.value = '';
-      emptyOpt.textContent = `-- 使用引擎默认模型 (${cat.default_model || '自动'}) --`;
-      modelSel.appendChild(emptyOpt);
-
-      for (const m of allModels) {
-        const isDis = disabledModels.includes(m);
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = isDis ? `🚫 ${m} [已禁用]` : `✅ ${m}`;
-        modelSel.appendChild(opt);
-      }
-
-      if (currentModel && allModels.includes(currentModel)) {
-        modelSel.value = currentModel;
-      }
-      document.getElementById('editProfileModelCustom').value = currentModel || '';
-
-      const thinkSel = document.getElementById('editProfileThinkingSelect');
-      thinkSel.innerHTML = '';
-      const emptyThink = document.createElement('option');
-      emptyThink.value = '';
-      emptyThink.textContent = `-- 使用引擎默认思考等级 (${cat.default_thinking_level || '自动'}) --`;
-      thinkSel.appendChild(emptyThink);
-
-      for (const lv of levels) {
-        const opt = document.createElement('option');
-        opt.value = lv;
-        opt.textContent = lv;
-        thinkSel.appendChild(opt);
-      }
-      if (currentThinking && levels.includes(currentThinking)) {
-        thinkSel.value = currentThinking;
-      }
-
-      const hintEl = document.getElementById('editorEngineHint');
-      hintEl.innerHTML = `
-        <div><strong>引擎自动识别信息 (${escapeHtml(cat.name || engine)}):</strong> 可执行文件 <code>${escapeHtml(cat.binary || 'N/A')}</code></div>
-        <div style="margin-top:4px;">参数注入规则: 模型 <code>${escapeHtml(flags.model || '自动')}</code> | 思考等级 <code>${escapeHtml(flags.thinking_level || '自动')}</code></div>
-        <div style="margin-top:4px;">当前已启用模型 (${enabledModels.length}/${allModels.length}): <code>${escapeHtml(enabledModels.join(', ') || '无')}</code></div>
-        ${disabledModels.length ? `<div style="margin-top:2px; color:#ff7b72;">已禁用模型 (${disabledModels.length}): <code>${escapeHtml(disabledModels.join(', '))}</code> (可在「🔘 模型启用/禁用开关」标签页一键切换)</div>` : ''}
-        <div style="margin-top:2px;">支持思考等级 (${levels.length}): <code>${escapeHtml(levels.join(', ') || '无')}</code></div>
-      `;
-    }
-
-    function onEditorModelSelectChange() {
-      const val = document.getElementById('editProfileModelSelect').value;
-      document.getElementById('editProfileModelCustom').value = val;
-    }
-
-    async function saveCurrentProfile() {
-      const id = document.getElementById('editProfileId').value.trim();
-      if (!id) {
-        alert('请填写 Profile ID');
-        return;
-      }
-      let parsedArgs = [];
-      try {
-        parsedArgs = JSON.parse(document.getElementById('editProfileArgs').value || '[]');
-      } catch (e) {
-        alert('附加启动参数 args 必须是合法的 JSON 数组，例如 [] 或 ["--auto-approve"]');
-        return;
-      }
-
-      const payload = {
-        id,
-        enabled: document.getElementById('editProfileEnabled').checked,
-        when_to_use: document.getElementById('editProfileWhenToUse').value.trim(),
-        name: document.getElementById('editProfileName').value.trim() || id,
-        engine: document.getElementById('editProfileEngine').value,
-        kind: document.getElementById('editProfileKind').value,
-        default_model: document.getElementById('editProfileModelCustom').value.trim() || null,
-        default_thinking_level: document.getElementById('editProfileThinkingSelect').value || null,
-        command: document.getElementById('editProfileCommand').value.trim(),
-        args: parsedArgs,
-        task_mode: document.getElementById('editProfileTaskMode').value,
-        startup_delay_sec: parseFloat(document.getElementById('editProfileDelay').value || '2.5'),
-        description: document.getElementById('editProfileDesc').value.trim()
-      };
-
-      const res = await fetch('/api/profiles', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      if (data.ok) {
-        selectedEditorProfileId = id;
-        await loadProfilesAndCatalog(false);
-        selectProfileForEdit(id);
-      } else {
-        alert('保存失败: ' + (data.detail || data.error || '未知错误'));
-      }
-    }
-
-    async function deleteCurrentProfile() {
-      const id = document.getElementById('editProfileId').value.trim();
-      if (!id || !profiles[id]) return;
-      if (!confirm(`确定要删除 Profile "${id}" 吗？`)) return;
-      const res = await fetch(`/api/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (data.ok) {
-        selectedEditorProfileId = null;
-        await loadProfilesAndCatalog(false);
-        const firstId = Object.keys(profiles)[0];
-        if (firstId) selectProfileForEdit(firstId);
-      }
-    }
-
-    async function toggleEngineModel(engine, modelId, enable) {
-      const res = await fetch(`/api/engines/${encodeURIComponent(engine)}/models/toggle`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelId, enabled: enable })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        await loadProfilesAndCatalog(false);
-        if (selectedEditorProfileId && profiles[selectedEditorProfileId]) {
-          selectProfileForEdit(selectedEditorProfileId);
-        }
-      }
-    }
-
-    async function batchSetEngineModels(engine, mode) {
-      const info = enginesCatalog[engine] || {};
-      const allModels = info.all_discovered_models || info.available_models || [];
-      const defModel = info.default_model || allModels[0];
-      for (const m of allModels) {
-        const shouldEnable = mode === 'all' ? true : (m === defModel);
-        await fetch(`/api/engines/${encodeURIComponent(engine)}/models/toggle`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: m, enabled: shouldEnable })
-        });
-      }
-      await loadProfilesAndCatalog(false);
-      if (selectedEditorProfileId && profiles[selectedEditorProfileId]) {
-        selectProfileForEdit(selectedEditorProfileId);
-      }
-    }
-
-    async function saveGlobalRoutingGuide() {
-      const text = document.getElementById('globalRoutingTextarea').value;
-      const res = await fetch('/api/routing-guide', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ global_routing_instructions: text })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        await loadProfilesAndCatalog(false);
-        alert('全局主 Agent 调度总则已保存！');
-      }
-    }
-
-    function renderCatalogTab() {
-      const wrap = document.getElementById('profileTabCatalog');
-      if (!wrap) return;
-      wrap.innerHTML = '';
-
-      const banner = document.createElement('div');
-      banner.style.cssText = 'font-size:12.5px; color:#79c0ff; background:rgba(47,129,247,0.1); border:1px solid rgba(47,129,247,0.35); border-radius:7px; padding:8px 12px;';
-      banner.innerHTML = '💡 <strong>操作提示：</strong>直接点击任意模型标签即可<strong>开启 (✅)</strong> 或 <strong>关闭/禁用 (🚫)</strong> 该模型。被关闭的模型将自动从侧边栏下拉列表与 MCP 可用模型列表中移除，且禁止主 Agent 调用。';
-      wrap.appendChild(banner);
-
-      for (const [eng, info] of Object.entries(enginesCatalog)) {
-        const card = document.createElement('div');
-        card.className = 'engine-card';
-        const allModels = info.all_discovered_models || info.available_models || [];
-        const enabledModels = info.available_models || [];
-        const disabledModels = info.disabled_models || [];
-        const levels = info.available_thinking_levels || [];
-        const flags = info.cli_flags_template || {};
-
-        const modelsHtml = allModels.map(m => {
-          const isEnabled = !disabledModels.includes(m);
-          const safeEng = escapeHtml(eng).replace(/'/g, "\\'");
-          const safeMod = escapeHtml(m).replace(/'/g, "\\'");
-          return `<span class="model-toggle-btn ${isEnabled ? '' : 'disabled-model'}" onclick="toggleEngineModel('${safeEng}', '${safeMod}', ${!isEnabled})" title="点击${isEnabled ? '禁用' : '启用'}模型 ${escapeHtml(m)}">${isEnabled ? '✅' : '🚫'} ${escapeHtml(m)}</span>`;
-        }).join('');
-
-        const thinkHtml = levels.map(t => `<span class="thinking-pill">🧠 ${escapeHtml(t)}</span>`).join('');
-        const safeEngBtn = escapeHtml(eng).replace(/'/g, "\\'");
-        card.innerHTML = `
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <div>
-              <strong style="font-size:14px; color:#58a6ff;">[${escapeHtml(eng.toUpperCase())}] ${escapeHtml(info.name || '')}</strong>
-              <span style="font-size:11.5px; margin-left:8px; color:${info.installed ? 'var(--green)' : 'var(--text-muted)'};">
-                ${info.installed ? '✅ 已安装' : '⚪ 未检测到本地二进制'} (<code>${escapeHtml(info.binary || '')}</code>)
-              </span>
-            </div>
-            <div style="display:flex; gap:6px;">
-              <button style="padding:3px 8px; font-size:11px;" onclick="batchSetEngineModels('${safeEngBtn}', 'all')">全部启用</button>
-              <button style="padding:3px 8px; font-size:11px;" onclick="batchSetEngineModels('${safeEngBtn}', 'only_default')">仅保留默认模型 (${escapeHtml(info.default_model || '')})</button>
-            </div>
-          </div>
-          <div style="font-size:12px; color:var(--text-muted);">
-            模型注入参数: <code>${escapeHtml(flags.model || 'N/A')}</code> &nbsp;|&nbsp;
-            思考等级参数: <code>${escapeHtml(flags.thinking_level || 'N/A')}</code>
-          </div>
-          <div>
-            <div class="field-label">点击模型标签切换【启用 ✅ / 禁用 🚫】 (已启用 ${enabledModels.length} / 共 ${allModels.length} 个, 默认: <code>${escapeHtml(info.default_model || 'N/A')}</code>):</div>
-            <div class="tag-wrap">${modelsHtml || '<span style="color:var(--text-muted); font-size:12px;">未检测到模型</span>'}</div>
-          </div>
-          <div>
-            <div class="field-label">自动识别支持思考等级 (${levels.length} 档, 默认: <code>${escapeHtml(info.default_thinking_level || 'N/A')}</code>):</div>
-            <div class="tag-wrap">${thinkHtml || '<span style="color:var(--text-muted); font-size:12px;">无独立思考等级</span>'}</div>
-          </div>
-        `;
-        wrap.appendChild(card);
-      }
-    }
-
-    async function openWin32Modal() {
-      document.getElementById('win32Modal').style.display = 'flex';
-      const listEl = document.getElementById('win32List');
-      listEl.innerHTML = '正在扫描桌面窗口...';
-      const res = await fetch('/api/win32/windows');
-      const data = await res.json();
-      listEl.innerHTML = '';
-      for (const w of (data.windows || [])) {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:8px; background:var(--bg-card); border-radius:6px;';
-        row.innerHTML = `
-          <div style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:360px;">
-            <strong>${escapeHtml(w.title)}</strong>
-            <div style="font-size:11px; color:var(--text-muted);">HWND: ${w.hwnd} | PID: ${w.pid} | ${w.width}x${w.height}</div>
-          </div>
-          <button class="primary" onclick="attachWin32Window(${w.hwnd}, '${escapeHtml(w.title).replace(/'/g, "\\'")}')">纳入总控台</button>
-        `;
-        listEl.appendChild(row);
-      }
-    }
-
-    async function attachWin32Window(hwnd, title) {
-      closeModal('win32Modal');
-      const res = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: 'desktop-gui', hwnd, title })
-      });
-      const data = await res.json();
-      if (data.session) {
-        activeSessionId = data.session.session_id;
-        await refreshSessions();
-        renderWorkspace();
-      }
-    }
-
-    function showMcpConfigModal() { document.getElementById('mcpModal').style.display = 'flex'; }
-    function closeModal(id) { document.getElementById(id).style.display = 'none'; }
-    function escapeHtml(s) {
-      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-
-    init();
-  </script>
+  <div class="toast-host" id="toastHost" aria-live="polite"></div>
 </body>
 </html>

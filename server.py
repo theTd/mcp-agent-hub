@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastmcp import Context, FastMCP
 import uvicorn
 
@@ -15,7 +16,8 @@ from transcript_summarizer import sanitize_tui_screen_text
 
 BASE_DIR = Path(__file__).parent.resolve()
 PROFILES_PATH = BASE_DIR / "agent_profiles.json"
-STATIC_INDEX = BASE_DIR / "static" / "index.html"
+STATIC_DIR = BASE_DIR / "static"
+STATIC_INDEX = STATIC_DIR / "index.html"
 
 hub = HubSessionManager(PROFILES_PATH)
 
@@ -720,10 +722,22 @@ async def api_parent_respond_interaction(session_id: str, req: Request):
 # ============================================================================
 # 4. Web 总控台与 ConPTY / Win32 路由
 # ============================================================================
+class RevalidatingStaticFiles(StaticFiles):
+    """Console assets: always revalidate (cheap 304) so an edited module never mixes with a cached one."""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", RevalidatingStaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/ui", response_class=HTMLResponse)
 async def serve_console():
-    return HTMLResponse(STATIC_INDEX.read_text(encoding="utf-8"))
+    return HTMLResponse(STATIC_INDEX.read_text(encoding="utf-8"), headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/profiles")
