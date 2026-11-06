@@ -563,6 +563,20 @@ class HubDatabase:
                 params.append(session_id)
                 conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
 
+    def clear_turn_answer(self, session_id: str) -> None:
+        """T1/R10: the previous turn's answer stops being this session's answer.
+
+        upsert_session COALESCEs final_response and final_response_source so telemetry never erases
+        a final record, so the clear needs a statement of its own — and exactly one definition,
+        because a resume (§5.3) and a follow-up message that starts a new turn (T1) must clear the
+        same two columns.
+        """
+        with self._lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET final_response=NULL, final_response_source=NULL WHERE session_id=?",
+                (session_id,),
+            )
+
     def reset_session_after_resume(self, session_id: str) -> None:
         """A revived session is live again: it leaves the archive and its end state (§5.3)."""
         with self._lock, self._conn() as conn:
@@ -570,12 +584,13 @@ class HubDatabase:
                 """
                 UPDATE sessions
                 SET archived_at=NULL, end_reason=NULL, ended_at=NULL, exit_code=NULL,
-                    resumable=NULL, resume_block_reason=NULL, status='starting',
-                    final_response=NULL, final_response_source=NULL
+                    resumable=NULL, resume_block_reason=NULL, status='starting'
                 WHERE session_id=?
                 """,
                 (session_id,),
             )
+        # R10/T1: the ended turn's answer is cleared by the one helper a live follow-up uses too.
+        self.clear_turn_answer(session_id)
 
     def list_session_ids(self) -> List[str]:
         with self._lock, self._conn() as conn:
@@ -2949,8 +2964,10 @@ class HubSessionManager:
         sess.last_resumed_at = time.time()
         # R10: deliberately no final_response carry-over. It belongs to the ended turn, and its high
         # source priority would block the revived turn's own (lower-priority) answer from being
-        # recorded. reset_session_after_resume clears it on purpose; the previous reply survives only
-        # in the scrollback (the archived pane replay), never as this session's final_response.
+        # recorded. reset_session_after_resume clears the stored one through clear_turn_answer — the
+        # same helper the live follow-up path uses (T1) — and the new object starts without it; the
+        # previous reply survives only in the scrollback (the archived pane replay), never as this
+        # session's final_response.
         # Spec §5.3: the pane starts with the archived output, then the resume separator.
         archived = self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
@@ -4448,6 +4465,23 @@ class HubSessionManager:
             "action_trace": action_trace,
         }
 
+    def begin_new_turn(self, session: AgentSession, status: Optional[str] = None) -> None:
+        """T1: a message to a session that already reported completion starts a new turn.
+
+        This is the one definition of the decision "a new turn clears the previous final reply":
+        a resume (§5.3) clears through db.reset_session_after_resume, which calls the same
+        db.clear_turn_answer, so a change to that decision changes both paths. Clearing the source
+        as well restarts the source priority — otherwise a turn-1 report_complete_mcp outranks the
+        turn-2 transcript — and completion_reported restarts with it, so a later exit is judged on
+        this turn's evidence. A parent must never read the previous turn's answer as this turn's.
+        """
+        session.final_response = None
+        session.final_response_source = None
+        session.completion_reported = False
+        if status is not None:
+            session.status = status
+        self.db.clear_turn_answer(session.session_id)
+
     def deliver_parent_message(
         self,
         session_id: str,
@@ -4457,6 +4491,11 @@ class HubSessionManager:
         press_enter: bool = True,
     ) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
+        # T1: this message may start a new turn on a session that already reported completion. The
+        # status is captured before the delivery branches change it, and the reset itself runs at
+        # the end, only when the text really reached the session — a failed delivery must not leave
+        # the session "running" with no turn behind it.
+        starts_new_turn = bool(sess is not None and sess.status == "completed")
         # If there is an active structured approval/question interaction on this session,
         # route through our engine-aware responder automatically!
         if sess and sess.pending_interaction:
@@ -4620,11 +4659,10 @@ class HubSessionManager:
                     except Exception:
                         sess.write_input("\r")
 
-        if sess:
-            self.persist_session(sess)
-
         if dsh_error is not None:
             # A8: a message DSH could not take is reported with its reason, never as a canned true.
+            if sess:
+                self.persist_session(sess)
             return {
                 "delivered": False,
                 "reason": dsh_error,
@@ -4634,6 +4672,15 @@ class HubSessionManager:
                 "injection": "dsh_failed",
                 "mailbox_message_id": msg_rec["id"],
             }
+
+        if sess and starts_new_turn and pty_written and not resolved_question_id:
+            # T1: send_to_subagent's live write, the console's send and a parent reply all land
+            # here. The completed turn's answer is cleared and the status goes back to running, so
+            # the wait in send_to_subagent sees a turn in progress instead of status_completed.
+            self.begin_new_turn(sess, status="running")
+
+        if sess:
+            self.persist_session(sess)
 
         return {
             "delivered": True,
