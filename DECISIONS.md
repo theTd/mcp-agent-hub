@@ -24,3 +24,15 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 | waiting-parent | The console shows a sub-agent's question to the main agent in full but does not answer it. |
 | launch-wording | UI says 启动 (not 拉起). |
 | launcher-after-launch | The launcher collapses after a successful launch without changing its saved expanded/collapsed preference. |
+
+## Archive and resume (2026-11-07, decision page archive-resume-2026-11-07)
+
+| id | decision | default kept |
+|---|---|---|
+| resume-same-id | A resumed session keeps its hub session id; the record counts resumes and the terminal shows `── 已恢复（第 N 次）──`. | yes |
+| auto-revive | `send_to_subagent` to an ended, resumable session resumes it and then delivers the message; a non-resumable one returns the reason in Chinese. | yes |
+| retention | Archive records are kept forever; only a manual delete (console 删除记录 / `DELETE /api/archive/{id}`) removes one. Scrollback stays capped at 512 KB per session. | no (was: 30 days or newest 500) |
+| resume-clears-reply | Resume and a follow-up message to a completed session keep the previous final reply until the new turn writes one; meanwhile `get_subagent_final_response` adds `from_previous_turn: true`. | no (was: clear it) |
+| shutdown-ends-cli | A graceful hub shutdown ends each sub-agent's CLI process tree and cancels running dsh jobs, archiving them as `interrupted` (resumable). | yes |
+| dsh-one-event | A dsh turn emits one `turn_completed` event (no separate `completed`), like the other engines. | yes |
+| unconfirmed-injection | When the hub cannot confirm a typed task was submitted, it presses Enter once more (never while a known trust/update dialog is on screen); if still unknown, it records the injection as unconfirmed. | no (was: press nothing more) |

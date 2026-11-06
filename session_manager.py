@@ -245,7 +245,8 @@ class HubDatabase:
             if col == "session_id":
                 continue
             # A12: a plain telemetry persist (which knows none of these) must never erase what the
-            # final record already wrote. reset_session_after_resume is the only place that clears them.
+            # final record already wrote. D2 removed the one clear that used to exist: a resume now
+            # keeps the previous answer too, and the new turn overwrites it through set_final_response.
             if col in ("ended_at", "exit_code", "archived_at", "spawned_at",
                        "profile_snapshot", "conversation_ref", "parent_messages",
                        "last_resumed_at", "end_reason", "final_response", "final_response_source"):
@@ -505,29 +506,8 @@ class HubDatabase:
             cur = conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
             return cur.rowcount > 0
 
-    def prune_archived(self, cutoff: float, keep_newest: Optional[int] = None) -> int:
-        """Deletes archived rows older than `cutoff` that are not among the newest `keep_newest` (§1.6)."""
-        if keep_newest is None:
-            keep_newest = ARCHIVE_RETENTION_KEEP_NEWEST
-        with self._lock, self._conn() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM sessions
-                WHERE archived_at IS NOT NULL
-                  AND archived_at < ?
-                  AND session_id NOT IN (
-                    SELECT session_id FROM sessions
-                    WHERE archived_at IS NOT NULL
-                    ORDER BY archived_at DESC
-                    LIMIT ?
-                  )
-                """,
-                (float(cutoff), max(0, int(keep_newest))),
-            )
-            return int(cur.rowcount or 0)
-
     def update_archive_fields(self, session_id: str, **fields: Any) -> None:
-        """Writes a few session columns directly (startup normalisation, retention, resume blocks)."""
+        """Writes a few session columns directly (startup normalisation, resume blocks)."""
         # The startup normalisation also rewrites the live status it found in the row, and the
         # resume-block updates rewrite nothing else; both sets must be allowed here.
         allowed = set(ARCHIVE_COLUMNS) | {"status", "ended_at", "current_activity"}
@@ -563,22 +543,13 @@ class HubDatabase:
                 params.append(session_id)
                 conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
 
-    def clear_turn_answer(self, session_id: str) -> None:
-        """T1/R10: the previous turn's answer stops being this session's answer.
-
-        upsert_session COALESCEs final_response and final_response_source so telemetry never erases
-        a final record, so the clear needs a statement of its own — and exactly one definition,
-        because a resume (§5.3) and a follow-up message that starts a new turn (T1) must clear the
-        same two columns.
-        """
-        with self._lock, self._conn() as conn:
-            conn.execute(
-                "UPDATE sessions SET final_response=NULL, final_response_source=NULL WHERE session_id=?",
-                (session_id,),
-            )
-
     def reset_session_after_resume(self, session_id: str) -> None:
-        """A revived session is live again: it leaves the archive and its end state (§5.3)."""
+        """A revived session is live again: it leaves the archive and its end state (§5.3).
+
+        D2: the stored final answer is deliberately left in place. The previous turn's reply stays
+        readable until the revived turn writes its own; begin_new_turn marks it in memory as
+        "from_previous_turn" and the next final-response source overwrites it.
+        """
         with self._lock, self._conn() as conn:
             conn.execute(
                 """
@@ -589,8 +560,6 @@ class HubDatabase:
                 """,
                 (session_id,),
             )
-        # R10/T1: the ended turn's answer is cleared by the one helper a live follow-up uses too.
-        self.clear_turn_answer(session_id)
 
     def list_session_ids(self) -> List[str]:
         with self._lock, self._conn() as conn:
@@ -693,9 +662,8 @@ ENGINE_RESUME_BLOCK_REASONS = {
 DEFAULT_RESUME_BLOCK_REASON = "该引擎的会话结束后无法恢复上下文"
 RESUME_SCROLLBACK_MAX_BYTES = 512 * 1024
 RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
-ARCHIVE_RETENTION_DAYS = 30
-ARCHIVE_RETENTION_KEEP_NEWEST = 500
-ARCHIVE_PRUNE_INTERVAL_SEC = 6 * 60 * 60
+# D1: archive records are kept forever. There is no age/count limit and no pruning loop; the only
+# way a record leaves the hub is the manual delete (console 删除记录 / DELETE /api/archive/{id}).
 # R5/R6: a graceful stop must not hang on a CLI that ignores the first signal or a DSH host that
 # takes its time; each session is bounded and so is the whole loop.
 SHUTDOWN_MAX_SEC = 15.0
@@ -740,6 +708,9 @@ TUI_SUBMIT_CONFIRM_POLL_SEC = 0.25
 TUI_SUBMIT_MAX_TRIES = 3
 TUI_SUBMIT_RETRY_STEP_SEC = 1.0
 TUI_TYPE_SETTLE_SEC = 0.8
+# D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
+# watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
+TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
 # W2: engine input boxes do not live on the last line (kimi draws two status lines under its
 # composer), so the prompt is searched in the bottom rows of the screen, per engine.
 TUI_PROMPT_SCAN_ROWS = 10
@@ -756,6 +727,12 @@ TUI_TRUST_DIALOG_PHRASES = (
     "Do you trust the authors of the files in this folder?",
     "Do you trust the files in this folder?",
     "Yes, I trust this folder",
+)
+# D3: a known dialog must never receive the extra Enter. The omp ready capture carries this banner
+# right above the composer ("Update Available / New version 18.17.0 is available"), so it counts.
+TUI_UPDATE_DIALOG_PHRASES = (
+    "Update Available",
+    "New version ",
 )
 # W3/K2: the screen proves the agent is working or answering when one of these is visible.
 # K2 removed the words that are NOT evidence, and every one of them came from a real capture:
@@ -1021,6 +998,9 @@ class AgentSession:
         self.current_activity: str = "Initializing session..."
         self.final_response: Optional[str] = None
         self.final_response_source: Optional[str] = None
+        # D2: True while the stored answer belongs to the turn that ended (set by begin_new_turn on
+        # a resume and on a follow-up). The next turn's first source overwrites it whatever its rank.
+        self.final_response_from_previous_turn: bool = False
         self.files_changed: List[str] = []
         self.pending_question_id: Optional[str] = None
         self.pending_interaction: Optional[Dict[str, Any]] = None
@@ -1101,11 +1081,20 @@ class AgentSession:
         text = (text or "").strip()
         if not text:
             return
-        cur_prio = FINAL_SOURCE_PRIORITY.get(self.final_response_source, 0)
         new_prio = FINAL_SOURCE_PRIORITY.get(source, 1)
-        if new_prio >= cur_prio:
+        if self.final_response_from_previous_turn:
+            # D2: the previous turn's answer is kept only until this turn writes one. The new turn's
+            # first source wins whatever its rank, so an old report_complete_mcp can no longer
+            # outrank the turn that is running now; the flag clears with that first write.
             self.final_response = text
             self.final_response_source = source
+            self.final_response_from_previous_turn = False
+        else:
+            # Within one turn the source priority stays exactly as the K4 table defines it.
+            cur_prio = FINAL_SOURCE_PRIORITY.get(self.final_response_source, 0)
+            if new_prio >= cur_prio:
+                self.final_response = text
+                self.final_response_source = source
         # Spec §1.4: "reported completion" is what separates a clean exit from an abnormal one.
         if str(source) in ("report_complete_mcp", "codex_task_complete", "dsh_hub_completion"):
             self.completion_reported = True
@@ -1466,6 +1455,8 @@ class AgentSession:
             "pending_interaction": self.pending_interaction,
             "final_response": self.final_response,
             "final_response_source": self.final_response_source,
+            # D2: true while the answer above still belongs to the turn before the current one.
+            "from_previous_turn": self.final_response_from_previous_turn,
             "files_changed": self.files_changed,
             "pid": getattr(self.pty, "pid", None) if self.pty else None,
             "created_at": self.created_at,
@@ -1693,15 +1684,14 @@ class HubSessionManager:
         # the very first /api/sessions poll answers immediately.
         self._discovery_ready = threading.Event()
         self.load_profiles(discovery=self.model_discovery.peek_cache() or {"engines": {}})
-        # Archive spec §1.5/§5: rows a stopped hub left live become interrupted + archived, ended rows
-        # get their final record, then retention prunes (start, then every 6 hours). Profiles are loaded
-        # first, because "still resumable" depends on the profile still existing and being enabled.
+        # Archive spec §1.5/§5: rows a stopped hub left live become interrupted + archived, and ended
+        # rows get their final record. D1: nothing is pruned here or anywhere else — records are kept
+        # forever. Profiles are loaded first, because "still resumable" depends on the profile still
+        # existing and being enabled.
         try:
             self._normalize_archive_on_startup()
-            self.prune_archive()
         except Exception:
             pass
-        threading.Thread(target=self._prune_loop, name="hub-archive-prune", daemon=True).start()
         # Spec §3: while a session is live its scrollback is written at most once every 60 s, only
         # when it changed — a timer, not a side effect of some other persist that may never come.
         threading.Thread(target=self._scrollback_flush_loop, name="hub-scrollback-flush", daemon=True).start()
@@ -2962,12 +2952,12 @@ class HubSessionManager:
         sess.attach_offset = int(built.get("attach_offset") or 0)
         sess.resume_count = count
         sess.last_resumed_at = time.time()
-        # R10: deliberately no final_response carry-over. It belongs to the ended turn, and its high
-        # source priority would block the revived turn's own (lower-priority) answer from being
-        # recorded. reset_session_after_resume clears the stored one through clear_turn_answer — the
-        # same helper the live follow-up path uses (T1) — and the new object starts without it; the
-        # previous reply survives only in the scrollback (the archived pane replay), never as this
-        # session's final_response.
+        # D2: the ended turn's answer comes back with the revived object, and begin_new_turn marks it
+        # as from_previous_turn at the resume call site. It is kept only until the revived turn
+        # writes its own; set_final_response lets that first source win whatever its rank. The
+        # archived pane still replays the scrollback, so the old answer is visible there too.
+        sess.final_response = record.get("final_response") or None
+        sess.final_response_source = record.get("final_response_source") or None
         # Spec §5.3: the pane starts with the archived output, then the resume separator.
         archived = self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
@@ -3144,6 +3134,9 @@ class HubSessionManager:
         if old is not None:
             self._release_transcripts(session_id)
         self.db.reset_session_after_resume(session_id)
+        # D2: the same shared helper the live follow-up uses marks the archived answer as the
+        # previous turn's; it stays readable until the resumed turn writes its own.
+        self.begin_new_turn(sess)
         self.persist_session(sess)
 
         if engine == "codex":
@@ -3334,6 +3327,8 @@ class HubSessionManager:
         if old is not None:
             self._release_transcripts(session_id)
         self.db.reset_session_after_resume(session_id)
+        # D2: same shared helper as every other new turn (resume keeps the archived answer).
+        self.begin_new_turn(sess)
         if clean:
             # R5: a /messages delivery keeps the job and its original token; a /continue delivery
             # gets the new job and the new token. Both are persisted with the conversation ref.
@@ -3537,19 +3532,6 @@ class HubSessionManager:
         if not rec.get("archived_at"):
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
         return self.db.delete_session_record(session_id)
-
-    def prune_archive(self) -> int:
-        """Spec §1.6: keep 30 days or the newest 500 records, whichever keeps more."""
-        cutoff = time.time() - ARCHIVE_RETENTION_DAYS * 86400
-        return self.db.prune_archived(cutoff, ARCHIVE_RETENTION_KEEP_NEWEST)
-
-    def _prune_loop(self) -> None:
-        while True:
-            time.sleep(ARCHIVE_PRUNE_INTERVAL_SEC)
-            try:
-                self.prune_archive()
-            except Exception:
-                pass
 
     def _scrollback_flush_loop(self) -> None:
         """Write each live session's scrollback once it is 60 s old (spec §1.6/§3).
@@ -3911,8 +3893,13 @@ class HubSessionManager:
             raw_screen_fallback=raw_fallback,
         )
 
-        # Upgrade session's final_response if transcript summarizer found a clean conclusion
-        if sess and summary.get("latest_conclusion"):
+        # Upgrade session's final_response if transcript summarizer found a clean conclusion.
+        # D2: never while the stored answer is still the previous turn's. The summariser reads
+        # whatever transcript exists, which right after a follow-up or a resume is still the ended
+        # turn's; letting it "overwrite" would both lose the kept answer and clear from_previous_turn
+        # before the new turn produced anything. The new turn's own sources (turn_completed, the
+        # native transcript, report_complete) still replace the kept answer through set_final_response.
+        if sess and summary.get("latest_conclusion") and not sess.final_response_from_previous_turn:
             sess.set_final_response(summary["latest_conclusion"], "transcript_summarizer")
             self.persist_session(sess)
 
@@ -3964,6 +3951,8 @@ class HubSessionManager:
             "intermediate_messages": inter_msgs,
             "final_response": final_resp,
             "final_response_source": final_src,
+            # D2: the answer is still the previous turn's while the flag says so.
+            "from_previous_turn": bool(meta.get("from_previous_turn", False)),
             "files_changed": meta.get("files_changed", []),
             # A10: the real outcome of the startup/resume text, when there was one.
             "last_injection": meta.get("last_injection"),
@@ -4005,6 +3994,11 @@ class HubSessionManager:
             "exit_code": rec.get("exit_code"),
             "final_response": final_resp,
             "final_response_source": final_src,
+            # D2: a live session knows the answer above is the previous turn's; an archived record
+            # has no live flag and shows the stored value exactly as before.
+            "from_previous_turn": bool(
+                sess is not None and getattr(sess, "final_response_from_previous_turn", False)
+            ),
             "files_changed": rec.get("files_changed", []),
             "transcript_summary": transcript_summary,
         }
@@ -4466,21 +4460,20 @@ class HubSessionManager:
         }
 
     def begin_new_turn(self, session: AgentSession, status: Optional[str] = None) -> None:
-        """T1: a message to a session that already reported completion starts a new turn.
+        """T1/D2: a message to a completed session (or a resume) starts a new turn.
 
-        This is the one definition of the decision "a new turn clears the previous final reply":
-        a resume (§5.3) clears through db.reset_session_after_resume, which calls the same
-        db.clear_turn_answer, so a change to that decision changes both paths. Clearing the source
-        as well restarts the source priority — otherwise a turn-1 report_complete_mcp outranks the
-        turn-2 transcript — and completion_reported restarts with it, so a later exit is judged on
-        this turn's evidence. A parent must never read the previous turn's answer as this turn's.
+        This is the one definition of the decision "the previous final reply is kept until the new
+        turn overwrites it". Both paths call it: a live follow-up from deliver_parent_message and
+        both resume paths (§5.3), right after db.reset_session_after_resume. The answer and its
+        source stay in place, and the flag marks them as belonging to the ended turn:
+        set_final_response lets the new turn's first source replace them whatever its rank. The
+        priority table still governs the rest of that turn. completion_reported restarts with the
+        turn, so a later exit is judged on this turn's evidence.
         """
-        session.final_response = None
-        session.final_response_source = None
+        session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
         if status is not None:
             session.status = status
-        self.db.clear_turn_answer(session.session_id)
 
     def deliver_parent_message(
         self,
@@ -5819,6 +5812,21 @@ class HubSessionManager:
         """W3/K2: the screen shows the agent working or answering, which confirms a submit."""
         return bool(TUI_AGENT_ACTIVE_RE.search(str(screen_text or "")))
 
+    @classmethod
+    def _tui_blocking_dialog(cls, screen_text: str, session: Any = None) -> str:
+        """D3: the known trust/update dialog on screen ("" when there is none).
+
+        A dialog the hub already registered as a structured interaction counts as known too: an
+        Enter there would answer that dialog for the agent instead of submitting the task.
+        """
+        if session is not None and getattr(session, "pending_interaction", None):
+            return "pending_interaction"
+        text = str(screen_text or "")
+        for phrase in TUI_TRUST_DIALOG_PHRASES + TUI_UPDATE_DIALOG_PHRASES:
+            if phrase in text:
+                return phrase
+        return ""
+
     @staticmethod
     def _composer_holds(line: Optional[str], probe: str, tail: str) -> bool:
         """True when the located composer row still shows part of the typed text.
@@ -5850,7 +5858,8 @@ class HubSessionManager:
           (b) the transcript grew; or
           (c) the engine's working indicator is on screen.
         ("unsubmitted", reason) only when the text is POSITIVELY still on the located input row.
-        ("unknown", reason) when nothing decides it yet, so the caller presses nothing more.
+        ("unknown", reason) when nothing decides it yet. D3 then lets the caller press Enter once
+        more, but only with no known trust/update dialog on screen (see _submit_text_to_tui).
         """
         # K2: when the text was never seen on the composer, an empty composer proves nothing, so the
         # look keeps watching for ~15 s instead of deciding. A seen echo keeps the shorter W3 window.
@@ -5898,7 +5907,13 @@ class HubSessionManager:
         with echoed=False (kimi's box was still booting, then the screen redrew) proves nothing, so
         the check keeps watching for TUI_SUBMIT_EVIDENCE_SEC. If the text then appears on the
         composer with nothing indicating work, one more Enter is pressed (within the same retry
-        budget); if nothing decides it, the honest outcome is ok:null / "unconfirmed".
+        budget).
+
+        D3: when the evidence window ends with nothing proved (unknown), the hub presses Enter once
+        more and watches TUI_SUBMIT_EXTRA_PRESS_SEC. That press counts toward
+        TUI_SUBMIT_MAX_TRIES, is skipped entirely while a known trust/update dialog is on screen,
+        and if the outcome is still unknown the result stays ok:null / "unconfirmed" with
+        extra_press=true so last_injection shows that the extra press really happened.
         """
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
@@ -5917,6 +5932,7 @@ class HubSessionManager:
         line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
         echoed = self._composer_holds(line, probe, tail)
         attempts = 0
+        extra_press = False
         # K2: echoed is the FIRST look, right after typing, and it is what the result reports. The
         # later presses may additionally be judged by (a) once the text has really been seen sitting
         # on the composer -- that is what turns "the box looked empty while kimi was still booting"
@@ -5932,15 +5948,35 @@ class HubSessionManager:
                 deadline=evidence_deadline,
             )
             if state == "confirmed":
-                return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed, "label": "成功"}
+                return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed,
+                        "extra_press": extra_press, "label": "成功"}
             if state == "unknown":
-                # W3: nothing proves the text is still waiting -- the old code pressed Enter twice
-                # more here, and one of those Enters selected "Trust and continue" on a dialog.
-                return {"ok": None, "reason": "unconfirmed", "attempts": attempts, "echoed": echoed, "label": "未确认"}
+                # D3: nothing proved either way. Press Enter once more and watch a short window --
+                # but never while a known trust/update dialog is on screen, because that Enter
+                # would answer the dialog instead of submitting the task.
+                dialog = self._tui_blocking_dialog(
+                    session.get_clean_screen_text(max_lines=40), session
+                )
+                if extra_press or attempts >= TUI_SUBMIT_MAX_TRIES or dialog:
+                    result = {"ok": None, "reason": "unconfirmed", "attempts": attempts,
+                              "echoed": echoed, "extra_press": extra_press,
+                              "dialog": dialog or None, "label": "未确认"}
+                    if extra_press:
+                        # The extra press was made and the short D3 window still proved nothing.
+                        result["detail"] = "checked_after_extra_press"
+                    return result
+                extra_press = True
+                # The next loop iteration is that one extra Enter; it counts toward the attempt
+                # limit and gets the short D3 window instead of the long evidence one.
+                evidence_deadline = time.time() + TUI_SUBMIT_EXTRA_PRESS_SEC
+                continue
             # "unsubmitted": the text is visibly still on the input row, so one more Enter is safe.
+            # K2's one evidence budget for the whole submit stays in force here; only the D3 extra
+            # press gets a window of its own.
             seen = True
             await asyncio.sleep(TUI_SUBMIT_RETRY_STEP_SEC * attempts)
-        return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts, "echoed": echoed, "label": "失败"}
+        return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts,
+                "echoed": echoed, "extra_press": extra_press, "label": "失败"}
 
     async def _auto_handle_tui_startup_and_trust(
         self,
