@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.runtime_mcp_configs/
+hub_state.db
+hub_state.db-journal
+hub_state.db-shm
+hub_state.db-wal
+dsh_sec_test_dir/
+.stress_test_workspace/
