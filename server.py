@@ -41,16 +41,28 @@ def _get_refresh_lock() -> asyncio.Lock:
     return _refresh_lock
 
 
+def _load_profiles_from_cache_blocking() -> None:
+    """Loads profiles off the event loop, using only the discovery cache (R3).
+
+    If the cache is still empty the startup discovery thread is running: wait for it in this worker
+    thread, never on the loop. `load_profiles(discovery=None)` would run discovery synchronously, which
+    is exactly what made the first poll crawl.
+    """
+    discovery = hub.model_discovery.peek_cache()
+    if discovery is None:
+        hub.wait_for_discovery(180.0)
+        discovery = hub.model_discovery.peek_cache()
+        if discovery is None:
+            # Still discovering; keep the state the last load produced instead of wiping it.
+            return
+    hub.load_profiles(refresh_discovery=False, discovery=discovery)
+
+
 async def ensure_profiles_loaded(refresh_discovery: bool = False) -> None:
     """Refresh profiles in a worker thread (shared in-flight task per refresh)."""
     global _refresh_task
     if not refresh_discovery:
-        hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
-        if not hub.engines_catalog and not hub.model_discovery.peek_cache():
-            # Startup discovery is still running. Wait for it off the event loop before answering,
-            # otherwise a launch would resolve with no catalog and silently inject no model at all.
-            await asyncio.to_thread(hub.wait_for_discovery, 180.0)
-            hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
+        await asyncio.to_thread(_load_profiles_from_cache_blocking)
         return
 
     async with _get_refresh_lock():
@@ -64,8 +76,7 @@ async def ensure_profiles_loaded(refresh_discovery: bool = False) -> None:
         # A failed refresh must not take the route down; the cached catalog still answers.
         pass
     if not hub.engines_catalog:
-        await asyncio.to_thread(hub.wait_for_discovery, 180.0)
-        hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
+        await asyncio.to_thread(_load_profiles_from_cache_blocking)
 
 
 async def profiles_payload() -> Dict[str, Any]:
@@ -829,6 +840,23 @@ async def api_save_profile(req: Request):
     return payload
 
 
+@app.post("/api/routing-guide")
+async def api_save_routing_guide(req: Request):
+    """R2: persist the global routing instructions every parent agent reads. 400 on bad input."""
+    body = await req.json()
+    text = body.get("global_routing_instructions")
+    if not isinstance(text, str):
+        return bad_request("global_routing_instructions 必须是字符串。")
+    try:
+        hub.save_global_routing_instructions(text)
+    except ValueError as e:
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload["ok"] = True
+    payload["global_routing_instructions"] = hub.global_routing_instructions
+    return payload
+
+
 @app.delete("/api/profiles/{profile_id}")
 async def api_delete_profile(profile_id: str):
     try:
@@ -846,8 +874,8 @@ async def api_toggle_engine_model(engine: str, req: Request):
     model_id = body.get("model") or body.get("model_id") or ""
     note = body.get("note")
     enabled_field = body.get("enabled")
-    # B13: a note-only update passes the model's current `enabled` value.
-    enabled = True if enabled_field is None else bool(enabled_field)
+    # R6: a missing `enabled` is a note-only update; the model keeps its current state.
+    enabled = None if enabled_field is None else bool(enabled_field)
     try:
         eng_info = hub.toggle_engine_model(engine=engine, model_id=model_id, enabled=enabled, note=note)
     except ValueError as e:
@@ -869,7 +897,7 @@ async def api_list_sessions():
     return {
         "global_seq": hub.global_seq,
         "sessions": [s.to_dict() for s in hub.sessions.values()],
-        "persisted_sessions": hub.db.list_persisted_sessions(limit=20),
+        "persisted_sessions": hub.db.list_persisted_sessions(limit=50),
         "recent_events": hub.worker_events[-30:],
         "default_cwd": hub.hub_default_cwd(),
         "hub_port": hub_port(),
@@ -975,8 +1003,11 @@ async def api_get_window_frame(session_id: str):
 @app.post("/api/sessions/{session_id}/tuck")
 async def api_tuck_window(session_id: str, req: Request):
     sess = hub.sessions.get(session_id)
-    if not sess or not sess.hwnd:
-        raise HTTPException(status_code=404, detail="GUI session not found")
+    # S2: an unknown session is a 404 with the same wording every other session route uses.
+    if not sess:
+        return not_found(f"找不到会话 {session_id}")
+    if not sess.hwnd:
+        return bad_request(f"会话 {session_id} 不是桌面窗口会话。")
     body = await req.json()
     tuck = bool(body.get("tuck", True))
     Win32WindowHelper.tuck_window_offscreen(sess, tuck)
@@ -986,8 +1017,10 @@ async def api_tuck_window(session_id: str, req: Request):
 @app.post("/api/sessions/{session_id}/click")
 async def api_click_window(session_id: str, req: Request):
     sess = hub.sessions.get(session_id)
-    if not sess or not sess.hwnd:
-        raise HTTPException(status_code=404, detail="GUI session not found")
+    if not sess:
+        return not_found(f"找不到会话 {session_id}")
+    if not sess.hwnd:
+        return bad_request(f"会话 {session_id} 不是桌面窗口会话。")
     body = await req.json()
     Win32WindowHelper.send_click(sess.hwnd, int(body.get("x", 0)), int(body.get("y", 0)))
     return {"ok": True}
@@ -1003,6 +1036,9 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
 
     if sess.raw_history:
         await websocket.send_text("".join(sess.raw_history))
+    # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal
+    # query responses xterm generates while parsing this replay and keeps forwarding the live ones.
+    await websocket.send_text(json.dumps({"type": "replay_end"}))
 
     q: asyncio.Queue = asyncio.Queue(maxsize=500)
     sess.ws_queues.add(q)

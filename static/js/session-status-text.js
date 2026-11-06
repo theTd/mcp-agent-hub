@@ -63,6 +63,8 @@ export function eventTypeTone(type) {
 const ACTIVITY_RULES = [
   [/^Interactive session running/i, () => '交互会话运行中'],
   [/^Session exited \(exit_code=(-?\d+)\)/i, (m) => `进程已退出（退出码 ${m[1]}）`],
+  // F2 addition: the worker's exit message carries the parent-call hint after the code.
+  [/^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=(-?\d+)\s*[)）][\s\S]*$/i, (m) => `进程已退出（退出码 ${m[1]}）`],
   [/^Task completed/i, () => '任务已完成'],
   [/^Waiting for parent answer:?\s*(.*)$/i, (m) => (m[1] ? `等待主 Agent 回复：${m[1]}` : '等待主 Agent 回复')],
   [/^Terminated by/i, () => '已终止'],
@@ -76,5 +78,8 @@ export function activityLabel(text) {
     const match = value.match(pattern);
     if (match) return format(match);
   }
+  // F2 addition: any remaining `exit_code=N` text (older activity strings, event text) reads the same.
+  const exit = value.match(/exit_code=(-?\d+)/i);
+  if (exit) return `进程已退出（退出码 ${exit[1]}）`;
   return value;
 }

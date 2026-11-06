@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -25,6 +26,20 @@ from transcript_summarizer import TranscriptSummarizerRegistry, sanitize_tui_scr
 # Win32 API constants for Desktop GUI window capture & off-screen tucking
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
+
+# S4: a window's process name is read through a limited-information handle; a failure is not an error.
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+try:
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+except Exception:  # pragma: no cover - only on a non-Windows host
+    pass
 
 PW_RENDERFULLCONTENT = 0x00000002
 WM_LBUTTONDOWN = 0x0201
@@ -313,7 +328,7 @@ class HubDatabase:
                        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
                        final_response_source
                 FROM sessions
-                ORDER BY created_at DESC
+                ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -467,6 +482,8 @@ class AgentSession:
         self.ended_at: Optional[float] = None
         self.status = "starting"  # starting | running | waiting_parent | completed | exited | terminated
         self.exit_code: Optional[int] = None
+        # V-5: set by terminate(); the PTY reader must not report a second lifecycle event for it.
+        self.terminated_by_user: bool = False
         # B9: the initial task, never overwritten by follow-up messages or by status text.
         self.last_task: str = ""
 
@@ -586,7 +603,8 @@ class AgentSession:
 
         self.current_activity = f"Session {self.status} (exit_code={self.exit_code})"
 
-        if self.on_exit_cb and self._loop:
+        if self.on_exit_cb and self._loop and not self.terminated_by_user:
+            # V-5: a user termination already has its one lifecycle event; do not queue a second one.
             self._loop.call_soon_threadsafe(self.on_exit_cb, self.session_id, self.exit_code or 0)
 
     def _on_pty_output(self, data: str):
@@ -716,20 +734,24 @@ class AgentSession:
         clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10)
         if clean_lines:
             self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+        if was_alive:
+            # R14: a live process always ends as terminated, even when telemetry had already marked it
+            # completed. V-5: remember the cause so the PTY reader does not also emit an `exited` event.
+            self.terminated_by_user = True
+            self.status = "terminated"
+            self.current_activity = "Terminated by parent/user"
         if self.pty and was_alive:
             try:
                 self.pty.terminate(force=True)
             except Exception:
                 pass
-        if self.dsh_job_id and self.status in ("starting", "running", "waiting_parent"):
+        if self.dsh_job_id and was_alive:
             job_id = self.dsh_job_id
             threading.Thread(
                 target=lambda: httpx.post(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel", timeout=3.0),
                 daemon=True,
             ).start()
-        if was_alive and self.status != "completed":
-            self.status = "terminated"
-            self.current_activity = "Terminated by parent/user"
+        if was_alive:
             return True
         # The process had already ended: keep its real final status and activity untouched.
         return False
@@ -780,6 +802,30 @@ class Win32WindowHelper:
     """Manages native Windows GUI Agent windows so they can be viewed & controlled inside the Web Console without cluttering the desktop."""
 
     @staticmethod
+    def _process_exe_name(pid: int) -> str:
+        """S4: the window owner's executable file name, or "" when Windows refuses the query."""
+        if not pid:
+            return ""
+        handle = None
+        try:
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return ""
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return ""
+            return os.path.basename(buf.value)
+        except Exception:
+            return ""
+        finally:
+            if handle:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+
+    @staticmethod
     def list_top_windows() -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -807,6 +853,7 @@ class Win32WindowHelper:
                 "hwnd": int(hwnd),
                 "title": title,
                 "pid": int(pid.value),
+                "process_name": Win32WindowHelper._process_exe_name(int(pid.value)),
                 "x": rect.left,
                 "y": rect.top,
                 "width": w,
@@ -918,6 +965,13 @@ class HubSessionManager:
         self.engine_policies: Dict[str, Dict[str, Any]] = {}
         self.global_routing_instructions: str = ""
         self.sessions: Dict[str, AgentSession] = {}
+        # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
+        # the same conversation, and a file that existed before a session started is not its own.
+        self._claimed_transcripts: Dict[str, str] = {}
+        self._transcript_lock = threading.Lock()
+        # V-5: ids whose one lifecycle event is the terminated event, even if the PTY reader
+        # reported its own exit just before close_session removed the session from the live list.
+        self._user_terminated: Set[str] = set()
 
         # Bidirectional Mailbox & Sequenced Event Bus
         self.global_seq: int = self.db.get_max_seq()
@@ -944,6 +998,57 @@ class HubSessionManager:
     def wait_for_discovery(self, timeout: float = 60.0) -> bool:
         """Blocks until the startup discovery thread finished (used by scripts and tests)."""
         return self._discovery_ready.wait(timeout)
+
+    # ---- V2: transcript ownership ---------------------------------------------------------
+
+    @staticmethod
+    def _conversation_created_after(path: Path, session: AgentSession, levels_up: int = 0, slack: float = 2.0) -> bool:
+        """True when the conversation this file belongs to was created after the session started.
+
+        A transcript that already existed before the launch belongs to another conversation; attaching
+        to it is the V2 bug (a second session reporting the first session's thoughts). Windows has a
+        real creation time: `st_birthtime` on Python 3.12+, and `st_ctime` is creation time there too.
+        `levels_up` walks from the transcript file to the conversation directory.
+        """
+        target = Path(path)
+        for _ in range(max(0, int(levels_up))):
+            target = target.parent
+        try:
+            st = target.stat()
+        except OSError:
+            return False
+        created = getattr(st, "st_birthtime", None)
+        if created is None:
+            created = st.st_ctime
+        return created >= (session.created_at - slack)
+
+    @staticmethod
+    def _transcript_key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _transcript_claimed_by_other(self, path: Path, session: AgentSession) -> bool:
+        key = self._transcript_key(path)
+        with self._transcript_lock:
+            owner = self._claimed_transcripts.get(key)
+        return bool(owner) and owner != session.session_id
+
+    def _claim_transcript(self, session: AgentSession, path: Path) -> bool:
+        """Claims one transcript file for this session; False when another live session owns it."""
+        key = self._transcript_key(path)
+        with self._transcript_lock:
+            owner = self._claimed_transcripts.get(key)
+            if owner and owner != session.session_id:
+                return False
+            self._claimed_transcripts[key] = session.session_id
+        session.transcript_path = Path(path)
+        self.persist_session(session)
+        return True
+
+    def _release_transcripts(self, session_id: str) -> None:
+        with self._transcript_lock:
+            for key, owner in list(self._claimed_transcripts.items()):
+                if owner == session_id:
+                    del self._claimed_transcripts[key]
 
     def _infer_engine(self, profile_id: str, prof: Dict[str, Any]) -> str:
         if prof.get("engine"):
@@ -1222,25 +1327,46 @@ class HubSessionManager:
         "disabled_models",
     )
 
-    # B5: keys the UI clears by sending null / "". They are deleted from the stored profile.
-    PROFILE_CLEARABLE_KEYS = (
-        "task_mode",
-        "default_model",
-        "default_thinking_level",
-        "gui_url",
-        "dsh_tier",
-    )
+    # B5 / R11: every persistable key except these three can be cleared with null or "". The stored
+    # key is deleted, so `startup_delay_sec` falls back to 2.5 and `task_mode` to pty_input.
+    PROFILE_REQUIRED_KEYS = ("name", "engine", "command")
 
     def _read_profiles_file(self) -> Dict[str, Any]:
-        if self.profiles_path.exists():
-            try:
-                return json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            except Exception:
-                return {"profiles": {}}
-        return {"profiles": {}}
+        """Reads the profile file for a caller that is about to write it back.
+
+        R16: a parse error raises instead of returning an empty document. Returning `{"profiles": {}}`
+        here would make the following write silently destroy every Profile in the file.
+        """
+        if not self.profiles_path.exists():
+            return {"profiles": {}}
+        try:
+            data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"agent_profiles.json 解析失败，本次修改未写入：{exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("agent_profiles.json 顶层不是 JSON 对象，本次修改未写入。")
+        return data
 
     def _write_profiles_file(self, raw_data: Dict[str, Any]) -> None:
-        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        """R16: write a temp file in the same folder and replace, so a crash never leaves a half file.
+
+        LF line endings, UTF-8, Chinese kept readable (`ensure_ascii=False`), indent 2.
+        """
+        text = json.dumps(raw_data, ensure_ascii=False, indent=2) + "\n"
+        target = self.profiles_path
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, target)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     def engine_model_options(self, engine: str) -> List[Dict[str, Any]]:
         info = self.engines_catalog.get((engine or "").strip().lower()) or {}
@@ -1263,14 +1389,16 @@ class HubSessionManager:
         self,
         engine: str,
         model_id: str,
-        enabled: bool,
+        enabled: Optional[bool] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         """B13: enable/disable one model (agy: a base id toggles every suffixed id of that base) and edit its note.
 
-        The endpoint also accepts a note-only update: pass the same `enabled` as the model currently has and a new
-        `note`. An empty note deletes it.
+        R6: `enabled=None` means a note-only update; the model's enable/disable state is left exactly as
+        it is. An empty note deletes it.
         """
+        if enabled is None and note is None:
+            raise ValueError("缺少 enabled 或 note，无法更新模型。")
         eng = (engine or "").strip().lower()
         mid = (model_id or "").strip()
         if not eng or not mid:
@@ -1299,12 +1427,13 @@ class HubSessionManager:
         eng_pol = policies.setdefault(eng, {"disabled_models": [], "model_notes": {}})
         disabled_list: List[str] = [str(m) for m in (eng_pol.get("disabled_models") or [])]
 
-        for target in targets:
-            if enabled:
-                disabled_list = [m for m in disabled_list if m != target]
-            elif target not in disabled_list:
-                disabled_list.append(target)
-        eng_pol["disabled_models"] = disabled_list
+        if enabled is not None:
+            for target in targets:
+                if enabled:
+                    disabled_list = [m for m in disabled_list if m != target]
+                elif target not in disabled_list:
+                    disabled_list.append(target)
+            eng_pol["disabled_models"] = disabled_list
 
         note_engine_key = base if eng == "agy" else mid
         if note is not None:
@@ -1389,7 +1518,9 @@ class HubSessionManager:
             if key not in incoming:
                 continue
             value = incoming[key]
-            if key in self.PROFILE_CLEARABLE_KEYS and (value is None or (isinstance(value, str) and not value.strip())):
+            if key not in self.PROFILE_REQUIRED_KEYS and (
+                value is None or (isinstance(value, str) and not value.strip())
+            ):
                 merged.pop(key, None)
                 continue
             merged[key] = value
@@ -1405,7 +1536,8 @@ class HubSessionManager:
 
         raw_args = merged.get("args")
         if raw_args is None:
-            raw_args = merged.get("args", [])
+            # R11: a cleared args key means "no arguments", not a validation failure.
+            raw_args = []
         if not isinstance(raw_args, list) or any(not isinstance(a, str) for a in raw_args):
             raise ValueError("参数（args）必须是字符串列表，每行一个参数。")
         args = [a for a in raw_args]
@@ -1427,7 +1559,8 @@ class HubSessionManager:
         if eng == "agy" and default_model:
             default_model, suffix_level = split_agy_model_id(default_model)
             merged["default_model"] = default_model
-            if suffix_level:
+            # R8: a suffixed model id only supplies the level when the caller did not supply one.
+            if suffix_level and not default_thinking:
                 merged["default_thinking_level"] = suffix_level
 
         clean_entry: Dict[str, Any] = {}
@@ -1437,11 +1570,9 @@ class HubSessionManager:
         clean_entry["id"] = pid
         clean_entry["engine"] = eng
         clean_entry["args"] = args
-        clean_entry.setdefault("enabled", True)
-        clean_entry.setdefault("when_to_use", "")
-        clean_entry.setdefault("kind", "tui")
-        clean_entry.setdefault("submit_key", "\r")
-        clean_entry.setdefault("startup_delay_sec", 2.5)
+        # R11: a key the caller cleared is not written back. The readers below default what is missing:
+        # load_profiles fills enabled / when_to_use, resolve_launch defaults kind, create_session `\r`
+        # for submit_key and 2.5 for a missing startup_delay_sec.
         if not clean_entry.get("name"):
             clean_entry["name"] = pid
         if clean_entry.get("default_model") in (None, ""):
@@ -1489,6 +1620,9 @@ class HubSessionManager:
         terminated = sess.terminate()
         self.persist_session(sess)
         del self.sessions[session_id]
+        if terminated:
+            self._user_terminated.add(session_id)
+        self._release_transcripts(session_id)
         if terminated or (was_alive and sess.status == "terminated"):
             self.record_worker_event(
                 session_id,
@@ -2455,7 +2589,11 @@ class HubSessionManager:
     def build_poll_command(self, session_id: str, after_seq: int = 0, timeout: int = 1800) -> str:
         python_exe = self.base_dir / ".venv" / "Scripts" / "python.exe"
         poll_script = self.base_dir / "hub_poll.py"
-        return f'& "{python_exe}" "{poll_script}" --session {session_id} --after-seq {after_seq} --timeout {timeout}'
+        # R9: the poll command must reach the hub that issued it, not a hard-coded default port.
+        return (
+            f'& "{python_exe}" "{poll_script}" --session {session_id} '
+            f'--after-seq {after_seq} --timeout {timeout} --hub-url "{hub_api_base_url()}"'
+        )
 
     def _build_session_mcp_config(self, session_id: str) -> Path:
         python_exe = str((self.base_dir / ".venv" / "Scripts" / "python.exe").resolve())
@@ -2489,15 +2627,27 @@ class HubSessionManager:
         while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 30.0:
             await asyncio.sleep(1.0)
             now_files = set(codex_root.rglob("rollout-*.jsonl"))
-            new_files = sorted(now_files - seen_before, key=lambda p: p.stat().st_mtime, reverse=True)
-            if new_files:
-                target_file = new_files[0]
+            candidates = []
+            for candidate in now_files - seen_before:
+                try:
+                    # V2: only a rollout created after this session started, and only one nobody else owns.
+                    if not self._conversation_created_after(candidate, session):
+                        continue
+                    candidates.append((candidate.stat().st_mtime, candidate))
+                except OSError:
+                    continue
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            for _mtime, candidate in candidates:
+                if self._transcript_claimed_by_other(candidate, session):
+                    continue
+                if self._claim_transcript(session, candidate):
+                    target_file = candidate
+                    break
+            if target_file:
                 break
 
         if not target_file:
             return
-        session.transcript_path = target_file
-        self.persist_session(session)
 
         offset = 0
         while session.status in ("starting", "running", "waiting_parent"):
@@ -2613,14 +2763,19 @@ class HubSessionManager:
         start_wait = time.time()
         while session.status in ("starting", "running", "waiting_parent") and (time.time() - start_wait) < 40.0:
             await asyncio.sleep(0.8)
+            # This directory is created by the hub for this one session (`--session-dir`), so a
+            # cross-session attach is already impossible; claim it anyway so the rule is uniform.
             files = sorted(omp_session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if files:
-                target_file = files[0]
+            for candidate in files:
+                if not self._conversation_created_after(candidate, session):
+                    continue
+                if self._claim_transcript(session, candidate):
+                    target_file = candidate
+                    break
+            if target_file:
                 break
         if not target_file:
             return
-        session.transcript_path = target_file
-        self.persist_session(session)
 
         offset = 0
         while session.status in ("starting", "running", "waiting_parent"):
@@ -2764,9 +2919,11 @@ class HubSessionManager:
             scr_txt = session.get_clean_screen_text(max_lines=35)
             m = re.search(r"(session_[0-9a-f\-]{20,})", scr_txt)
             if m:
+                # The TUI banner names the exact conversation, so this path needs no time heuristic;
+                # it still must not be a transcript another hub session is already tailing (V2).
                 kimi_sid = m.group(1)
                 exact = list(kimi_root.rglob(f"{kimi_sid}/agents/main/wire.jsonl"))
-                if exact and exact[0].exists():
+                if exact and exact[0].exists() and self._claim_transcript(session, exact[0]):
                     target_file = exact[0]
                     break
 
@@ -2774,13 +2931,23 @@ class HubSessionManager:
             for p in kimi_root.rglob("wire.jsonl"):
                 try:
                     mtime = p.stat().st_mtime
-                    if p not in seen_before or mtime > seen_before[p]:
-                        candidates.append((mtime, p))
-                except Exception:
+                    if p in seen_before and mtime <= seen_before[p]:
+                        continue
+                    # V2: a wire.jsonl that was merely touched by another conversation (or that already
+                    # existed) is not this session's; only a session directory created after the launch.
+                    if not self._conversation_created_after(p, session, levels_up=2):
+                        continue
+                    candidates.append((mtime, p))
+                except OSError:
                     pass
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                target_file = candidates[0][1]
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for _mtime, candidate in candidates:
+                if self._transcript_claimed_by_other(candidate, session):
+                    continue
+                if self._claim_transcript(session, candidate):
+                    target_file = candidate
+                    break
+            if target_file:
                 break
 
         if not target_file:
@@ -2985,7 +3152,6 @@ class HubSessionManager:
         if not brain_root.exists():
             return
 
-        seen_before = {p: p.stat().st_mtime for p in brain_root.rglob("transcript.jsonl") if p.exists()}
         target_file: Optional[Path] = None
         start_wait = time.time()
 
@@ -2994,23 +3160,26 @@ class HubSessionManager:
             candidates = []
             for p in brain_root.rglob("transcript.jsonl"):
                 try:
-                    # Ignore our own current conversation transcript if any
-                    if "ed53e67b-76e2-42ec-a195-24c89a9d4e5d" in str(p):
+                    # V2: the conversation directory (brain/<uuid>) must be younger than this session.
+                    # A transcript that already existed, or one another running agent just appended to,
+                    # belongs to somebody else; 2 s of slack covers process start vs. bookkeeping.
+                    if not self._conversation_created_after(p, session, levels_up=2):
                         continue
-                    mtime = p.stat().st_mtime
-                    if p not in seen_before or mtime > seen_before[p]:
-                        candidates.append((mtime, p))
-                except Exception:
-                    pass
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                target_file = candidates[0][1]
+                    candidates.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            for _mtime, candidate in candidates:
+                if self._transcript_claimed_by_other(candidate, session):
+                    continue
+                if self._claim_transcript(session, candidate):
+                    target_file = candidate
+                    break
+            if target_file:
                 break
 
         if not target_file:
             return
-        session.transcript_path = target_file
-        self.persist_session(session)
 
         offset = 0
         while session.status in ("starting", "running", "waiting_parent"):
@@ -3136,9 +3305,14 @@ class HubSessionManager:
                 break
 
     def _on_session_exit(self, session_id: str, exit_code: int):
+        if session_id in self._user_terminated:
+            # V-5: the user termination already emitted its one lifecycle event.
+            return
         sess = self.sessions.get(session_id)
         if sess:
             self.persist_session(sess)
+            if sess.terminated_by_user:
+                return
         self.record_worker_event(
             session_id,
             {
@@ -3665,16 +3839,70 @@ class HubSessionManager:
         thinking_source: Optional[str] = None
         cli_model: Optional[str] = None
 
+        # R13: the profile's own disabled_models apply on top of the engine policy. For agy a disabled
+        # suffixed id removes just that level from the base id; a disabled base removes the whole model.
+        profile_disabled = {str(x) for x in (prof.get('disabled_models') or [])}
+        enabled_options: List[Dict[str, Any]] = []
+        for catalog_entry in options:
+            if not catalog_entry.get('enabled'):
+                continue
+            entry_id = str(catalog_entry.get('id'))
+            entry = dict(catalog_entry)
+            if eng == 'agy':
+                blocked_levels = set()
+                blocked_entirely = False
+                for blocked in profile_disabled:
+                    blocked_base, blocked_level = split_agy_model_id(blocked)
+                    if blocked_base != entry_id:
+                        continue
+                    if blocked_level:
+                        blocked_levels.add(blocked_level)
+                    else:
+                        blocked_entirely = True
+                if blocked_entirely:
+                    continue
+                remaining = [str(x) for x in (entry.get('thinking_levels') or []) if str(x) not in blocked_levels]
+                if not remaining:
+                    continue
+                entry['thinking_levels'] = remaining
+                if entry.get('default_thinking_level') not in remaining:
+                    entry['default_thinking_level'] = None
+            elif entry_id in profile_disabled:
+                continue
+            enabled_options.append(entry)
+
+        option: Optional[Dict[str, Any]] = None
         if not options:
-            # pwsh and engines without a catalog skip model and thinking entirely.
-            explicit_model = None
-            explicit_level = None
+            if self.engines_catalog.get(eng) is not None and (
+                prof.get('default_model') or prof.get('default_thinking_level') or explicit_model or explicit_level
+            ):
+                # R4: discovery found the engine but zero models (a discovery gap). Launching with the
+                # profile's own defaults, unvalidated, beats silently injecting nothing.
+                resolved_model = explicit_model or (str(prof.get('default_model') or '').strip() or None)
+                resolved_level = explicit_level or (str(prof.get('default_thinking_level') or '').strip() or None)
+                if eng == 'agy' and resolved_model:
+                    base_model, suffix_level = split_agy_model_id(resolved_model)
+                    resolved_model = base_model
+                    if not resolved_level and suffix_level:
+                        resolved_level = suffix_level
+                    cli_model = f'{resolved_model}-{resolved_level}' if resolved_level else resolved_model
+                model_source = 'explicit' if explicit_model else ('profile' if resolved_model else None)
+                thinking_source = 'explicit' if explicit_level else ('profile' if resolved_level else None)
+                notes.append(
+                    '未能探测到模型列表，按启动时指定的模型与思考等级启动'
+                    if (explicit_model or explicit_level)
+                    else '未能探测到模型列表，按 Profile 默认值启动'
+                )
+            else:
+                # pwsh and engines without a catalog skip model and thinking entirely.
+                explicit_model = None
+                explicit_level = None
+        elif not enabled_options:
+            # R4: the engine has models, but every one is disabled by policy or by this profile.
+            raise ValueError(f'{eng} 的模型都已停用，请先在「引擎与模型」里启用一个。')
         else:
-            enabled_options = [m for m in options if m.get('enabled')]
             enabled_option_ids = [str(m.get('id')) for m in enabled_options]
             by_id = {str(m.get('id')): m for m in enabled_options}
-
-            option: Optional[Dict[str, Any]] = None
             if explicit_model:
                 option = by_id.get(explicit_model)
                 if option is None and eng == 'agy':
@@ -3798,6 +4026,24 @@ class HubSessionManager:
         if eng == 'agy' and cli_model is None and resolved_model:
             cli_model = f'{resolved_model}-{resolved_level}' if resolved_level else resolved_model
 
+        # V-3: dsh travels as an API payload, not as CLI args, so the preview must carry the same spec
+        # the session will really use.
+        dsh_spec: Optional[Dict[str, Any]] = None
+        if eng == 'dsh':
+            dsh_provider = 'clay'
+            dsh_model_name = 'deepseek-flash'
+            if resolved_model:
+                if '/' in resolved_model:
+                    dsh_provider, dsh_model_name = resolved_model.split('/', 1)
+                else:
+                    dsh_model_name = resolved_model
+            dsh_spec = {
+                'tier': str(prof.get('dsh_tier') or 'flash'),
+                'provider': dsh_provider,
+                'model': dsh_model_name,
+                'effort': resolved_level or 'high',
+            }
+
         return {
             'profile_id': pid,
             'profile_name': name,
@@ -3812,6 +4058,7 @@ class HubSessionManager:
             'thinking_level': resolved_level,
             'thinking_source': thinking_source,
             'cli_model': cli_model,
+            'dsh_spec': dsh_spec,
             'notes': notes,
         }
 
@@ -3863,7 +4110,18 @@ class HubSessionManager:
         session_id = f'{profile_id}-{uuid.uuid4().hex[:6]}'
         effective_approval_mode = (approval_mode or prof.get('approval_mode') or 'auto').strip().lower()
         args = self._apply_approval_mode_args(engine=engine, base_args=args, approval_mode=effective_approval_mode)
-        task_mode = prof.get("task_mode", "pty_input")
+        task_mode = str(prof.get("task_mode") or "pty_input")
+        # R1: everything that can raise runs before the PTY starts and before the session is stored,
+        # so a bad profile value leaves no orphan session behind.
+        try:
+            startup_delay = float(prof.get("startup_delay_sec") or 2.5)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Profile「{profile_id}」的启动等待（startup_delay_sec）不是数字：{prof.get('startup_delay_sec')!r}"
+            )
+        if startup_delay < 0:
+            startup_delay = 0.0
+        submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
 
         if task_mode == "omp_positional":
@@ -3912,22 +4170,9 @@ class HubSessionManager:
             sess.current_activity = f"Running initial task: {task[:80]}"
 
         if task_mode == "dsh_hub_api":
-            # B6 rule 4: dsh injects no args. The dsh spec carries the provider/model split of the
-            # resolved model (clay/deepseek-flash -> clay + deepseek-flash), the resolved effort and
-            # the profile's tier.
-            dsh_prov = "clay"
-            dsh_mod = "deepseek-flash"
-            if effective_model:
-                if "/" in effective_model:
-                    dsh_prov, dsh_mod = effective_model.split("/", 1)
-                else:
-                    dsh_mod = effective_model
-            sess.dsh_spec = {
-                "tier": prof.get("dsh_tier") or "flash",
-                "effort": effective_thinking or "high",
-                "provider": dsh_prov,
-                "model": dsh_mod,
-            }
+            # B6 rule 4 / V-3: dsh injects no args. resolve_launch already built the dsh spec
+            # (tier, provider/model split, effort), so the session and the preview use one value.
+            sess.dsh_spec = dict(launch.get("dsh_spec") or {})
             sess.start_virtual(
                 loop,
                 on_virtual_line_cb=lambda sid, line: self.deliver_parent_message(sid, line, also_write_pty=False),
@@ -3952,8 +4197,6 @@ class HubSessionManager:
 
         if prof.get("kind") == "tui":
             asyncio.create_task(self._watch_tui_interactive_prompts(sess))
-            startup_delay = float(prof.get("startup_delay_sec", 2.5))
-            submit_key = prof.get("submit_key", "\r")
             prompt_to_send: Optional[str] = None
             if task and task_mode == "pty_input":
                 prompt_to_send = task

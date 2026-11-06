@@ -203,7 +203,8 @@ class AgentModelDiscovery:
             "available_thinking_levels": all_efforts,
             "cli_flags_template": {
                 "model": "-m {model}",
-                "thinking_level": "TUI /effort {thinking_level} (or via OMP --model={model} --thinking={thinking_level})",
+                # V-4: the level really reaches Kimi through the child process environment only.
+                "thinking_level": "环境变量 KIMI_MODEL_THINKING_EFFORT={thinking_level}（只作用于本会话）",
             },
         }
 
@@ -274,8 +275,9 @@ class AgentModelDiscovery:
             "model_details": models,
             "available_thinking_levels": thinking_levels,
             "cli_flags_template": {
-                "model": "--model {model}",
-                "thinking_level": "--effort {thinking_level} (or model suffix -low/-medium/-high)",
+                # V-4: agy has no thinking flag; the level is appended to the model name.
+                "model": "--model {model}-{thinking_level}",
+                "thinking_level": "模型名后缀 -{thinking_level}",
             },
         }
 

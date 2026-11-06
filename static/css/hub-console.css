@@ -583,7 +583,10 @@ body.sidebar-collapsed .sidebar { margin-left: calc(-1 * var(--sidebar-w)); visi
 .sc-activity:empty { display: none; }
 .sc-meta { display: flex; align-items: center; gap: 6px; min-width: 0; padding-left: 16px; color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
 .sc-meta .engine-badge { height: 18px; font-size: 10px; }
-.sc-meta [data-ref="idle"] { overflow: hidden; text-overflow: ellipsis; }
+.sc-meta [data-ref="idle"] { flex: none; overflow: hidden; text-overflow: ellipsis; }
+/* V-2: model · thinking gets its own line; folder + short id sit below it. */
+.sc-meta-model { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sc-meta-sub { margin-top: 1px; }
 .dot-sep::before { content: "·"; color: var(--line-3); }
 
 .events-section { flex: none; display: flex; flex-direction: column; max-height: 36%; border-top: 1px solid var(--line); }
@@ -639,6 +642,8 @@ body.sidebar-collapsed .sidebar { margin-left: calc(-1 * var(--sidebar-w)); visi
   line-height: 1.5;
   word-break: break-word;
 }
+/* R12: an expanded event shows its whole text instead of the two-line clamp. */
+.event-item.is-expanded .event-content { display: block; -webkit-line-clamp: unset; overflow: visible; }
 
 /* -------------------------------------------------------------- workspace */
 .grid { flex: 1; min-height: 0; display: grid; gap: 8px; padding: 8px; overflow: auto; }

@@ -16,6 +16,21 @@ const QUICK_KEYS = {
   interrupt: { text: '\x03', label: '^C', title: '发送 Ctrl+C（中断）' },
 };
 
+// V3: xterm answers device-attribute / cursor-position queries found in replayed history through
+// onData. Those answers are replies, not typing, and must never be forwarded into the PTY.
+const TERMINAL_REPLY_RE = /^\x1b\[[?>]?[0-9;]*[cRn]$/;
+
+/** The server's explicit end-of-replay marker; every other frame is raw terminal output. */
+function isReplayEndFrame(data) {
+  if (typeof data !== 'string' || !data.startsWith('{')) return false;
+  try {
+    const msg = JSON.parse(data);
+    return !!msg && msg.type === 'replay_end';
+  } catch {
+    return false;
+  }
+}
+
 const TERMINAL_THEME = {
   background: '#0b0e14',
   foreground: '#d7dce5',
@@ -41,6 +56,7 @@ const TERMINAL_THEME = {
 };
 
 const cards = new Map(); // session_id -> { el, sig }
+const historyRows = new Map(); // session_id -> { el, sig } for the 历史 list (R7 keeps scroll + focus)
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
 const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
 const streams = new Map(); // session_id -> { stopped, timer }
@@ -134,7 +150,10 @@ function renderSessionList() {
   }
   list.querySelector('.list-empty')?.remove();
   // Coming back from 历史: the list holds history rows, not cards.
-  if (list.querySelector('.history-item')) list.innerHTML = '';
+  if (list.querySelector('.history-item')) {
+    list.innerHTML = '';
+    historyRows.clear();
+  }
 
   ordered.forEach((s, index) => {
     let card = cards.get(s.session_id);
@@ -162,10 +181,15 @@ function renderSessionList() {
   });
 }
 
-function metaBitsHtml(s) {
-  const bits = [];
+/** Model · thinking on its own meta line so it stays readable (V-2). */
+function modelMetaHtml(s) {
   const model = modelLine(s);
-  if (model) bits.push(`<span class="sc-meta-text" title="${escapeHtml(model)}">${escapeHtml(model)}</span>`);
+  return model ? `<span class="sc-meta-model" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` : '';
+}
+
+/** Folder + short id on the line below the model (V-2). */
+function pathMetaHtml(s) {
+  const bits = [];
   const folder = cwdBase(s.cwd);
   if (folder) bits.push(`<span class="sc-meta-text" title="${escapeHtml(s.cwd || '')}">${icon('folder', 'icon-xs')}${escapeHtml(folder)}</span>`);
   const tail = String(s.session_id || '').slice(-6);
@@ -175,6 +199,7 @@ function metaBitsHtml(s) {
 
 function sessionCardHtml(s) {
   const live = isLive(s);
+  const path = pathMetaHtml(s);
   return `
     <div class="sc-row">
       <span class="status-dot" data-status="${escapeHtml(s.status)}" title="${escapeHtml(statusLabel(s.status))}"></span>
@@ -186,9 +211,10 @@ function sessionCardHtml(s) {
     <div class="sc-meta">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
       <span class="status-text" data-tone="${statusTone(s.status)}">${escapeHtml(statusLabel(s.status))}</span>
-      ${metaBitsHtml(s)}
+      ${modelMetaHtml(s)}
       <span data-ref="idle"></span>
-    </div>`;
+    </div>
+    ${path ? `<div class="sc-meta sc-meta-sub">${path}</div>` : ''}`;
 }
 
 function activityText(s) {
@@ -200,20 +226,65 @@ function idleText(s) {
   return s.exit_code !== null && s.exit_code !== undefined ? `退出码 ${s.exit_code}` : '';
 }
 
+function historySignature(entries) {
+  return entries.map((rec) => [
+    rec.session_id, sessionTitle(rec), rec.status, rec.exit_code,
+    rec.ended_at || rec.updated_at || rec.created_at,
+    rec.effective_model, rec.effective_thinking_level,
+  ].join('|')).join('\n');
+}
+
+let historySig = '';
+
 function renderHistoryList(list) {
   const entries = historyEntries();
+  const sig = historySignature(entries);
+  // R7: a poll that renders the same records must not rebuild the list — that is what threw away
+  // the scroll position and the focused row every 2.5 s.
+  if (sig === historySig && list.querySelector('.history-item, .list-empty')) return;
+  historySig = sig;
   if (!entries.length) {
     list.innerHTML = '<div class="list-empty">暂无历史会话</div>';
+    historyRows.clear();
     return;
   }
-  list.innerHTML = entries.map(historyItemHtml).join('');
+  list.querySelector('.list-empty')?.remove();
+  if (list.querySelector('.session-card')) {
+    list.innerHTML = '';
+    historyRows.clear();
+  }
+  entries.forEach((rec, index) => {
+    let row = historyRows.get(rec.session_id);
+    if (!row) {
+      const el = document.createElement('div');
+      el.className = 'history-item';
+      el.dataset.id = rec.session_id;
+      el.tabIndex = 0;
+      el.setAttribute('role', 'option');
+      el.innerHTML = historyItemHtml(rec);
+      row = { el, sig: historySignature([rec]) };
+      historyRows.set(rec.session_id, row);
+    } else {
+      const rowSig = historySignature([rec]);
+      if (row.sig !== rowSig) {
+        row.el.innerHTML = historyItemHtml(rec);
+        row.sig = rowSig;
+      }
+    }
+    if (list.children[index] !== row.el) list.insertBefore(row.el, list.children[index] || null);
+  });
+  const keep = new Set(entries.map((rec) => rec.session_id));
+  for (const [id, row] of historyRows) {
+    if (keep.has(id)) continue;
+    row.el.remove();
+    historyRows.delete(id);
+  }
 }
 
 function historyItemHtml(rec) {
   const model = [rec.effective_model, rec.effective_thinking_level].filter(Boolean).join(' · ');
   const when = formatWhen(rec.ended_at || rec.updated_at || rec.created_at);
   return `
-    <div class="history-item" data-id="${escapeHtml(rec.session_id)}" tabindex="0" role="option">
       <div class="hi-row">
         <span class="status-dot" data-status="${escapeHtml(rec.status || '')}"></span>
         <span class="hi-title" title="${escapeHtml(sessionTitle(rec))}">${escapeHtml(sessionTitle(rec))}</span>
@@ -222,8 +293,7 @@ function historyItemHtml(rec) {
         <span class="status-text" data-tone="${statusTone(rec.status)}">${escapeHtml(statusLabel(rec.status))}</span>
         ${when ? `<span class="dot-sep"></span><span>结束 ${escapeHtml(when)}</span>` : ''}
         ${model ? `<span class="dot-sep"></span><span class="hi-model" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` : ''}
-      </div>
-    </div>`;
+      </div>`;
 }
 
 async function onSessionListClick(ev) {
@@ -276,6 +346,28 @@ function visibleSessions() {
     : state.sessions;
 }
 
+/**
+ * R15: a pane created lazily goes to its newest-first slot — before the first existing pane of an
+ * older session — while panes that are already attached are never moved.
+ */
+function insertPaneInOrder(grid, paneEl, sessionId) {
+  const ranked = new Map(orderedSessions().map((s, index) => [s.session_id, index]));
+  const rank = ranked.get(sessionId);
+  if (rank === undefined) {
+    grid.insertBefore(paneEl, grid.firstChild);
+    return;
+  }
+  for (const child of grid.children) {
+    if (!child.classList.contains('pane') || !child.dataset.id) continue;
+    const childRank = ranked.get(child.dataset.id);
+    if (childRank === undefined || childRank > rank) {
+      grid.insertBefore(paneEl, child);
+      return;
+    }
+  }
+  grid.appendChild(paneEl);
+}
+
 function renderWorkspace() {
   const grid = $('#gridContainer');
   grid.className = `grid ${state.layoutMode === 'single' ? 'grid-single' : 'grid-matrix'}`;
@@ -313,7 +405,7 @@ function renderWorkspace() {
     }
     pane.el.hidden = !isVisible;
     updatePane(pane, s);
-    if (!pane.el.isConnected) grid.insertBefore(pane.el, grid.firstChild);
+    if (!pane.el.isConnected) insertPaneInOrder(grid, pane.el, s.session_id);
     if (isVisible && !pane.mounted) {
       mountPaneBody(pane, s);
       pane.mounted = true;
@@ -535,7 +627,7 @@ function createTerminal(sessionId) {
   const fit = new window.FitAddon.FitAddon();
   term.loadAddon(fit);
 
-  const t = { term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0, wsOpen: false };
+  const t = { term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0, wsOpen: false, replaying: false, replayTimer: 0 };
   const sendResize = () => {
     if (t.opened && t.ws?.readyState === WebSocket.OPEN) {
       t.ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -549,10 +641,24 @@ function createTerminal(sessionId) {
       if (t.retries > 0) term.reset();
       t.retries = 0;
       t.wsOpen = true;
+      // V3: the replay arrives first, then a replay_end marker. While the terminal is parsing the
+      // history, the query replies xterm generates (DA / DSR) must not be typed into the session.
+      t.replaying = true;
+      clearTimeout(t.replayTimer);
+      // A hub that predates the marker never sends one; do not stay in replay mode forever.
+      t.replayTimer = setTimeout(() => { t.replaying = false; }, 1500);
       sendResize();
       refreshPaneHead(sessionId);
     };
-    ws.onmessage = (ev) => term.write(ev.data);
+    ws.onmessage = (ev) => {
+      const data = ev.data;
+      if (t.replaying && isReplayEndFrame(data)) {
+        t.replaying = false;
+        clearTimeout(t.replayTimer);
+        return;
+      }
+      term.write(data);
+    };
     ws.onclose = () => {
       t.wsOpen = false;
       refreshPaneHead(sessionId);
@@ -568,6 +674,9 @@ function createTerminal(sessionId) {
     };
   };
   term.onData((data) => {
+    // V3: terminal queries in the replayed history make xterm answer by itself; those answers are
+    // not user input. Live output still needs its answers, so only the replay window drops replies.
+    if (t.replaying && TERMINAL_REPLY_RE.test(data)) return;
     if (t.ws?.readyState === WebSocket.OPEN) t.ws.send(JSON.stringify({ type: 'input', data }));
   });
   term.onResize(sendResize);

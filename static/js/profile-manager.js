@@ -291,6 +291,9 @@ function renderEngineGroups(engine) {
   const isDsh = engine === 'dsh';
   $('#groupLaunch').hidden = isDsh;
   $('#groupDsh').hidden = !isDsh;
+  // V-7: pwsh (and any engine the catalog knows no models for) has no model / thinking defaults.
+  const hasModels = !!engine && engineModels(engine).length > 0;
+  $('#groupDefaults').hidden = !hasModels;
 }
 
 function ensureOption(select, value) {
@@ -365,7 +368,24 @@ function renderEngineInfo(engine) {
       <div class="field-help">选择引擎后显示本机的可执行文件、模型与思考等级参数。</div>`;
     return;
   }
-  const cat = state.enginesCatalog[engine] || {};
+  const cat = state.enginesCatalog[engine];
+  if (!cat) {
+    // V-7: an engine the catalog does not list (pwsh) still has a real launch command. Show it
+    // instead of a false "未检测到本地程序" and an N/A binary.
+    const command = ($('#editCommand')?.value || '').trim()
+      || (selectedId ? (state.profiles[selectedId]?.command || '') : '');
+    card.innerHTML = `
+      <div class="info-card-head">
+        ${icon('cpu')}<strong>${escapeHtml(engine)}</strong>
+        <span class="state-badge">无模型探测</span>
+        <span class="muted" style="margin-left:auto;font-size:11.5px">引擎自动识别信息</span>
+      </div>
+      <dl class="kv-list">
+        <dt>可执行文件</dt><dd><code>${escapeHtml(command || '未填写')}</code></dd>
+        <dt>模型 / 思考等级</dt><dd>该引擎没有模型列表，启动时不会注入模型与思考等级参数。</dd>
+      </dl>`;
+    return;
+  }
   const flags = cat.cli_flags_template || {};
   const enabled = cat.available_models || [];
   const all = cat.all_discovered_models || enabled;
@@ -430,6 +450,8 @@ function engineDefaults(engine) {
     command: mostCommon((p) => p.command) || FALLBACK_COMMANDS[engine] || '',
     task_mode: mostCommon((p) => p.task_mode) || '',
     argsText: mostCommon((p) => (Array.isArray(p.args) ? p.args.join('\n') : '')) || '',
+    // S3: a new profile starts from the delay an existing profile of the same engine uses.
+    delayText: String(mostCommon((p) => p.startup_delay_sec) ?? 2.5),
   };
 }
 
@@ -439,6 +461,7 @@ function applyEngineDefaults(engine) {
   ensureOption($('#editTaskMode'), defaults.task_mode);
   $('#editTaskMode').value = defaults.task_mode;
   $('#editArgs').value = defaults.argsText;
+  $('#editDelay').value = defaults.delayText;
 }
 
 function onModelSelectChange() {
@@ -649,7 +672,7 @@ async function saveProfile() {
     task_mode: d.task_mode || null,
     startup_delay_sec: Number.isFinite(delay) ? delay : null,
     gui_url: isDsh ? (d.gui_url || null) : null,
-    dsh_tier: isDsh ? d.dshTier : null,
+    dsh_tier: isDsh ? d.dsh_tier : null,
   };
 
   const btn = $('#btnSaveProfile');

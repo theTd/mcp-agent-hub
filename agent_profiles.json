@@ -30,7 +30,7 @@
       "submit_key": "\r",
       "enabled": true,
       "when_to_use": "长上下文与中文语境任务：通读中大型文件或整个代码库、中文技术文档与策划对齐、深度代码审查、跨模块重构。",
-      "description": "Kimi Code CLI。模型用 -m 传入；思考等级通过环境变量 KIMI_MODEL_THINKING_EFFORT 只作用于本会话。"
+      "description": "Kimi Code CLI。模型用 -m 传入；思考等级通过环境变量 KIMI_MODEL_THINKING_EFFORT 只作用于本会话（Kimi 状态栏显示的仍是全局设置，实际请求按本会话等级）。"
     },
     "agy": {
       "id": "agy",
@@ -54,7 +54,11 @@
       "engine": "codex",
       "kind": "tui",
       "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": ["--dangerously-bypass-approvals-and-sandbox"],
+      "args": [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-c",
+        "check_for_update_on_startup=false"
+      ],
       "default_model": "gpt-6.1-sol",
       "default_thinking_level": "medium",
       "task_mode": "codex_positional",

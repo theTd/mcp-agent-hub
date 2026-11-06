@@ -1,7 +1,7 @@
 // Sidebar feed of worker → parent events reported through the hub mailbox.
 import { state, prefs, savePrefs, on, emit, setActiveSession } from './console-state.js';
 import { $, escapeHtml, formatClock } from './ui-kit.js';
-import { eventTypeLabel, eventTypeTone } from './session-status-text.js';
+import { activityLabel, eventTypeLabel, eventTypeTone } from './session-status-text.js';
 
 const MAX_EVENTS = 30;
 
@@ -29,7 +29,15 @@ export function initEventFeed() {
       item.classList.toggle('is-expanded', expanded.has(key));
     }
     if (!id) return;
-    if (state.sessions.some((s) => s.session_id === id)) setActiveSession(id);
+    // S1: a session stays in the live list until it is removed, but once its process is gone it is
+    // history, so an event click opens the record instead of a dead pane.
+    const session = state.sessions.find((s) => s.session_id === id);
+    const alive = session
+      ? (typeof session.process_alive === 'boolean'
+        ? session.process_alive
+        : ['starting', 'running', 'waiting_parent'].includes(session.status))
+      : false;
+    if (alive) setActiveSession(id);
     else emit('history:open', id);
   });
   on('sessions:changed', render);
@@ -46,7 +54,8 @@ function toneOf(ev) {
 }
 
 function cleanContent(text) {
-  return String(text ?? '').replace(CALL_HINT_RE, '').replace(/\s+$/g, '').trim();
+  // F2: the same status-text module the cards use, so an exit reads 进程已退出（退出码 N） here too.
+  return activityLabel(String(text ?? '').replace(CALL_HINT_RE, '')).replace(/\s+$/g, '').trim();
 }
 
 function eventKey(ev) {

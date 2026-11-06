@@ -159,13 +159,13 @@ function renderThinkingPills({ keepLevel }) {
   const modelId = $('#modelSelect').value;
   const model = modelId
     ? models.find((m) => m.id === modelId)
-    : (models.find((m) => m.id === (p.default_model || engineDefaultModel(p.engine || '')))
-      || models.find((m) => m.enabled !== false));
+    : defaultModelEntry(models);
   const levels = (model?.thinking_levels || []).filter(Boolean);
   // Changing the model resets thinking to 默认 when the current level is not supported.
   if (!keepLevel || !levels.includes(currentLevel)) currentLevel = '';
 
-  const defaultLevel = preview.status === 'ok' ? (preview.data?.thinking_level || '') : '';
+  // V-1: the label is the level a launch with 思考等级 = 默认 would really use, not the selected one.
+  const defaultLevel = defaultThinkingLevel();
   const defaultLabel = `默认${defaultLevel ? ` · ${escapeHtml(defaultLevel)}` : ''}`;
   wrap.innerHTML = [`<button type="button" class="level-pill" role="radio" data-level="" aria-checked="${currentLevel === ''}">${defaultLabel}</button>`]
     .concat(levels.map((level) =>
@@ -210,8 +210,34 @@ function onPillsKeydown(ev) {
 function updateDefaultPillLabel() {
   const pill = $('#thinkingPills [data-level=""]');
   if (!pill) return;
-  const level = preview.status === 'ok' ? (preview.data?.thinking_level || '') : '';
-  pill.textContent = `默认${level ? ` · ${level}` : ''}`;
+  pill.textContent = `默认${defaultThinkingLevel() ? ` · ${defaultThinkingLevel()}` : ''}`;
+}
+
+/** The model a launch with 模型 = Profile 默认 really runs (a disabled default is substituted). */
+function defaultModelEntry(models) {
+  const p = currentProfile();
+  const def = p.default_model || engineDefaultModel(p.engine || '');
+  const entry = def ? models.find((m) => m.id === def) : null;
+  if (entry && entry.enabled !== false) return entry;
+  return models.find((m) => m.enabled !== false) || null;
+}
+
+/**
+ * V-1: the level a launch with 思考等级 = 默认 would use for the current model choice — the profile
+ * default when that model supports it, else the model's default, else the middle level.
+ */
+function defaultThinkingLevel() {
+  const p = currentProfile();
+  const models = engineModels(p.engine || '');
+  const selectedId = $('#modelSelect').value;
+  const entry = selectedId ? models.find((m) => m.id === selectedId) : defaultModelEntry(models);
+  if (!entry) return '';
+  const levels = (entry.thinking_levels || []).filter(Boolean);
+  const profileLevel = p.default_thinking_level || '';
+  if (profileLevel && levels.includes(profileLevel)) return profileLevel;
+  const modelDefault = entry.default_thinking_level || '';
+  if (modelDefault && levels.includes(modelDefault)) return modelDefault;
+  return levels.length ? levels[Math.floor(levels.length / 2)] : '';
 }
 
 // ----------------------------------------------------------------- preview
@@ -278,13 +304,18 @@ function renderPreview() {
     .map((note) => `<div class="preview-note">${escapeHtml(note)}</div>`).join('');
   const args = Array.isArray(d.args) ? d.args : [];
   const commandLine = [d.command || '', ...args].map(quoteArg).join(' ').trim();
+  // V-3b: dsh is launched through the hub API, so the pwsh wrapper says nothing about what runs.
+  const spec = d.dsh_spec;
+  const dshLine = spec && (spec.provider || spec.model)
+    ? `DSH Hub API：${spec.tier || ''} · ${spec.provider || ''}/${spec.model || ''} · 思考 ${spec.effort || ''}`
+    : '';
   const env = Object.entries(d.env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
   box.innerHTML = `
     <div class="preview-head">${head}</div>
     ${notes}
     <details class="run-command">
       <summary>完整命令</summary>
-      <pre class="run-pre">${escapeHtml(commandLine)}</pre>
+      <pre class="run-pre">${escapeHtml(dshLine || commandLine)}</pre>
       ${env ? `<pre class="run-pre run-env">${escapeHtml(env)}</pre>` : ''}
       ${d.cwd ? `<div class="run-cwd">工作目录：<code>${escapeHtml(d.cwd)}</code></div>` : ''}
     </details>`;
