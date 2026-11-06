@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -16,30 +17,46 @@ class AgentModelDiscovery:
     across all locally installed Agent CLIs (omp, kimi, agy, codex, dsh).
     """
 
+    # A forced refresh younger than this is answered from cache, so parallel
+    # callers share one in-flight discovery run instead of spawning it N times.
+    REFRESH_FLOOR_SEC = 5.0
+
     def __init__(self):
         self.home = Path(os.path.expanduser("~"))
         self._cache: Optional[Dict[str, Any]] = None
         self._cache_at: float = 0.0
         self._cache_ttl: float = 120.0
+        self._lock = threading.Lock()
+
+    def peek_cache(self) -> Optional[Dict[str, Any]]:
+        """Returns whatever has already been discovered, without ever running a CLI (never blocks)."""
+        return self._cache
 
     def discover_all(self, force_refresh: bool = False) -> Dict[str, Any]:
         now = time.time()
         if not force_refresh and self._cache and (now - self._cache_at) < self._cache_ttl:
             return self._cache
 
-        engines = {
-            "omp": self._discover_omp(),
-            "kimi": self._discover_kimi(),
-            "agy": self._discover_agy(),
-            "codex": self._discover_codex(),
-            "dsh": self._discover_dsh(),
-        }
-        self._cache = {
-            "discovered_at": round(now, 3),
-            "engines": engines,
-        }
-        self._cache_at = now
-        return self._cache
+        with self._lock:
+            now = time.time()
+            age = now - self._cache_at
+            if self._cache is not None and age < self._cache_ttl and (not force_refresh or age < self.REFRESH_FLOOR_SEC):
+                # A concurrent caller already refreshed while we waited on the lock.
+                return self._cache
+
+            engines = {
+                "omp": self._discover_omp(),
+                "kimi": self._discover_kimi(),
+                "agy": self._discover_agy(),
+                "codex": self._discover_codex(),
+                "dsh": self._discover_dsh(),
+            }
+            self._cache = {
+                "discovered_at": round(now, 3),
+                "engines": engines,
+            }
+            self._cache_at = now
+            return self._cache
 
     def _discover_omp(self) -> Dict[str, Any]:
         omp_bin = Path(r"C:\Users\cui\AppData\Local\omp\omp.exe")

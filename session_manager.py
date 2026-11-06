@@ -82,6 +82,9 @@ class HubDatabase:
                     step_count INTEGER DEFAULT 0,
                     current_activity TEXT DEFAULT '',
                     last_task TEXT DEFAULT '',
+                    engine TEXT DEFAULT '',
+                    effective_model TEXT,
+                    effective_thinking_level TEXT,
                     final_response TEXT,
                     final_response_source TEXT,
                     files_changed_json TEXT DEFAULT '[]',
@@ -125,10 +128,17 @@ class HubDatabase:
                 );
                 """
             )
-            try:
-                conn.execute("ALTER TABLE sessions ADD COLUMN transcript_path TEXT DEFAULT ''")
-            except Exception:
-                pass
+            # B9: persisted history must say which engine/model really ran, and which process status ended.
+            for ddl in (
+                "ALTER TABLE sessions ADD COLUMN transcript_path TEXT DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN engine TEXT DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN effective_model TEXT",
+                "ALTER TABLE sessions ADD COLUMN effective_thinking_level TEXT",
+            ):
+                try:
+                    conn.execute(ddl)
+                except Exception:
+                    pass
 
     def get_max_seq(self) -> int:
         with self._lock, self._conn() as conn:
@@ -142,9 +152,10 @@ class HubDatabase:
                 INSERT INTO sessions (
                     session_id, profile_id, profile_name, kind, title, cwd, status,
                     created_at, updated_at, ended_at, exit_code, step_count,
-                    current_activity, last_task, final_response, final_response_source,
+                    current_activity, last_task, engine, effective_model, effective_thinking_level,
+                    final_response, final_response_source,
                     files_changed_json, scrollback_text, transcript_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     status=excluded.status,
                     updated_at=excluded.updated_at,
@@ -153,6 +164,9 @@ class HubDatabase:
                     step_count=excluded.step_count,
                     current_activity=excluded.current_activity,
                     last_task=excluded.last_task,
+                    engine=COALESCE(NULLIF(excluded.engine, ''), sessions.engine),
+                    effective_model=COALESCE(excluded.effective_model, sessions.effective_model),
+                    effective_thinking_level=COALESCE(excluded.effective_thinking_level, sessions.effective_thinking_level),
                     final_response=COALESCE(excluded.final_response, sessions.final_response),
                     final_response_source=COALESCE(excluded.final_response_source, sessions.final_response_source),
                     files_changed_json=excluded.files_changed_json,
@@ -174,6 +188,9 @@ class HubDatabase:
                     s_dict.get("step_count", 0),
                     s_dict.get("current_activity", ""),
                     s_dict.get("last_task", ""),
+                    s_dict.get("engine") or "",
+                    s_dict.get("effective_model"),
+                    s_dict.get("effective_thinking_level"),
                     s_dict.get("final_response"),
                     s_dict.get("final_response_source"),
                     json.dumps(s_dict.get("files_changed", []), ensure_ascii=False),
@@ -292,7 +309,7 @@ class HubDatabase:
                 """
                 SELECT session_id, profile_id, profile_name, kind, title, cwd, status,
                        created_at, updated_at, ended_at, exit_code, step_count,
-                       current_activity, last_task,
+                       current_activity, last_task, engine, effective_model, effective_thinking_level,
                        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
                        final_response_source
                 FROM sessions
@@ -320,6 +337,92 @@ TUI_TOOL_PATTERN = re.compile(
     r"^\s*[●•✦⚡▶]\s*(Bash|Read|Edit|Write|Grep|Glob|LS|WebSearch|Fetch|Task|MultiEdit|NotebookEdit|cmd|powershell)\s*(?:\((.+?)\)|:\s*(.+))?$",
     re.IGNORECASE,
 )
+
+DEFAULT_HUB_PORT = 4444
+KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "dsh", "pwsh")
+AGY_THINKING_LEVELS = ("low", "medium", "high")
+AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
+# A profile with an absurdly long argument list is a mistake, not a launch recipe.
+MAX_LAUNCH_ARGS = 4096
+
+
+def hub_port() -> int:
+    """The port this hub really listens on (`HUB_PORT`, default 4444)."""
+    try:
+        return int(os.environ.get("HUB_PORT") or DEFAULT_HUB_PORT)
+    except ValueError:
+        return DEFAULT_HUB_PORT
+
+
+def hub_api_base_url() -> str:
+    return os.environ.get("HUB_API_URL") or f"http://127.0.0.1:{hub_port()}"
+
+
+def split_agy_model_id(model_id: str) -> tuple:
+    """`gpt-oss-120b-medium` -> ("gpt-oss-120b", "medium"); a bare base id keeps a None level."""
+    mid = model_id or ""
+    m = AGY_SUFFIX_RE.search(mid)
+    if not m:
+        return mid, None
+    return mid[: m.start()], m.group(1)
+
+
+def _injected_flag_tokens(engine: str, args: List[str]):
+    """Yields (index, flag label) for every argument the hub injects itself, for one engine."""
+    eng = (engine or "").strip().lower()
+    i = 0
+    total = len(args)
+    while i < total:
+        a = str(args[i])
+        if eng == "omp":
+            if a.startswith("--model=") or a.startswith("--thinking="):
+                yield i, a.split("=", 1)[0] + "="
+                i += 1
+                continue
+        elif eng == "kimi":
+            if a in ("-m", "--model"):
+                yield i, a
+                if i + 1 < total:
+                    yield i + 1, a
+                i += 2
+                continue
+        elif eng == "agy":
+            if a in ("--model", "--effort"):
+                yield i, a
+                if i + 1 < total:
+                    yield i + 1, a
+                i += 2
+                continue
+        elif eng == "codex":
+            if a in ("-m", "--model"):
+                yield i, a
+                if i + 1 < total:
+                    yield i + 1, a
+                i += 2
+                continue
+            if a == "-c" and i + 1 < total:
+                nxt = str(args[i + 1]).strip().lstrip('"').lstrip("'")
+                if nxt.startswith("model_reasoning_effort") or nxt.startswith("model="):
+                    yield i, "-c"
+                    yield i + 1, "-c"
+                    i += 2
+                    continue
+        i += 1
+
+
+def injected_flags_in_args(engine: str, args: List[str]) -> List[str]:
+    """Every distinct flag in `args` that the hub injects at launch time, in first-appearance order."""
+    labels: List[str] = []
+    for _idx, label in _injected_flag_tokens(engine, args):
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
+    """Removes every hub-injected model/thinking flag, so old profile files still launch cleanly."""
+    drop = {idx for idx, _label in _injected_flag_tokens(engine, args)}
+    return [str(a) for i, a in enumerate(args) if i not in drop]
 
 
 class AgentSession:
@@ -364,6 +467,7 @@ class AgentSession:
         self.ended_at: Optional[float] = None
         self.status = "starting"  # starting | running | waiting_parent | completed | exited | terminated
         self.exit_code: Optional[int] = None
+        # B9: the initial task, never overwritten by follow-up messages or by status text.
         self.last_task: str = ""
 
         # Rich Telemetry & Lifecycle State
@@ -435,7 +539,7 @@ class AgentSession:
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["HUB_SESSION_ID"] = self.session_id
-        env["HUB_API_URL"] = os.environ.get("HUB_API_URL", "http://127.0.0.1:4444")
+        env["HUB_API_URL"] = hub_api_base_url()
         if env_overrides:
             env.update(env_overrides)
 
@@ -590,13 +694,29 @@ class AgentSession:
                 all_lines = all_lines[-max_lines:]
             return "\n".join(all_lines)
 
-    def terminate(self):
+    def is_process_alive(self) -> bool:
+        """B9: "live" means the process is alive (PTY alive; dsh virtual sessions by status), never the status alone."""
+        if self.pty is not None:
+            try:
+                return bool(self.pty.isalive())
+            except Exception:
+                return False
+        if self.dsh_job_id or self.dsh_spec:
+            return self.status in ("starting", "running", "waiting_parent")
+        return self.status in ("running", "waiting_parent")
+
+    def terminate(self) -> bool:
+        """Closes the session. An ended session keeps its own final status (B9); only a live one becomes terminated.
+
+        Returns True when this call really terminated a live process.
+        """
+        was_alive = self.is_process_alive()
         self.ended_at = time.time()
         scrollback = self.get_full_scrollback_text(max_lines=80)
         clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10)
         if clean_lines:
             self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
-        if self.pty and self.pty.isalive():
+        if self.pty and was_alive:
             try:
                 self.pty.terminate(force=True)
             except Exception:
@@ -607,12 +727,15 @@ class AgentSession:
                 target=lambda: httpx.post(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel", timeout=3.0),
                 daemon=True,
             ).start()
-        if self.status != "completed":
+        if was_alive and self.status != "completed":
             self.status = "terminated"
-        self.current_activity = "Terminated by parent/user"
+            self.current_activity = "Terminated by parent/user"
+            return True
+        # The process had already ended: keep its real final status and activity untouched.
+        return False
 
     def to_dict(self) -> Dict[str, Any]:
-        alive = bool(self.pty and self.pty.isalive()) if self.pty else (self.status in ("running", "waiting_parent"))
+        alive = self.is_process_alive()
         if not alive and self.pty is not None and self.status not in ("completed", "exited", "terminated"):
             self.status = "exited"
         return {
@@ -628,6 +751,7 @@ class AgentSession:
             "hwnd": self.hwnd,
             "tucked_offscreen": self.tucked_offscreen,
             "status": self.status,
+            "process_alive": alive,
             "step_count": self.step_count,
             "current_activity": self.current_activity,
             "pending_question_id": self.pending_question_id,
@@ -802,7 +926,24 @@ class HubSessionManager:
         self.pending_questions: Dict[str, Dict[str, Any]] = {}
         self._event_waiters: Set[asyncio.Event] = set()
 
-        self.load_profiles()
+        # B11: the constructor must never shell out to five CLIs. It loads the profile file at once
+        # (using whatever discovery already has) and finishes discovery on a background thread, so
+        # the very first /api/sessions poll answers immediately.
+        self._discovery_ready = threading.Event()
+        self.load_profiles(discovery=self.model_discovery.peek_cache() or {"engines": {}})
+        threading.Thread(target=self._initial_discovery, name="hub-initial-discovery", daemon=True).start()
+
+    def _initial_discovery(self) -> None:
+        try:
+            self.load_profiles()
+        except Exception:
+            pass
+        finally:
+            self._discovery_ready.set()
+
+    def wait_for_discovery(self, timeout: float = 60.0) -> bool:
+        """Blocks until the startup discovery thread finished (used by scripts and tests)."""
+        return self._discovery_ready.wait(timeout)
 
     def _infer_engine(self, profile_id: str, prof: Dict[str, Any]) -> str:
         if prof.get("engine"):
@@ -813,8 +954,97 @@ class HubSessionManager:
                 return prefix
         return "generic"
 
-    def load_profiles(self, refresh_discovery: bool = False):
-        discovery = self.model_discovery.discover_all(force_refresh=refresh_discovery)
+    def _build_engine_model_options(
+        self,
+        eng: str,
+        engine_info: Dict[str, Any],
+        all_models: List[str],
+        disabled_models: List[str],
+        model_notes: Dict[str, str],
+        details: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """B3: the normalised `models` list the console and the routing guide use instead of raw CLI ids."""
+        engine_levels = [str(x) for x in (engine_info.get("available_thinking_levels") or [])]
+        detail_by_id: Dict[str, Dict[str, Any]] = {}
+        for d in details:
+            mid = str(d.get("id") or "")
+            if mid and mid not in detail_by_id:
+                detail_by_id[mid] = d
+        disabled = set(disabled_models or [])
+        notes = model_notes or {}
+
+        def _levels_for(mid: str) -> List[str]:
+            d = detail_by_id.get(mid) or {}
+            if eng == "omp":
+                # The omp CLI accepts its own level names for every model it can reach.
+                omp_levels = d.get("omp_cli_thinking_levels")
+                if omp_levels:
+                    return [str(x) for x in omp_levels]
+            supported = d.get("supported_thinking_levels")
+            if supported:
+                return [str(x) for x in supported]
+            return list(engine_levels)
+
+        result: List[Dict[str, Any]] = []
+        if eng == "agy":
+            # agy carries its thinking level in the model name suffix: group the raw ids by base.
+            order: List[str] = []
+            groups: Dict[str, Dict[str, Any]] = {}
+            for mid in all_models:
+                base, suffix = split_agy_model_id(mid)
+                if base not in groups:
+                    groups[base] = {"ids": [], "levels": [], "first": mid, "enabled": False}
+                    order.append(base)
+                grp = groups[base]
+                grp["ids"].append(mid)
+                if suffix and suffix not in grp["levels"]:
+                    grp["levels"].append(suffix)
+                if mid not in disabled:
+                    grp["enabled"] = True
+            for base in order:
+                grp = groups[base]
+                # Keep the engine's own order (low, medium, high), then anything unexpected.
+                levels = [l for l in AGY_THINKING_LEVELS if l in grp["levels"]]
+                levels += [l for l in grp["levels"] if l not in AGY_THINKING_LEVELS]
+                first_detail = detail_by_id.get(grp["first"]) or {}
+                label = str(first_detail.get("display_name") or base)
+                label = re.sub(r"\s*\((low|medium|high)\)\s*$", "", label, flags=re.IGNORECASE).strip() or base
+                _first_base, first_suffix = split_agy_model_id(grp["first"])
+                result.append(
+                    {
+                        "id": base,
+                        "label": label,
+                        "thinking_levels": levels,
+                        "default_thinking_level": first_suffix if first_suffix in levels else None,
+                        "enabled": grp["enabled"],
+                        "note": str(notes.get(base) or ""),
+                    }
+                )
+        else:
+            for mid in all_models:
+                d = detail_by_id.get(mid) or {}
+                levels = _levels_for(mid)
+                default_level = d.get("default_thinking_level")
+                if default_level not in levels:
+                    default_level = None
+                label = str(d.get("display_name") or mid)
+                result.append(
+                    {
+                        "id": mid,
+                        "label": label or mid,
+                        "thinking_levels": levels,
+                        "default_thinking_level": default_level,
+                        "enabled": mid not in disabled,
+                        "note": str(notes.get(mid) or ""),
+                    }
+                )
+
+        # Enabled first, discovery order preserved inside each group.
+        return [m for m in result if m["enabled"]] + [m for m in result if not m["enabled"]]
+
+    def load_profiles(self, refresh_discovery: bool = False, discovery: Optional[Dict[str, Any]] = None):
+        if discovery is None:
+            discovery = self.model_discovery.discover_all(force_refresh=refresh_discovery)
         raw_engines = discovery.get("engines", {})
         data: Dict[str, Any] = {}
         if self.profiles_path.exists():
@@ -854,6 +1084,14 @@ class HubSessionManager:
                     md_copy["note"] = mod_notes[mid]
                 details.append(md_copy)
             e_copy["model_details"] = details
+            e_copy["models"] = self._build_engine_model_options(
+                eng=eng,
+                engine_info=e_copy,
+                all_models=all_mods,
+                disabled_models=disabled_mods,
+                model_notes=mod_notes,
+                details=details,
+            )
             processed_engines[eng] = e_copy
 
         self.engines_catalog = processed_engines
@@ -867,10 +1105,25 @@ class HubSessionManager:
             prof["enabled"] = bool(prof.get("enabled", True))
             prof["when_to_use"] = prof.get("when_to_use") or ""
             eng_info = self.engines_catalog.get(eng) or {}
-            if not prof.get("default_model") and eng_info.get("default_model"):
+            # B4: remember whether the default came from the profile file or from the engine.
+            explicit_model = str(prof.get("default_model") or "").strip()
+            explicit_thinking = str(prof.get("default_thinking_level") or "").strip()
+            if eng == "agy" and explicit_model:
+                # agy ids carry a thinking suffix: store the base, keep the suffix as the thinking level.
+                base_model, suffix_level = split_agy_model_id(explicit_model)
+                explicit_model = base_model
+                if not explicit_thinking and suffix_level:
+                    explicit_thinking = suffix_level
+            if explicit_model:
+                prof["default_model"] = explicit_model
+            elif eng_info.get("default_model"):
                 prof["default_model"] = eng_info["default_model"]
-            if not prof.get("default_thinking_level") and eng_info.get("default_thinking_level"):
+            if explicit_thinking:
+                prof["default_thinking_level"] = explicit_thinking
+            elif eng_info.get("default_thinking_level"):
                 prof["default_thinking_level"] = eng_info["default_thinking_level"]
+            prof["default_model_source"] = "profile" if explicit_model else "engine"
+            prof["default_thinking_source"] = "profile" if explicit_thinking else "engine"
 
             all_mods = eng_info.get("all_discovered_models", [])
             prof_disabled = list(
@@ -885,81 +1138,8 @@ class HubSessionManager:
             prof["model_details"] = eng_info.get("model_details", [])
             enriched[pid] = prof
 
-        # Auto-discover and register Codex profiles from ~/.codex/config.toml & .codex-global-state.json
-        codex_info = self.engines_catalog.get("codex") or {}
-        codex_bin = codex_info.get("binary") or r"C:\Users\cui\AppData\Roaming\npm\codex.cmd"
-        codex_all_models = codex_info.get("all_discovered_models", [])
-        codex_disabled_models = codex_info.get("disabled_models", [])
-        codex_avail_models = codex_info.get("available_models", [])
-        codex_avail_levels = codex_info.get("available_thinking_levels", [])
-        codex_model_details = codex_info.get("model_details", [])
-
-        # 1) [profiles.<name>] in ~/.codex/config.toml
-        for c_prof_name, c_prof_cfg in (codex_info.get("config_profiles") or {}).items():
-            if not isinstance(c_prof_cfg, dict):
-                continue
-            synth_id = f"codex-{c_prof_name}"
-            if synth_id not in enriched:
-                c_mod = c_prof_cfg.get("model") or codex_info.get("default_model", "gpt-6.1-sol")
-                c_eff = c_prof_cfg.get("model_reasoning_effort") or codex_info.get("default_thinking_level", "medium")
-                enriched[synth_id] = {
-                    "id": synth_id,
-                    "name": f"Codex Profile: {c_prof_name} ({c_mod} [{c_eff}])",
-                    "engine": "codex",
-                    "enabled": c_mod not in codex_disabled_models,
-                    "kind": "tui",
-                    "command": codex_bin,
-                    "args": ["-p", c_prof_name, "--dangerously-bypass-approvals-and-sandbox"],
-                    "default_model": c_mod,
-                    "default_thinking_level": c_eff,
-                    "task_mode": "codex_positional",
-                    "when_to_use": f"当需要使用 ~/.codex/config.toml 中预设的 [{c_prof_name}] 配置 ({c_mod}, 思考等级 {c_eff}) 执行代码工程任务时调用。",
-                    "description": f"自动扫描自 ~/.codex/config.toml [profiles.{c_prof_name}] ({c_mod}, effort={c_eff})",
-                    "startup_delay_sec": 2.5,
-                    "submit_key": "\r",
-                    "all_discovered_models": codex_all_models,
-                    "disabled_models": codex_disabled_models,
-                    "available_models": codex_avail_models,
-                    "available_thinking_levels": codex_avail_levels,
-                    "model_details": codex_model_details,
-                }
-
-        # 2) Recent model configurations from ~/.codex/.codex-global-state.json
-        for rc in (codex_info.get("recent_configurations") or []):
-            rc_mod = rc.get("model")
-            rc_eff = rc.get("thinking_level") or "medium"
-            if not rc_mod:
-                continue
-            synth_id = f"codex-{rc_mod}-{rc_eff}".lower().replace(".", "_")
-            clean_id = f"codex-{rc_mod}-{rc_eff}"
-            if clean_id not in enriched and synth_id not in enriched:
-                enriched[clean_id] = {
-                    "id": clean_id,
-                    "name": f"Codex {rc_mod} ({rc_eff.capitalize()})",
-                    "engine": "codex",
-                    "enabled": rc_mod not in codex_disabled_models,
-                    "kind": "tui",
-                    "command": codex_bin,
-                    "args": [
-                        "-m",
-                        rc_mod,
-                        "-c",
-                        f'model_reasoning_effort="{rc_eff}"',
-                        "--dangerously-bypass-approvals-and-sandbox",
-                    ],
-                    "default_model": rc_mod,
-                    "default_thinking_level": rc_eff,
-                    "task_mode": "codex_positional",
-                    "when_to_use": f"当需要使用 OpenAI Codex CLI 的 {rc_mod} 模型（思考等级 {rc_eff}）进行代码实现或调试时调用。",
-                    "description": f"自动扫描自本机 Codex 最近使用配置 ({rc_mod}, reasoning_effort={rc_eff})",
-                    "startup_delay_sec": 2.5,
-                    "submit_key": "\r",
-                    "all_discovered_models": codex_all_models,
-                    "disabled_models": codex_disabled_models,
-                    "available_models": codex_avail_models,
-                    "available_thinking_levels": codex_avail_levels,
-                    "model_details": codex_model_details,
-                }
+        # B2: discovery may still report ~/.codex [profiles.*] and recent configurations in the
+        # catalog, but they no longer synthesise profiles. A Profile is a launch recipe, not a combo.
 
         self.profiles = enriched
 
@@ -973,35 +1153,111 @@ class HubSessionManager:
         return result
 
     def build_routing_guide_markdown(self) -> str:
-        """Compiles user-authored `when_to_use` annotations and model enable/disable policies into a structured guide for the Parent Agent."""
-        lines: List[str] = [
-            "# 🧭 Sub-Agent 调用与路由指南 (User-Configured Routing Guide)",
-            self.global_routing_instructions.strip(),
-            "",
-            "## 1. 各 Sub-Agent Profile 调用场景注释 (`when_to_use`)",
-        ]
+        """B12: the guide parent agents read. Only enabled profiles and enabled models appear."""
+        lines: List[str] = ["# Sub-Agent 调用与路由指南"]
+        instructions = (self.global_routing_instructions or "").strip()
+        if instructions:
+            lines.append(instructions)
+        lines.append("")
+        lines.append("## Profile（agent_type）")
         for pid, p in self.profiles.items():
             if not p.get("enabled", True):
                 continue
-            name = p.get("name", pid)
-            eng = p.get("engine", "generic")
-            def_mod = p.get("default_model") or "N/A"
-            def_thk = p.get("default_thinking_level") or "N/A"
+            name = p.get("name") or pid
+            def_mod = p.get("default_model") or "无"
+            def_thk = p.get("default_thinking_level") or "无"
+            lines.append(f"- `{pid}` — {name}｜默认：{def_mod} · {def_thk}")
             when = (p.get("when_to_use") or p.get("description") or "").strip()
-            lines.append(
-                f"- **`{pid}`** ({name} | engine=`{eng}`, default_model=`{def_mod}`, thinking=`{def_thk}`):\n"
-                f"  - 📌 **何时调用**: {when}"
-            )
-        lines.append("\n## 2. 各 Agent 引擎当前已启用模型 (`available_models`) 与已禁用模型 (`disabled_models`)")
+            if when:
+                lines.append(f"  何时用：{when}")
+        lines.append("")
+        lines.append("## 可用模型与思考等级（model / thinking_level）")
         for eng, info in self.engines_catalog.items():
-            avail = info.get("available_models", [])
-            dis = info.get("disabled_models", [])
-            thk = info.get("available_thinking_levels", [])
-            dis_str = f" | 🚫 已禁用(禁止调用): `{', '.join(dis)}`" if dis else ""
-            lines.append(
-                f"- **`{eng}`**: ✅ 可用模型: `{', '.join(avail) or '无'}` | 🧠 思考等级: `{', '.join(thk) or '无'}`{dis_str}"
-            )
+            models = info.get("models") or []
+            if not models:
+                continue
+            header = f"### {eng}"
+            if eng == "agy":
+                header += "（思考等级会拼成模型名后缀）"
+            lines.append(header)
+            for m in models:
+                if not m.get("enabled"):
+                    continue
+                levels = ", ".join(m.get("thinking_levels") or []) or "无"
+                note = (m.get("note") or "").strip()
+                model_line = f"- `{(m.get('id') or '')}`"
+                if note:
+                    model_line += f" — {note}"
+                model_line += f"｜思考等级：{levels}"
+                lines.append(model_line)
+        disabled_groups: List[str] = []
+        for eng, info in self.engines_catalog.items():
+            disabled_entries = [m.get("id") for m in (info.get("models") or []) if not m.get("enabled")]
+            if disabled_entries:
+                disabled_groups.append(f"{eng}: {', '.join(str(x) for x in disabled_entries)}")
+        if disabled_groups:
+            lines.append("")
+            lines.append("已停用（禁止调用）：" + "，".join(disabled_groups))
         return "\n".join(lines)
+
+    # ---- B13: model enable/disable + per-model notes -------------------------------------
+
+    PROFILE_PERSIST_KEYS = (
+        "id",
+        "name",
+        "engine",
+        "kind",
+        "command",
+        "args",
+        "default_model",
+        "default_thinking_level",
+        "task_mode",
+        "startup_delay_sec",
+        "submit_key",
+        "enabled",
+        "when_to_use",
+        "description",
+        "gui_url",
+        "dsh_tier",
+        "disabled_models",
+    )
+
+    # B5: keys the UI clears by sending null / "". They are deleted from the stored profile.
+    PROFILE_CLEARABLE_KEYS = (
+        "task_mode",
+        "default_model",
+        "default_thinking_level",
+        "gui_url",
+        "dsh_tier",
+    )
+
+    def _read_profiles_file(self) -> Dict[str, Any]:
+        if self.profiles_path.exists():
+            try:
+                return json.loads(self.profiles_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {"profiles": {}}
+        return {"profiles": {}}
+
+    def _write_profiles_file(self, raw_data: Dict[str, Any]) -> None:
+        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def engine_model_options(self, engine: str) -> List[Dict[str, Any]]:
+        info = self.engines_catalog.get((engine or "").strip().lower()) or {}
+        return list(info.get("models") or [])
+
+    def engine_model_option(self, engine: str, model_id: str) -> Optional[Dict[str, Any]]:
+        mid = (model_id or "").strip()
+        for m in self.engine_model_options(engine):
+            if m.get("id") == mid:
+                return m
+        return None
+
+    def _sorted_levels_by_engine_order(self, engine: str, levels: List[str]) -> List[str]:
+        info = self.engines_catalog.get(engine) or {}
+        order = [str(x) for x in (info.get("available_thinking_levels") or [])]
+        seen = [l for l in order if l in levels]
+        return seen + [l for l in levels if l not in seen]
 
     def toggle_engine_model(
         self,
@@ -1010,96 +1266,206 @@ class HubSessionManager:
         enabled: bool,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Enables or disables a specific model for an Agent engine and persists to agent_profiles.json."""
-        eng = engine.strip().lower()
-        mid = model_id.strip()
+        """B13: enable/disable one model (agy: a base id toggles every suffixed id of that base) and edit its note.
+
+        The endpoint also accepts a note-only update: pass the same `enabled` as the model currently has and a new
+        `note`. An empty note deletes it.
+        """
+        eng = (engine or "").strip().lower()
+        mid = (model_id or "").strip()
         if not eng or not mid:
-            raise ValueError("Both 'engine' and 'model_id' are required.")
+            raise ValueError("缺少引擎或模型标识。")
+        if eng not in KNOWN_ENGINES:
+            raise ValueError(f"未知引擎「{eng}」。可用：{', '.join(KNOWN_ENGINES)}")
 
-        raw_data: Dict[str, Any] = {"profiles": {}}
-        if self.profiles_path.exists():
-            try:
-                raw_data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            except Exception:
-                raw_data = {"profiles": {}}
+        # Accept either a raw discovered id or a B3 base id (agy groups its suffix variants).
+        catalog_ids = set(str(x) for x in (self.engines_catalog.get(eng, {}).get("all_discovered_models") or []))
+        base_ids = set(str(m.get("id")) for m in self.engine_model_options(eng) if m.get("id"))
+        base, _suffix = split_agy_model_id(mid) if eng == "agy" else (mid, None)
+        if catalog_ids and mid not in catalog_ids and mid not in base_ids and base not in base_ids:
+            raise ValueError(f"引擎「{eng}」里没有模型「{mid}」。")
 
+        # Every raw id this call must write policy for (agy: all suffixes of the base).
+        if eng == "agy":
+            targets = sorted(m for m in catalog_ids if split_agy_model_id(m)[0] == base)
+            if not targets:
+                # Policy may key a base id directly when discovery reported no suffix variants.
+                targets = [base]
+        else:
+            targets = [mid]
+
+        raw_data = self._read_profiles_file()
         policies = raw_data.setdefault("engine_policies", {})
         eng_pol = policies.setdefault(eng, {"disabled_models": [], "model_notes": {}})
-        disabled_list: List[str] = list(eng_pol.get("disabled_models") or [])
+        disabled_list: List[str] = [str(m) for m in (eng_pol.get("disabled_models") or [])]
 
-        if enabled:
-            disabled_list = [m for m in disabled_list if m != mid]
-        else:
-            if mid not in disabled_list:
-                disabled_list.append(mid)
+        for target in targets:
+            if enabled:
+                disabled_list = [m for m in disabled_list if m != target]
+            elif target not in disabled_list:
+                disabled_list.append(target)
         eng_pol["disabled_models"] = disabled_list
 
+        note_engine_key = base if eng == "agy" else mid
         if note is not None:
             notes_map = eng_pol.setdefault("model_notes", {})
-            if note.strip():
-                notes_map[mid] = note.strip()
+            cleaned = str(note).strip()
+            if cleaned:
+                notes_map[note_engine_key] = cleaned
             else:
-                notes_map.pop(mid, None)
+                notes_map.pop(note_engine_key, None)
 
-        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.load_profiles(refresh_discovery=False)
+        self._write_profiles_file(raw_data)
+        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
         return self.engines_catalog.get(eng, {})
 
     def save_global_routing_instructions(self, instructions: str) -> str:
         """Persists global routing instructions for Parent Agents into agent_profiles.json."""
-        raw_data: Dict[str, Any] = {"profiles": {}}
-        if self.profiles_path.exists():
-            try:
-                raw_data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            except Exception:
-                raw_data = {"profiles": {}}
+        raw_data = self._read_profiles_file()
         raw_data["global_routing_instructions"] = instructions.strip()
-        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.load_profiles(refresh_discovery=False)
+        self._write_profiles_file(raw_data)
+        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
         return self.global_routing_instructions
 
+    # ---- B5: saving and deleting profiles ------------------------------------------------
+
+    def _validate_profile_input(
+        self,
+        eng: str,
+        args: List[str],
+        kind: str,
+        default_model: Optional[str],
+        default_thinking: Optional[str],
+    ) -> None:
+        bad = injected_flags_in_args(eng, args)
+        if bad:
+            raise ValueError(
+                f"参数里不要写模型或思考等级（{bad[0]}）：Hub 会按启动时的选择自动注入。"
+            )
+        if kind not in ("tui", "web_gui"):
+            raise ValueError(f"会话形式「{kind}」无效，只能是 tui 或 web_gui。")
+        if kind == "web_gui" and eng != "dsh":
+            raise ValueError("只有 dsh 引擎可以使用 web_gui 会话形式。")
+
+        options = self.engine_model_options(eng)
+        if not options:
+            # pwsh and engines without a catalog have no model / thinking choice at all.
+            return
+        ids = [str(m.get("id")) for m in options]
+        enabled_ids = [str(m.get("id")) for m in options if m.get("enabled")]
+        chosen = self.engine_model_option(eng, default_model) if default_model else None
+        if default_model and not chosen:
+            if eng == "agy":
+                base, _suffix = split_agy_model_id(str(default_model))
+                chosen = self.engine_model_option(eng, base)
+            if chosen is None:
+                raise ValueError(f"模型「{default_model}」不在引擎「{eng}」的可用模型里。可用：{', '.join(enabled_ids) or '无'}")
+        if chosen is not None and not chosen.get("enabled"):
+            raise ValueError(f"模型「{chosen.get('id')}」已被停用，不能设为默认模型。")
+        if default_thinking and chosen is not None:
+            levels = [str(x) for x in (chosen.get("thinking_levels") or [])]
+            if str(default_thinking) not in levels:
+                raise ValueError(
+                    f"{chosen.get('id')} 支持的思考等级：{', '.join(levels) or '无'}"
+                )
+        if default_model and str(default_model) not in ids and not chosen:
+            raise ValueError(f"模型「{default_model}」不在引擎「{eng}」的可用模型里。")
+
     def save_or_update_profile(self, profile_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Persists a new or modified Agent Profile to agent_profiles.json and reloads enriched profiles."""
-        pid = (profile_data.get("id") or "").strip()
+        """B5: persists one Profile as a launch recipe, dropping every enrichment key."""
+        pid = str(profile_data.get("id") or "").strip()
         if not pid:
-            raise ValueError("Profile 'id' is required.")
-        raw_data = {"profiles": {}}
-        if self.profiles_path.exists():
-            try:
-                raw_data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-            except Exception:
-                raw_data = {"profiles": {}}
+            raise ValueError("Profile 的 id 不能为空。")
+
+        raw_data = self._read_profiles_file()
         profiles_map = raw_data.setdefault("profiles", {})
-        existing = dict(profiles_map.get(pid) or {})
-        # Strip transient auto-discovered arrays before writing to disk
-        clean_entry = dict(existing)
-        for k, v in profile_data.items():
-            if k in ("available_models", "available_thinking_levels", "model_details", "all_discovered_models"):
+        existing = profiles_map.get(pid) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        incoming = dict(profile_data)
+        merged = dict(existing)
+        for key in self.PROFILE_PERSIST_KEYS:
+            if key not in incoming:
                 continue
-            clean_entry[k] = v
+            value = incoming[key]
+            if key in self.PROFILE_CLEARABLE_KEYS and (value is None or (isinstance(value, str) and not value.strip())):
+                merged.pop(key, None)
+                continue
+            merged[key] = value
+
+        for required in ("name", "engine", "command"):
+            value = merged.get(required)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                raise ValueError(f"Profile 的 {required} 不能清空。")
+
+        eng = self._infer_engine(pid, merged)
+        merged["engine"] = eng
+        merged["id"] = pid
+
+        raw_args = merged.get("args")
+        if raw_args is None:
+            raw_args = merged.get("args", [])
+        if not isinstance(raw_args, list) or any(not isinstance(a, str) for a in raw_args):
+            raise ValueError("参数（args）必须是字符串列表，每行一个参数。")
+        args = [a for a in raw_args]
+        if len(args) > MAX_LAUNCH_ARGS:
+            raise ValueError("参数（args）过多。")
+
+        kind = str(merged.get("kind") or "tui")
+        default_model = merged.get("default_model")
+        default_model = str(default_model).strip() if default_model else None
+        if not default_model:
+            default_model = None
+        default_thinking = merged.get("default_thinking_level")
+        default_thinking = str(default_thinking).strip() if default_thinking else None
+        if not default_thinking:
+            default_thinking = None
+
+        self._validate_profile_input(eng, args, kind, default_model, default_thinking)
+
+        if eng == "agy" and default_model:
+            default_model, suffix_level = split_agy_model_id(default_model)
+            merged["default_model"] = default_model
+            if suffix_level:
+                merged["default_thinking_level"] = suffix_level
+
+        clean_entry: Dict[str, Any] = {}
+        for key in self.PROFILE_PERSIST_KEYS:
+            if key in merged:
+                clean_entry[key] = merged[key]
         clean_entry["id"] = pid
+        clean_entry["engine"] = eng
+        clean_entry["args"] = args
         clean_entry.setdefault("enabled", True)
         clean_entry.setdefault("when_to_use", "")
         clean_entry.setdefault("kind", "tui")
         clean_entry.setdefault("submit_key", "\r")
         clean_entry.setdefault("startup_delay_sec", 2.5)
+        if not clean_entry.get("name"):
+            clean_entry["name"] = pid
+        if clean_entry.get("default_model") in (None, ""):
+            clean_entry.pop("default_model", None)
+        if clean_entry.get("default_thinking_level") in (None, ""):
+            clean_entry.pop("default_thinking_level", None)
+
         profiles_map[pid] = clean_entry
-        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.load_profiles()
-        return self.profiles[pid]
+        self._write_profiles_file(raw_data)
+        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
+        return self.profiles.get(pid, {})
 
     def delete_profile(self, profile_id: str) -> bool:
-        """Deletes a profile from agent_profiles.json."""
-        if not self.profiles_path.exists():
-            return False
-        raw_data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-        profiles_map = raw_data.get("profiles", {})
-        if profile_id not in profiles_map:
-            return False
-        del profiles_map[profile_id]
-        self.profiles_path.write_text(json.dumps(raw_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.load_profiles()
+        """B5: deletes one Profile; an unknown id raises a Chinese ValueError."""
+        pid = (profile_id or "").strip()
+        raw_data = self._read_profiles_file()
+        profiles_map = raw_data.get("profiles") or {}
+        if pid not in profiles_map:
+            raise ValueError(f"找不到 Profile「{pid}」。")
+        del profiles_map[pid]
+        self._write_profiles_file(raw_data)
+        self.load_profiles(refresh_discovery=False, discovery=self.model_discovery.peek_cache())
         return True
+
 
     def _notify_waiters(self):
         for ev in list(self._event_waiters):
@@ -1108,6 +1474,32 @@ class HubSessionManager:
     def persist_session(self, session: AgentSession):
         scrollback = session.get_full_scrollback_text(max_lines=250)
         self.db.upsert_session(session.to_dict(), scrollback_text=scrollback)
+
+    def close_session(self, session_id: str) -> Dict[str, Any]:
+        """B9: removes a session from the live list without rewriting the status an ended process already earned.
+
+        A session whose process was alive is terminated (and emits a `terminated` worker event,
+        message 「用户在总控台终止了会话」); one that had already ended keeps its own final status and activity.
+        Returns {"found": bool, "was_alive": bool, "status": str}.
+        """
+        sess = self.sessions.get(session_id)
+        if not sess:
+            return {"found": False, "was_alive": False, "status": None}
+        was_alive = sess.is_process_alive()
+        terminated = sess.terminate()
+        self.persist_session(sess)
+        del self.sessions[session_id]
+        if terminated or (was_alive and sess.status == "terminated"):
+            self.record_worker_event(
+                session_id,
+                {
+                    "type": "terminated",
+                    "category": "lifecycle",
+                    "status": "terminated",
+                    "content": "用户在总控台终止了会话",
+                },
+            )
+        return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
 
     def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Processes telemetry from Claude Hooks, Codex JSONL Tailer, Worker MCP `report_step`, or TUI Heuristic Parser."""
@@ -1953,7 +2345,9 @@ class HubSessionManager:
                             sess.dsh_job_id = cjob["id"]
                             sess.dsh_token = new_token
                             sess.status = "running"
-                            sess.last_task = clean_txt
+                            # B9: last_task stays the initial task; follow-ups live in current_activity.
+                            if not sess.last_task:
+                                sess.last_task = clean_txt
                             sess.current_activity = f"Continuing DSH session ({cjob['id']}): {clean_txt[:60]}"
                             sess.emit_virtual_ansi(
                                 f"\r\n\x1b[1;36m↻ [Continuing DSH Session {sess.dsh_session_id} -> {cjob['id']}]: {clean_txt}\x1b[0m\r\n"
@@ -2073,7 +2467,7 @@ class HubSessionManager:
                     "args": [bridge_script],
                     "env": {
                         "HUB_SESSION_ID": session_id,
-                        "HUB_API_URL": "http://127.0.0.1:4444",
+                        "HUB_API_URL": hub_api_base_url(),
                     },
                 }
             }
@@ -3224,66 +3618,202 @@ class HubSessionManager:
         return args
 
     @staticmethod
-    def _apply_engine_model_and_thinking_args(
-        engine: str,
-        base_args: List[str],
-        effective_model: Optional[str],
-        effective_thinking: Optional[str],
-        explicit_model: Optional[str],
-        explicit_thinking: Optional[str],
-    ) -> tuple[List[str], Optional[str], Optional[str]]:
-        """Dynamically injects/overrides CLI flags for model and thinking_level across omp, kimi, agy, codex, claude, reclaude."""
-        args = list(base_args)
-        eng = (engine or "").lower()
+    def _middle_level(levels) -> Optional[str]:
+        """The middle of a level list, used when neither the profile nor the model names a default."""
+        if not levels:
+            return None
+        return levels[len(levels) // 2]
 
-        if eng == "omp":
-            args = [a for a in args if not a.startswith("--model=") and not a.startswith("--thinking=")]
-            if effective_model:
-                args.insert(0, f"--model={effective_model}")
-            if effective_thinking:
-                args.insert(1 if effective_model else 0, f"--thinking={effective_thinking}")
-        elif eng == "kimi":
-            cleaned: List[str] = []
-            skip_next = False
-            for a in args:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if a in ("-m", "--model"):
-                    skip_next = True
-                    continue
-                cleaned.append(a)
-            args = cleaned
-            if effective_model:
-                args = ["-m", effective_model] + args
-        elif eng == "agy":
-            cleaned = []
-            skip_next = False
-            for a in args:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if a in ("--model", "--effort"):
-                    skip_next = True
-                    continue
-                cleaned.append(a)
-            args = cleaned
-            resolved_model = effective_model
-            if resolved_model and effective_thinking in ("low", "medium", "high"):
-                if explicit_thinking and re.search(r"-(low|medium|high)$", resolved_model):
-                    resolved_model = re.sub(r"-(low|medium|high)$", f"-{effective_thinking}", resolved_model)
-                elif resolved_model in ("gemini-3.8-flash", "gemini-4-argon", "claude-sonnet-5-5", "claude-opus-5-5"):
-                    resolved_model = f"{resolved_model}-{effective_thinking}"
-            effective_model = resolved_model
-            if effective_model:
-                args = ["--model", effective_model] + args
-        elif eng == "codex":
-            if explicit_model and effective_model:
-                args = ["-m", effective_model] + args
-            if explicit_thinking and effective_thinking:
-                args = ["-c", f'model_reasoning_effort="{effective_thinking}"'] + args
+    def hub_default_cwd(self) -> str:
+        """B10: the hub's own working directory, absolute."""
+        return os.path.abspath(os.getcwd())
 
-        return args, effective_model, effective_thinking
+    def resolve_launch(
+        self,
+        profile_id: str,
+        model: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """B6: the one place that turns (profile, model, thinking, cwd) into a real command line.
+
+        Returns exactly what will run; raises a Chinese ValueError for invalid input. Spawns nothing.
+        """
+        pid = (profile_id or '').strip()
+        prof = self.profiles.get(pid)
+        enabled_ids = [k for k, v in self.profiles.items() if v.get('enabled', True)]
+        if not prof or not prof.get('enabled', True):
+            raise ValueError(
+                f"Profile「{pid}」不存在或已停用。可用：{', '.join(enabled_ids) or '无'}"
+            )
+
+        eng = str(prof.get('engine') or 'generic').strip().lower()
+        name = str(prof.get('name') or pid)
+        kind = str(prof.get('kind') or 'tui')
+        command = str(prof.get('command') or '')
+        base_args = [str(a) for a in (prof.get('args') or [])]
+        notes = []  # Chinese notes, e.g. substitutions
+        env: Dict[str, str] = {}
+
+        options = self.engine_model_options(eng)
+        explicit_model = str(model).strip() if model and str(model).strip() else None
+        explicit_level = str(thinking_level).strip() if thinking_level and str(thinking_level).strip() else None
+
+        resolved_model: Optional[str] = None
+        model_source: Optional[str] = None
+        resolved_level: Optional[str] = None
+        thinking_source: Optional[str] = None
+        cli_model: Optional[str] = None
+
+        if not options:
+            # pwsh and engines without a catalog skip model and thinking entirely.
+            explicit_model = None
+            explicit_level = None
+        else:
+            enabled_options = [m for m in options if m.get('enabled')]
+            enabled_option_ids = [str(m.get('id')) for m in enabled_options]
+            by_id = {str(m.get('id')): m for m in enabled_options}
+
+            option: Optional[Dict[str, Any]] = None
+            if explicit_model:
+                option = by_id.get(explicit_model)
+                if option is None and eng == 'agy':
+                    # agy also accepts a suffixed id: the suffix counts as explicit thinking,
+                    # unless an explicit thinking_level was given too, in which case that wins.
+                    agy_base, agy_suffix = split_agy_model_id(explicit_model)
+                    option = by_id.get(agy_base)
+                    if option is not None and agy_suffix and explicit_level is None:
+                        explicit_level = agy_suffix
+                if option is None:
+                    raise ValueError(
+                        f"模型「{explicit_model}」不可用（可能已停用或不存在）。可用："
+                        f"{', '.join(enabled_option_ids) or '无'}"
+                    )
+                resolved_model = str(option.get('id'))
+                model_source = 'explicit'
+            else:
+                default_model = str(prof.get('default_model') or '').strip() or None
+                if default_model:
+                    default_source = 'profile' if prof.get('default_model_source') != 'engine' else 'engine'
+                    candidate = by_id.get(default_model)
+                    if eng == 'agy' and candidate is None:
+                        candidate = by_id.get(split_agy_model_id(default_model)[0])
+                    if candidate is not None:
+                        resolved_model = str(candidate.get('id'))
+                        model_source = default_source
+                        option = candidate
+                if option is None and enabled_options:
+                    option = enabled_options[0]
+                    resolved_model = str(option.get('id'))
+                    model_source = 'substituted'
+                    notes.append(
+                        f"默认模型 {default_model or '（未设置）'} 已停用，改用 {resolved_model}"
+                    )
+
+            if option is not None:
+                levels = [str(x) for x in (option.get('thinking_levels') or [])]
+                levels = self._sorted_levels_by_engine_order(eng, levels)
+                if True:
+                    if explicit_level:
+                        if explicit_level not in levels:
+                            raise ValueError(
+                                f"{resolved_model} 支持的思考等级：{', '.join(levels) or '无'}"
+                            )
+                        resolved_level = explicit_level
+                        thinking_source = 'explicit'
+                    else:
+                        profile_level = str(prof.get('default_thinking_level') or '').strip() or None
+                        if profile_level and profile_level in levels:
+                            resolved_level = profile_level
+                            thinking_source = 'profile'
+                        elif profile_level:
+                            model_default = option.get('default_thinking_level')
+                            if model_default in levels:
+                                resolved_level = str(model_default)
+                                thinking_source = 'model'
+                            else:
+                                resolved_level = self._middle_level(levels)
+                                thinking_source = 'model' if resolved_level else None
+                            notes.append(
+                                f"Profile 默认思考等级 {profile_level} 不被 {resolved_model} 支持，改用 {resolved_level}"
+                            )
+                        else:
+                            model_default = option.get('default_thinking_level')
+                            if model_default and str(model_default) in levels:
+                                resolved_level = str(model_default)
+                                thinking_source = 'model'
+                            elif levels:
+                                resolved_level = self._middle_level(levels)
+                                thinking_source = 'model'
+                            else:
+                                engine_levels = self._sorted_levels_by_engine_order(
+                                    eng, [str(x) for x in ((self.engines_catalog.get(eng) or {}).get('available_thinking_levels') or [])]
+                                )
+                                resolved_level = engine_levels[0] if engine_levels else None
+                                thinking_source = 'engine' if resolved_level else None
+
+        # Rule 4: start from the stored args, strip injected flags (old files still work), inject at the front.
+        args = strip_injected_flags(eng, base_args)
+
+        if eng == 'omp':
+            injected = []
+            if resolved_model:
+                injected.append(f'--model={resolved_model}')
+            if resolved_level:
+                injected.append(f'--thinking={resolved_level}')
+            args = injected + args
+        elif eng == 'kimi':
+            if resolved_model:
+                args = ['-m', resolved_model] + args
+            if resolved_level:
+                # Only this child process; never the hub's own environment.
+                env['KIMI_MODEL_THINKING_EFFORT'] = resolved_level
+        elif eng == 'agy':
+            if resolved_model:
+                if resolved_level:
+                    cli_model = f'{resolved_model}-{resolved_level}'
+                else:
+                    cli_model = resolved_model
+                args = ['--model', cli_model] + args
+        elif eng == 'codex':
+            injected = []
+            if resolved_model:
+                injected.extend(['-m', resolved_model])
+            if resolved_level:
+                injected.extend(['-c', f'model_reasoning_effort="{resolved_level}"'])
+            args = injected + args
+        # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
+
+        # Rule 5: cwd.
+        if cwd is None or str(cwd).strip() == '':
+            work_dir = self.hub_default_cwd()
+        else:
+            candidate_cwd = str(cwd).strip()
+            expanded = os.path.expandvars(os.path.expanduser(candidate_cwd))
+            resolved_cwd = os.path.abspath(expanded)
+            if not os.path.isdir(resolved_cwd):
+                raise ValueError(f'工作目录不存在：{candidate_cwd}')
+            work_dir = resolved_cwd
+
+        if eng == 'agy' and cli_model is None and resolved_model:
+            cli_model = f'{resolved_model}-{resolved_level}' if resolved_level else resolved_model
+
+        return {
+            'profile_id': pid,
+            'profile_name': name,
+            'engine': eng,
+            'kind': kind,
+            'command': command,
+            'args': args,
+            'env': env,
+            'cwd': work_dir,
+            'model': resolved_model,
+            'model_source': model_source,
+            'thinking_level': resolved_level,
+            'thinking_source': thinking_source,
+            'cli_model': cli_model,
+            'notes': notes,
+        }
 
     async def create_session(
         self,
@@ -3318,51 +3848,20 @@ class HubSessionManager:
             self.persist_session(sess)
             return sess
 
-        if profile_id not in self.profiles:
-            enabled_keys = [k for k, v in self.profiles.items() if v.get("enabled", True)]
-            raise ValueError(f"Unknown agent profile '{profile_id}'. Enabled profiles: {enabled_keys}")
+        launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd)
 
         prof = self.profiles[profile_id]
-        if not prof.get("enabled", True):
-            enabled_keys = [k for k, v in self.profiles.items() if v.get("enabled", True)]
-            raise ValueError(
-                f"Agent profile '{profile_id}' has been disabled by user policy. "
-                f"Please choose an enabled profile from: {enabled_keys}"
-            )
+        engine = launch['engine']
+        work_dir = launch['cwd']
+        effective_model = launch['model']
+        effective_thinking = launch['thinking_level']
+        args = list(launch['args'])
+        env_overrides: Dict[str, str] = dict(launch.get('env') or {})
+        if engine == 'agy' and launch.get('cli_model'):
+            effective_model = launch['cli_model']
 
-        engine = self._infer_engine(profile_id, prof)
-        disabled_mods = set(prof.get("disabled_models") or [])
-        avail_mods = list(prof.get("available_models") or [])
-
-        if model and model.strip() in disabled_mods:
-            raise ValueError(
-                f"Model '{model.strip()}' for engine '{engine}' has been disabled by user policy. "
-                f"Currently enabled models for '{engine}': {avail_mods}"
-            )
-
-        effective_model = (model or prof.get("default_model") or "").strip() or None
-        if effective_model and effective_model in disabled_mods:
-            if avail_mods:
-                effective_model = avail_mods[0]
-            else:
-                raise ValueError(f"All models for engine '{engine}' are currently disabled by user policy.")
-
-        session_id = f"{profile_id}-{uuid.uuid4().hex[:6]}"
-        work_dir = cwd or os.getcwd()
-        if not os.path.isdir(work_dir):
-            work_dir = os.getcwd()
-
-        effective_thinking = (thinking_level or prof.get("default_thinking_level") or "").strip() or None
-
-        args, effective_model, effective_thinking = self._apply_engine_model_and_thinking_args(
-            engine=engine,
-            base_args=list(prof.get("args", [])),
-            effective_model=effective_model,
-            effective_thinking=effective_thinking,
-            explicit_model=model,
-            explicit_thinking=thinking_level,
-        )
-        effective_approval_mode = (approval_mode or prof.get("approval_mode") or "auto").strip().lower()
+        session_id = f'{profile_id}-{uuid.uuid4().hex[:6]}'
+        effective_approval_mode = (approval_mode or prof.get('approval_mode') or 'auto').strip().lower()
         args = self._apply_approval_mode_args(engine=engine, base_args=args, approval_mode=effective_approval_mode)
         task_mode = prof.get("task_mode", "pty_input")
         omp_sess_dir: Optional[Path] = None
@@ -3408,20 +3907,24 @@ class HubSessionManager:
                 sess.args = ["-NoLogo", "-NoProfile"]
 
         if task:
+            # B9: last_task is the initial task and is never overwritten afterwards.
             sess.last_task = task
             sess.current_activity = f"Running initial task: {task[:80]}"
 
         if task_mode == "dsh_hub_api":
-            dsh_prov = prof.get("dsh_provider", "clay")
-            dsh_mod = prof.get("dsh_model", "deepseek-flash")
+            # B6 rule 4: dsh injects no args. The dsh spec carries the provider/model split of the
+            # resolved model (clay/deepseek-flash -> clay + deepseek-flash), the resolved effort and
+            # the profile's tier.
+            dsh_prov = "clay"
+            dsh_mod = "deepseek-flash"
             if effective_model:
                 if "/" in effective_model:
                     dsh_prov, dsh_mod = effective_model.split("/", 1)
                 else:
                     dsh_mod = effective_model
             sess.dsh_spec = {
-                "tier": prof.get("dsh_tier", "flash"),
-                "effort": effective_thinking or prof.get("dsh_effort", "high"),
+                "tier": prof.get("dsh_tier") or "flash",
+                "effort": effective_thinking or "high",
                 "provider": dsh_prov,
                 "model": dsh_mod,
             }
@@ -3434,7 +3937,7 @@ class HubSessionManager:
             asyncio.create_task(self._spawn_dsh_hub_job(sess, task))
             return sess
 
-        sess.start_pty(loop)
+        sess.start_pty(loop, env_overrides=env_overrides or None)
         self.sessions[session_id] = sess
         self.persist_session(sess)
 

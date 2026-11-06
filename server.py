@@ -6,12 +6,17 @@ from typing import Any, Dict, List, Optional
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import Context, FastMCP
 import uvicorn
 
-from session_manager import HubSessionManager, Win32WindowHelper
+from session_manager import (
+    HubSessionManager,
+    Win32WindowHelper,
+    hub_api_base_url,
+    hub_port,
+)
 from transcript_summarizer import sanitize_tui_screen_text
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -20,6 +25,67 @@ STATIC_DIR = BASE_DIR / "static"
 STATIC_INDEX = STATIC_DIR / "index.html"
 
 hub = HubSessionManager(PROFILES_PATH)
+
+
+# B11: discovery shells out to five CLIs and talks to the DSH host over HTTP, so it never runs on
+# the event loop. Concurrent refreshes share one in-flight task, and a route that only needs the
+# current data answers from the cache at once.
+_refresh_task: Optional[asyncio.Task] = None
+_refresh_lock: Optional[asyncio.Lock] = None
+
+
+def _get_refresh_lock() -> asyncio.Lock:
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
+
+
+async def ensure_profiles_loaded(refresh_discovery: bool = False) -> None:
+    """Refresh profiles in a worker thread (shared in-flight task per refresh)."""
+    global _refresh_task
+    if not refresh_discovery:
+        hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
+        if not hub.engines_catalog and not hub.model_discovery.peek_cache():
+            # Startup discovery is still running. Wait for it off the event loop before answering,
+            # otherwise a launch would resolve with no catalog and silently inject no model at all.
+            await asyncio.to_thread(hub.wait_for_discovery, 180.0)
+            hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
+        return
+
+    async with _get_refresh_lock():
+        task = _refresh_task
+        if task is None or task.done():
+            task = asyncio.create_task(asyncio.to_thread(hub.load_profiles, True))
+            _refresh_task = task
+    try:
+        await asyncio.shield(task)
+    except Exception:
+        # A failed refresh must not take the route down; the cached catalog still answers.
+        pass
+    if not hub.engines_catalog:
+        await asyncio.to_thread(hub.wait_for_discovery, 180.0)
+        hub.load_profiles(refresh_discovery=False, discovery=hub.model_discovery.peek_cache())
+
+
+async def profiles_payload() -> Dict[str, Any]:
+    return {
+        "profiles": hub.profiles,
+        "engines_catalog": hub.engines_catalog,
+        "global_routing_instructions": hub.global_routing_instructions,
+        "routing_guide_markdown": hub.build_routing_guide_markdown(),
+        "default_cwd": hub.hub_default_cwd(),
+        "hub_port": hub_port(),
+    }
+
+
+def bad_request(detail: str):
+    return JSONResponse({"detail": detail}, status_code=400)
+
+
+def not_found(detail: str):
+    return JSONResponse({"detail": detail}, status_code=404)
+
 
 # ============================================================================
 # 1. 北向 MCP Server (/mcp) —— 暴露给【主 Agent / Parent Agent】的调度、遥测与双向通信接口
@@ -46,12 +112,13 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
     2. 每个 Profile 的 `when_to_use`（何时调用注释）、已启用模型列表 (`available_models`) 与思考等级 (`available_thinking_levels`)；
     3. 已被用户禁用的模型 (`disabled_models`) 与 Profile (`disabled_profiles`) 不会在可用列表中暴露，请勿调用。
     """
-    hub.load_profiles(refresh_discovery=refresh_discovery)
+    await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
+    base_url = hub_api_base_url()
     return {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "global_routing_instructions": hub.global_routing_instructions,
-        "hub_console_url": "http://127.0.0.1:4444/",
-        "worker_mcp_http_url": "http://127.0.0.1:4444/worker-mcp",
+        "hub_console_url": f"{base_url}/",
+        "worker_mcp_http_url": f"{base_url}/worker-mcp",
         "worker_cli_script": str(BASE_DIR / "hub_worker.py"),
         "engines_catalog": hub.engines_catalog,
         "profiles": hub.get_enabled_profiles(),
@@ -60,14 +127,14 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
 
 
 @mcp.tool()
-async def discover_agent_models_and_thinking_levels(refresh: bool = True) -> Dict[str, Any]:
+async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Dict[str, Any]:
     """
     [自动探测模型与思考等级] 实时扫描宿主机上安装的所有 Sub-Agent 引擎（omp / kimi / agy / codex / dsh），
     返回每个引擎当前已启用的模型列表 (`available_models`)、已禁用的模型列表 (`disabled_models`)、全部思考等级 (`available_thinking_levels`)，
     以及用户编写的 `routing_guide_markdown`（指示何时调用何种 Agent 与模型）。
     主 Agent 可将 `available_models` 中的任意 `model` 和 `thinking_level` 直接传入 `spawn_subagent(agent_type, task, model=..., thinking_level=...)`。
     """
-    hub.load_profiles(refresh_discovery=refresh)
+    await ensure_profiles_loaded(refresh_discovery=refresh)
     return {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "engines": hub.engines_catalog,
@@ -94,7 +161,7 @@ async def spawn_subagent(
       * `"auto"`（默认）：常规命令自动放行；当 Sub-Agent 触发高风险安全规则（如 `dsh-security-mode` 的 `action: ask`）或主动调用交互式提问工具（`ask` / `AskUserQuestion` / `ask_question` / `request_user_input_async`）时，自动进入 `waiting_parent` 状态并上报给主 Agent 代批或代选；
       * `"delegate_to_parent"`：开启高风险行为代批模式（如 Kimi `-y` Ask When Needed、Codex `-a on-request`、AGY `--mode accept-edits`），所有敏感命令/修改及多选题均交由主 Agent 审批！
     """
-    hub.load_profiles()
+    await ensure_profiles_loaded()
     start_seq = hub.global_seq
     session = await hub.create_session(
         profile_id=agent_type,
@@ -139,7 +206,7 @@ async def spawn_subagent(
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
-        "console_url": f"http://127.0.0.1:4444/?session={session.session_id}",
+        "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
         "worker_events": events,
@@ -196,7 +263,10 @@ async def send_to_subagent(
     if not session:
         raise ValueError(f"Session '{session_id}' is not active in memory. Use get_subagent_final_response('{session_id}') to read its persisted result.")
 
-    session.last_task = text
+    # B9: last_task is the initial task only; a steering message is activity, not history.
+    if not session.last_task:
+        session.last_task = text
+    session.current_activity = f"Steering message from parent: {text[:80]}"
     start_seq = hub.global_seq
 
     delivery = hub.deliver_parent_message(
@@ -453,13 +523,13 @@ async def terminate_subagent(session_id: str) -> Dict[str, Any]:
             }
         raise ValueError(f"Session '{session_id}' not found.")
 
-    session.terminate()
-    hub.persist_session(session)
+    result = hub.close_session(session_id)
     final_info = hub.get_subagent_final_response(session_id)
-    del hub.sessions[session_id]
     return {
         "terminated": True,
         "session_id": session_id,
+        "was_alive": result.get("was_alive"),
+        "status": result.get("status"),
         "persisted_in_sqlite": True,
         "final_response": final_info.get("final_response"),
         "final_response_source": final_info.get("final_response_source"),
@@ -494,7 +564,7 @@ async def attach_desktop_gui_window(
         "session_id": sess.session_id,
         "window": target,
         "tucked_offscreen": sess.tucked_offscreen,
-        "console_url": f"http://127.0.0.1:4444/?session={sess.session_id}",
+        "console_url": f"{hub_api_base_url()}/?session={sess.session_id}",
     }
 
 
@@ -624,7 +694,7 @@ async def api_get_session_trace(session_id: str):
     try:
         return hub.get_subagent_status_and_trace(session_id)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return not_found(f"找不到会话 {session_id}")
 
 
 @app.get("/api/sessions/{session_id}/final")
@@ -632,7 +702,7 @@ async def api_get_session_final(session_id: str):
     try:
         return hub.get_subagent_final_response(session_id)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return not_found(f"找不到会话 {session_id}")
 
 
 @app.get("/api/history/sessions")
@@ -742,13 +812,8 @@ async def serve_console():
 
 @app.get("/api/profiles")
 async def api_list_profiles(refresh: bool = Query(False)):
-    hub.load_profiles(refresh_discovery=refresh)
-    return {
-        "profiles": hub.profiles,
-        "engines_catalog": hub.engines_catalog,
-        "global_routing_instructions": hub.global_routing_instructions,
-        "routing_guide_markdown": hub.build_routing_guide_markdown(),
-    }
+    await ensure_profiles_loaded(refresh_discovery=refresh)
+    return await profiles_payload()
 
 
 @app.post("/api/profiles")
@@ -756,69 +821,78 @@ async def api_save_profile(req: Request):
     body = await req.json()
     try:
         saved = hub.save_or_update_profile(body)
-        return {
-            "ok": True,
-            "profile": saved,
-            "profiles": hub.profiles,
-            "engines_catalog": hub.engines_catalog,
-            "routing_guide_markdown": hub.build_routing_guide_markdown(),
-        }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # B8: a validation failure is the client's mistake, not a server fault.
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload.update({"ok": True, "profile": saved})
+    return payload
 
 
 @app.delete("/api/profiles/{profile_id}")
 async def api_delete_profile(profile_id: str):
-    deleted = hub.delete_profile(profile_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found")
-    return {
-        "ok": True,
-        "profiles": hub.profiles,
-        "routing_guide_markdown": hub.build_routing_guide_markdown(),
-    }
+    try:
+        hub.delete_profile(profile_id)
+    except ValueError as e:
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload["ok"] = True
+    return payload
 
 
 @app.post("/api/engines/{engine}/models/toggle")
 async def api_toggle_engine_model(engine: str, req: Request):
     body = await req.json()
     model_id = body.get("model") or body.get("model_id") or ""
-    enabled = bool(body.get("enabled", True))
     note = body.get("note")
+    enabled_field = body.get("enabled")
+    # B13: a note-only update passes the model's current `enabled` value.
+    enabled = True if enabled_field is None else bool(enabled_field)
     try:
         eng_info = hub.toggle_engine_model(engine=engine, model_id=model_id, enabled=enabled, note=note)
-        return {
-            "ok": True,
-            "engine": engine,
-            "engine_info": eng_info,
-            "profiles": hub.profiles,
-            "engines_catalog": hub.engines_catalog,
-            "routing_guide_markdown": hub.build_routing_guide_markdown(),
-        }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/routing-guide")
-async def api_save_routing_guide(req: Request):
-    body = await req.json()
-    instructions = body.get("global_routing_instructions", "")
-    saved_text = hub.save_global_routing_instructions(instructions)
+        return bad_request(str(e))
     return {
         "ok": True,
-        "global_routing_instructions": saved_text,
+        "engine": engine,
+        "engine_info": eng_info,
+        "profiles": hub.profiles,
+        "engines_catalog": hub.engines_catalog,
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
+        "default_cwd": hub.hub_default_cwd(),
+        "hub_port": hub_port(),
     }
-
 
 @app.get("/api/sessions")
 async def api_list_sessions():
+    # B11: never block the first poll on discovery; answer from whatever is already loaded.
     return {
         "global_seq": hub.global_seq,
         "sessions": [s.to_dict() for s in hub.sessions.values()],
         "persisted_sessions": hub.db.list_persisted_sessions(limit=20),
         "recent_events": hub.worker_events[-30:],
+        "default_cwd": hub.hub_default_cwd(),
+        "hub_port": hub_port(),
     }
+
+
+@app.post("/api/launch-preview")
+async def api_launch_preview(req: Request):
+    """B7: what a launch would really run. Spawns nothing."""
+    body = await req.json()
+    await ensure_profiles_loaded()
+    try:
+        preview = hub.resolve_launch(
+            profile_id=body.get("profile_id") or "",
+            model=body.get("model"),
+            thinking_level=body.get("thinking_level"),
+            cwd=body.get("cwd"),
+        )
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+    payload = {"ok": True}
+    payload.update(preview)
+    return payload
 
 
 @app.get("/api/sessions/{session_id}/transcript-summary")
@@ -826,7 +900,7 @@ async def api_session_transcript_summary(session_id: str):
     try:
         return hub.summarize_transcript(session_id)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return not_found(f"找不到会话 {session_id}")
 
 
 @app.post("/api/sessions")
@@ -840,16 +914,20 @@ async def api_create_session(req: Request):
     model = body.get("model")
     thinking_level = body.get("thinking_level")
     approval_mode = body.get("approval_mode", "auto")
-    sess = await hub.create_session(
-        profile_id=profile_id,
-        task=task,
-        cwd=cwd,
-        title=title,
-        hwnd=hwnd,
-        model=model,
-        thinking_level=thinking_level,
-        approval_mode=approval_mode,
-    )
+    await ensure_profiles_loaded()
+    try:
+        sess = await hub.create_session(
+            profile_id=profile_id,
+            task=task,
+            cwd=cwd,
+            title=title,
+            hwnd=hwnd,
+            model=model,
+            thinking_level=thinking_level,
+            approval_mode=approval_mode,
+        )
+    except ValueError as e:
+        return bad_request(str(e))
     return {"session": sess.to_dict()}
 
 
@@ -857,7 +935,7 @@ async def api_create_session(req: Request):
 async def api_send_input(session_id: str, req: Request):
     sess = hub.sessions.get(session_id)
     if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
+        return not_found(f"找不到会话 {session_id}")
     body = await req.json()
     text = body.get("text", "")
     hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True, press_enter=False)
@@ -866,12 +944,16 @@ async def api_send_input(session_id: str, req: Request):
 
 @app.delete("/api/sessions/{session_id}")
 async def api_delete_session(session_id: str):
-    sess = hub.sessions.get(session_id)
-    if sess:
-        sess.terminate()
-        hub.persist_session(sess)
-        del hub.sessions[session_id]
-    return {"ok": True}
+    """B9: removal never rewrites the final status an ended process already earned."""
+    result = hub.close_session(session_id)
+    if not result.get("found"):
+        return not_found(f"找不到会话 {session_id}")
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "was_alive": result.get("was_alive"),
+        "status": result.get("status"),
+    }
 
 
 @app.get("/api/win32/windows")
@@ -883,10 +965,10 @@ async def api_list_win32_windows():
 async def api_get_window_frame(session_id: str):
     sess = hub.sessions.get(session_id)
     if not sess or not sess.hwnd:
-        raise HTTPException(status_code=404, detail="GUI session not found")
+        return not_found(f"找不到会话 {session_id}")
     frame = Win32WindowHelper.capture_window_jpeg_b64(sess.hwnd)
     if not frame:
-        raise HTTPException(status_code=410, detail="Window closed or unavailable")
+        raise HTTPException(status_code=410, detail="窗口已关闭或不可用")
     return frame
 
 
@@ -961,5 +1043,6 @@ for route in mcp_parent_app.routes:
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("HUB_PORT", "4444"))
+    port = hub_port()
+    # B11: startup discovery runs in a thread, so the first /api/sessions poll answers at once.
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

@@ -2,515 +2,136 @@
   "profiles": {
     "omp": {
       "id": "omp",
-      "name": "OMP CLI (Dynamic Model & Thinking)",
+      "name": "OMP（Oh-My-Pi）",
       "engine": "omp",
       "kind": "tui",
       "command": "C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe",
-      "args": [
-        "--auto-approve"
-      ],
+      "args": ["--auto-approve"],
       "default_model": "clay/deepseek-flash",
       "default_thinking_level": "high",
       "task_mode": "omp_positional",
-      "description": "Oh-My-Pi (OMP) 通用入口 — 支持动态指定任意模型 (clay/deepseek-flash, kimi-code/*) 与全部 8 级思考等级 (off/minimal/low/medium/high/xhigh/max/auto)",
       "startup_delay_sec": 2.0,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "通用 Oh-My-Pi 入口。当需要灵活指定 clay/deepseek-flash 或 kimi-code/* 模型以及 8 档思考等级 (off~max) 执行快速文件探索、脚本编写或并发子任务时调用。"
-    },
-    "omp-dsflash-low": {
-      "id": "omp-dsflash-low",
-      "name": "OMP DeepSeek-Flash (Low)",
-      "engine": "omp",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe",
-      "args": [
-        "--model=clay/deepseek-flash",
-        "--thinking=low",
-        "--auto-approve"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "low",
-      "task_mode": "omp_positional",
-      "description": "OMP TUI Agent — clay/deepseek-flash (thinking=low, 非无头 ConPTY + 原生会话 JSONL 实时遥测)",
-      "startup_delay_sec": 2.0,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要极低延迟、高并发执行简单代码搜索、日志分析、单文件小改动或并行验证子任务时优先调用（速度最快）。"
-    },
-    "omp-dsflash-high": {
-      "id": "omp-dsflash-high",
-      "name": "OMP DeepSeek-Flash (High)",
-      "engine": "omp",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe",
-      "args": [
-        "--model=clay/deepseek-flash",
-        "--thinking=high",
-        "--auto-approve"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "high",
-      "task_mode": "omp_positional",
-      "description": "OMP TUI Agent — clay/deepseek-flash (thinking=high, 非无头 ConPTY + 原生会话 JSONL 实时遥测)",
-      "startup_delay_sec": 2.0,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要兼顾响应速度与推理质量，执行常规模块编写、单元测试补全、中等复杂度 Bug 修复时调用。"
-    },
-    "omp-dsflash-max": {
-      "id": "omp-dsflash-max",
-      "name": "OMP DeepSeek-Flash (Max)",
-      "engine": "omp",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe",
-      "args": [
-        "--model=clay/deepseek-flash",
-        "--thinking=max",
-        "--auto-approve"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "max",
-      "task_mode": "omp_positional",
-      "description": "OMP TUI Agent — clay/deepseek-flash (thinking=max, 最高深度推理)",
-      "startup_delay_sec": 2.0,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当希望使用 DeepSeek-Flash 的最高推理深度 (thinking=max) 处理复杂算法或棘手逻辑分析时调用。"
+      "when_to_use": "通用快速执行入口：代码与日志检索、脚本编写、单文件小改动、批量或并发子任务。响应最快、适合高并发；也可指定 kimi-code/* 模型。",
+      "description": "Oh-My-Pi 终端 Agent，模型与思考等级在启动时传入（--model / --thinking）。"
     },
     "kimi": {
       "id": "kimi",
-      "name": "Kimi Code CLI (Dynamic Model & Effort)",
+      "name": "Kimi Code",
       "engine": "kimi",
       "kind": "tui",
       "command": "C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe",
-      "args": [
-        "--auto"
-      ],
+      "args": ["--auto"],
       "default_model": "kimi-code/k3.1-pro",
       "default_thinking_level": "high",
       "task_mode": "pty_input",
-      "description": "Kimi Code CLI 通用入口 — 自动识别 config.toml 中全部模型 (k3.1-pro, k3.1-pro-highspeed, k3, k3-256k, kimi-for-coding) 与思考等级 (low/high/max)",
       "startup_delay_sec": 3.5,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "Kimi Code CLI 通用入口。当需要长上下文阅读、中文技术文档/代码库综合理解，并动态指定 k3.1-pro / k3-256k 模型时调用。"
-    },
-    "kimi-k3.1-pro-low": {
-      "id": "kimi-k3.1-pro-low",
-      "name": "Kimi CLI K3.1 Pro (Low)",
-      "engine": "kimi",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe",
-      "args": [
-        "-m",
-        "kimi-code/k3.1-pro",
-        "--auto"
-      ],
-      "default_model": "kimi-code/k3.1-pro",
-      "default_thinking_level": "low",
-      "task_mode": "pty_input",
-      "description": "Kimi Code CLI TUI Agent — k3.1-pro (effort=low, 非无头 ConPTY + wire.jsonl 实时遥测)",
-      "startup_delay_sec": 3.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要使用 Kimi K3.1 Pro 快速处理中大型文件阅读、常规功能开发且对延迟敏感时调用。"
-    },
-    "kimi-k3.1-pro-high": {
-      "id": "kimi-k3.1-pro-high",
-      "name": "Kimi CLI K3.1 Pro (High)",
-      "engine": "kimi",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe",
-      "args": [
-        "-m",
-        "kimi-code/k3.1-pro",
-        "--auto"
-      ],
-      "default_model": "kimi-code/k3.1-pro",
-      "default_thinking_level": "high",
-      "task_mode": "pty_input",
-      "description": "Kimi Code CLI TUI Agent — k3.1-pro (effort=high)",
-      "startup_delay_sec": 3.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要 Kimi K3.1 Pro 进行深度代码审查、跨模块重构、复杂业务规则实现或中文策划/架构对齐时调用。"
-    },
-    "kimi-k3.1-pro-max": {
-      "id": "kimi-k3.1-pro-max",
-      "name": "Kimi CLI K3.1 Pro (Max)",
-      "engine": "kimi",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe",
-      "args": [
-        "-m",
-        "kimi-code/k3.1-pro",
-        "--auto"
-      ],
-      "default_model": "kimi-code/k3.1-pro",
-      "default_thinking_level": "max",
-      "task_mode": "pty_input",
-      "description": "Kimi Code CLI TUI Agent — k3.1-pro (effort=max)",
-      "startup_delay_sec": 3.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当遇到极高难度的长上下文综合推理或疑难工程问题，需要 Kimi K3.1 Pro 全力思考 (effort=max) 时调用。"
+      "when_to_use": "长上下文与中文语境任务：通读中大型文件或整个代码库、中文技术文档与策划对齐、深度代码审查、跨模块重构。",
+      "description": "Kimi Code CLI。模型用 -m 传入；思考等级通过环境变量 KIMI_MODEL_THINKING_EFFORT 只作用于本会话。"
     },
     "agy": {
       "id": "agy",
-      "name": "AGY CLI (Dynamic Model & Effort)",
+      "name": "Antigravity（AGY）",
       "engine": "agy",
       "kind": "tui",
       "command": "C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE",
-      "args": [
-        "--dangerously-skip-permissions"
-      ],
-      "default_model": "gemini-3.8-flash-low",
+      "args": ["--dangerously-skip-permissions"],
+      "default_model": "gemini-3.8-flash",
       "default_thinking_level": "low",
       "task_mode": "agy_interactive_flag",
-      "description": "Antigravity (AGY) 通用入口 — 自动识别本机全部 13 个模型 (gemini-4-argon, gemini-3.8-flash, claude-opus-5-5, claude-sonnet-5-5, gpt-oss-120b) 与思考等级 (low/medium/high)",
       "startup_delay_sec": 2.5,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "Antigravity (AGY) CLI 通用入口。当需要调用 Gemini 4 Argon / Gemini 3.8 Flash / Claude 5.5 系列模型处理多模态或全栈任务时调用。"
-    },
-    "agy-flash": {
-      "id": "agy-flash",
-      "name": "AGY CLI (Gemini 3.8 Flash Low)",
-      "engine": "agy",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE",
-      "args": [
-        "--model",
-        "gemini-3.8-flash-low",
-        "--dangerously-skip-permissions"
-      ],
-      "default_model": "gemini-3.8-flash-low",
-      "default_thinking_level": "low",
-      "task_mode": "agy_interactive_flag",
-      "description": "Antigravity (AGY) CLI TUI Agent — gemini-3.8-flash-low (非无头交互模式 -i)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要使用 Gemini 3.8 Flash 快速完成前端/全栈原型、工具脚本或轻量级代码检视时调用。"
-    },
-    "agy-argon": {
-      "id": "agy-argon",
-      "name": "AGY CLI (Gemini 4 Argon Low)",
-      "engine": "agy",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE",
-      "args": [
-        "--model",
-        "gemini-4-argon-low",
-        "--dangerously-skip-permissions"
-      ],
-      "default_model": "gemini-4-argon-low",
-      "default_thinking_level": "low",
-      "task_mode": "agy_interactive_flag",
-      "description": "Antigravity (AGY) CLI TUI Agent — gemini-4-argon-low (非无头交互模式 -i)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要使用旗舰 Gemini 4 Argon 模型解决复杂系统设计、跨语言重构或深层逻辑推理时调用。"
+      "when_to_use": "Gemini 与 Claude 系列模型入口：前端与全栈原型、多模态任务，或需要换一个模型家族给出第二意见时。",
+      "description": "Antigravity CLI。思考等级是模型名后缀（如 gemini-4-argon-high），由 Hub 按所选等级拼接。"
     },
     "codex": {
       "id": "codex",
-      "name": "OpenAI Codex CLI (Dynamic Model & Effort)",
+      "name": "Codex",
       "engine": "codex",
       "kind": "tui",
       "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
+      "args": ["--dangerously-bypass-approvals-and-sandbox"],
       "default_model": "gpt-6.1-sol",
       "default_thinking_level": "medium",
       "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI 通用入口 — 自动识别 codex.exe 内置全部 12 个模型 (gpt-6.1-sol, gpt-6.1-terra, gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-* 等) 与全部 6 档思考等级 (low/medium/high/xhigh/max/ultra)",
       "startup_delay_sec": 2.5,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "OpenAI Codex CLI 通用入口。当需要调用 GPT-6.1-Sol / GPT-6.1-Terra / GPT-6-Astra 并自由指定 low~ultra 思考等级完成高标准代码工程任务时调用。"
+      "when_to_use": "高标准代码工程主力：功能开发、重构、编写测试；多文件联动修改、复杂状态或并发逻辑、疑难 Bug 定位。",
+      "description": "OpenAI Codex CLI。模型用 -m 传入，思考等级用 -c model_reasoning_effort 传入。"
     },
-    "codex-gpt-6.1-sol-medium": {
-      "id": "codex-gpt-6.1-sol-medium",
-      "name": "Codex GPT-6.1-Sol (Medium)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6.1-sol",
-        "-c",
-        "model_reasoning_effort=\"medium\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6.1-sol",
-      "default_thinking_level": "medium",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6.1-sol (effort=medium, 对应 ~/.codex/config.toml 默认配置)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "日常主力编码 Profile（对应本机 Codex 默认配置）。适合绝大多数功能开发、重构与自动化测试编写，速度与质量均衡。"
-    },
-    "codex-gpt-6.1-sol-high": {
-      "id": "codex-gpt-6.1-sol-high",
-      "name": "Codex GPT-6.1-Sol (High)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6.1-sol",
-        "-c",
-        "model_reasoning_effort=\"high\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6.1-sol",
-      "default_thinking_level": "high",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6.1-sol (effort=high)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当任务涉及多文件联动修改、复杂并发/状态机逻辑或需要高准确率一次跑通时优先调用。"
-    },
-    "codex-gpt-6.1-sol-max": {
-      "id": "codex-gpt-6.1-sol-max",
-      "name": "Codex GPT-6.1-Sol (Max)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6.1-sol",
-        "-c",
-        "model_reasoning_effort=\"max\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6.1-sol",
-      "default_thinking_level": "max",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6.1-sol (effort=max)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当面对核心底层架构改动、极难复现的底层 Bug 或高风险重构，需要 GPT-6.1-Sol 最高深度思考时调用。"
-    },
-    "codex-gpt-6.1-terra-medium": {
-      "id": "codex-gpt-6.1-terra-medium",
-      "name": "Codex GPT-6.1-Terra (Medium)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6.1-terra",
-        "-c",
-        "model_reasoning_effort=\"medium\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6.1-terra",
-      "default_thinking_level": "medium",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6.1-terra (effort=medium, 对应 ~/.codex/.codex-global-state.json 常用配置)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要 GPT-6.1-Terra 的稳健工程代码风格处理中大型模块重构或代码合入检查时调用。"
-    },
-    "codex-gpt-6.1-terra-high": {
-      "id": "codex-gpt-6.1-terra-high",
-      "name": "Codex GPT-6.1-Terra (High)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6.1-terra",
-        "-c",
-        "model_reasoning_effort=\"high\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6.1-terra",
-      "default_thinking_level": "high",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6.1-terra (effort=high)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要 GPT-6.1-Terra 进行高强度架构分析、复杂仓库迁移或深度技术攻关时调用。"
-    },
-    "codex-gpt-6-astra-high": {
-      "id": "codex-gpt-6-astra-high",
-      "name": "Codex GPT-6-Astra (High)",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "-m",
-        "gpt-6-astra",
-        "-c",
-        "model_reasoning_effort=\"high\"",
-        "--dangerously-bypass-approvals-and-sandbox"
-      ],
-      "default_model": "gpt-6-astra",
-      "default_thinking_level": "high",
-      "task_mode": "codex_positional",
-      "description": "OpenAI Codex CLI — gpt-6-astra (effort=high)",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要调用最新的 GPT-6-Astra (effort=high) 处理前沿算法或高复杂度研发任务时调用。"
-    },
-    "dsh-flash-high": {
-      "id": "dsh-flash-high",
-      "name": "DeepSeek Harness (V4.1 Flash High)",
+    "dsh": {
+      "id": "dsh",
+      "name": "DeepSeek Harness",
       "engine": "dsh",
       "kind": "tui",
       "gui_url": "http://127.0.0.1:3080",
       "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
+      "args": ["-NoLogo", "-NoProfile"],
       "default_model": "clay/deepseek-flash",
       "default_thinking_level": "high",
       "task_mode": "dsh_hub_api",
       "dsh_tier": "flash",
-      "dsh_effort": "high",
-      "dsh_provider": "clay",
-      "dsh_model": "deepseek-flash",
-      "description": "DeepSeek Harness 宿主内原生会话 (clay/deepseek-flash, effort=high, 支持动态覆盖模型与 off/low/medium/high/max 思考等级)",
       "startup_delay_sec": 0.5,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "当需要后台常驻热会话、极速流式遥测以及子 Agent 主动向主 Agent 发起双向提问确认 (ask_parent) 时优先调用。"
-    },
-    "dsh-flash-max": {
-      "id": "dsh-flash-max",
-      "name": "DeepSeek Harness (V4.1 Flash Max)",
-      "engine": "dsh",
-      "kind": "tui",
-      "gui_url": "http://127.0.0.1:3080",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "max",
-      "task_mode": "dsh_hub_api",
-      "dsh_tier": "flash",
-      "dsh_effort": "max",
-      "dsh_provider": "clay",
-      "dsh_model": "deepseek-flash",
-      "description": "DeepSeek Harness 宿主内原生会话 (clay/deepseek-flash, effort=max)",
-      "startup_delay_sec": 0.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要在 DeepSeek Harness 宿主内以最高思考强度 (effort=max) 执行多轮连续迭代任务时调用。"
-    },
-    "dsh-minimax-flash": {
-      "id": "dsh-minimax-flash",
-      "name": "DeepSeek Harness (MiniMax M3.1 Flash)",
-      "engine": "dsh",
-      "kind": "tui",
-      "gui_url": "http://127.0.0.1:3080",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
-      "default_model": "clay/minimax-m3.1-flash",
-      "default_thinking_level": "high",
-      "task_mode": "dsh_hub_api",
-      "dsh_tier": "flash",
-      "dsh_effort": "high",
-      "dsh_provider": "clay",
-      "dsh_model": "minimax-m3.1-flash",
-      "description": "DeepSeek Harness 宿主内原生会话 (clay/minimax-m3.1-flash, effort=high)",
-      "startup_delay_sec": 0.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要对比不同模型视角或使用 MiniMax M3.1 Flash 进行快速文本/代码生成与审查时调用。"
-    },
-    "dsh-tui": {
-      "id": "dsh-tui",
-      "name": "DeepSeek Harness (In-Host Live Stream)",
-      "engine": "dsh",
-      "kind": "tui",
-      "gui_url": "http://127.0.0.1:3080",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "high",
-      "task_mode": "dsh_hub_api",
-      "dsh_tier": "flash",
-      "dsh_effort": "high",
-      "dsh_provider": "clay",
-      "dsh_model": "deepseek-flash",
-      "description": "DeepSeek Harness 宿主内原生会话（实时 ANSI 事件流 + DSH Web 双向同步）",
-      "startup_delay_sec": 0.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "DeepSeek Harness 交互式流控制台入口，适合需要人工或主 Agent 持续多轮跟进的任务。"
-    },
-    "dsh-gui": {
-      "id": "dsh-gui",
-      "name": "DeepSeek Harness (Web Host + Live Stream)",
-      "engine": "dsh",
-      "kind": "tui",
-      "gui_url": "http://127.0.0.1:3080",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "high",
-      "task_mode": "dsh_hub_api",
-      "dsh_tier": "flash",
-      "dsh_effort": "high",
-      "dsh_provider": "clay",
-      "dsh_model": "deepseek-flash",
-      "description": "DeepSeek Harness (dsh web) 宿主内一等公民会话（自动挂载至 127.0.0.1:3080 Web UI + 总控台实时流）",
-      "startup_delay_sec": 0.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "当需要同时挂载 DeepSeek Harness Web UI (127.0.0.1:3080) 进行可视化监控与协同操作时调用。"
+      "when_to_use": "DeepSeek Harness 宿主会话：需要后台常驻热会话、实时流式遥测、Sub-Agent 主动向主 Agent 提问（ask_parent），或要在 DSH Web UI（127.0.0.1:3080）里可视化协同时。",
+      "description": "通过 DSH Hub API 创建的原生会话，总控台显示其实时事件流。"
     },
     "pwsh": {
       "id": "pwsh",
-      "name": "PowerShell 7 Interactive",
+      "name": "PowerShell 7",
       "engine": "pwsh",
       "kind": "tui",
       "command": "pwsh.exe",
-      "args": [
-        "-NoLogo"
-      ],
-      "description": "交互式 PowerShell 7 终端会话（已自动注入 HUB_SESSION_ID 与 hub_worker.py 桥接）",
+      "args": ["-NoLogo"],
       "startup_delay_sec": 1.0,
       "submit_key": "\r",
       "enabled": true,
-      "when_to_use": "当只需要一个受控的交互式 PowerShell 7 终端来执行长耗时构建、测试脚本或交互式命令行工具时调用。"
+      "when_to_use": "只需要一个受控的交互式 PowerShell 7 终端：长耗时构建、测试脚本、交互式命令行工具。",
+      "description": "交互式 PowerShell 7 终端（已注入 HUB_SESSION_ID 与 hub_worker.py 桥接）。"
     }
   },
-  "global_routing_instructions": "【主 Agent 调度总则（请在调用 spawn_subagent 前阅读）】\n1. 高频并发检索、快速脚本编写、批量子任务：优先调用 `omp-dsflash-low`、`omp-dsflash-high` 或 `dsh-flash-high`（响应极快、支持并发）；\n2. 复杂工程架构重构、跨多文件深度 Debug、严密逻辑推导：优先调用 `codex-gpt-6.1-sol-high`、`codex-gpt-6.1-terra-high`、`kimi-k3.1-pro-high` 或 `agy-argon`；\n3. 需要宿主 Web 控制台可视化协同与双向问答：优先调用 `dsh-flash-high` 或 `dsh-flash-max`；\n4. 严禁调用已被用户禁用 (`disabled_models` 或 `enabled=false`) 的模型与 Profile。",
+  "global_routing_instructions": "【主 Agent 调度总则（调用 spawn_subagent 前请阅读）】\n调用方式：spawn_subagent(agent_type=<Profile ID>, task=..., model=<可选>, thinking_level=<可选>)。不传 model / thinking_level 时使用该 Profile 的默认值；只能传该引擎“可用模型”里的模型，以及该模型支持的思考等级。\n1. 选 Profile：高频并发检索、快速脚本、批量子任务 → omp 或 dsh；高标准工程实现、多文件重构、疑难 Bug → codex（gpt-6.1-sol 或 gpt-6.1-terra）或 kimi（kimi-code/k3.1-pro）；需要 Gemini / Claude 视角 → agy；需要与主 Agent 双向问答或 Web 可视化协同 → dsh。\n2. 选思考等级：简单检索与小改动用 low；常规开发、补测试、中等难度 Bug 用 high（codex 用 medium 或 high）；核心架构改动、极难复现的 Bug、复杂算法用 max。等级越高越慢、越贵。\n3. 已被用户停用的模型与 Profile 禁止调用。",
   "engine_policies": {
-    "codex": {
-      "disabled_models": [
-        "gpt-daybreak-blue-latest",
-        "gpt-daybreak-red-latest",
-        "codex-auto-review"
-      ],
+    "omp": {
+      "disabled_models": [],
       "model_notes": {
-        "gpt-6.1-sol": "主力高速高智商代码模型，适合绝大多数编码与重构任务",
-        "gpt-6.1-terra": "深度工程推理模型，适合复杂架构与疑难 Bug 定位"
+        "clay/deepseek-flash": "速度最快、并发友好，常规任务首选。",
+        "kimi-code/k3.1-pro": "Kimi 旗舰模型，长上下文推理更强，速度较慢。"
+      }
+    },
+    "kimi": {
+      "disabled_models": [],
+      "model_notes": {
+        "kimi-code/k3.1-pro": "旗舰：深度审查、跨模块重构、长上下文综合推理。",
+        "kimi-code/k3.1-pro-highspeed": "同代高速版：对延迟敏感的中大型文件阅读与常规开发。"
+      }
+    },
+    "agy": {
+      "disabled_models": [],
+      "model_notes": {
+        "gemini-4-argon": "旗舰：复杂系统设计、跨语言重构、深层逻辑推理。",
+        "gemini-3.8-flash": "快速：前端与全栈原型、工具脚本、轻量代码检视。"
+      }
+    },
+    "codex": {
+      "disabled_models": ["gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "codex-auto-review"],
+      "model_notes": {
+        "gpt-6.1-sol": "主力高速高智商代码模型，适合绝大多数编码与重构任务。",
+        "gpt-6.1-terra": "深度工程推理模型，适合复杂架构与疑难 Bug 定位。",
+        "gpt-6-astra": "前沿算法与高复杂度研发任务。"
+      }
+    },
+    "dsh": {
+      "disabled_models": [],
+      "model_notes": {
+        "clay/deepseek-flash": "默认：速度快，适合多轮连续迭代。",
+        "clay/minimax-m3.1-flash": "换一个模型视角做对比，快速生成与审查。"
       }
     }
   }
