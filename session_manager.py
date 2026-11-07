@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1241,6 +1242,91 @@ def apply_approval_flags(engine: str, args: List[str], bypass: bool = False) -> 
     return inject + kept
 
 
+# ── Round 3 (DECISIONS.md D10): agy reports through a per-session MCP bridge ─────────────────────
+# In auto mode agy's shell runs in a sandbox without loopback network, so `python hub_worker.py …`
+# can never reach the hub. agy's own MCP client runs outside that sandbox: the hub writes a
+# per-session `.agents/mcp_config.json` (read by agy from every workspace dir, `--add-dir` included)
+# that starts worker_bridge_mcp.py for this session, and allows its tools for this session only.
+# The server name must differ from the user's global agy MCP servers (agent-hub, playwright, ...).
+AGY_BRIDGE_SERVER_NAME = "hub-bridge"
+AGY_BRIDGE_ALLOW_RULE = f"mcp({AGY_BRIDGE_SERVER_NAME}/*)"
+AGY_BRIDGE_DIR_PREFIX = "agy_sess_"
+
+
+def agy_bridge_session_dir(runtime_dir: Path, session_id: str) -> Path:
+    """`<runtime_configs_dir>\\agy_sess_<sid>`: the hub-private dir agy gets as an extra workspace."""
+    return Path(runtime_dir) / f"{AGY_BRIDGE_DIR_PREFIX}{session_id}"
+
+
+def agy_bridge_mcp_config(session_id: str, python_exe: str, bridge_script: str, hub_url: str) -> Dict[str, Any]:
+    """The `.agents/mcp_config.json` content that runs the worker bridge for one session."""
+    return {
+        "mcpServers": {
+            AGY_BRIDGE_SERVER_NAME: {
+                "command": str(python_exe),
+                "args": [str(bridge_script)],
+                "env": {"HUB_API_URL": str(hub_url), "HUB_SESSION_ID": str(session_id)},
+            }
+        }
+    }
+
+
+def agy_bridge_launch_args(args: List[str], cwd: str, sess_dir: str, bypass: bool = False) -> List[str]:
+    """D10: the session-only part of an agy launch, merged into the args apply_approval_flags made.
+
+    The hub's `--settings` gains `trustedWorkspaces` [cwd, sessdir] (session only: no trust dialog,
+    nothing saved) and, unless the profile bypasses approvals, the allow rule for the bridge's tools;
+    `--add-dir <sessdir>` makes agy read the bridge config. Idempotent: running it twice (or on a
+    resume of args that already carry it) adds nothing twice.
+    """
+    out = [str(a) for a in args]
+    cwd_s = str(cwd or "")
+    dir_native = str(sess_dir)
+    dir_fwd = dir_native.replace("\\", "/")
+    idx: Optional[int] = None
+    inline = False
+    for i, a in enumerate(out):
+        if a == "--settings" and i + 1 < len(out):
+            idx = i
+            break
+        if a.startswith("--settings="):
+            idx, inline = i, True
+            break
+    raw_value = (out[idx].split("=", 1)[1] if inline else out[idx + 1]) if idx is not None else ""
+    settings = (_agy_settings_object(raw_value) if idx is not None else None) or {}
+    trusted = [str(t) for t in (settings.get("trustedWorkspaces") or []) if str(t)]
+    known = {os.path.normcase(os.path.normpath(t)) for t in trusted}
+    for path in (cwd_s, dir_native):
+        if path and os.path.normcase(os.path.normpath(path)) not in known:
+            trusted.append(path)
+            known.add(os.path.normcase(os.path.normpath(path)))
+    settings["trustedWorkspaces"] = trusted
+    if not bypass:
+        perms = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
+        perms = dict(perms)
+        allow = [str(r) for r in (perms.get("allow") or [])]
+        if AGY_BRIDGE_ALLOW_RULE not in allow:
+            allow.append(AGY_BRIDGE_ALLOW_RULE)
+        perms["allow"] = allow
+        settings["permissions"] = perms
+    value = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+    if idx is None:
+        at = out.index("--dangerously-skip-permissions") + 1 if "--dangerously-skip-permissions" in out else 0
+        out[at:at] = ["--settings", value]
+    elif inline:
+        out[idx] = f"--settings={value}"
+    else:
+        out[idx + 1] = value
+    has_dir = any(
+        out[i] == "--add-dir" and i + 1 < len(out)
+        and os.path.normcase(os.path.normpath(out[i + 1])) == os.path.normcase(os.path.normpath(dir_native))
+        for i in range(len(out))
+    )
+    if not has_dir:
+        out.extend(["--add-dir", dir_fwd])
+    return out
+
+
 # ── D7: reading the engines' approval prompts and answering them ──────────────────────────────
 # What an option of an approval prompt does when chosen. "persist" writes a permanent rule (agy
 # option 3 -> settings.json, codex `p` -> ~/.codex/rules/default.rules): the hub never sends it.
@@ -1268,10 +1354,16 @@ def classify_approval_label(label: str) -> str:
     low = str(label or "").strip().lower()
     if "with feedback" in low or "deny and send" in low:
         return "deny_feedback"
-    if low.startswith("no") or low.startswith("reject") or low.startswith("deny") or "cancel" == low:
-        return "deny"
+    # Round 3: checked before the deny prefixes, because agy also has deny options that persist
+    # (`No, and always deny tool '…' (Persist to settings.json)`); those are never sent either.
     if "persist" in low or "settings.json" in low or low.endswith("(p)"):
         return "persist"
+    if low.startswith("no") or low.startswith("reject") or low.startswith("deny") or "cancel" == low:
+        # agy's `No, and always deny … in this conversation` is a conversation-wide deny rule, not
+        # the plain deny the parent asks for: it is kept apart and not offered.
+        if "always deny" in low:
+            return "deny_session"
+        return "deny"
     if ("for this session" in low or "in this conversation" in low
             or "don't ask again for these files" in low):
         return "approve_session"
@@ -1377,7 +1469,11 @@ def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     head = None
     for idx, line in enumerate(lines):
         s = line.strip()
-        if s.startswith(("Run this command?", "Requesting permission for", "Allow access to")):
+        # Round 3: agy's other prompt questions (its string table): `Allow calling this tool?`
+        # (MCP tools not covered by an allow rule, 6 options), `Allow access to this file?`,
+        # `Allow creation of this file?`, `Allow sandbox bypass for command execution?`, ...
+        if s.startswith(("Run this command?", "Requesting permission for", "Allow access to",
+                         "Accept this file edit")) or (s.startswith("Allow ") and s.endswith("?")):
             head = idx
     if head is None:
         # A prompt worded differently (file / URL access, not captured yet): Yes/No options with
@@ -1410,10 +1506,23 @@ def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
                 collecting = False
             else:
                 command_lines.append(s)
+    header = lines[head].strip() if lines else ""
+    command = " ".join(command_lines).strip()
+    if not command and header.startswith("Allow ") and header.endswith("?"):
+        # The subject of an `Allow …?` prompt is the block between the section's rule line and the
+        # question: the MCP tool (`server/tool`) or the file path (captured 2026-11-07, agy2\run6).
+        subject: List[str] = []
+        for line in reversed(lines[:head]):
+            s = line.strip()
+            if (s and set(s) <= set("─━-═")) or len(subject) >= 4:
+                break
+            if s:
+                subject.insert(0, s)
+        command = " ".join(subject).strip()
     return {
-        "header": lines[head].strip() if lines else "",
+        "header": header,
         "reason": reason,
-        "command": " ".join(command_lines).strip(),
+        "command": command,
         "options": opts,
     }
 
@@ -3618,7 +3727,13 @@ class HubSessionManager:
             built["args"] = ["-S", str(ref.get("session_id"))] + cleaned
             built["message_mode"] = "pty_input"
         elif engine == "agy":
-            built["args"] = [f"--conversation={ref.get('conversation_id')}"] + base_args
+            # D10: the same per-session MCP bridge as the spawn (the caller rewrites its config file
+            # before the launch, recreating the dir if it went missing).
+            sid = str(record.get("session_id") or "")
+            built["args"] = agy_bridge_launch_args(
+                [f"--conversation={ref.get('conversation_id')}"] + base_args,
+                cwd, str(self._agy_bridge_dir(sid)), bypass=bypass,
+            )
             built["message_mode"] = "agy_interactive_flag"
         elif engine == "codex":
             built["args"] = ["resume", str(ref.get("session_id")), "-C", cwd] + base_args
@@ -3845,6 +3960,10 @@ class HubSessionManager:
         if engine == "kimi":
             # Spec §4: the kimi task is typed into the TUI with the session-id marker.
             return f"{clean}\n\n[Sub-Agent Bridge Info: session_id={session_id}]"
+        if engine == "agy":
+            # D10: the bridge hint again, so a conversation started with the old shell-command hint
+            # (which cannot reach the hub from agy's sandbox) learns the MCP tools.
+            return f"{clean}\n{self._build_agy_bridge_hint(session_id)}"
         return clean
 
     async def _resume_process_session(
@@ -3872,6 +3991,9 @@ class HubSessionManager:
                 prompt_for_tui = self._resume_task_text(session_id, message, engine)
                 injection = "pending"
 
+        if engine == "agy":
+            # D10: (re)write the bridge config the built args point at (--add-dir).
+            self._write_agy_bridge_config(session_id)
         sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
         startup_delay = 2.5
         try:
@@ -4309,7 +4431,12 @@ class HubSessionManager:
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
         if not rec.get("archived_at"):
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
-        return self.db.delete_session_record(session_id)
+        deleted = self.db.delete_session_record(session_id)
+        if deleted:
+            # D10: the hub-private agy bridge dir goes with the record (the engine's own
+            # conversation files stay).
+            self._remove_agy_bridge_dir(session_id)
+        return deleted
 
     def _scrollback_flush_loop(self) -> None:
         """Write each live session's scrollback once it is 60 s old (spec §1.6/§3).
@@ -5048,7 +5175,12 @@ class HubSessionManager:
             action = action_of(idx)
             if action == "persist":
                 # Never sent: a permanent rule is the owner's call, not a sub-agent approval.
-                action = "approve_once"
+                # Round 3: agy also has persisting deny options; those fall back to a plain deny.
+                low = str(label or "").strip().lower()
+                action = "deny" if low.startswith(("no", "deny", "reject")) else "approve_once"
+            elif action == "deny_session":
+                # Not offered (round 3); a plain deny if a caller names it anyway.
+                action = "deny"
             if action == "deny" and with_feedback and feedback:
                 action = "deny_feedback"
             if action == "deny_feedback" and not (with_feedback and feedback):
@@ -5187,7 +5319,9 @@ class HubSessionManager:
                 {"key": "2", "label": "Yes, and always allow in this conversation", "action": "approve_session"},
                 {"key": "4", "label": "No, cancel", "action": "deny"},
             ]
-        sendable = [o for o in opts if o.get("action") != "persist"]
+        # Never sent: an option that persists to settings.json (allow or deny), nor the
+        # conversation-wide deny rule (round 3: the 6-option MCP tool prompt has both).
+        sendable = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
         want = "deny" if action == "deny_feedback" else action
         chosen = next((o for o in sendable if o.get("label") == chosen_label and o.get("action") == want), None)
         if chosen is None:
@@ -8331,7 +8465,9 @@ class HubSessionManager:
 
                 await asyncio.sleep(0.4)
 
-    def _build_worker_bridge_system_hint(self, session_id: str) -> str:
+    def _build_worker_bridge_system_hint(self, session_id: str, engine: Optional[str] = None) -> str:
+        if (engine or "").strip().lower() == "agy":
+            return self._build_agy_bridge_hint(session_id)
         # W10: the hub may run on an interpreter that has no <repo>/.venv (this worktree does not);
         # the hint must name the interpreter the hub itself runs on, or every bridge command fails.
         python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
@@ -8345,6 +8481,62 @@ class HubSessionManager:
             f'- Report task complete: `{python_exe} "{worker_cli}" complete "{COMPLETION_SUMMARY_PLACEHOLDER}"`'
             f' (replace the placeholder with your own one-sentence result)\n'
         )
+
+    @staticmethod
+    def _build_agy_bridge_hint(session_id: str) -> str:
+        """D10: agy's shell sandbox has no loopback network, so agy reports through the MCP tools of
+        its per-session `hub-bridge` server (allowed for this session, no prompt). The session is
+        preset in the server's environment. Arguments as in worker_bridge_mcp.py."""
+        srv = AGY_BRIDGE_SERVER_NAME
+        return (
+            f"\n[Sub-Agent Bridge Info: session_id={session_id}]\n"
+            f"You are running inside MCP Agent Hub. To communicate with the Parent Agent, call the MCP tools of"
+            f" server `{srv}` (do not run shell commands for this; your session is preset, do not pass session_id):\n"
+            f"- Report step: `{srv}/report_step` (step_title, optional tool_name, tool_input_summary,"
+            f" intermediate_message)\n"
+            f"- Send message to parent: `{srv}/message_parent` (message, optional category=\"progress\")\n"
+            f"- Ask parent & wait for answer: `{srv}/ask_parent` (question, optional timeout_seconds=300)\n"
+            f"- Report task complete: `{srv}/report_complete` (summary = your own one-sentence result,"
+            f" optional status=\"success\", files_changed)\n"
+        )
+
+    def _agy_bridge_dir(self, session_id: str) -> Path:
+        return agy_bridge_session_dir(self.runtime_configs_dir, session_id)
+
+    def _write_agy_bridge_config(self, session_id: str) -> Path:
+        """D10: (re)writes `<runtime>\\agy_sess_<sid>\\.agents\\mcp_config.json` and returns the dir.
+        Called on spawn and on every resume, so a dir that went missing is simply recreated."""
+        sess_dir = self._agy_bridge_dir(session_id)
+        agents_dir = sess_dir / ".agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        config = agy_bridge_mcp_config(
+            session_id,
+            str(Path(sys.executable).resolve()),
+            str((Path(__file__).resolve().parent / "worker_bridge_mcp.py")),
+            hub_api_base_url(),
+        )
+        (agents_dir / "mcp_config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return sess_dir
+
+    def _remove_agy_bridge_dir(self, session_id: str) -> bool:
+        """D10: drops the hub-private bridge dir of one session (only that literal dir under the
+        runtime configs dir); a missing dir is fine."""
+        sid = str(session_id or "").strip()
+        if not sid or "/" in sid or "\\" in sid or sid in (".", ".."):
+            return False
+        target = self._agy_bridge_dir(sid)
+        try:
+            root = Path(self.runtime_configs_dir).resolve()
+            if target.resolve().parent != root or not target.name.startswith(AGY_BRIDGE_DIR_PREFIX):
+                return False
+        except OSError:
+            return False
+        if not target.exists():
+            return False
+        shutil.rmtree(target, ignore_errors=True)
+        return not target.exists()
 
     def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7 + round 2 (owner): every option on the screen is offered, each with the action its
@@ -8392,12 +8584,17 @@ class HubSessionManager:
     def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7: agy's options are offered by label; the one that persists to settings.json never is."""
         opts = [dict(o) for o in parsed.get("options") or []]
-        offered = [o["label"] for o in opts if o.get("action") != "persist"]
+        # Round 3: the conversation-wide deny rule (`No, and always deny … in this conversation`) is
+        # not offered either; the parent's choices are approve once / for this conversation / deny.
+        offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
+        offered = [o["label"] for o in offered_opts]
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
         if parsed.get("command"):
-            lines.append(f"Requesting permission for: {parsed['command']}")
+            what = "MCP tool" if str(parsed.get("header") or "").startswith("Allow calling this tool") \
+                else "Requesting permission for"
+            lines.append(f"{what}: {parsed['command']}")
         if parsed.get("header"):
             lines.append(parsed["header"])
         return self.register_pending_interaction(
@@ -8407,7 +8604,11 @@ class HubSessionManager:
             prompt="\n".join(lines) if lines else scr.strip()[-600:],
             options=offered,
             source="agy_tui_screen_detector",
-            metadata={"agy_options": opts, "command": parsed.get("command") or ""},
+            metadata={
+                "agy_options": opts,
+                "option_actions": [o.get("action") for o in offered_opts],
+                "command": parsed.get("command") or "",
+            },
         )
 
     def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
@@ -8435,7 +8636,10 @@ class HubSessionManager:
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
         across Codex, Kimi, OMP, and AGY (catches prompts that only render in the TUI without a separate JSONL event).
         """
-        while session.status in ("starting", "running", "waiting_parent"):
+        # Round 3 live check: "completed" (the worker reported completion, the TUI is still alive)
+        # keeps the watch going. Leaving the loop there stopped all prompt detection for the rest
+        # of the session, so a follow-up turn's risky command sat at agy's prompt unseen.
+        while session.status in LIVE_STATUSES:
             await asyncio.sleep(0.9)
             if session.pending_interaction is not None:
                 continue
@@ -8918,6 +9122,15 @@ class HubSessionManager:
             startup_delay = 0.0
         submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
+        agy_bridge_dir: Optional[Path] = None
+
+        if engine == "agy":
+            # D10: the per-session MCP bridge (config file + --add-dir + session-only settings).
+            # Like omp's --session-dir it is not part of the snapshot: a resume rebuilds it.
+            agy_bridge_dir = self._write_agy_bridge_config(session_id)
+            args = agy_bridge_launch_args(
+                args, work_dir, str(agy_bridge_dir), bypass=bool(launch.get("bypass_approvals"))
+            )
 
         if task_mode == "omp_positional":
             omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
@@ -8930,7 +9143,7 @@ class HubSessionManager:
                 args.append(task)
         elif task_mode == "agy_interactive_flag":
             if task:
-                args.extend(["-i", task + "\n" + self._build_worker_bridge_system_hint(session_id)])
+                args.extend(["-i", task + "\n" + self._build_worker_bridge_system_hint(session_id, engine)])
         elif task_mode == "codex_positional":
             if task:
                 args.append(task + "\n" + self._build_worker_bridge_system_hint(session_id))
@@ -8998,7 +9211,12 @@ class HubSessionManager:
             asyncio.create_task(self._spawn_dsh_hub_job(sess, task))
             return sess
 
-        sess.start_pty(loop, env_overrides=env_overrides or None)
+        try:
+            sess.start_pty(loop, env_overrides=env_overrides or None)
+        except Exception:
+            if agy_bridge_dir is not None:
+                self._remove_agy_bridge_dir(session_id)
+            raise
         self.sessions[session_id] = sess
         self.persist_session(sess)
 

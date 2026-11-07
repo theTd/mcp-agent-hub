@@ -535,7 +535,7 @@ async def respond_to_subagent_approval_or_choice(
     主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
     - `decision`：审批决定，`"approve"`（只允许这一次）、`"approve_session"`（本会话内同类操作不再询问）、`"deny"`（拒绝）；
       审批请求必须给出明确决定，不传任何参数不会默认放行。
-    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（agy、omp 会写入全局设置的「永久允许」选项不会出现在列表里；codex 的 p 选项会出现，见下）；
+    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（agy、omp 会写入全局设置的「永久允许/永久拒绝」选项和 agy「本对话内一律拒绝」选项不会出现在列表里；codex 的 p 选项会出现，见下）；
     - `custom_input`：与 `decision="deny"` 同传时作为拒绝理由反馈给 Sub-Agent；审批请求只传 `custom_input` 时视为「拒绝并反馈这段文字」；
       回答问题时作为 Other 自由输入。
     - 引擎差异：codex 命令审批的 `approve_session` 发送 p＝**永久放行**：codex 会把该命令前缀的放行规则写入用户的
