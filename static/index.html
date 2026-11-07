@@ -304,6 +304,20 @@
                 </div>
               </section>
 
+              <section class="form-section" id="groupApproval">
+                <h5 class="form-section-title">审批</h5>
+                <div class="form-grid">
+                  <div class="field full">
+                    <label class="switch" id="editBypassSwitch" title="打开后，这个 Profile 启动的会话不再暂停等待高风险操作审批">
+                      <input type="checkbox" id="editBypassApprovals" />
+                      <span class="switch-track"></span>
+                      <span>跳过高风险审批（全自动，不推荐） <code>bypass_approvals</code></span>
+                    </label>
+                    <span class="field-help warn" id="editBypassHelp">打开后递归删除、强推、发布等高风险操作会直接执行，不再交给主 Agent 审批；已归档会话恢复时也按此开关的当前值启动。</span>
+                  </div>
+                </div>
+              </section>
+
               <section class="form-section" id="groupDsh" hidden>
                 <h5 class="form-section-title">DSH</h5>
                 <div class="form-grid">

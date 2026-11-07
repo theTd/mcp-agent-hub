@@ -28,7 +28,11 @@ const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'dsh', 'pwsh'];
 const SHOWN_KEYS = new Set([
   'id', 'name', 'engine', 'kind', 'command', 'args', 'default_model', 'default_thinking_level',
   'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'gui_url', 'dsh_tier',
+  'bypass_approvals',
 ]);
+// Engines whose launch the hub injects approval flags into; bypass_approvals does nothing elsewhere.
+const APPROVAL_ENGINES = new Set(['omp', 'kimi', 'codex', 'agy']);
+const BYPASS_HELP = '打开后递归删除、强推、发布等高风险操作会直接执行，不再交给主 Agent 审批；已归档会话恢复时也按此开关的当前值启动。';
 // Values the hub computes on the way out; they are not stored keys.
 const COMPUTED_KEYS = new Set([
   'all_discovered_models', 'available_models', 'available_thinking_levels', 'model_details',
@@ -199,6 +203,7 @@ function profileDraft(id, p) {
     delayText: p.startup_delay_sec ?? '',
     gui_url: p.gui_url || '',
     dsh_tier: p.dsh_tier === 'pro' ? 'pro' : 'flash',
+    bypass_approvals: p.bypass_approvals === true,
     extra: p,
   };
 }
@@ -227,6 +232,7 @@ function readDraft() {
     delayText: $('#editDelay').value,
     gui_url: $('#editGuiUrl').value.trim(),
     dsh_tier: $('#editDshTier').value,
+    bypass_approvals: $('#editBypassApprovals').checked,
     extra: selectedId ? state.profiles[selectedId] : null,
   };
 }
@@ -257,6 +263,7 @@ function writeDraft(d) {
   $('#editDelay').value = d.delayText;
   $('#editGuiUrl').value = d.gui_url;
   $('#editDshTier').value = d.dsh_tier;
+  $('#editBypassApprovals').checked = d.bypass_approvals === true;
 
   renderEngineGroups(d.engine);
   populateDefaults(d.engine, d.model_source === 'engine' ? '' : d.default_model,
@@ -294,6 +301,18 @@ function renderEngineGroups(engine) {
   // V-7: pwsh (and any engine the catalog knows no models for) has no model / thinking defaults.
   const hasModels = !!engine && engineModels(engine).length > 0;
   $('#groupDefaults').hidden = !hasModels;
+  renderBypassSwitch(engine);
+}
+
+/** bypass_approvals applies to omp / kimi / codex / agy only; dsh and pwsh show it disabled (不适用). */
+function renderBypassSwitch(engine) {
+  const applies = !engine || APPROVAL_ENGINES.has(engine);
+  const box = $('#editBypassApprovals');
+  box.disabled = !applies;
+  $('#editBypassSwitch').classList.toggle('is-disabled', !applies);
+  const help = $('#editBypassHelp');
+  help.textContent = applies ? BYPASS_HELP : `不适用：${engine} 引擎没有 Hub 注入的审批参数，这个开关对它没有作用。`;
+  help.classList.toggle('warn', applies);
 }
 
 function ensureOption(select, value) {
@@ -598,6 +617,7 @@ async function startNewProfile() {
     delayText: 2.5,
     gui_url: '',
     dsh_tier: 'flash',
+    bypass_approvals: false,
     extra: null,
   });
   renderProfileList();
@@ -673,6 +693,9 @@ async function saveProfile() {
     startup_delay_sec: Number.isFinite(delay) ? delay : null,
     gui_url: isDsh ? (d.gui_url || null) : null,
     dsh_tier: isDsh ? d.dsh_tier : null,
+    // Round 2: always a bool (false clears the key). For dsh / pwsh the box is disabled and keeps
+    // the stored value, so a save there never changes it.
+    bypass_approvals: d.bypass_approvals === true,
   };
 
   const btn = $('#btnSaveProfile');

@@ -281,7 +281,7 @@ function renderSessionList() {
     }
     const sig = [
       sessionTitle(s), s.status, s.process_alive, s.engine, s.kind,
-      s.effective_model, s.effective_thinking_level, s.cwd,
+      s.effective_model, s.effective_thinking_level, s.cwd, s.high_risk_approval,
     ].join('|');
     if (sig !== card.sig) {
       card.el.innerHTML = sessionCardHtml(s);
@@ -310,6 +310,13 @@ function pathMetaHtml(s) {
   return bits.map((bit) => `<span class="dot-sep"></span>${bit}`).join('');
 }
 
+/** Round 2: a session launched with the profile's bypass_approvals on (no high-risk approval). */
+function bypassBadgeHtml(s) {
+  return s.high_risk_approval === false
+    ? '<span class="approval-off-badge" title="该 Profile 打开了 bypass_approvals：高风险操作不会暂停等待审批">全自动</span>'
+    : '';
+}
+
 function sessionCardHtml(s) {
   const live = isLive(s);
   const path = pathMetaHtml(s);
@@ -323,6 +330,7 @@ function sessionCardHtml(s) {
     <div class="sc-activity" data-ref="activity"></div>
     <div class="sc-meta">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
+      ${bypassBadgeHtml(s)}
       <span class="status-text" data-tone="${statusTone(s.status)}">${escapeHtml(statusLabel(s.status))}</span>
       ${modelMetaHtml(s)}
       <span data-ref="idle"></span>
@@ -624,6 +632,7 @@ function paneHeadHtml(s) {
     <div class="pane-title">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
       <strong title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</strong>
+      ${bypassBadgeHtml(s)}
       ${pillsHtml(s)}
     </div>
     <div class="pane-actions">
@@ -647,7 +656,7 @@ function pillsHtml(s) {
 function updatePane(pane, s) {
   const sig = [
     state.layoutMode, sessionTitle(s), s.status, s.process_alive, s.kind, s.engine,
-    s.effective_model, s.effective_thinking_level, s.tucked_offscreen,
+    s.effective_model, s.effective_thinking_level, s.tucked_offscreen, s.high_risk_approval,
     terminals.get(s.session_id)?.wsOpen ? '1' : '0',
   ].join('|');
   if (sig !== pane.headSig) {

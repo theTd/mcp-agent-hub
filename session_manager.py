@@ -717,11 +717,13 @@ TUI_COMPOSER_SHAPES = {
     "codex": "glyph",
     "agy": "glyph",
 }
-# Owner decision engines-checked (2026-11-06, decision page kimi-injection-2026-11-06): only these
-# engines type a LIVE message through the checked submit (K5 settle -> Enter -> K3 proof). kimi is the
-# one engine whose Enter was really lost; omp, codex and agy keep the old write + Enter, recorded as
-# ok:null "live_write_unchecked". Their composers stay in TUI_COMPOSER_SHAPES for reading the screen.
-TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi"})
+# Owner decision engines-checked (2026-11-06, decision page kimi-injection-2026-11-06; revised
+# 2026-11-07 to kimi + codex): only these engines type a LIVE message through the checked submit
+# (K5 settle -> Enter -> K3 proof). kimi lost its Enter first; the approval live check of 2026-11-07
+# saw codex leave a live message in its composer 2 of 5 times. omp and agy keep the old write +
+# Enter, recorded as ok:null "live_write_unchecked". Their composers stay in TUI_COMPOSER_SHAPES for
+# reading the screen.
+TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi", "codex"})
 # K7 (fix 9d): a "glyph" composer wraps a long text onto the rows under its prompt row, and those
 # rows end at the engine's own closing row (real screens of the 22b0573 live check):
 #   omp    rule, "❯ …", wrapped rows indented two columns, rule, status line   (o1l2_screens.txt)
@@ -1057,9 +1059,10 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
 
 # ── Approval by default (owner decision 2026-11-07, DECISIONS.md D1-D5/D9) ─────────────────────
 # Every engine runs in the mode where routine work runs on its own and high-risk operations stop
-# for approval (the main agent answers through respond_to_subagent_approval_or_choice). There is
-# no opt-out: the hub strips each engine's bypass/mode flags from the profile (or the archived
-# snapshot on resume) and injects its own, in the same place as the model/thinking injection.
+# for approval (the main agent answers through respond_to_subagent_approval_or_choice). The hub
+# strips each engine's bypass/mode flags from the profile (or the archived snapshot on resume) and
+# injects its own, in the same place as the model/thinking injection. The only way out is the
+# profile's own `bypass_approvals: true` (round 2, see bypass_launch_flags below).
 ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
 OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
 # D5: agy's `--mode auto` falls back to `default` at launch (its check runs before sign-in ends);
@@ -1187,12 +1190,55 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
     return []
 
 
-def apply_approval_flags(engine: str, args: List[str]) -> List[str]:
-    """D1/D9: strip every approval/bypass/mode flag, then inject the hub's own at the front."""
+# Round 2 (owner, decision page approval-by-default-2026-11-07): a profile may switch approval off
+# with `bypass_approvals: true`. The hub then injects that engine's full-bypass flag instead of the
+# approval flags. Only the engines below have approval flags; dsh and pwsh ignore the key.
+APPROVAL_ENGINES = ("omp", "kimi", "codex", "agy")
+BYPASS_APPROVALS_KEY = "bypass_approvals"
+BYPASS_ON_NOTE = "bypass_approvals is on for this profile：该 Profile 已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
+BYPASS_NO_EFFECT_NOTE = "bypass_approvals 对 {engine} 引擎不适用（该引擎没有 Hub 注入的审批参数），已忽略"
+
+
+def profile_bypasses_approvals(profile: Optional[Dict[str, Any]]) -> bool:
+    """True only for a stored boolean true; a missing key (or anything else) means approval stays on."""
+    return isinstance(profile, dict) and profile.get(BYPASS_APPROVALS_KEY) is True
+
+
+def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bool]:
+    """What the session runs with: True = high-risk approval on, False = bypassed, None = the engine
+    has no hub-injected approval (dsh, pwsh, desktop GUI)."""
+    eng = (engine or "").strip().lower()
+    if eng not in APPROVAL_ENGINES:
+        return None
+    return not bypass
+
+
+def bypass_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -> List[str]:
+    """The engine's old full-bypass flag, injected instead of the approval flags when bypassed."""
+    eng = (engine or "").strip().lower()
+    if eng == "omp":
+        return ["--auto-approve"]
+    if eng == "kimi":
+        return ["--auto"]
+    if eng == "codex":
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    if eng == "agy":
+        # The profile's own --settings keys survive; agentMode is the bypass flag's business now.
+        settings = _agy_profile_settings(list(profile_args or []))
+        settings.pop("agentMode", None)
+        extra = ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":"))] if settings else []
+        return ["--dangerously-skip-permissions"] + extra
+    return []
+
+
+def apply_approval_flags(engine: str, args: List[str], bypass: bool = False) -> List[str]:
+    """D1/D9: strip every approval/bypass/mode flag, then inject the hub's own at the front: the
+    approval flags, or the engine's full-bypass flag when the profile has bypass_approvals on."""
     raw = [str(a) for a in args]
     drop = {idx for idx, _label in _approval_flag_tokens(engine, raw)}
     kept = [a for i, a in enumerate(raw) if i not in drop]
-    return approval_launch_flags(engine, raw) + kept
+    inject = bypass_launch_flags(engine, raw) if bypass else approval_launch_flags(engine, raw)
+    return inject + kept
 
 
 # ── D7: reading the engines' approval prompts and answering them ──────────────────────────────
@@ -1372,8 +1418,59 @@ def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# A line that ends the `$ <command>` block of an approval prompt (besides a blank line or the first
+# numbered option): the prompt's own field labels and key hints.
+_PROMPT_FIELD_PREFIXES = (
+    "Reason:", "Environment:", "Destination:", "Description:", "cwd:", "Dangerous:",
+    "Press enter", "Run this command?", "Would you like",
+)
+
+
+def _dollar_command(lines: List[str]) -> str:
+    """The command of the first `$ <command>` line, with its wrapped continuation lines joined.
+
+    A long command wraps on screen (live check 2026-11-07: codex cut `Remove-Item … -LiteralPath`
+    from its target on the next line); the continuation runs up to a blank line, the first numbered
+    option, or the prompt's next field. The TUIs wrap at word boundaries, so the pieces are joined
+    with one space.
+    """
+    parts: List[str] = []
+    for raw in lines:
+        s = raw.strip().strip("│┃║").strip()
+        if not parts:
+            if s.startswith("$ "):
+                parts.append(s[2:].strip())
+            continue
+        if not s or _OPTION_LINE_RE.match(s) or s.startswith(_PROMPT_FIELD_PREFIXES):
+            break
+        parts.append(s)
+    return " ".join(p for p in parts if p).strip()
+
+
+_CODEX_SHORTCUT_RE = re.compile(r"\(([A-Za-z]+)\)\s*$")
+
+
+def _codex_option_action(label: str, shortcut: str) -> str:
+    """What a codex option does, by its shortcut key read from the screen: y once, p (command
+    prompt: permanent allow rule for the command prefix) and a (edit prompt: these files) are the
+    prompt's "don't ask again" choice, esc / n deny."""
+    key = (shortcut or "").lower()
+    if key == "y":
+        return "approve_once"
+    if key in ("p", "a"):
+        return "approve_session"
+    if key in ("esc", "n"):
+        return "deny"
+    return classify_approval_label(label)
+
+
 def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
-    """codex's approval modal: a command prompt or an edit prompt, with its numbered options."""
+    """codex's approval modal: a command prompt or an edit prompt, with its numbered options.
+
+    Each option carries the shortcut key shown at the end of its label (`(y)`, `(p)`, `(a)`,
+    `(esc)`); session_key is the shortcut of the prompt's "don't ask again" option as read from the
+    screen (`p` on command prompts, `a` on edit prompts), or "" when the screen shows none.
+    """
     text = str(screen or "")
     if "Would you like to run the following command?" in text:
         kind, marker = "command", "Would you like to run the following command?"
@@ -1384,30 +1481,40 @@ def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     lines = text.splitlines()
     head = max(i for i, line in enumerate(lines) if marker in line)
     opts = _numbered_options(lines[head + 1:])
+    session_key = ""
     for o in opts:
-        o["action"] = classify_approval_label(o["label"])
-    reason = ""
-    command = ""
+        m = _CODEX_SHORTCUT_RE.search(o["label"])
+        o["shortcut"] = m.group(1).lower() if m else ""
+        o["action"] = _codex_option_action(o["label"], o["shortcut"])
+        if o["action"] == "approve_session" and o["shortcut"] in ("p", "a") and not session_key:
+            session_key = o["shortcut"]
+    reason_parts: List[str] = []
     destination = ""
+    in_reason = False
     for line in lines[head + 1:]:
         s = line.strip()
         if s.startswith("Reason:"):
-            reason = s.split(":", 1)[1].strip()
-        elif s.startswith("$ ") and not command:
-            command = s[2:].strip()
-        elif s.startswith("Destination:"):
+            reason_parts = [s.split(":", 1)[1].strip()]
+            in_reason = True
+            continue
+        if in_reason:
+            # A long reason wraps like a long command does.
+            if s and not s.startswith("$ ") and not _OPTION_LINE_RE.match(s) \
+                    and not s.startswith(_PROMPT_FIELD_PREFIXES):
+                reason_parts.append(s)
+                continue
+            in_reason = False
+        if s.startswith("Destination:"):
             destination = s.split(":", 1)[1].strip()
+    reason = " ".join(p for p in reason_parts if p).strip()
+    command = _dollar_command(lines[head + 1:])
     return {"prompt_kind": kind, "reason": reason, "command": command,
-            "destination": destination, "options": opts}
+            "destination": destination, "options": opts, "session_key": session_key}
 
 
 def kimi_panel_command(screen: str) -> str:
-    """The `$ <command>` line of kimi's approval panel (empty when there is none)."""
-    for line in str(screen or "").splitlines():
-        s = line.strip()
-        if s.startswith("$ "):
-            return s[2:].strip()
-    return ""
+    """The `$ <command>` of kimi's approval panel, wrapped lines joined (empty when there is none)."""
+    return _dollar_command(str(screen or "").splitlines())
 
 
 def _collapsed(text: str) -> str:
@@ -1586,6 +1693,8 @@ class AgentSession:
         self.archived_at: Optional[float] = None
         self.last_screen: str = ""
         self.profile_snapshot: Dict[str, Any] = {}
+        # Round 2: the Chinese notes of the launch this object ran (resolve_launch / resume).
+        self.launch_notes: List[str] = []
         self.conversation_ref: Dict[str, Any] = {}
         self.resume_count: int = 0
         self.last_resumed_at: Optional[float] = None
@@ -2055,6 +2164,14 @@ class AgentSession:
             history.insert(first_pending, record)
         del history[:-TUI_RECENT_INJECTIONS_MAX]
 
+    @property
+    def high_risk_approval(self) -> Optional[bool]:
+        """Round 2: what this launch runs with (see high_risk_approval_state)."""
+        snap = self.profile_snapshot if isinstance(self.profile_snapshot, dict) else {}
+        return high_risk_approval_state(
+            self.engine or snap.get("engine"), snap.get(BYPASS_APPROVALS_KEY) is True
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
         if not alive and self.pty is not None and self.status not in (
@@ -2096,6 +2213,9 @@ class AgentSession:
             "dsh_session_id": self.dsh_session_id,
             "effective_model": self.effective_model,
             "effective_thinking_level": self.effective_thinking_level,
+            # Round 2: true = high-risk approval on, false = the profile's bypass_approvals was on
+            # for this launch, null = the engine has no hub approval (dsh, pwsh).
+            "high_risk_approval": self.high_risk_approval,
             "transcript_path": str(self.transcript_path) if self.transcript_path else "",
             "end_reason": self.end_reason,
             "archived_at": self.archived_at,
@@ -2750,6 +2870,8 @@ class HubSessionManager:
             prof["engine"] = eng
             prof["enabled"] = bool(prof.get("enabled", True))
             prof["when_to_use"] = prof.get("when_to_use") or ""
+            # Round 2: the console and the launch read a plain bool (a hand-edited non-bool is off).
+            prof[BYPASS_APPROVALS_KEY] = profile_bypasses_approvals(prof)
             eng_info = self.engines_catalog.get(eng) or {}
             # B4: remember whether the default came from the profile file or from the engine.
             explicit_model = str(prof.get("default_model") or "").strip()
@@ -2874,6 +2996,8 @@ class HubSessionManager:
         "gui_url",
         "dsh_tier",
         "disabled_models",
+        # Round 2: the per-profile approval off switch (bool; missing = false).
+        "bypass_approvals",
     )
 
     # B5 / R11: every persistable key except these three can be cleared with null or "". The stored
@@ -3099,6 +3223,12 @@ class HubSessionManager:
             existing = {}
 
         incoming = dict(profile_data)
+        if BYPASS_APPROVALS_KEY in incoming and incoming[BYPASS_APPROVALS_KEY] is not None \
+                and not isinstance(incoming[BYPASS_APPROVALS_KEY], bool):
+            raise ValueError(
+                f"bypass_approvals 只能是 true 或 false（布尔值），收到的是 "
+                f"{json.dumps(incoming[BYPASS_APPROVALS_KEY], ensure_ascii=False)}。"
+            )
         merged = dict(existing)
         for key in self.PROFILE_PERSIST_KEYS:
             if key not in incoming:
@@ -3165,6 +3295,10 @@ class HubSessionManager:
             clean_entry.pop("default_model", None)
         if clean_entry.get("default_thinking_level") in (None, ""):
             clean_entry.pop("default_thinking_level", None)
+        # Round 2: only a true switch is written (missing = false), so saving a profile with the
+        # switch off leaves the file exactly as before this key existed.
+        if clean_entry.get(BYPASS_APPROVALS_KEY) is not True:
+            clean_entry.pop(BYPASS_APPROVALS_KEY, None)
 
         profiles_map[pid] = clean_entry
         self._write_profiles_file(raw_data)
@@ -3450,8 +3584,18 @@ class HubSessionManager:
         # D9 (2026-11-07): the snapshot goes through the same strip+inject as a fresh launch, so a
         # session archived before approval-by-default (with --auto-approve, --auto, ...) resumes in
         # the safe mode too. omp's in-memory "approve for this session" is gone after a resume anyway.
-        if engine in ("omp", "kimi", "agy", "codex"):
-            base_args = apply_approval_flags(engine, base_args)
+        # Round 2: the profile's CURRENT bypass_approvals decides, not the value at the first launch,
+        # so switching it off makes resumed sessions safe again (and on makes them full-auto).
+        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
+        bypass = profile_bypasses_approvals(self.profiles.get(profile_id))
+        built["bypass_approvals"] = bypass
+        built["notes"] = []
+        if engine in APPROVAL_ENGINES:
+            base_args = apply_approval_flags(engine, base_args, bypass=bypass)
+            if bypass:
+                built["notes"].append(BYPASS_ON_NOTE)
+        elif bypass:
+            built["notes"].append(BYPASS_NO_EFFECT_NOTE.format(engine=engine))
         if engine == "omp":
             # V4: the spawn carried --append-system-prompt=<worker-bridge hint>. A resume that drops
             # it leaves the same session without the hint it was started with.
@@ -3578,6 +3722,9 @@ class HubSessionManager:
         sess.last_task = str(record.get("last_task") or "")
         sess.created_at = float(record.get("created_at") or time.time())
         sess.profile_snapshot = dict(snapshot)
+        # Round 2: the resume ran with the profile's current switch; record that, not the old one.
+        sess.profile_snapshot[BYPASS_APPROVALS_KEY] = bool(built.get("bypass_approvals"))
+        sess.launch_notes = list(built.get("notes") or [])
         sess.conversation_ref = dict(ref)
         sess.resume_attach = True
         sess.attach_offset = int(built.get("attach_offset") or 0)
@@ -4588,8 +4735,27 @@ class HubSessionManager:
             "last_injection": meta.get("last_injection"),
             # K8 (fix 9d): the last few submit records (startup text, live messages), newest last.
             "recent_injections": meta.get("recent_injections") or [],
+            # Round 2: false only when the profile's bypass_approvals was on for this launch;
+            # null for engines without hub approval (dsh, pwsh).
+            "high_risk_approval": (
+                sess.high_risk_approval if sess else self._record_high_risk_approval(meta)
+            ),
             "transcript_summary": transcript_summary,
         }
+
+    @staticmethod
+    def _record_high_risk_approval(rec: Dict[str, Any]) -> Optional[bool]:
+        """Round 2: high_risk_approval of a stored record (from its launch snapshot)."""
+        snap = rec.get("profile_snapshot")
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap) if snap else {}
+            except Exception:
+                snap = {}
+        snap = snap if isinstance(snap, dict) else {}
+        return high_risk_approval_state(
+            rec.get("engine") or snap.get("engine"), snap.get(BYPASS_APPROVALS_KEY) is True
+        )
 
     def get_subagent_final_response(self, session_id: str) -> Dict[str, Any]:
         """Retrieves the Sub-Agent's clean final response and transcript summary both during and after its lifecycle."""
@@ -4858,19 +5024,28 @@ class HubSessionManager:
         option_index: Optional[int],
         custom_input: Optional[str],
         options: List[str],
+        option_actions: Optional[List[str]] = None,
     ) -> tuple:
         """D7: (action, chosen label, option index) for an approval prompt of kimi / omp / codex / agy.
 
         action is approve_once | approve_session | deny | deny_feedback. An option picked by number
         or by its exact label acts as that option; free text without a decision denies the call and
         is sent as feedback (the engines' "type to deny and steer"). No decision at all is refused:
-        a high-risk call is never approved by default.
+        a high-risk call is never approved by default. `option_actions` (aligned with `options`)
+        is what the detector read for each option (codex: from its shortcut key); without it the
+        label is classified.
         """
         feedback = (custom_input or "").strip()
+        known = list(option_actions or [])
+        if len(known) != len(options):
+            known = []
+
+        def action_of(idx: int) -> str:
+            return str(known[idx]) if known else classify_approval_label(options[idx])
 
         def by_label(idx: int, with_feedback: bool) -> tuple:
             label = options[idx]
-            action = classify_approval_label(label)
+            action = action_of(idx)
             if action == "persist":
                 # Never sent: a permanent rule is the owner's call, not a sub-agent approval.
                 action = "approve_once"
@@ -4882,8 +5057,8 @@ class HubSessionManager:
 
         def label_for(action: str) -> str:
             want = "deny" if action == "deny_feedback" else action
-            for opt in options:
-                if classify_approval_label(opt) == want:
+            for i, opt in enumerate(options):
+                if action_of(i) == want:
                     return opt
             return action
 
@@ -5086,7 +5261,7 @@ class HubSessionManager:
         notes: List[str] = []
         if kind == "approval_request" and eng in ("kimi", "omp", "codex", "agy") and not sess.dsh_spec:
             approval_action, chosen_label, chosen_idx_1based = self._resolve_approval_choice(
-                dec_norm, option_index, custom_input, options
+                dec_norm, option_index, custom_input, options, meta.get("option_actions")
             )
 
         # Map semantic decision or custom_input matching onto 1-based option_index
@@ -5288,17 +5463,29 @@ class HubSessionManager:
                     action_trace = "Codex approval key 'n' (Reject)" + (
                         f" + feedback {feedback!r}" if approval_action == "deny_feedback" else ""
                     )
-                elif approval_action == "approve_session" and meta.get("codex_prompt") == "edit":
+                elif approval_action == "approve_session" and meta.get("codex_session_key") == "p":
+                    # Round 2 (owner): a command prompt's "don't ask again" is p, read from the
+                    # screen. codex writes a permanent allow rule for the command prefix.
+                    sess.write_input("p")
+                    action_trace = "Codex approval key 'p' (don't ask again for this command prefix; permanent)"
+                    notes.append(
+                        "已发送 p：永久放行。codex 已把这个命令前缀的放行规则写入 "
+                        "~/.codex/rules/default.rules，之后所有 codex 会话（包括你自己用的 codex）都不再询问；"
+                        "要撤销请删除该文件里对应的规则"
+                    )
+                elif approval_action == "approve_session" and (
+                    meta.get("codex_session_key") == "a"
+                    # a record registered before round 2 carries only the prompt kind
+                    or ("codex_session_key" not in meta and meta.get("codex_prompt") == "edit")
+                ):
                     sess.write_input("a")
                     action_trace = "Codex approval key 'a' (don't ask again for these files)"
                 else:
-                    # D7: a command prompt has no session option; its `p` writes a permanent rule
-                    # to ~/.codex/rules/default.rules, so the hub never sends it.
                     sess.write_input("y")
                     action_trace = "Codex approval key 'y' (Approve once)"
                     if approval_action == "approve_session":
                         notes.append(
-                            "codex 的命令审批没有「本会话允许」（p 会写入永久规则，Hub 不发送）：本次只允许了一次"
+                            "这个 codex 提示上没有读到「不再询问」选项：本次只允许了一次"
                         )
                 delivered = True
             else:
@@ -6072,7 +6259,16 @@ class HubSessionManager:
                             ),
                             source="codex_jsonl_approval",
                             request_id=payload.get("call_id") or f"codex-appr-{uuid.uuid4().hex[:6]}",
-                            metadata={"codex_prompt": "edit" if is_edit else "command"},
+                            # No screen was read here, so no `p` is ever sent from this record:
+                            # a command prompt answers approve_session with y (approve once).
+                            metadata={
+                                "codex_prompt": "edit" if is_edit else "command",
+                                "codex_session_key": "a" if is_edit else "",
+                                "option_actions": (
+                                    ["approve_once", "approve_session", "deny"] if is_edit
+                                    else ["approve_once", "deny"]
+                                ),
+                            },
                         )
                     elif otype == "event_msg" and ptype == "task_complete":
                         last_msg = payload.get("last_agent_message")
@@ -8151,18 +8347,18 @@ class HubSessionManager:
         )
 
     def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
-        """D7: codex's command prompt has no session option (its `p` writes a permanent rule to
-        ~/.codex/rules/default.rules), so the parent is offered only y / esc there; the edit prompt
-        keeps its `a` (don't ask again for these files)."""
+        """D7 + round 2 (owner): every option on the screen is offered, each with the action its
+        shortcut key means. approve_session sends the key the screen shows for the "don't ask again"
+        option: `p` on a command prompt (codex writes a permanent allow rule for that command prefix
+        into ~/.codex/rules/default.rules), `a` on an edit prompt (these files, this session)."""
         kind = parsed.get("prompt_kind") or "command"
-        offered = [o["label"] for o in parsed.get("options") or [] if o.get("action") != "persist"]
+        opts = [o for o in parsed.get("options") or [] if o.get("action") != "persist"]
+        offered = [o["label"] for o in opts]
+        actions = [o["action"] for o in opts]
         if not offered:
-            offered = (
-                ["Yes, proceed (y)", "No, and tell Codex what to do differently (esc)"]
-                if kind == "command" else
-                ["Yes, proceed (y)", "Yes, and don't ask again for these files (a)",
-                 "No, and tell Codex what to do differently (esc)"]
-            )
+            offered = ["Yes, proceed (y)", "No, and tell Codex what to do differently (esc)"]
+            actions = ["approve_once", "deny"]
+        session_key = str(parsed.get("session_key") or "")
         lines = ["Would you like to run the following command?" if kind == "command"
                  else "Would you like to make the following edits?"]
         if parsed.get("reason"):
@@ -8171,8 +8367,13 @@ class HubSessionManager:
             lines.append(f"$ {parsed['command']}")
         if parsed.get("destination"):
             lines.append(f"Destination: {parsed['destination']}")
-        if kind == "command":
-            lines.append("（命令审批没有「本会话允许」：approve_session 按允许一次处理）")
+        if session_key == "p":
+            lines.append(
+                "（approve_session = 发送 p：永久放行，codex 会把这个命令前缀的放行规则写入 "
+                "~/.codex/rules/default.rules，以后所有 codex 会话都不再询问）"
+            )
+        elif not session_key:
+            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
         return self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -8180,7 +8381,12 @@ class HubSessionManager:
             prompt="\n".join(lines) if len(lines) > 1 else scr.strip()[-600:],
             options=offered,
             source="codex_tui_screen_detector",
-            metadata={"codex_prompt": kind, "command": parsed.get("command") or ""},
+            metadata={
+                "codex_prompt": kind,
+                "command": parsed.get("command") or "",
+                "codex_session_key": session_key,
+                "option_actions": actions,
+            },
         )
 
     def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
@@ -8566,18 +8772,26 @@ class HubSessionManager:
             args = injected + args
         # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
 
-        # D1 (2026-11-07): high-risk approval is on for every engine, with no opt-out. The profile's
-        # own bypass/mode flags (old files still carry --auto-approve, --auto, ...) are stripped.
+        # D1 (2026-11-07): high-risk approval is on for every engine unless the profile switches it
+        # off (bypass_approvals, round 2). The profile's own bypass/mode flags (old files still carry
+        # --auto-approve, --auto, ...) are stripped either way; the hub injects what the switch says.
+        bypass = profile_bypasses_approvals(prof)
+        high_risk_approval = high_risk_approval_state(eng, bypass)
         ignored_approval = [
             label for label in approval_flags_in_args(eng, base_args)
             if label not in ("--settings", "--settings=")
         ]
-        args = apply_approval_flags(eng, args)
+        args = apply_approval_flags(eng, args, bypass=bypass)
         if ignored_approval:
             notes.append(
                 f"已忽略 Profile 参数里的审批相关参数（{'、'.join(ignored_approval)}）："
-                f"Hub 统一以高风险操作需审批的模式启动"
+                + ("由 bypass_approvals 开关决定，Hub 注入全自动参数" if bypass
+                   else "Hub 统一以高风险操作需审批的模式启动")
             )
+        if bypass and high_risk_approval is False:
+            notes.append(BYPASS_ON_NOTE)
+        elif bypass:
+            notes.append(BYPASS_NO_EFFECT_NOTE.format(engine=eng))
 
         # Rule 5: cwd.
         if cwd is None or str(cwd).strip() == '':
@@ -8626,6 +8840,8 @@ class HubSessionManager:
             'thinking_source': thinking_source,
             'cli_model': cli_model,
             'dsh_spec': dsh_spec,
+            'bypass_approvals': bypass,
+            'high_risk_approval': high_risk_approval,
             'notes': notes,
         }
 
@@ -8750,7 +8966,11 @@ class HubSessionManager:
             "startup_delay_sec": startup_delay,
             "submit_key": submit_key,
             "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
+            # Round 2: whether this launch had the profile's approval off switch on (a resume
+            # re-reads the profile's current value and overwrites this).
+            "bypass_approvals": bool(launch.get("bypass_approvals")),
         }
+        sess.launch_notes = list(launch.get("notes") or [])
 
         if kind == "web_gui":
             if task:

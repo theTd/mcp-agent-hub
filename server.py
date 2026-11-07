@@ -209,7 +209,8 @@ async def spawn_subagent(
     """
     以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台阻塞监听命令 `background_poll_command`。
     - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
-    - 所有引擎一律以「高风险操作需审批」模式运行，无需也无法关闭：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
+    - 引擎默认以「高风险操作需审批」模式运行：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
+    - 只有用户在总控台给某个 Profile 打开 `bypass_approvals`（全自动）时才不审批；返回值 `high_risk_approval` 为 `false` 即表示本次为全自动（`null` 表示该引擎没有 Hub 审批，如 dsh / pwsh），`launch_notes` 会写明。
     - 高风险操作暂停时，会话进入 `waiting_parent` 状态，并带有 `approval_request` 事件（`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
     - 请调用 `respond_to_subagent_approval_or_choice(session_id, decision=...)` 代批或代选，未答复前 Sub-Agent 会一直等待。
     """
@@ -261,6 +262,11 @@ async def spawn_subagent(
         "effective_thinking_level": session.effective_thinking_level,
         "kind": session.kind,
         "status": session.status,
+        # Round 2: true = high-risk approval on; false = the profile's bypass_approvals is on
+        # (full-auto); null = the engine has no hub approval (dsh, pwsh).
+        "high_risk_approval": session.high_risk_approval,
+        # The launch's notes (ignored profile flags, substitutions, "bypass_approvals is on ...").
+        "launch_notes": list(getattr(session, "launch_notes", None) or []),
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
@@ -384,6 +390,9 @@ async def send_to_subagent(
         "status": session.status,
         "resumed": resumed,
         "resume_count": session.resume_count,
+        # Round 2: a resume follows the profile's current bypass_approvals switch.
+        "high_risk_approval": session.high_risk_approval,
+        **({"launch_notes": list(session.launch_notes)} if resumed and session.launch_notes else {}),
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
@@ -521,16 +530,18 @@ async def respond_to_subagent_approval_or_choice(
 ) -> Dict[str, Any]:
     """
     [主 Agent 代批高风险操作 & 代选交互选项工具]
-    所有引擎都以「高风险操作需审批」模式运行：Sub-Agent 要执行高风险操作时，会话进入 `waiting_parent` 状态并发出 `approval_request` 事件
+    引擎默认以「高风险操作需审批」模式运行（Profile 打开 `bypass_approvals` 时为全自动，不会出现审批请求）：Sub-Agent 要执行高风险操作时，会话进入 `waiting_parent` 状态并发出 `approval_request` 事件
     （`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
     主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
     - `decision`：审批决定，`"approve"`（只允许这一次）、`"approve_session"`（本会话内同类操作不再询问）、`"deny"`（拒绝）；
       审批请求必须给出明确决定，不传任何参数不会默认放行。
-    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（会持久写入全局规则的选项不会出现在列表里）；
+    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（agy、omp 会写入全局设置的「永久允许」选项不会出现在列表里；codex 的 p 选项会出现，见下）；
     - `custom_input`：与 `decision="deny"` 同传时作为拒绝理由反馈给 Sub-Agent；审批请求只传 `custom_input` 时视为「拒绝并反馈这段文字」；
       回答问题时作为 Other 自由输入。
-    - 引擎差异：codex 的命令审批、以及由规则触发的 omp 审批没有「本会话允许」，`approve_session` 会按允许一次处理；
-      kimi 的「本会话允许」对危险命令不生效。返回值的 `notes` 会说明实际效果。
+    - 引擎差异：codex 命令审批的 `approve_session` 发送 p＝**永久放行**：codex 会把该命令前缀的放行规则写入用户的
+      `~/.codex/rules/default.rules`，之后所有 codex 会话都不再询问（codex 改文件审批的 `approve_session` 发送 a，只对这些文件、本会话有效）；
+      由规则触发的 omp 审批没有「本会话允许」，`approve_session` 会按允许一次处理；kimi 的「本会话允许」对危险命令不生效。
+      返回值的 `notes` 会说明实际效果。
     """
     session = hub.sessions.get(session_id)
     if not session:
