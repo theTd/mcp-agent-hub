@@ -716,7 +716,17 @@ TUI_SUBMIT_CONFIRM_SEC = 3.0
 TUI_SUBMIT_CONFIRM_POLL_SEC = 0.25
 TUI_SUBMIT_MAX_TRIES = 3
 TUI_SUBMIT_RETRY_STEP_SEC = 1.0
+# K5 (fix 9b): after typing, Enter waits until the typed text has SETTLED on the composer: the
+# composer (or the rows it wrapped onto) holds the text's last chars and has not changed for
+# TUI_TYPE_SETTLE_SEC. The live check of 30a638e pressed Enter 0.8 s after typing kimi's 1,073-char
+# task while its box was still empty; kimi took that Enter as a newline inside the typed burst and
+# every fresh spawn needed 2-3 Enters (probe k5-fixed-01: Enter at 0.83 s, tail drawn at 1.03 s,
+# Enter lost; k5-settle-01..05: tail at 0.4-2.2 s, Enter after it, submitted on the first press).
+# A text that never shows is pressed after TUI_TYPE_SETTLE_CAP_SEC anyway (the old behaviour) and
+# the result records that the echo never settled.
 TUI_TYPE_SETTLE_SEC = 0.8
+TUI_TYPE_SETTLE_POLL_SEC = 0.1
+TUI_TYPE_SETTLE_CAP_SEC = 10.0
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
@@ -6145,6 +6155,58 @@ class HubSessionManager:
             return "unsubmitted", "still_in_input_line"
         return "unknown", "unconfirmed"
 
+    @classmethod
+    def _tui_typed_tail_shown(cls, lines: List[str], span: Optional[tuple], tail: str) -> bool:
+        """K5 (fix 9b): the END of the typed text is drawn on the composer or the rows it wrapped onto.
+
+        The end is what proves the engine took in the whole typed burst: a long text's start scrolls
+        out of kimi's box ("↑ 2 more" on its top border), and a bare-glyph composer (omp/codex/agy)
+        holds only its first row in `span`, so the rows below it are read too. Rows above the
+        composer (submitted history) never count. Whitespace is ignored, as in _composer_holds.
+        """
+        key = re.sub(r"\s+", "", tail or "")
+        if span is None or not key:
+            return False
+        below = "".join(lines[span[2] + 1:])
+        return key in re.sub(r"\s+", "", span[0] + below)
+
+    async def _await_typed_text_settled(
+        self, session: AgentSession, engine: str, probe: str, tail: str
+    ) -> tuple:
+        """K5 (fix 9b): wait until the typed text has settled on the composer; (screen, echoed, settled, waited).
+
+        Settled = the end of the text is shown (_tui_typed_tail_shown) and the composer text has not
+        changed for TUI_TYPE_SETTLE_SEC. Only the composer is watched, not the whole screen: a
+        spinner or status timer elsewhere (omp's working row, kimi's MCP lines) would otherwise keep
+        the wait running until the cap on every submit. After TUI_TYPE_SETTLE_CAP_SEC the caller
+        presses Enter anyway, as it always did, with settled=False. `echoed` is whether the last
+        look held the text (its start or its end) on the composer.
+        """
+        started = time.time()
+        cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC)
+        quiet_key: Any = object()
+        quiet_since = started
+        while True:
+            await asyncio.sleep(TUI_TYPE_SETTLE_POLL_SEC)
+            screen = session.get_clean_screen_text(max_lines=40)
+            lines = [ln.rstrip() for ln in str(screen or "").splitlines()]
+            span = self._tui_composer_span(lines, engine)
+            line = span[0] if span is not None else None
+            shown = self._tui_typed_tail_shown(lines, span, tail)
+            now = time.time()
+            key = (line, shown)
+            if key != quiet_key:
+                quiet_key, quiet_since = key, now
+            echoed = shown or self._composer_holds(line, probe, tail)
+            if shown and now - quiet_since >= TUI_TYPE_SETTLE_SEC:
+                return screen, echoed, True, now - started
+            if now >= cap:
+                logger.warning(
+                    "K5: %s typed text never settled on the composer after %.1fs; pressing Enter anyway",
+                    getattr(session, "session_id", "?"), now - started,
+                )
+                return screen, echoed, False, now - started
+
     async def _submit_text_to_tui(
         self,
         session: AgentSession,
@@ -6171,6 +6233,11 @@ class HubSessionManager:
         from its composer. The result then carries retype=true while Enters remain: the caller waits
         for readiness again and calls this once more with `prior` (the earlier result), so the
         attempts, the one D3 extra press and the retype count all continue across the retype.
+
+        K5 (fix 9b): the first Enter is pressed only once the typed text has settled on the composer
+        (_await_typed_text_settled), not after a fixed pause; an Enter that reaches kimi while it is
+        still taking in a long typed burst becomes a newline in its box. The result carries
+        echo_settled / echo_wait_sec, and `echoed` is that settled look.
         """
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
@@ -6182,22 +6249,25 @@ class HubSessionManager:
             except OSError:
                 size_before = 0
         session.write_input(clean)
-        await asyncio.sleep(TUI_TYPE_SETTLE_SEC)
         probe = clean[:30].strip()
         tail = clean[-30:].strip()
         engine = session.engine
-        screen = session.get_clean_screen_text(max_lines=40)
-        line = self._tui_input_line(screen, engine)
-        echoed = self._composer_holds(line, probe, tail)
+        # K5 (fix 9b): the first Enter waits for the typed text to settle on the composer.
+        screen, echoed, settled, waited = await self._await_typed_text_settled(
+            session, engine, probe, tail
+        )
         prior = prior or {}
         attempts = int(prior.get("attempts") or 0)
         extra_press = bool(prior.get("extra_press"))
         retyped = int(prior.get("retyped") or 0)
         extra: Dict[str, Any] = {"retyped": retyped} if retyped else {}
-        # K2: echoed is the FIRST look, right after typing, and it is what the result reports. The
-        # later presses may additionally be judged by (a) once the text has really been seen sitting
-        # on the composer -- that is what turns "the box looked empty while kimi was still booting"
-        # into one more Enter and a real success instead of a success that was never earned.
+        # K5: how long the first Enter waited, and whether the echo settled or the cap ran out.
+        extra["echo_settled"] = settled
+        extra["echo_wait_sec"] = round(waited, 2)
+        # K2/K5: echoed is the settled look right before the first Enter, and it is what the result
+        # reports. The later presses may additionally be judged by (a) once the text has really been
+        # seen sitting on the composer -- that is what turns "the box looked empty while kimi was
+        # still booting" into one more Enter and a real success instead of one never earned.
         seen = echoed
         # K2: one evidence budget for the whole submit, not one per Enter.
         evidence_deadline = time.time() + TUI_SUBMIT_EVIDENCE_SEC
