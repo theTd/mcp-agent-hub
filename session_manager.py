@@ -28,6 +28,7 @@ from winpty import PtyProcess
 # session_manager.PtyProcess with a fake without making the shutdown tree-kill touch a fake PID.
 REAL_PTY_PROCESS = PtyProcess
 
+from dsh_endpoint import dsh_base_url, dsh_url
 from model_discovery import AgentModelDiscovery
 from transcript_summarizer import (
     ENGINE_BUSY_LINE_RES,
@@ -1638,7 +1639,7 @@ class AgentSession:
         if self.dsh_job_id and was_alive:
             job_id = self.dsh_job_id
             threading.Thread(
-                target=lambda: httpx.post(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel", timeout=3.0),
+                target=lambda: httpx.post(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0),
                 daemon=True,
             ).start()
         if was_alive:
@@ -3453,7 +3454,7 @@ class HubSessionManager:
             return False
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.get(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0})
+                resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
                 if resp.status_code == 404:
                     return False
                 data = resp.json()
@@ -3482,7 +3483,7 @@ class HubSessionManager:
         try:
             async with httpx.AsyncClient(timeout=max(1.0, float(timeout))) as client:
                 return await client.post(
-                    f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/messages",
+                    dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/messages"),
                     headers={"x-dsh-crew-job-token": token},
                     json={"message": clean},
                 )
@@ -3513,7 +3514,7 @@ class HubSessionManager:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     resp = await client.post(
-                        f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/continue",
+                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/continue"),
                         json={"text": clean, "messaging_token": token},
                     )
             except Exception as e:
@@ -3550,7 +3551,7 @@ class HubSessionManager:
             try:
                 async with httpx.AsyncClient(timeout=8.0) as client:
                     resp = await client.get(
-                        f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0}
+                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0}
                     )
             except Exception as e:
                 raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=e)) from e
@@ -3894,7 +3895,7 @@ class HubSessionManager:
             return False
         try:
             resp = httpx.post(
-                f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel",
+                dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"),
                 timeout=max(0.2, float(timeout)),
             )
             return bool(resp.is_success)
@@ -4497,7 +4498,7 @@ class HubSessionManager:
 
             if dsh_job_id and dsh_msg_id and not dsh_needs_continue:
                 r = httpx.post(
-                    f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{dsh_job_id}/messages",
+                    dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/messages"),
                     headers={"x-dsh-crew-job-token": dsh_token},
                     json={"message": reply_str, "reply_to": dsh_msg_id},
                     timeout=6.0,
@@ -4510,7 +4511,7 @@ class HubSessionManager:
             elif dsh_job_id:
                 new_token = str(uuid.uuid4())
                 r = httpx.post(
-                    f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{dsh_job_id}/continue",
+                    dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/continue"),
                     json={"text": reply_str, "messaging_token": new_token},
                     timeout=10.0,
                 )
@@ -4997,7 +4998,7 @@ class HubSessionManager:
                 if q_entry.get("dsh_message_id") and q_entry.get("dsh_job_id"):
                     try:
                         httpx.post(
-                            f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{q_entry['dsh_job_id']}/messages",
+                            dsh_url(f"/_dsh/dsh-crew/jobs/{q_entry['dsh_job_id']}/messages"),
                             headers={"x-dsh-crew-job-token": q_entry["dsh_token"]},
                             json={"message": text, "reply_to": q_entry["dsh_message_id"]},
                             timeout=5.0,
@@ -5038,7 +5039,7 @@ class HubSessionManager:
                     loop = asyncio.get_running_loop()
                     if sess.dsh_job_id and sess.status == "running":
                         r = httpx.post(
-                            f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/messages",
+                            dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/messages"),
                             headers={"x-dsh-crew-job-token": sess.dsh_token or ""},
                             json={"message": clean_txt},
                             timeout=5.0,
@@ -5051,7 +5052,7 @@ class HubSessionManager:
                     elif sess.dsh_job_id and sess.status in ("completed", "exited"):
                         new_token = str(uuid.uuid4())
                         r = httpx.post(
-                            f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/continue",
+                            dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/continue"),
                             json={"text": clean_txt, "messaging_token": new_token},
                             timeout=10.0,
                         )
@@ -7068,7 +7069,7 @@ class HubSessionManager:
         self._user_terminated.discard(session_id)
 
     async def _spawn_dsh_hub_job(self, session: AgentSession, task: Optional[str]):
-        """Spawns a first-class in-host DSH session via http://127.0.0.1:3080/_dsh/dsh-crew/jobs."""
+        """Spawns a first-class in-host DSH session via <DSH host>/_dsh/dsh-crew/jobs (dsh_base_url)."""
         if session.terminated_by_user:
             # Q4: the user terminated the session before this task got its first turn.
             return
@@ -7078,8 +7079,10 @@ class HubSessionManager:
         tier = spec.get("tier", "flash")
         effort = spec.get("effort", "high")
 
+        dsh_host = dsh_base_url().split("://", 1)[-1]
+        banner_head = f"╭─── DeepSeek Harness (In-Host Session @ {dsh_host}) "
         banner = (
-            f"\x1b[1;36m╭─── DeepSeek Harness (In-Host Session @ 127.0.0.1:3080) ──────────────────────╮\x1b[0m\r\n"
+            f"\x1b[1;36m{banner_head}{'─' * max(1, 79 - len(banner_head))}╮\x1b[0m\r\n"
             f"\x1b[1;36m│\x1b[0m Hub Session : \x1b[1;33m{session.session_id:<62}\x1b[1;36m│\x1b[0m\r\n"
             f"\x1b[1;36m│\x1b[0m Model Route : \x1b[1;32m{provider} / {model} (tier={tier}, effort={effort}){'':<23}\x1b[1;36m│\x1b[0m\r\n"
             f"\x1b[1;36m│\x1b[0m Workspace   : {session.cwd[:62]:<62}\x1b[1;36m│\x1b[0m\r\n"
@@ -7107,7 +7110,7 @@ class HubSessionManager:
         }
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post("http://127.0.0.1:3080/_dsh/dsh-crew/jobs", json=payload)
+                r = await client.post(dsh_url("/_dsh/dsh-crew/jobs"), json=payload)
                 data = r.json()
                 if not r.is_success or not data.get("ok"):
                     err_msg = data.get("error") or f"HTTP {r.status_code}"
@@ -7127,7 +7130,7 @@ class HubSessionManager:
                     # left them.
                     threading.Thread(
                         target=lambda: httpx.post(
-                            f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/cancel", timeout=3.0
+                            dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0
                         ),
                         daemon=True,
                     ).start()
@@ -7156,7 +7159,7 @@ class HubSessionManager:
             if session.terminated_by_user:
                 # Q4: a spawn that fails after the user terminated must not resurrect the session.
                 return
-            session.emit_virtual_ansi(f"\x1b[1;31m✖ Failed to reach DSH Host on 127.0.0.1:3080: {e}\x1b[0m\r\n")
+            session.emit_virtual_ansi(f"\x1b[1;31m✖ Failed to reach DSH Host on {dsh_host}: {e}\x1b[0m\r\n")
             session.status = "exited"
             self.persist_session(session)
 
@@ -7249,7 +7252,7 @@ class HubSessionManager:
                 # Poll DSH WorkerMailbox for worker->parent messages or blocking questions
                 try:
                     m_resp = await client.get(
-                        f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}/messages",
+                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/messages"),
                         params={"after": msg_cursor, "wait": 1},
                         headers={"x-dsh-crew-job-token": token},
                     )
@@ -7320,7 +7323,7 @@ class HubSessionManager:
 
                 # Check job status & final result
                 try:
-                    j_resp = await client.get(f"http://127.0.0.1:3080/_dsh/dsh-crew/jobs/{job_id}", params={"wait": 0})
+                    j_resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
                     if session.terminated_by_user:
                         # Q4: same rule for the job-status poll.
                         return

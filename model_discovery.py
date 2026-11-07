@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from dsh_endpoint import dsh_url
+
 
 class AgentModelDiscovery:
     """
@@ -449,7 +451,7 @@ class AgentModelDiscovery:
                 pass
 
         try:
-            r = httpx.get("http://127.0.0.1:3080/_dsh/dsh-crew/providers", timeout=2.0)
+            r = httpx.get(dsh_url("/_dsh/dsh-crew/providers", dsh_cfg_path), timeout=2.0)
             if r.is_success:
                 data = r.json()
                 providers_list = data.get("providers") or []
@@ -483,7 +485,7 @@ class AgentModelDiscovery:
         return {
             "engine": "dsh",
             "name": "DeepSeek Harness (In-Host Web / Crew)",
-            "binary": "http://127.0.0.1:3080/_dsh/dsh-crew/jobs",
+            "binary": dsh_url("/_dsh/dsh-crew/jobs", dsh_cfg_path),
             "installed": True,
             "default_model": default_model,
             "default_thinking_level": default_effort,
