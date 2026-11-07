@@ -715,6 +715,33 @@ TUI_COMPOSER_SHAPES = {
     "codex": "glyph",
     "agy": "glyph",
 }
+# K7 (fix 9d): a "glyph" composer wraps a long text onto the rows under its prompt row, and those
+# rows end at the engine's own closing row (real screens of the 22b0573 live check):
+#   omp    rule, "❯ …", wrapped rows indented two columns, rule, status line   (o1l2_screens.txt)
+#   agy    rule, "> …", wrapped rows indented two columns, rule, status line   (a1l_screens.txt)
+#   codex  "› …", wrapped rows indented two columns, a blank row, status lines (c1l_screens.txt)
+# "top" is the row that must sit right above the prompt row, "bottom" the row that must follow the
+# wrapped rows ("rule" = a run of ─, "blank" = an empty row, "" = not checked). The wrapped rows are
+# read only when that closing row follows them; a prompt row above the bottom TUI_PROMPT_SCAN_ROWS
+# rows is accepted only when its whole frame is there and the closing row lies in those rows, so a
+# history row higher up (agy draws its submitted messages as "> …" rows too) is never the composer.
+TUI_GLYPH_COMPOSER_FRAMES = {
+    "omp": {"top": "rule", "bottom": "rule"},
+    "agy": {"top": "rule", "bottom": "rule"},
+    "codex": {"top": "", "bottom": "blank"},
+}
+TUI_RULE_ROW_RE = re.compile(r"^\s*[─━═]{8,}")
+# K7 (fix 9d): a row under a glyph composer's closing row that starts an answer or a tool line
+# means the "composer" above it is submitted history, not the input row.
+TUI_GLYPH_HISTORY_BELOW_RE = re.compile(r"^\s*[•●✗⏺]")
+# K7 (fix 9d): codex shows a long typed burst as "[Pasted Content N chars]" instead of the text, so
+# the text's end never appears. That row with N (summed over all such rows) within a few chars of
+# the typed length counts as the typed text being on the composer (live check: 1,027 for the
+# 1,027-char longc.txt).
+TUI_PASTE_PLACEHOLDER_RES = {
+    "codex": re.compile(r"\[Pasted Content (\d+) chars\]"),
+}
+TUI_PASTE_PLACEHOLDER_SLACK_CHARS = 4
 TUI_BOX_TOP_RE = re.compile(r"^\s*╭─.*╮\s*$")
 TUI_BOX_BOTTOM_RE = re.compile(r"^\s*╰─.*╯\s*$")
 TUI_BOX_SIDE_RE = re.compile(r"^\s*[│┃]")
@@ -743,6 +770,9 @@ TUI_UNCHECKED_ENTER_DELAY_SEC = 0.25
 # K6 (fix 9c): a live message the engine refused (kimi "Error: LLM not set") is typed again after
 # this pause, within the same attempt limit.
 TUI_LIVE_RETYPE_PAUSE_SEC = 1.5
+# K8 (fix 9d): how many recent submit records (startup text, live messages) a session keeps beside
+# last_injection, newest last. In memory only, like last_injection.
+TUI_RECENT_INJECTIONS_MAX = 5
 # W2: engine input boxes do not live on the last line (kimi draws two status lines under its
 # composer), so the prompt is searched in the bottom rows of the screen, per engine.
 TUI_PROMPT_SCAN_ROWS = 10
@@ -1196,7 +1226,9 @@ class AgentSession:
         self.attach_offset: Optional[int] = None
         self.completion_reported: bool = False
         # A10: the real outcome of typing a startup/resume text into the TUI (never guessed).
-        self.last_injection: Optional[Dict[str, Any]] = None
+        # K8 (fix 9d): every record set here is also kept in recent_injections (see the property).
+        self._recent_injections: List[Dict[str, Any]] = []
+        self.last_injection = None
         # K6 (fix 9c): the startup text and the live messages type into the TUI one at a time.
         self.tui_writer = TuiWriterQueue()
         self._scrollback_written_at: float = 0.0
@@ -1608,6 +1640,47 @@ class AgentSession:
         # The process had already ended: keep its real final status and activity untouched.
         return False
 
+    @property
+    def last_injection(self) -> Optional[Dict[str, Any]]:
+        """A10/K6: the latest submit record (startup text, live message), or None before any."""
+        return self.__dict__.get("_last_injection")
+
+    @last_injection.setter
+    def last_injection(self, record: Optional[Dict[str, Any]]) -> None:
+        """K8 (fix 9d): setting the latest record also keeps it in recent_injections."""
+        self.__dict__["_last_injection"] = record
+        if isinstance(record, dict) and record:
+            self._remember_injection(record)
+
+    @property
+    def recent_injections(self) -> List[Dict[str, Any]]:
+        """K8 (fix 9d): the last TUI_RECENT_INJECTIONS_MAX submit records, in typing order (newest last)."""
+        return list(self.__dict__.get("_recent_injections") or [])
+
+    def _remember_injection(self, record: Dict[str, Any]) -> None:
+        """K8 (fix 9d): one entry per submit, keyed by its submit_id.
+
+        A record whose submit_id is already kept replaces that entry in place (a live message's
+        "submitting" record by its outcome), so one submit never shows twice. A new finished record
+        goes in front of the still-pending ones: those wait in the writer queue behind it, so it
+        was typed first (the startup text's outcome landing while a live message waits for it).
+        A record without a submit_id gets a fresh one.
+        """
+        history = self.__dict__.setdefault("_recent_injections", [])
+        submit_id = record.get("submit_id")
+        if not submit_id:
+            submit_id = record["submit_id"] = f"inj-{uuid.uuid4().hex[:8]}"
+        for idx, kept in enumerate(history):
+            if kept.get("submit_id") == submit_id:
+                history[idx] = record
+                return
+        if record.get("pending"):
+            history.append(record)
+        else:
+            first_pending = next((i for i, kept in enumerate(history) if kept.get("pending")), len(history))
+            history.insert(first_pending, record)
+        del history[:-TUI_RECENT_INJECTIONS_MAX]
+
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
         if not alive and self.pty is not None and self.status not in (
@@ -1659,6 +1732,8 @@ class AgentSession:
             "resume_block_reason": self.resume_block_reason,
             # A10: "pending" until the TUI really took the text; the outcome is recorded here.
             "last_injection": self.last_injection,
+            # K8 (fix 9d): the recent submit records, newest last (last_injection is one of them).
+            "recent_injections": self.recent_injections,
         }
 
 
@@ -4135,6 +4210,8 @@ class HubSessionManager:
             "files_changed": meta.get("files_changed", []),
             # A10: the real outcome of the startup/resume text, when there was one.
             "last_injection": meta.get("last_injection"),
+            # K8 (fix 9d): the last few submit records (startup text, live messages), newest last.
+            "recent_injections": meta.get("recent_injections") or [],
             "transcript_summary": transcript_summary,
         }
 
@@ -4721,14 +4798,23 @@ class HubSessionManager:
             loop.call_later(TUI_UNCHECKED_ENTER_DELAY_SEC, self._press_unchecked_enter, sess, claim)
             return {"pty_written": True, "injection": "live_write", "queued": False}
         submit_key = str((getattr(sess, "profile_snapshot", None) or {}).get("submit_key") or "\r")
-        sess.last_injection = self._live_submitting_record()
-        loop.create_task(self._submit_queued_live_text(sess, text, submit_key, claim, turn_before))
+        # K8 (fix 9d): one id for this message's "submitting" record and its outcome, so the outcome
+        # replaces that entry in recent_injections instead of adding a second one.
+        submit_id = f"inj-{uuid.uuid4().hex[:8]}"
+        sess.last_injection = self._live_submitting_record(submit_id)
+        loop.create_task(
+            self._submit_queued_live_text(sess, text, submit_key, claim, turn_before, submit_id)
+        )
         return {"pty_written": False, "injection": "pending", "queued": True}
 
     @staticmethod
-    def _live_submitting_record() -> Dict[str, Any]:
-        """K6 (fix 9c): last_injection while a live message waits for its turn or is being proved."""
+    def _live_submitting_record(submit_id: str = "") -> Dict[str, Any]:
+        """K6 (fix 9c): last_injection while a live message waits for its turn or is being proved.
+
+        K8 (fix 9d): `submit_id` ties it to the outcome that replaces it in recent_injections.
+        """
         return {
+            "submit_id": submit_id or f"inj-{uuid.uuid4().hex[:8]}",
             "at": round(time.time(), 3),
             "ok": None,
             "reason": "submitting",
@@ -4753,6 +4839,7 @@ class HubSessionManager:
         submit_key: str,
         claim: TuiWriterClaim,
         turn_before: Optional[Dict[str, Any]],
+        submit_id: str = "",
     ) -> None:
         """K6 (fix 9c): type one live message once its turn in the writer queue comes, and record it.
 
@@ -4767,7 +4854,8 @@ class HubSessionManager:
             await claim.wait_turn()
             # The writer ahead (the startup text, an earlier message) recorded its own outcome
             # meanwhile; this message is the one being submitted now.
-            sess.last_injection = self._live_submitting_record()
+            submit_id = submit_id or f"inj-{uuid.uuid4().hex[:8]}"
+            sess.last_injection = self._live_submitting_record(submit_id)
             if not sess.is_process_alive():
                 result = {"ok": False, "reason": "process_gone", "attempts": 0, "label": "失败"}
             elif self._tui_composer_located(sess):
@@ -4799,6 +4887,8 @@ class HubSessionManager:
         try:
             result["mode"] = "parent_message"
             result["at"] = round(time.time(), 3)
+            if submit_id:
+                result["submit_id"] = submit_id
             if result.get("ok") is False and turn_before is not None:
                 self._restore_turn_after_failed_message(sess, turn_before)
             self._record_tui_injection(sess, result)
@@ -6089,6 +6179,8 @@ class HubSessionManager:
         Looking only at the last non-empty line (the old code) always found a status line instead.
         K2 (fix 9): a box is located by its frame, so the whole text of a composer of any height is
         returned; the old bottom-rows search missed the "│ > " row of a tall box altogether.
+        K7 (fix 9d): the same for omp/agy/codex, whose long text wraps onto the rows under the
+        prompt row (_tui_wrapped_glyph_composer).
         """
         lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
         span = cls._tui_composer_span(lines, engine)
@@ -6102,7 +6194,9 @@ class HubSessionManager:
         included); wrapped_rows counts the text rows below its first one, which is how much taller
         it is than a one-line composer. The composer is searched from the bottom: its lowest row
         (a box's bottom border) must lie in the bottom TUI_PROMPT_SCAN_ROWS rows, as before, while
-        the composer itself may reach any height above that.
+        the composer itself may reach any height above that. K7 (fix 9d): for a glyph composer
+        (TUI_GLYPH_COMPOSER_FRAMES) the span is the prompt row and its wrapped rows; its closing
+        row is the one that must lie in the bottom rows.
         """
         eng = (engine or "").strip().lower()
         window = max(0, len(lines) - TUI_PROMPT_SCAN_ROWS)
@@ -6139,11 +6233,66 @@ class HubSessionManager:
                     return None
                 return match.group(1).rstrip(), i, i, 0
             return None
+        frame = TUI_GLYPH_COMPOSER_FRAMES.get(eng)
+        if frame is not None:
+            return cls._tui_wrapped_glyph_composer(lines, window, frame)
         for i in range(len(lines) - 1, window - 1, -1):
             match = TUI_INPUT_GLYPH_RE.match(lines[i])
             if match:
                 return match.group(1).rstrip(), i, i, 0
         return None
+
+    @classmethod
+    def _tui_wrapped_glyph_composer(
+        cls, lines: List[str], window: int, frame: Dict[str, str]
+    ) -> Optional[tuple]:
+        """K7 (fix 9d): a glyph composer (omp/agy/codex) with the rows its text wrapped onto.
+
+        Only the LOWEST prompt row on screen is a candidate; every prompt row above it is submitted
+        history. A prompt glyph indented like a wrapped row (column 2 or more) is part of the text
+        ("a > b" broken before the ">"), not a prompt. The rows under the prompt row that are
+        indented at least as far as its text are its wrapped rows, and they count only when the
+        engine's closing row (TUI_GLYPH_COMPOSER_FRAMES "bottom") follows them with no answer row
+        (TUI_GLYPH_HISTORY_BELOW_RE) further down -- a history row is followed by its answer.
+        A prompt row in the bottom TUI_PROMPT_SCAN_ROWS rows is the composer as before (one row when
+        no closed frame is found); one above them only with its whole frame ("top" row right above
+        it as well) and the closing row inside the bottom rows, the K2 rule for kimi's box.
+        """
+        for i in range(len(lines) - 1, -1, -1):
+            match = TUI_INPUT_GLYPH_RE.match(lines[i])
+            if match is None or len(lines[i]) - len(lines[i].lstrip()) >= 2:
+                continue
+            indent = max(2, match.start(1))
+            j = i + 1
+            while j < len(lines) and cls._tui_glyph_wrapped_row(lines[j], indent):
+                j += 1
+            closed = (
+                j < len(lines)
+                and cls._tui_frame_row_is(lines[j], frame.get("bottom") or "")
+                and not any(TUI_GLYPH_HISTORY_BELOW_RE.match(ln) for ln in lines[j + 1:])
+            )
+            opened = not frame.get("top") or (i > 0 and cls._tui_frame_row_is(lines[i - 1], frame["top"]))
+            if closed and (i >= window or (opened and j >= window)):
+                parts = [match.group(1).rstrip()] + [ln.strip() for ln in lines[i + 1:j]]
+                return " ".join(p for p in parts if p), i, j - 1, j - 1 - i
+            if i >= window:
+                return match.group(1).rstrip(), i, i, 0
+            return None
+        return None
+
+    @staticmethod
+    def _tui_glyph_wrapped_row(row: str, indent: int) -> bool:
+        """K7 (fix 9d): a row the composer's text wrapped onto: text indented at least `indent`."""
+        return bool(row.strip()) and len(row) - len(row.lstrip()) >= indent and not TUI_RULE_ROW_RE.match(row)
+
+    @staticmethod
+    def _tui_frame_row_is(row: str, kind: str) -> bool:
+        """K7 (fix 9d): the row is the frame row TUI_GLYPH_COMPOSER_FRAMES names ("" matches any)."""
+        if kind == "rule":
+            return bool(TUI_RULE_ROW_RE.match(row))
+        if kind == "blank":
+            return not row.strip()
+        return not kind
 
     @classmethod
     def _tui_framed_box_composer(cls, lines: List[str], window: int) -> Optional[tuple]:
@@ -6276,6 +6425,29 @@ class HubSessionManager:
         return False
 
     @staticmethod
+    def _tui_paste_placeholder_holds(engine: str, line: Optional[str], typed_len: int) -> bool:
+        """K7 (fix 9d): the composer shows the engine's paste placeholder for the typed text.
+
+        codex draws a long typed burst as "[Pasted Content N chars]"; N summed over every such
+        placeholder on the composer must be within TUI_PASTE_PLACEHOLDER_SLACK_CHARS of the length
+        the hub typed (after its newline flattening). Engines without a placeholder never match.
+        """
+        pattern = TUI_PASTE_PLACEHOLDER_RES.get((engine or "").strip().lower())
+        if pattern is None or line is None or typed_len <= 0:
+            return False
+        counts = [int(n) for n in pattern.findall(line)]
+        return bool(counts) and abs(sum(counts) - typed_len) <= TUI_PASTE_PLACEHOLDER_SLACK_CHARS
+
+    @classmethod
+    def _composer_holds_typed(
+        cls, line: Optional[str], probe: str, tail: str, engine: str = "", typed_len: int = 0
+    ) -> bool:
+        """K7 (fix 9d): _composer_holds, or the engine's paste placeholder standing for the text."""
+        return cls._composer_holds(line, probe, tail) or cls._tui_paste_placeholder_holds(
+            engine, line, typed_len
+        )
+
+    @staticmethod
     def _tui_submit_proof_rules(engine: str = "") -> Dict[str, Any]:
         """K3 (fix 9): the engine's submit-proof rules (TUI_SUBMIT_PROOF_RULES over the defaults)."""
         eng = (engine or "").strip().lower()
@@ -6358,6 +6530,7 @@ class HubSessionManager:
         echoed: bool = True,
         deadline: Optional[float] = None,
         marks: Optional[Dict[str, Any]] = None,
+        typed_len: int = 0,
     ) -> tuple:
         """V2(b)/W3/K2/K3: confirmation of one Enter, on positive evidence only.
 
@@ -6376,6 +6549,8 @@ class HubSessionManager:
         more, but only with no known trust/update dialog on screen (see _submit_text_to_tui).
         `marks` holds what was there before the Enter (_tui_submit_marks); the last screen read is
         written back into it, as the next Enter's starting point.
+        K7 (fix 9d): `typed_len` lets codex's "[Pasted Content N chars]" row count as the text
+        still sitting on its composer, so that row is never taken for a cleared composer.
         """
         rules = self._tui_submit_proof_rules(engine)
         marks = marks if marks is not None else {}
@@ -6399,7 +6574,7 @@ class HubSessionManager:
             if self._tui_reject_count(screen, rules) > int(marks.get("rejects") or 0):
                 phrase = next((p for p in rules.get("reject_phrases") or () if p in screen), "rejected")
                 return "rejected", phrase
-            holds = self._composer_holds(last_line, probe, tail)
+            holds = self._composer_holds_typed(last_line, probe, tail, engine, typed_len)
             if echoed and rules.get("cleared_composer") and last_line is not None and not holds:
                 return "confirmed", "input_line_cleared"
             proof = self._tui_transcript_proof(session, rules, size_before, marks, probe, tail)
@@ -6420,7 +6595,7 @@ class HubSessionManager:
             screen = session.get_clean_screen_text(max_lines=40)
             marks["screen"] = screen
             last_line = self._tui_input_line(screen, engine)
-        if self._composer_holds(last_line, probe, tail):
+        if self._composer_holds_typed(last_line, probe, tail, engine, typed_len):
             return "unsubmitted", "still_in_input_line"
         return "unknown", "unconfirmed"
 
@@ -6429,8 +6604,9 @@ class HubSessionManager:
         """K5 (fix 9b): the END of the typed text is drawn on the composer or the rows it wrapped onto.
 
         The end is what proves the engine took in the whole typed burst: a long text's start scrolls
-        out of kimi's box ("↑ 2 more" on its top border), and a bare-glyph composer (omp/codex/agy)
-        holds only its first row in `span`, so the rows below it are read too. Rows above the
+        out of kimi's box ("↑ 2 more" on its top border). K7 (fix 9d): a glyph composer's span holds
+        its wrapped rows when its frame is closed; otherwise it is only its first row, so the rows
+        below it are read too. Rows above the
         composer (submitted history) never count. Whitespace is ignored, as in _composer_holds.
         """
         key = re.sub(r"\s+", "", tail or "")
@@ -6440,7 +6616,7 @@ class HubSessionManager:
         return key in re.sub(r"\s+", "", span[0] + below)
 
     async def _await_typed_text_settled(
-        self, session: AgentSession, engine: str, probe: str, tail: str
+        self, session: AgentSession, engine: str, probe: str, tail: str, typed_len: int = 0
     ) -> tuple:
         """K5 (fix 9b): wait until the typed text has settled on the composer; (screen, echoed, settled, waited).
 
@@ -6450,6 +6626,9 @@ class HubSessionManager:
         the wait running until the cap on every submit. After TUI_TYPE_SETTLE_CAP_SEC the caller
         presses Enter anyway, as it always did, with settled=False. `echoed` is whether the last
         look held the text (its start or its end) on the composer.
+        K7 (fix 9d): the composer of every known engine is read whole (kimi's box, the wrapped rows
+        of omp/agy/codex), and codex's paste placeholder for the typed length counts as the end
+        shown, so the cap is a safety net only: reaching it means detection failed, and it warns.
         """
         started = time.time()
         cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC)
@@ -6461,7 +6640,9 @@ class HubSessionManager:
             lines = [ln.rstrip() for ln in str(screen or "").splitlines()]
             span = self._tui_composer_span(lines, engine)
             line = span[0] if span is not None else None
-            shown = self._tui_typed_tail_shown(lines, span, tail)
+            shown = self._tui_typed_tail_shown(lines, span, tail) or self._tui_paste_placeholder_holds(
+                engine, line, typed_len
+            )
             now = time.time()
             key = (line, shown)
             if key != quiet_key:
@@ -6523,7 +6704,7 @@ class HubSessionManager:
         engine = session.engine
         # K5 (fix 9b): the first Enter waits for the typed text to settle on the composer.
         screen, echoed, settled, waited = await self._await_typed_text_settled(
-            session, engine, probe, tail
+            session, engine, probe, tail, typed_len=len(clean)
         )
         prior = prior or {}
         attempts = int(prior.get("attempts") or 0)
@@ -6548,7 +6729,7 @@ class HubSessionManager:
             session.write_input(submit_key)
             state, reason = await self._confirm_tui_submit(
                 session, probe, tail, size_before, engine, echoed=seen,
-                deadline=evidence_deadline, marks=marks,
+                deadline=evidence_deadline, marks=marks, typed_len=len(clean),
             )
             if state == "confirmed":
                 return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed,

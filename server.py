@@ -118,15 +118,19 @@ def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
     text yet, so last_injection is still null. The CALLER knows whether text was sent in this call
     and whether it is still waiting (delivery.injection == "pending"), so it passes that in; this
     helper must not guess it from task_mode, or a resume without text would claim a pending typing.
+    K8 (fix 9d): with any record, the session's recent submit records (startup text, live messages,
+    newest last) come along as recent_injections, so an earlier outcome stays visible.
     """
     injection = getattr(session, "last_injection", None)
+    recent = list(getattr(session, "recent_injections", None) or [])
+    history = {"recent_injections": recent} if recent else {}
     if isinstance(injection, dict) and injection.get("pending"):
         # K6 (fix 9c): a live message is still being typed and proved in the background; the
         # record says so ("submitting") and its real outcome replaces it.
         return {"injection": "pending", "last_injection": injection,
-                "injection_hint": INJECTION_PENDING_HINT}
+                "injection_hint": INJECTION_PENDING_HINT, **history}
     if isinstance(injection, dict) and injection:
-        return {"injection": "recorded", "last_injection": injection}
+        return {"injection": "recorded", "last_injection": injection, **history}
     if pending:
         return {
             "injection": "pending",
