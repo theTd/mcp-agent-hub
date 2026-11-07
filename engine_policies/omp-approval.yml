@@ -1,0 +1,195 @@
+# omp approval overlay. The hub passes it to every omp session it starts or resumes
+# (--approval-mode=write --config=<this file>); edits here take effect at the next launch.
+#
+# - Ordinary shell commands run on their own (tools.approval.bash: allow); without this, write
+#   mode asks before every command and unattended work stalls.
+# - omp's built-in critical list still asks (rm -rf on /, sudo rm, mkfs, dd of=/dev/..., curl | sh,
+#   shutdown/reboot, chmod -R ... /).
+# - Every pattern below also asks; the session then waits in waiting_parent with an
+#   approval_request until the main agent answers with respond_to_subagent_approval_or_choice.
+#
+# Pattern rules (omp 2026-11, packages/coding-agent/src/tools/bash.ts):
+# - '*' is the only wildcard (any text, also empty); whitespace is collapsed; the match is anchored
+#   at both ends and case-sensitive.
+# - A prompt rule is tested against the whole command and against each simple command parsed out
+#   of it (argv joined by spaces), so "cd x && rm -rf y" matches "rm -r*". The "* <cmd>" twin of a
+#   rule catches the command behind a wrapper (sudo, xargs, bash -c, cmd /c, powershell -Command).
+# - A prompt rule beats tools.approval.bash: allow.
+# Plain network fetches (curl, wget, Invoke-WebRequest) are deliberately not on this list.
+tools:
+  approval:
+    bash: allow
+bash:
+  patterns:
+    # Recursive or forced deletes (POSIX rm)
+    - match: "rm -r*"
+      approval: prompt
+    - match: "* rm -r*"
+      approval: prompt
+    - match: "rm -R*"
+      approval: prompt
+    - match: "* rm -R*"
+      approval: prompt
+    - match: "rm -fr*"
+      approval: prompt
+    - match: "* rm -fr*"
+      approval: prompt
+    - match: "rm -fR*"
+      approval: prompt
+    - match: "* rm -fR*"
+      approval: prompt
+    - match: "rm -f -r*"
+      approval: prompt
+    - match: "* rm -f -r*"
+      approval: prompt
+    - match: "rm --recursive*"
+      approval: prompt
+    - match: "* rm --recursive*"
+      approval: prompt
+    # Recursive deletes (PowerShell; the cmdlet and its aliases, both common casings)
+    - match: "*Remove-Item*-Recurse*"
+      approval: prompt
+    - match: "*Remove-Item*-recurse*"
+      approval: prompt
+    - match: "*remove-item*-recurse*"
+      approval: prompt
+    - match: "*remove-item*-Recurse*"
+      approval: prompt
+    - match: "rm *-Recurse*"
+      approval: prompt
+    - match: "* rm *-Recurse*"
+      approval: prompt
+    - match: "ri *-Recurse*"
+      approval: prompt
+    - match: "* ri *-Recurse*"
+      approval: prompt
+    - match: "del *-Recurse*"
+      approval: prompt
+    - match: "* del *-Recurse*"
+      approval: prompt
+    - match: "rmdir *-Recurse*"
+      approval: prompt
+    - match: "* rmdir *-Recurse*"
+      approval: prompt
+    # Recursive deletes (cmd.exe)
+    - match: "rd /s*"
+      approval: prompt
+    - match: "* rd /s*"
+      approval: prompt
+    - match: "rd /S*"
+      approval: prompt
+    - match: "* rd /S*"
+      approval: prompt
+    - match: "rd /q /s*"
+      approval: prompt
+    - match: "* rd /q /s*"
+      approval: prompt
+    - match: "rmdir /s*"
+      approval: prompt
+    - match: "* rmdir /s*"
+      approval: prompt
+    - match: "rmdir /S*"
+      approval: prompt
+    - match: "* rmdir /S*"
+      approval: prompt
+    - match: "rmdir /q /s*"
+      approval: prompt
+    - match: "* rmdir /q /s*"
+      approval: prompt
+    - match: "del /s*"
+      approval: prompt
+    - match: "* del /s*"
+      approval: prompt
+    - match: "del /S*"
+      approval: prompt
+    - match: "* del /S*"
+      approval: prompt
+    - match: "del /*/s*"
+      approval: prompt
+    - match: "* del /*/s*"
+      approval: prompt
+    - match: "del /*/S*"
+      approval: prompt
+    - match: "* del /*/S*"
+      approval: prompt
+    # Destructive git
+    - match: "git push --force*"
+      approval: prompt
+    - match: "* git push --force*"
+      approval: prompt
+    - match: "git push -f*"
+      approval: prompt
+    - match: "* git push -f*"
+      approval: prompt
+    - match: "git push * --force*"
+      approval: prompt
+    - match: "* git push * --force*"
+      approval: prompt
+    - match: "git push * -f*"
+      approval: prompt
+    - match: "* git push * -f*"
+      approval: prompt
+    - match: "git push * +*"
+      approval: prompt
+    - match: "* git push * +*"
+      approval: prompt
+    - match: "git reset --hard*"
+      approval: prompt
+    - match: "* git reset --hard*"
+      approval: prompt
+    - match: "git reset * --hard*"
+      approval: prompt
+    - match: "* git reset * --hard*"
+      approval: prompt
+    - match: "git clean -*f*"
+      approval: prompt
+    - match: "* git clean -*f*"
+      approval: prompt
+    - match: "git branch -D*"
+      approval: prompt
+    - match: "* git branch -D*"
+      approval: prompt
+    - match: "git branch * -D*"
+      approval: prompt
+    - match: "* git branch * -D*"
+      approval: prompt
+    # Publishing
+    - match: "npm publish*"
+      approval: prompt
+    - match: "* npm publish*"
+      approval: prompt
+    - match: "pnpm publish*"
+      approval: prompt
+    - match: "* pnpm publish*"
+      approval: prompt
+    - match: "yarn publish*"
+      approval: prompt
+    - match: "* yarn publish*"
+      approval: prompt
+    - match: "yarn npm publish*"
+      approval: prompt
+    - match: "* yarn npm publish*"
+      approval: prompt
+    # Disk and system ("format" only at the start: "ruff format ." / "dotnet format" are routine)
+    - match: "format *"
+      approval: prompt
+    - match: "*Format-Volume*"
+      approval: prompt
+    - match: "*Clear-Disk*"
+      approval: prompt
+    - match: "diskpart*"
+      approval: prompt
+    - match: "* diskpart*"
+      approval: prompt
+    - match: "shutdown*"
+      approval: prompt
+    - match: "* shutdown*"
+      approval: prompt
+    - match: "*Restart-Computer*"
+      approval: prompt
+    - match: "*restart-computer*"
+      approval: prompt
+    - match: "*Stop-Computer*"
+      approval: prompt
+    - match: "*stop-computer*"
+      approval: prompt

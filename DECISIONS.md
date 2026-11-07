@@ -37,6 +37,20 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 | dsh-one-event | A dsh turn emits one `turn_completed` event (no separate `completed`), like the other engines. | yes |
 | unconfirmed-injection | When the hub cannot confirm a typed task was submitted, it presses Enter once more (never while a known trust/update dialog is on screen); if still unknown, it records the injection as unconfirmed. | no (was: press nothing more) |
 
+## Approval by default (2026-11-07, decided by the orchestrator, owner may revise)
+
+| id | decision |
+|---|---|
+| D1 enforced | Every engine starts and resumes with high-risk approval on; there is no opt-out. The hub strips each engine's bypass/mode flags from the profile args at launch (`apply_approval_flags`, next to the model/thinking injection) and adds a note to the launch result; `agent_profiles.json` is not rewritten. Stripped: omp `--auto-approve`, `--approval-mode`, `--config` at the hub overlay; kimi `--auto`, `--yolo`, `-y`; codex `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `--approve-for-me`, `-a`/`--ask-for-approval`, `-s`/`--sandbox`, `-c approval_policy=…`/`-c sandbox_mode=…`; agy `--dangerously-skip-permissions`, `--mode`. |
+| D2 omp | `--approval-mode=write --config=<repo>\engine_policies\omp-approval.yml`. The overlay allows ordinary shell commands and asks for the high-risk list (recursive deletes, force push / hard reset / clean -f / branch -D, publish, format / diskpart / shutdown / Restart-/Stop-Computer). Plain network fetches are not on it. |
+| D3 kimi | `-y` (Ask When Needed). `KIMI_CODE_DANGEROUS_COMMAND_GUARD` is never set; wider kimi coverage needs the owner's global config. |
+| D4 codex | `-a on-request -s workspace-write`, also on `codex resume`. Network through the proxy port stays reachable (accepted). |
+| D5 agy | `--settings '{"agentMode":"auto"}'` per launch (merged with any `--settings` in the profile); `~/.gemini/antigravity-cli/settings.json` is never written. A live launch showed it holds from the first turn, unlike `--mode auto`, so the task still goes in with `-i` and there is no Shift+Tab step. |
+| D6 dsh | Jobs need no flag (DSH already runs workspace-write + ask). The hub reads DSH's base URL from `hub_url` in dsh-crew's `config.json` (`HUB_DSH_CREW_CONFIG` overrides the path), falling back to `http://127.0.0.1:3080` (`dsh_endpoint.py`). |
+| D7 answering | No decision means an error, never an approval; free text means deny with that feedback. omp: approve once Ctrl+Q, session row by arrows + Enter (else approve once, noted), deny one Escape, keys wait 0.6 s after the prompt. agy: options read from the screen and mapped by label; the persist option (`3`) is never sent; deny feedback goes in as the next message. codex: `y` / `n`; session approval `a` on edit prompts only, command prompts approve once (never `p`), noted. kimi: one prompt is one pending interaction (the wire record adopts the screen one). |
+| D8 no approval_mode | The `approval_mode` parameter, field and output are gone; old records that carry it still load. |
+| D9 resume | Resume applies the same strip + inject to the stored args, so sessions created before this change resume with approval on. |
+
 ## Kimi startup and message injection (2026-11-06, decision page kimi-injection-2026-11-06)
 
 | id | decision | default kept |

@@ -201,7 +201,6 @@ async def spawn_subagent(
     task: Optional[str] = None,
     model: Optional[str] = None,
     thinking_level: Optional[str] = None,
-    approval_mode: str = "auto",
     cwd: Optional[str] = None,
     title: Optional[str] = None,
     wait_seconds: float = 5.0,
@@ -210,9 +209,9 @@ async def spawn_subagent(
     """
     以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台阻塞监听命令 `background_poll_command`。
     - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
-    - 支持通过 `approval_mode` 控制高风险权限与提问代批策略：
-      * `"auto"`（默认）：常规命令自动放行；当 Sub-Agent 触发高风险安全规则（如 `dsh-security-mode` 的 `action: ask`）或主动调用交互式提问工具（`ask` / `AskUserQuestion` / `ask_question` / `request_user_input_async`）时，自动进入 `waiting_parent` 状态并上报给主 Agent 代批或代选；
-      * `"delegate_to_parent"`：开启高风险行为代批模式（如 Kimi `-y` Ask When Needed、Codex `-a on-request`、AGY `--mode accept-edits`），所有敏感命令/修改及多选题均交由主 Agent 审批！
+    - 所有引擎一律以「高风险操作需审批」模式运行，无需也无法关闭：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
+    - 高风险操作暂停时，会话进入 `waiting_parent` 状态，并带有 `approval_request` 事件（`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
+    - 请调用 `respond_to_subagent_approval_or_choice(session_id, decision=...)` 代批或代选，未答复前 Sub-Agent 会一直等待。
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -223,7 +222,6 @@ async def spawn_subagent(
         title=title,
         model=model,
         thinking_level=thinking_level,
-        approval_mode=approval_mode,
     )
 
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
@@ -259,7 +257,6 @@ async def spawn_subagent(
         "session_id": session.session_id,
         "agent_type": session.profile_id,
         "engine": session.engine,
-        "approval_mode": session.approval_mode,
         "effective_model": session.effective_model,
         "effective_thinking_level": session.effective_thinking_level,
         "kind": session.kind,
@@ -524,11 +521,16 @@ async def respond_to_subagent_approval_or_choice(
 ) -> Dict[str, Any]:
     """
     [主 Agent 代批高风险操作 & 代选交互选项工具]
-    当 Sub-Agent 处于 `waiting_parent` 状态（收到 `approval_request` 或 `question` 事件，或 `pending_interaction` 非空）时，
-    主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / agy）的原生协议完成精准代批或代选：
-    - `decision`：语义化审批决策，可选 `"approve"`（允许一次 / 选第1项）、`"approve_session"`（本会话允许 / 选第2项）、`"deny"`（拒绝）；
-    - `option_index`：1-based 选项序号（如 `1`, `2`, `3`），直接选择 `pending_interaction.options` 中的第 N 项；
-    - `custom_input`：自定义文本输入（当选择 Other 自由输入、提供拒绝原因反馈或回答开放式问题时传入）。
+    所有引擎都以「高风险操作需审批」模式运行：Sub-Agent 要执行高风险操作时，会话进入 `waiting_parent` 状态并发出 `approval_request` 事件
+    （`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
+    主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
+    - `decision`：审批决定，`"approve"`（只允许这一次）、`"approve_session"`（本会话内同类操作不再询问）、`"deny"`（拒绝）；
+      审批请求必须给出明确决定，不传任何参数不会默认放行。
+    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（会持久写入全局规则的选项不会出现在列表里）；
+    - `custom_input`：与 `decision="deny"` 同传时作为拒绝理由反馈给 Sub-Agent；审批请求只传 `custom_input` 时视为「拒绝并反馈这段文字」；
+      回答问题时作为 Other 自由输入。
+    - 引擎差异：codex 的命令审批、以及由规则触发的 omp 审批没有「本会话允许」，`approve_session` 会按允许一次处理；
+      kimi 的「本会话允许」对危险命令不生效。返回值的 `notes` 会说明实际效果。
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -1221,7 +1223,6 @@ async def api_create_session(req: Request):
     hwnd = body.get("hwnd")
     model = body.get("model")
     thinking_level = body.get("thinking_level")
-    approval_mode = body.get("approval_mode", "auto")
     await ensure_profiles_loaded()
     try:
         sess = await hub.create_session(
@@ -1232,7 +1233,6 @@ async def api_create_session(req: Request):
             hwnd=hwnd,
             model=model,
             thinking_level=thinking_level,
-            approval_mode=approval_mode,
         )
     except ValueError as e:
         return bad_request(str(e))

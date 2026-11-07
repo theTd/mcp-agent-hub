@@ -1055,6 +1055,370 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
     return [str(a) for i, a in enumerate(args) if i not in drop]
 
 
+# ── Approval by default (owner decision 2026-11-07, DECISIONS.md D1-D5/D9) ─────────────────────
+# Every engine runs in the mode where routine work runs on its own and high-risk operations stop
+# for approval (the main agent answers through respond_to_subagent_approval_or_choice). There is
+# no opt-out: the hub strips each engine's bypass/mode flags from the profile (or the archived
+# snapshot on resume) and injects its own, in the same place as the model/thinking injection.
+ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
+OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
+# D5: agy's `--mode auto` falls back to `default` at launch (its check runs before sign-in ends);
+# `--settings` (this session only, never saved) applies agentMode after sign-in, before turn one.
+AGY_SESSION_SETTINGS: Dict[str, Any] = {"agentMode": "auto"}
+
+
+def omp_approval_overlay_path() -> Path:
+    """D2: the omp settings overlay shipped in the repo (bash allowed, high-risk patterns prompt)."""
+    return ENGINE_POLICIES_DIR / OMP_APPROVAL_OVERLAY_NAME
+
+
+def _is_omp_overlay_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_OVERLAY_NAME
+
+
+def _approval_flag_tokens(engine: str, args: List[str]):
+    """Yields (index, flag label) for every approval/bypass/mode argument of one engine (D1)."""
+    eng = (engine or "").strip().lower()
+    total = len(args)
+    i = 0
+
+    def nxt(k: int) -> str:
+        return str(args[k + 1]) if k + 1 < total else ""
+
+    while i < total:
+        a = str(args[i])
+        width = 0
+        label = a
+        if eng == "omp":
+            if a == "--auto-approve" or a.startswith("--approval-mode="):
+                width, label = 1, a.split("=", 1)[0]
+            elif a == "--approval-mode":
+                width = 2
+            elif a.startswith("--config=") and _is_omp_overlay_path(a.split("=", 1)[1]):
+                width, label = 1, "--config="
+            elif a == "--config" and _is_omp_overlay_path(nxt(i)):
+                width = 2
+        elif eng == "kimi":
+            if a in ("--auto", "--yolo", "-y"):
+                width = 1
+        elif eng == "codex":
+            if a in ("--dangerously-bypass-approvals-and-sandbox", "--full-auto", "--approve-for-me"):
+                width = 1
+            elif a in ("-a", "--ask-for-approval", "-s", "--sandbox"):
+                width = 2
+            elif a.startswith("--ask-for-approval=") or a.startswith("--sandbox="):
+                width, label = 1, a.split("=", 1)[0]
+            elif a in ("-c", "--config"):
+                value = nxt(i).strip().lstrip('"').lstrip("'")
+                if value.startswith("approval_policy") or value.startswith("sandbox_mode"):
+                    width, label = 2, f"{a} {value.split('=', 1)[0].strip()}"
+        elif eng == "agy":
+            if a == "--dangerously-skip-permissions":
+                width = 1
+            elif a in ("--mode", "--settings"):
+                width = 2
+            elif a.startswith("--mode=") or a.startswith("--settings="):
+                width, label = 1, a.split("=", 1)[0]
+        if width:
+            for k in range(i, min(i + width, total)):
+                yield k, label
+            i += width
+            continue
+        i += 1
+
+
+def approval_flags_in_args(engine: str, args: List[str]) -> List[str]:
+    """The approval/bypass/mode flags present in `args` (labels, first-appearance order)."""
+    labels: List[str] = []
+    for _idx, label in _approval_flag_tokens(engine, args):
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _agy_settings_object(raw: str) -> Optional[Dict[str, Any]]:
+    """A `--settings` value (inline JSON object or a JSON file path) as a dict; None if unreadable."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        if text.startswith("{"):
+            obj = json.loads(text)
+        else:
+            obj = json.loads(Path(os.path.expanduser(text.strip('"').strip("'"))).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _agy_profile_settings(args: List[str]) -> Dict[str, Any]:
+    """Every readable `--settings` object in the profile args, merged in order (later keys win)."""
+    merged: Dict[str, Any] = {}
+    total = len(args)
+    i = 0
+    while i < total:
+        a = str(args[i])
+        value: Optional[str] = None
+        if a == "--settings" and i + 1 < total:
+            value = str(args[i + 1])
+            i += 1
+        elif a.startswith("--settings="):
+            value = a.split("=", 1)[1]
+        if value is not None:
+            merged.update(_agy_settings_object(value) or {})
+        i += 1
+    return merged
+
+
+def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -> List[str]:
+    """The flags the hub injects so `engine` runs with high-risk approval on (D2-D5)."""
+    eng = (engine or "").strip().lower()
+    if eng == "omp":
+        return ["--approval-mode=write", f"--config={omp_approval_overlay_path()}"]
+    if eng == "kimi":
+        return ["-y"]
+    if eng == "codex":
+        return ["-a", "on-request", "-s", "workspace-write"]
+    if eng == "agy":
+        settings = _agy_profile_settings(list(profile_args or []))
+        settings.update(AGY_SESSION_SETTINGS)
+        return ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":"))]
+    return []
+
+
+def apply_approval_flags(engine: str, args: List[str]) -> List[str]:
+    """D1/D9: strip every approval/bypass/mode flag, then inject the hub's own at the front."""
+    raw = [str(a) for a in args]
+    drop = {idx for idx, _label in _approval_flag_tokens(engine, raw)}
+    kept = [a for i, a in enumerate(raw) if i not in drop]
+    return approval_launch_flags(engine, raw) + kept
+
+
+# ── D7: reading the engines' approval prompts and answering them ──────────────────────────────
+# What an option of an approval prompt does when chosen. "persist" writes a permanent rule (agy
+# option 3 -> settings.json, codex `p` -> ~/.codex/rules/default.rules): the hub never sends it.
+APPROVAL_APPROVE_DECISIONS = ("approve", "allow", "allow_once", "approve_once", "yes", "y", "ok", "accept")
+APPROVAL_SESSION_DECISIONS = (
+    "approve_session", "allow_session", "always", "a", "session",
+    "approve_for_this_session", "allow_for_this_session",
+)
+APPROVAL_DENY_DECISIONS = ("deny", "reject", "no", "n", "cancel")
+# omp ignores keys for 500 ms after its prompt opens (research 2026-11-07); the hub waits longer.
+OMP_PROMPT_KEY_GUARD_SEC = 0.6
+# agy: after a deny the turn ends; the feedback is typed as the next message once the composer is back.
+AGY_DENY_FEEDBACK_DELAY_SEC = 1.2
+# A machine record (kimi wire) of a prompt the screen detector already registered and the parent
+# already answered is the same prompt if it arrives this soon after the screen registration.
+SCREEN_ADOPT_WINDOW_SEC = 20.0
+# After an interaction is answered or resolved, the screen detector waits this long before it
+# reads prompts again, so the closing prompt still on screen is not registered a second time.
+TUI_PROMPT_REDETECT_QUIET_SEC = 2.5
+_OPTION_LINE_RE = re.compile(r"^\s*[>❯›▶]?\s*(\d+)\.\s+(.*\S)\s*$")
+
+
+def classify_approval_label(label: str) -> str:
+    """approve_once | approve_session | persist | deny | deny_feedback for one option label."""
+    low = str(label or "").strip().lower()
+    if "with feedback" in low or "deny and send" in low:
+        return "deny_feedback"
+    if low.startswith("no") or low.startswith("reject") or low.startswith("deny") or "cancel" == low:
+        return "deny"
+    if "persist" in low or "settings.json" in low or low.endswith("(p)"):
+        return "persist"
+    if ("for this session" in low or "in this conversation" in low
+            or "don't ask again for these files" in low):
+        return "approve_session"
+    if "always" in low or "don't ask again" in low:
+        return "persist"
+    return "approve_once"
+
+
+def _numbered_options(lines: List[str]) -> List[Dict[str, Any]]:
+    """The last block of `N. label` lines; a wrapped label's continuation lines are joined to it."""
+    blocks: List[List[Dict[str, Any]]] = []
+    current: Optional[List[Dict[str, Any]]] = None
+    for raw in lines:
+        m = _OPTION_LINE_RE.match(raw)
+        if m:
+            key, label = m.group(1), m.group(2).strip()
+            if current is None or key == "1":
+                current = []
+                blocks.append(current)
+            current.append({"key": key, "label": label})
+            continue
+        stripped = raw.strip()
+        # A continuation of the previous label (agy wraps long ones at the screen edge); a blank
+        # line or the prompt's own key hint line ends the block.
+        if current and stripped and not any(
+            h in stripped for h in ("Navigate", "Press enter", "choose", "esc to cancel")
+        ):
+            current[-1]["label"] = f"{current[-1]['label']} {stripped}"
+            continue
+        current = None
+    return blocks[-1] if blocks else []
+
+
+def parse_omp_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
+    """omp's tool approval box: `Allow tool: <name>` header, `Approve…` and `Deny` rows (D7).
+
+    Returns {tool, reason, command, options, session_label, deny_label} or None. The optional
+    `Approve <subject> for this session` row only shows for plain write-mode prompts, not for
+    pattern / critical-pattern prompts.
+    """
+    lines = str(screen or "").splitlines()
+    head = None
+    for idx, line in enumerate(lines):
+        if "Allow tool:" in line:
+            head = idx
+    if head is None:
+        return None
+    tool = lines[head].split("Allow tool:", 1)[1].strip(" ─━│╮╭").strip()
+    rows: List[str] = []
+    for line in lines[head + 1:]:
+        s = line.strip()
+        if s.startswith(("├", "╰", "└", "┣", "┗")):
+            break
+        s = s.strip("│┃║").strip()
+        rows.append(s)
+    options: List[str] = []
+    details: List[str] = []
+    selected_index = 0
+    for s in rows:
+        label = s.lstrip("❯>›").strip()
+        if label == "Approve" or label.startswith(("Approve ", "Always Approve")) or label.startswith("Deny"):
+            if s[:1] in ("❯", ">", "›"):
+                selected_index = len(options)
+            options.append(label)
+        elif not options and s:
+            details.append(s)
+    approve = [o for o in options if o.startswith(("Approve", "Always Approve"))]
+    deny = [o for o in options if o.startswith("Deny")]
+    if not approve or not deny:
+        return None
+    reason = ""
+    command_lines: List[str] = []
+    for s in details:
+        if s.startswith("Reason:"):
+            reason = s.split(":", 1)[1].strip()
+        elif s.startswith("Command:"):
+            command_lines.append(s.split(":", 1)[1].strip())
+        elif command_lines:
+            command_lines.append(s)
+    session_label = next(
+        (o for o in approve if o.startswith("Approve ") and o.endswith("for this session")), None
+    )
+    return {
+        "tool": tool,
+        "reason": reason,
+        "command": " ".join(command_lines).strip(),
+        "details": details,
+        "options": options,
+        "selected_index": selected_index,
+        "session_label": session_label,
+        "deny_label": deny[0],
+    }
+
+
+def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
+    """agy's permission prompt (`Run this command?` + numbered Yes/No options, digits act at once).
+
+    The options are read from the screen and mapped by label, so a prompt with another option
+    count still gets the right key. Returns {header, reason, command, options:[{key,label,action}]}.
+    """
+    lines = str(screen or "").splitlines()
+    text = "\n".join(lines)
+    head = None
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith(("Run this command?", "Requesting permission for", "Allow access to")):
+            head = idx
+    if head is None:
+        # A prompt worded differently (file / URL access, not captured yet): Yes/No options with
+        # agy's "esc to cancel" hint, and not its ask_question selector.
+        if "esc to cancel" not in text or "Question 1/" in text:
+            return None
+        head = 0
+    opts = _numbered_options(lines[head:])
+    if not opts and "Yes, allow" in text and "No, deny" in text:
+        # The older two-row prompt without numbers: Enter takes the first row, Down+Enter the second.
+        opts = [{"key": "\r", "label": "Yes, allow"}, {"key": "\x1b[B\r", "label": "No, deny"}]
+    if not opts:
+        return None
+    for o in opts:
+        o["action"] = classify_approval_label(o["label"])
+    if not any(o["action"] == "approve_once" for o in opts) or not any(o["action"] == "deny" for o in opts):
+        return None
+    reason = ""
+    command_lines: List[str] = []
+    collecting = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("Reason:"):
+            reason = s.split(":", 1)[1].strip()
+        elif s.startswith("Requesting permission for"):
+            collecting = True
+            command_lines = []
+        elif collecting:
+            if not s or s.startswith("Run this command?"):
+                collecting = False
+            else:
+                command_lines.append(s)
+    return {
+        "header": lines[head].strip() if lines else "",
+        "reason": reason,
+        "command": " ".join(command_lines).strip(),
+        "options": opts,
+    }
+
+
+def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
+    """codex's approval modal: a command prompt or an edit prompt, with its numbered options."""
+    text = str(screen or "")
+    if "Would you like to run the following command?" in text:
+        kind, marker = "command", "Would you like to run the following command?"
+    elif "Would you like to make the following edits?" in text:
+        kind, marker = "edit", "Would you like to make the following edits?"
+    else:
+        return None
+    lines = text.splitlines()
+    head = max(i for i, line in enumerate(lines) if marker in line)
+    opts = _numbered_options(lines[head + 1:])
+    for o in opts:
+        o["action"] = classify_approval_label(o["label"])
+    reason = ""
+    command = ""
+    destination = ""
+    for line in lines[head + 1:]:
+        s = line.strip()
+        if s.startswith("Reason:"):
+            reason = s.split(":", 1)[1].strip()
+        elif s.startswith("$ ") and not command:
+            command = s[2:].strip()
+        elif s.startswith("Destination:"):
+            destination = s.split(":", 1)[1].strip()
+    return {"prompt_kind": kind, "reason": reason, "command": command,
+            "destination": destination, "options": opts}
+
+
+def kimi_panel_command(screen: str) -> str:
+    """The `$ <command>` line of kimi's approval panel (empty when there is none)."""
+    for line in str(screen or "").splitlines():
+        s = line.strip()
+        if s.startswith("$ "):
+            return s[2:].strip()
+    return ""
+
+
+def _collapsed(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _one_line(text: Optional[str]) -> str:
+    """Feedback typed into an approval prompt: a line break there would press Enter too early."""
+    return re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+
+
 class HubTerminalScreen(pyte.HistoryScreen):
     """K4 (fix 9): the hub's screen model of a PTY.
 
@@ -1209,7 +1573,6 @@ class AgentSession:
         self.pending_question_id: Optional[str] = None
         self.pending_interaction: Optional[Dict[str, Any]] = None
         self.engine: str = "generic"
-        self.approval_mode: str = "auto"
         self.transcript_path: Optional[Path] = None
         # K3 (fix 9): user messages the transcript watcher has read from this session's transcript
         # (a counter and the newest text), so a typed submit can be proved by the transcript itself.
@@ -1242,6 +1605,10 @@ class AgentSession:
         self._scrollback_rev_written: int = -1
         self._seen_tui_tool_lines: Set[str] = set()
         self._seen_tui_prompt_signatures: Set[str] = set()
+        # D7: the last screen-detected interaction no machine record has adopted yet, and the
+        # moment until which the screen detector leaves a just-answered prompt alone.
+        self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
+        self._prompt_quiet_until: float = 0.0
 
         # Headless VT100 terminal screen buffer WITH 3,000-line scrollback history!
         # K4 (fix 9): the hub's subclasses keep one bad escape sequence from losing the rest of a chunk.
@@ -1699,7 +2066,6 @@ class AgentSession:
             "profile_id": self.profile_id,
             "profile_name": self.profile_name,
             "engine": self.engine,
-            "approval_mode": self.approval_mode,
             "kind": self.kind,
             "title": self.title,
             "cwd": self.cwd,
@@ -3081,6 +3447,11 @@ class HubSessionManager:
             "command": command, "args": [], "env": env, "cwd": cwd,
             "message_mode": "none", "attach_offset": 0,
         }
+        # D9 (2026-11-07): the snapshot goes through the same strip+inject as a fresh launch, so a
+        # session archived before approval-by-default (with --auto-approve, --auto, ...) resumes in
+        # the safe mode too. omp's in-memory "approve for this session" is gone after a resume anyway.
+        if engine in ("omp", "kimi", "agy", "codex"):
+            base_args = apply_approval_flags(engine, base_args)
         if engine == "omp":
             # V4: the spawn carried --append-system-prompt=<worker-bridge hint>. A resume that drops
             # it leaves the same session without the hint it was started with.
@@ -3204,7 +3575,6 @@ class HubSessionManager:
         sess.engine = engine
         sess.effective_model = snapshot.get("model") or record.get("effective_model")
         sess.effective_thinking_level = snapshot.get("thinking_level") or record.get("effective_thinking_level")
-        sess.approval_mode = str(prof.get("approval_mode") or "auto")
         sess.last_task = str(record.get("last_task") or "")
         sess.created_at = float(record.get("created_at") or time.time())
         sess.profile_snapshot = dict(snapshot)
@@ -4200,7 +4570,6 @@ class HubSessionManager:
             "lifecycle_status": meta.get("status"),
             "profile_id": meta.get("profile_id"),
             "engine": meta.get("engine"),
-            "approval_mode": meta.get("approval_mode"),
             "title": meta.get("title"),
             "cwd": meta.get("cwd"),
             "step_count": max(meta.get("step_count", 0), transcript_summary.get("step_count", 0), len(tools)),
@@ -4332,8 +4701,17 @@ class HubSessionManager:
         transitions the session to `waiting_parent`, and emits a sequenced event to wake the Parent Agent.
         """
         req_id = request_id or f"int-{uuid.uuid4().hex[:8]}"
-        if session.pending_interaction and session.pending_interaction.get("request_id") == req_id:
+        if session.pending_interaction and req_id in self._interaction_ids(session.pending_interaction):
             return session.pending_interaction
+        from_screen = str(source or "").endswith("_screen_detector")
+        if request_id and not from_screen:
+            # D7: one prompt = one pending interaction. A machine record (kimi wire, agy transcript)
+            # of a prompt the screen detector registered first adopts that registration.
+            adopted = self._adopt_screen_interaction(
+                session, kind, req_id, title, prompt, source, dict(metadata or {})
+            )
+            if adopted is not None:
+                return adopted
 
         interaction: Dict[str, Any] = {
             "request_id": req_id,
@@ -4347,6 +4725,10 @@ class HubSessionManager:
             "created_at": round(time.time(), 3),
             "metadata": dict(metadata or {}),
         }
+        if from_screen:
+            interaction["origin"] = "screen"
+            # D7: remembered until a machine record adopts it (also after it has been answered).
+            session._unadopted_screen_interaction = interaction
         session.pending_interaction = interaction
         session.pending_question_id = req_id
         session.status = "waiting_parent"
@@ -4389,22 +4771,283 @@ class HubSessionManager:
         )
         return interaction
 
+    @staticmethod
+    def _interaction_ids(interaction: Optional[Dict[str, Any]]) -> Set[str]:
+        """The request id of an interaction plus the ids it was known by before an adoption (D7)."""
+        if not interaction:
+            return set()
+        ids = {str(i) for i in (interaction.get("aliases") or []) if i}
+        if interaction.get("request_id"):
+            ids.add(str(interaction["request_id"]))
+        return ids
+
+    def _adopt_screen_interaction(
+        self,
+        session: AgentSession,
+        kind: str,
+        request_id: str,
+        title: str,
+        prompt: str,
+        source: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """D7: a machine record of the prompt the screen detector already registered.
+
+        Pending: the screen registration takes the record's id (the old id stays an alias, so an
+        answer that quotes either id works) and no second event wakes the parent. Already answered
+        within SCREEN_ADOPT_WINDOW_SEC: the record is that prompt, already handled; nothing is
+        registered. Anything else (another kind, another command) is a new prompt: None.
+        """
+        cand = getattr(session, "_unadopted_screen_interaction", None)
+        if not cand or cand.get("kind") != kind:
+            return None
+        record_cmd = _collapsed(metadata.get("command") or "")[:40]
+        screen_text = _collapsed(
+            f"{(cand.get('metadata') or {}).get('command') or ''} {cand.get('prompt') or ''}"
+        )
+        if record_cmd and record_cmd not in screen_text:
+            return None
+        pending = session.pending_interaction
+        if pending is cand:
+            old_id = str(cand.get("request_id") or "")
+            entry = self.pending_questions.get(old_id)
+            cand["aliases"] = [i for i in (list(cand.get("aliases") or []) + [old_id]) if i]
+            cand["request_id"] = request_id
+            cand["title"] = title or cand.get("title")
+            cand["prompt"] = prompt or cand.get("prompt")
+            cand["source"] = f"{source} (adopted {cand.get('source')})"
+            cand["metadata"] = {**(cand.get("metadata") or {}), **metadata}
+            cand.pop("origin", None)
+            session.pending_question_id = request_id
+            if entry is not None:
+                entry["request_id"] = request_id
+                entry["interaction"] = cand
+                self.pending_questions[request_id] = entry
+            session._unadopted_screen_interaction = None
+            self.persist_session(session)
+            return cand
+        if pending is None and (time.time() - float(cand.get("created_at") or 0)) <= SCREEN_ADOPT_WINDOW_SEC:
+            # Answered before its machine record was read: the same prompt, already handled.
+            session._unadopted_screen_interaction = None
+            return dict(cand, request_id=request_id, aliases=[cand.get("request_id")], already_resolved=True)
+        return None
+
     def clear_pending_interaction(self, session: AgentSession, request_id: Optional[str] = None):
         """Clears an active pending interaction when resolved via Parent response or native Transcript event."""
         if not session.pending_interaction:
             return
-        if request_id and session.pending_interaction.get("request_id") != request_id:
+        ids = self._interaction_ids(session.pending_interaction)
+        if request_id and request_id not in ids:
             return
-        old_id = session.pending_interaction.get("request_id")
         session.pending_interaction = None
-        if session.pending_question_id == old_id:
+        if session.pending_question_id in ids:
             session.pending_question_id = None
-        if old_id and old_id in self.pending_questions:
-            self.pending_questions[old_id]["answered"] = True
-            self.pending_questions[old_id]["event"].set()
+        for qid in ids:
+            if qid in self.pending_questions:
+                self.pending_questions[qid]["answered"] = True
+                self.pending_questions[qid]["event"].set()
+        # D7: the answered prompt may still be drawn for a moment; the screen detector waits.
+        session._prompt_quiet_until = time.time() + TUI_PROMPT_REDETECT_QUIET_SEC
         if session.status == "waiting_parent":
             session.status = "running"
         self.persist_session(session)
+
+    @staticmethod
+    def _resolve_approval_choice(
+        dec_norm: str,
+        option_index: Optional[int],
+        custom_input: Optional[str],
+        options: List[str],
+    ) -> tuple:
+        """D7: (action, chosen label, option index) for an approval prompt of kimi / omp / codex / agy.
+
+        action is approve_once | approve_session | deny | deny_feedback. An option picked by number
+        or by its exact label acts as that option; free text without a decision denies the call and
+        is sent as feedback (the engines' "type to deny and steer"). No decision at all is refused:
+        a high-risk call is never approved by default.
+        """
+        feedback = (custom_input or "").strip()
+
+        def by_label(idx: int, with_feedback: bool) -> tuple:
+            label = options[idx]
+            action = classify_approval_label(label)
+            if action == "persist":
+                # Never sent: a permanent rule is the owner's call, not a sub-agent approval.
+                action = "approve_once"
+            if action == "deny" and with_feedback and feedback:
+                action = "deny_feedback"
+            if action == "deny_feedback" and not (with_feedback and feedback):
+                action = "deny"
+            return action, label, idx + 1
+
+        def label_for(action: str) -> str:
+            want = "deny" if action == "deny_feedback" else action
+            for opt in options:
+                if classify_approval_label(opt) == want:
+                    return opt
+            return action
+
+        idx = option_index
+        if idx is None and dec_norm.isdigit():
+            idx = int(dec_norm)
+        if idx is not None:
+            if not 1 <= int(idx) <= len(options):
+                raise ValueError(f"option_index 超出范围：可选 1..{len(options)}")
+            return by_label(int(idx) - 1, True)
+        if dec_norm:
+            if dec_norm in APPROVAL_APPROVE_DECISIONS:
+                action = "approve_once"
+            elif dec_norm in APPROVAL_SESSION_DECISIONS:
+                action = "approve_session"
+            elif dec_norm in APPROVAL_DENY_DECISIONS:
+                action = "deny_feedback" if feedback else "deny"
+            else:
+                raise ValueError(
+                    f"无法识别的审批决定「{dec_norm}」：请用 approve / approve_session / deny，"
+                    f"或 option_index / custom_input"
+                )
+            return action, label_for(action), None
+        if feedback:
+            low = feedback.lower()
+            for i, opt in enumerate(options):
+                if low == opt.strip().lower():
+                    return by_label(i, False)
+            as_decision = low.replace(" ", "_")
+            if as_decision in APPROVAL_APPROVE_DECISIONS:
+                return "approve_once", label_for("approve_once"), None
+            if as_decision in APPROVAL_SESSION_DECISIONS:
+                return "approve_session", label_for("approve_session"), None
+            if as_decision in APPROVAL_DENY_DECISIONS:
+                return "deny", label_for("deny"), None
+            return "deny_feedback", label_for("deny_feedback"), None
+        raise ValueError(
+            "审批请求需要明确的决定：decision=approve / approve_session / deny，或 option_index，"
+            "或 custom_input（自由文本＝拒绝并把文本作为反馈）"
+        )
+
+    @staticmethod
+    def _write_keys_scheduled(sess: AgentSession, loop, steps: List[tuple]) -> None:
+        """Writes (offset_sec, text) steps to the PTY: on the loop's timer, or in order with sleeps."""
+        if loop is not None:
+            for offset, text in steps:
+                if offset <= 0:
+                    sess.write_input(text)
+                else:
+                    loop.call_later(offset, sess.write_input, text)
+            return
+        elapsed = 0.0
+        for offset, text in steps:
+            if offset > elapsed:
+                time.sleep(offset - elapsed)
+                elapsed = offset
+            sess.write_input(text)
+
+    def _answer_omp_approval(
+        self,
+        sess: AgentSession,
+        loop,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        action: str,
+        custom_input: Optional[str],
+    ) -> tuple:
+        """D7: omp's tool approval box. Ctrl+Q approves once; the session row (only when it exists)
+        is reached with arrow keys from the selected row, then Enter; Escape denies, once only (the
+        owner's doubleEscapeAction is rewind); typed text + Enter denies and steers. omp ignores
+        keys for 500 ms after the box opens, so nothing is sent before 0.6 s have passed."""
+        feedback = _one_line(custom_input)
+        created = float(inter.get("created_at") or 0.0)
+        guard = max(0.0, OMP_PROMPT_KEY_GUARD_SEC - (time.time() - created)) if created else 0.0
+        note = ""
+        if meta.get("omp_prompt") == "settings":
+            # The settings-change confirm (Allow once / Always for this session / Deny).
+            keys = {"approve_once": [(0.0, "\r")], "approve_session": [(0.0, "\x1b[B"), (0.15, "\r")],
+                    "deny": [(0.0, "\x1b")], "deny_feedback": [(0.0, "\x1b")]}[action]
+            self._write_keys_scheduled(sess, loop, [(guard + off, k) for off, k in keys])
+            if action == "deny_feedback" and feedback:
+                note = "omp 设置变更确认不接受反馈文本：已拒绝，反馈请另用 send_to_subagent 发送"
+            return f"OMP settings confirm {action} ({keys!r})", note
+        if action == "approve_once":
+            steps = [(0.0, "\x11")]
+            trace = "OMP approval Ctrl+Q (Approve once)"
+        elif action == "approve_session":
+            screen_opts = list(meta.get("omp_options") or [])
+            label = meta.get("session_label")
+            if label and label in screen_opts:
+                move = screen_opts.index(label) - int(meta.get("selected_index") or 0)
+                arrows = ("\x1b[B" * move) if move >= 0 else ("\x1b[A" * -move)
+                steps = [(0.0, arrows), (0.15, "\r")] if arrows else [(0.0, "\r")]
+                trace = f"OMP approval {abs(move)}x{'Down' if move >= 0 else 'Up'} + Enter ({label})"
+            else:
+                steps = [(0.0, "\x11")]
+                trace = "OMP approval Ctrl+Q (Approve once; no session row)"
+                note = "这个 omp 审批框没有「本会话允许」选项（规则触发的提示只有 Approve / Deny）：本次只允许了一次"
+        elif action == "deny_feedback":
+            steps = [(0.0, feedback), (0.4, "\r")]
+            trace = f"OMP approval typed feedback {feedback!r} + Enter (Deny and send message)"
+        else:
+            steps = [(0.0, "\x1b")]
+            trace = "OMP approval Escape (Deny)"
+        self._write_keys_scheduled(sess, loop, [(guard + off, k) for off, k in steps])
+        return trace, note
+
+    def _answer_agy_approval(
+        self,
+        sess: AgentSession,
+        loop,
+        meta: Dict[str, Any],
+        action: str,
+        chosen_label: str,
+        custom_input: Optional[str],
+    ) -> tuple:
+        """D7: agy picks an option with its digit at once (no Enter). The key is looked up by label
+        among the options read from the screen; the option that persists to settings.json is never
+        sent. Deny with feedback = deny, then the feedback is typed as the next message."""
+        feedback = (custom_input or "").strip()
+        opts = [o for o in (meta.get("agy_options") or []) if isinstance(o, dict)]
+        if not opts:
+            # A registration without the screen's options: the layout captured on 2026-11-07.
+            opts = [
+                {"key": "1", "label": "Yes, run command", "action": "approve_once"},
+                {"key": "2", "label": "Yes, and always allow in this conversation", "action": "approve_session"},
+                {"key": "4", "label": "No, cancel", "action": "deny"},
+            ]
+        sendable = [o for o in opts if o.get("action") != "persist"]
+        want = "deny" if action == "deny_feedback" else action
+        chosen = next((o for o in sendable if o.get("label") == chosen_label and o.get("action") == want), None)
+        if chosen is None:
+            chosen = next((o for o in sendable if o.get("action") == want), None)
+        note = ""
+        if chosen is None and want == "approve_session":
+            chosen = next((o for o in sendable if o.get("action") == "approve_once"), None)
+            note = "这个 agy 提示没有「本对话允许」选项：本次只允许了一次"
+        if chosen is None and want == "deny":
+            chosen = {"key": "\x1b", "label": "esc to cancel", "action": "deny"}
+        if chosen is None:
+            raise ValueError("agy 审批提示里没有可用的允许选项，未发送任何按键")
+        sess.write_input(str(chosen["key"]))
+        trace = f"AGY permission prompt key {chosen['key']!r} ({chosen.get('label')})"
+        if action == "deny_feedback" and feedback:
+            trace += f" + feedback as next message {feedback!r}"
+        return trace, note
+
+    def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
+        """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
+
+        A new interaction pending by then would take the text as its own answer (a deny), so the
+        feedback is dropped instead, and the drop is recorded."""
+        sess = self.sessions.get(session_id)
+        if sess is None or not sess.is_process_alive():
+            return
+        if sess.pending_interaction is not None:
+            logger.warning("[%s] deny feedback not typed: a new interaction is pending", session_id)
+            self.db.add_intermediate_message(
+                session_id, sess.step_count,
+                f"[Parent deny feedback NOT delivered: a new interaction was pending] {text}",
+                source="parent_approval_proxy",
+            )
+            return
+        self.deliver_parent_message(session_id, text, also_write_pty=True)
 
     def respond_to_interaction(
         self,
@@ -4434,12 +5077,22 @@ class HubSessionManager:
         options: List[str] = list(inter.get("options") or [])
         meta: Dict[str, Any] = dict(inter.get("metadata") or (q_entry or {}))
 
-        dec_norm = (decision or "").strip().lower()
+        dec_norm = (decision or "").strip().lower().replace(" ", "_")
         chosen_idx_1based: Optional[int] = option_index
         chosen_label: str = ""
+        # D7: an approval prompt of a TUI engine is answered by what the choice does (approve once,
+        # approve for the session, deny, deny with feedback), mapped to that engine's own keys.
+        approval_action: Optional[str] = None
+        notes: List[str] = []
+        if kind == "approval_request" and eng in ("kimi", "omp", "codex", "agy") and not sess.dsh_spec:
+            approval_action, chosen_label, chosen_idx_1based = self._resolve_approval_choice(
+                dec_norm, option_index, custom_input, options
+            )
 
         # Map semantic decision or custom_input matching onto 1-based option_index
-        if chosen_idx_1based is None:
+        if approval_action is not None:
+            pass
+        elif chosen_idx_1based is None:
             if dec_norm in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
                 chosen_idx_1based = int(dec_norm)
             elif custom_input and options:
@@ -4449,7 +5102,7 @@ class HubSessionManager:
                         chosen_idx_1based = idx + 1
                         break
 
-        if chosen_idx_1based is None and dec_norm:
+        if approval_action is None and chosen_idx_1based is None and dec_norm:
             if dec_norm in ("approve", "allow", "allow_once", "yes", "y", "ok", "accept"):
                 chosen_idx_1based = 1
             elif dec_norm in ("approve_session", "allow_session", "always", "a", "session"):
@@ -4463,7 +5116,9 @@ class HubSessionManager:
                         break
                 chosen_idx_1based = deny_idx or (3 if len(options) >= 3 else max(1, len(options)))
 
-        if chosen_idx_1based is not None and 1 <= chosen_idx_1based <= len(options):
+        if approval_action is not None:
+            pass
+        elif chosen_idx_1based is not None and 1 <= chosen_idx_1based <= len(options):
             chosen_label = options[chosen_idx_1based - 1]
         elif custom_input:
             chosen_label = custom_input.strip()
@@ -4533,20 +5188,18 @@ class HubSessionManager:
             if kind == "approval_request":
                 # In Kimi ApprovalPanelComponent:
                 # 1 = Approve once, 2 = Approve for this session, 3 = Reject, 4 = Reject with feedback
-                if dec_norm in ("deny", "reject", "no") and custom_input:
-                    sess.write_input("4")
-                    if loop:
-                        loop.call_later(0.25, sess.write_input, custom_input.strip() + "\r")
-                    else:
-                        time.sleep(0.25)
-                        sess.write_input(custom_input.strip() + "\r")
-                    action_trace = f"Kimi ApprovalPanel key '4' + feedback {custom_input.strip()!r}"
+                feedback = _one_line(custom_input)
+                if approval_action == "deny_feedback":
+                    self._write_keys_scheduled(sess, loop, [(0.0, "4"), (0.25, feedback + "\r")])
+                    action_trace = f"Kimi ApprovalPanel key '4' + feedback {feedback!r}"
                 else:
-                    key_num = str(chosen_idx_1based or 1)
-                    if key_num not in ("1", "2", "3", "4"):
-                        key_num = "1"
+                    key_num = {"approve_once": "1", "approve_session": "2", "deny": "3"}[approval_action]
                     sess.write_input(key_num)
                     action_trace = f"Kimi ApprovalPanel key {key_num!r} ({chosen_label})"
+                    if approval_action == "approve_session":
+                        notes.append(
+                            "kimi 的「本会话允许」对危险命令不生效，Bash 也只记住完全相同的命令文本：同类操作下次仍会询问"
+                        )
                 delivered = True
             else:
                 # In Kimi QuestionDialogComponent:
@@ -4589,6 +5242,12 @@ class HubSessionManager:
                 delivered = True
 
         # ── Engine 3: OMP (`ask` tool selector `class qR` & `showHookConfirm`) ────────────────
+        elif eng == "omp" and kind == "approval_request":
+            action_trace, note = self._answer_omp_approval(sess, loop, inter, meta, approval_action, custom_input)
+            if note:
+                notes.append(note)
+            delivered = True
+
         elif eng == "omp":
             raw_opts_count = int(meta.get("raw_options_count") or max(1, len(options) - 1))
             clamp_ups = "\x1b[A" * (len(options) + 4)
@@ -4620,21 +5279,27 @@ class HubSessionManager:
         # ── Engine 4: Codex CLI (Approval modal & `request_user_input_async`) ─────────────────
         elif eng == "codex":
             if kind == "approval_request":
-                if dec_norm in ("deny", "reject", "no") or chosen_idx_1based == 3:
-                    sess.write_input("n")
-                    if custom_input:
-                        if loop:
-                            loop.call_later(0.25, sess.write_input, custom_input.strip() + "\r")
-                        else:
-                            time.sleep(0.25)
-                            sess.write_input(custom_input.strip() + "\r")
-                    action_trace = "Codex approval key 'n' (Reject)"
-                elif dec_norm in ("approve_session", "allow_session", "always") or chosen_idx_1based == 2:
+                feedback = _one_line(custom_input)
+                if approval_action in ("deny", "deny_feedback"):
+                    steps = [(0.0, "n")]
+                    if approval_action == "deny_feedback":
+                        steps.append((0.25, feedback + "\r"))
+                    self._write_keys_scheduled(sess, loop, steps)
+                    action_trace = "Codex approval key 'n' (Reject)" + (
+                        f" + feedback {feedback!r}" if approval_action == "deny_feedback" else ""
+                    )
+                elif approval_action == "approve_session" and meta.get("codex_prompt") == "edit":
                     sess.write_input("a")
-                    action_trace = "Codex approval key 'a' (Approve for session)"
+                    action_trace = "Codex approval key 'a' (don't ask again for these files)"
                 else:
+                    # D7: a command prompt has no session option; its `p` writes a permanent rule
+                    # to ~/.codex/rules/default.rules, so the hub never sends it.
                     sess.write_input("y")
                     action_trace = "Codex approval key 'y' (Approve once)"
+                    if approval_action == "approve_session":
+                        notes.append(
+                            "codex 的命令审批没有「本会话允许」（p 会写入永久规则，Hub 不发送）：本次只允许了一次"
+                        )
                 delivered = True
             else:
                 # For Codex `request_user_input_async` / question prompt:
@@ -4651,12 +5316,11 @@ class HubSessionManager:
         # ── Engine 5: AGY CLI (Permission prompt & `ask_question` selector) ───────────────────
         elif eng == "agy":
             if kind == "approval_request":
-                if dec_norm in ("deny", "reject", "no") or (chosen_idx_1based and chosen_idx_1based >= 2):
-                    sess.write_input("\x1b[B\r")
-                    action_trace = "AGY permission prompt Down + '\\r' (Deny)"
-                else:
-                    sess.write_input("\r")
-                    action_trace = "AGY permission prompt '\\r' (Allow)"
+                action_trace, note = self._answer_agy_approval(
+                    sess, loop, meta, approval_action, chosen_label, custom_input
+                )
+                if note:
+                    notes.append(note)
                 delivered = True
             else:
                 clamp_ups = "\x1b[A" * (len(options) + 3)
@@ -4710,6 +5374,16 @@ class HubSessionManager:
         )
         self.persist_session(sess)
 
+        if eng == "agy" and approval_action == "deny_feedback" and (custom_input or "").strip():
+            # D7: agy ends the turn on a deny; the feedback goes in as the next message once the
+            # composer is back (after the interaction above is cleared, never into the prompt).
+            feedback_text = (custom_input or "").strip()
+            if loop is not None:
+                loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, self._deliver_deny_feedback, session_id, feedback_text)
+            else:
+                time.sleep(AGY_DENY_FEEDBACK_DELAY_SEC)
+                self._deliver_deny_feedback(session_id, feedback_text)
+
         return {
             "ok": True,
             "delivered": delivered,
@@ -4719,7 +5393,9 @@ class HubSessionManager:
             "interaction_kind": kind,
             "chosen_option_index": chosen_idx_1based,
             "chosen_label": chosen_label,
+            "approval_action": approval_action,
             "action_trace": action_trace,
+            "notes": notes,
         }
 
     def begin_new_turn(self, session: AgentSession, status: Optional[str] = None) -> None:
@@ -5380,18 +6056,23 @@ class HubSessionManager:
                         cmd_desc = payload.get("command") or payload.get("reason") or json.dumps(payload, ensure_ascii=False)[:300]
                         if isinstance(cmd_desc, list):
                             cmd_desc = " ".join(str(x) for x in cmd_desc)
+                        # D7: codex 0.165 no longer writes these to the rollout (the screen detector
+                        # catches its prompts); kept for older builds, with the current labels.
+                        is_edit = ptype == "apply_patch_approval_request"
                         self.register_pending_interaction(
                             session=session,
                             kind="approval_request",
                             title=f"Codex {ptype}",
                             prompt=f"Would you like to run/apply: {cmd_desc}",
-                            options=[
-                                "Yes, proceed (y)",
-                                "Yes, and don't ask again for this command (a)",
-                                "No, and tell Codex what to do differently (n)",
-                            ],
+                            options=(
+                                ["Yes, proceed (y)", "Yes, and don't ask again for these files (a)",
+                                 "No, and tell Codex what to do differently (esc)"]
+                                if is_edit else
+                                ["Yes, proceed (y)", "No, and tell Codex what to do differently (esc)"]
+                            ),
                             source="codex_jsonl_approval",
                             request_id=payload.get("call_id") or f"codex-appr-{uuid.uuid4().hex[:6]}",
+                            metadata={"codex_prompt": "edit" if is_edit else "command"},
                         )
                     elif otype == "event_msg" and ptype == "task_complete":
                         last_msg = payload.get("last_agent_message")
@@ -5637,6 +6318,21 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(0.8)
 
+    @staticmethod
+    def _kimi_resolved_interaction_ids(lines: List[str]) -> Set[str]:
+        """D7: ids of the `interaction.resolved` records in one read of kimi's wire.jsonl."""
+        ids: Set[str] = set()
+        for raw in lines:
+            if '"interaction.resolved"' not in raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if obj.get("type") == "interaction.resolved" and obj.get("id"):
+                ids.add(str(obj["id"]))
+        return ids
+
     async def _watch_kimi_session(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended.
 
@@ -5704,6 +6400,7 @@ class HubSessionManager:
                     f.seek(offset)
                     lines = f.readlines()
                     offset = f.tell()
+                resolved_in_batch = self._kimi_resolved_interaction_ids(lines)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -5717,6 +6414,16 @@ class HubSessionManager:
                         req_id = str(obj.get("id") or f"kimi-int-{uuid.uuid4().hex[:6]}")
                         ikind = obj.get("kind") or "question"
                         req_obj = obj.get("request") or {}
+                        if req_id in resolved_in_batch:
+                            # D7: requested and resolved before this read (answered in the console,
+                            # or answered by the parent through the screen registration): nothing
+                            # is waiting. A screen registration of it is consumed, not left behind.
+                            cand = getattr(session, "_unadopted_screen_interaction", None)
+                            if cand and session.pending_interaction is not cand and cand.get("kind") == (
+                                "approval_request" if ikind == "approval" else "question"
+                            ):
+                                session._unadopted_screen_interaction = None
+                            continue
                         if ikind == "approval":
                             disp = req_obj.get("display") or {}
                             cmd_str = disp.get("command") or req_obj.get("description") or req_obj.get("action") or "action"
@@ -5733,6 +6440,7 @@ class HubSessionManager:
                                 ],
                                 source="kimi_wire_jsonl_interaction_request",
                                 request_id=req_id,
+                                metadata={"command": str(disp.get("command") or "")},
                             )
                         else:
                             qs = req_obj.get("questions") or []
@@ -7442,6 +8150,80 @@ class HubSessionManager:
             f' (replace the placeholder with your own one-sentence result)\n'
         )
 
+    def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+        """D7: codex's command prompt has no session option (its `p` writes a permanent rule to
+        ~/.codex/rules/default.rules), so the parent is offered only y / esc there; the edit prompt
+        keeps its `a` (don't ask again for these files)."""
+        kind = parsed.get("prompt_kind") or "command"
+        offered = [o["label"] for o in parsed.get("options") or [] if o.get("action") != "persist"]
+        if not offered:
+            offered = (
+                ["Yes, proceed (y)", "No, and tell Codex what to do differently (esc)"]
+                if kind == "command" else
+                ["Yes, proceed (y)", "Yes, and don't ask again for these files (a)",
+                 "No, and tell Codex what to do differently (esc)"]
+            )
+        lines = ["Would you like to run the following command?" if kind == "command"
+                 else "Would you like to make the following edits?"]
+        if parsed.get("reason"):
+            lines.append(f"Reason: {parsed['reason']}")
+        if parsed.get("command"):
+            lines.append(f"$ {parsed['command']}")
+        if parsed.get("destination"):
+            lines.append(f"Destination: {parsed['destination']}")
+        if kind == "command":
+            lines.append("（命令审批没有「本会话允许」：approve_session 按允许一次处理）")
+        return self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title="Codex TUI Approval Modal" if kind == "command" else "Codex TUI Edit Approval",
+            prompt="\n".join(lines) if len(lines) > 1 else scr.strip()[-600:],
+            options=offered,
+            source="codex_tui_screen_detector",
+            metadata={"codex_prompt": kind, "command": parsed.get("command") or ""},
+        )
+
+    def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+        """D7: agy's options are offered by label; the one that persists to settings.json never is."""
+        opts = [dict(o) for o in parsed.get("options") or []]
+        offered = [o["label"] for o in opts if o.get("action") != "persist"]
+        lines: List[str] = []
+        if parsed.get("reason"):
+            lines.append(f"Reason: {parsed['reason']}")
+        if parsed.get("command"):
+            lines.append(f"Requesting permission for: {parsed['command']}")
+        if parsed.get("header"):
+            lines.append(parsed["header"])
+        return self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title="AGY TUI Permission Prompt",
+            prompt="\n".join(lines) if lines else scr.strip()[-600:],
+            options=offered,
+            source="agy_tui_screen_detector",
+            metadata={"agy_options": opts, "command": parsed.get("command") or ""},
+        )
+
+    def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
+        """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered."""
+        offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
+        lines = [f"Allow tool: {parsed.get('tool') or '?'}"] + list(parsed.get("details") or [])
+        return self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title=f"OMP Tool Approval ({parsed.get('tool') or 'tool'})",
+            prompt="\n".join(lines),
+            options=offered,
+            source="omp_tui_screen_detector",
+            metadata={
+                "omp_prompt": "tool",
+                "omp_options": list(parsed.get("options") or []),
+                "selected_index": int(parsed.get("selected_index") or 0),
+                "session_label": parsed.get("session_label"),
+                "command": parsed.get("command") or "",
+            },
+        )
+
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
         """
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
@@ -7451,50 +8233,31 @@ class HubSessionManager:
             await asyncio.sleep(0.9)
             if session.pending_interaction is not None:
                 continue
+            # D7: an answered prompt can stay on screen for a moment; it is not a new one.
+            if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
+                continue
             scr = session.get_clean_screen_text(max_lines=38)
             if not scr.strip():
                 continue
 
             eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
 
-            # 1) Codex TUI approval modal ("Would you like to run the following command?" / "Would you like to make the following edits?")
-            if eng == "codex" and (
-                "Would you like to run the following command?" in scr
-                or "Would you like to make the following edits?" in scr
-            ):
+            # 1) Codex TUI approval modal: a command prompt (y / p / esc) or an edit prompt (y / a / esc).
+            codex_prompt = parse_codex_approval_prompt(scr) if eng == "codex" else None
+            if codex_prompt is not None:
                 sig = f"codex_appr:{hash(scr.strip()[-400:])}"
                 if sig not in session._seen_tui_prompt_signatures:
                     session._seen_tui_prompt_signatures.add(sig)
-                    self.register_pending_interaction(
-                        session=session,
-                        kind="approval_request",
-                        title="Codex TUI Approval Modal",
-                        prompt=scr.strip()[-600:],
-                        options=[
-                            "Yes, proceed (y)",
-                            "Yes, and don't ask again (a)",
-                            "No, and tell Codex what to do differently (n)",
-                        ],
-                        source="codex_tui_screen_detector",
-                    )
+                    self._register_codex_screen_approval(session, codex_prompt, scr)
                 continue
 
-            # 2) AGY TUI permission prompt ("Run this command?" / "Allow access to" / "Yes, allow access")
-            if eng == "agy" and (
-                "Run this command?" in scr
-                or ("Yes, allow" in scr and "No, deny" in scr)
-            ):
+            # 2) AGY TUI permission prompt ("Run this command?" + numbered options, mapped by label)
+            agy_prompt = parse_agy_approval_prompt(scr) if eng == "agy" else None
+            if agy_prompt is not None:
                 sig = f"agy_appr:{hash(scr.strip()[-400:])}"
                 if sig not in session._seen_tui_prompt_signatures:
                     session._seen_tui_prompt_signatures.add(sig)
-                    self.register_pending_interaction(
-                        session=session,
-                        kind="approval_request",
-                        title="AGY TUI Permission Prompt",
-                        prompt=scr.strip()[-600:],
-                        options=["Yes, allow", "No, deny"],
-                        source="agy_tui_screen_detector",
-                    )
+                    self._register_agy_screen_approval(session, agy_prompt, scr)
                 continue
 
             # 2b) AGY TUI `ask_question` multi-choice selector ("Question 1/" or "Navigate · enter Select")
@@ -7535,7 +8298,8 @@ class HubSessionManager:
                     )
                 continue
 
-            # 3) Kimi TUI ApprovalPanel fallback ("Approve once" + "Approve for this session")
+            # 3) Kimi TUI ApprovalPanel fallback ("Approve once" + "Approve for this session").
+            # The wire record of the same prompt adopts this registration (D7, one prompt = one).
             if eng == "kimi" and ("Approve once" in scr and "Approve for this session" in scr):
                 sig = f"kimi_appr:{hash(scr.strip()[-400:])}"
                 if sig not in session._seen_tui_prompt_signatures:
@@ -7552,57 +8316,34 @@ class HubSessionManager:
                             "Reject with feedback",
                         ],
                         source="kimi_tui_screen_detector",
+                        metadata={"command": kimi_panel_command(scr)},
                     )
                 continue
 
-            # 4) OMP TUI CollabApproval / HookConfirm fallback ("Allow once" + "Always for this session" + "Deny")
-            if eng == "omp" and ("Allow once" in scr and "Always for this session" in scr and "Deny" in scr):
+            # 4) OMP tool approval box ("Allow tool: <name>" + "Approve…" rows + "Deny").
+            omp_prompt = parse_omp_approval_prompt(scr) if eng == "omp" else None
+            if omp_prompt is not None:
                 sig = f"omp_appr:{hash(scr.strip()[-400:])}"
+                if sig not in session._seen_tui_prompt_signatures:
+                    session._seen_tui_prompt_signatures.add(sig)
+                    self._register_omp_screen_approval(session, omp_prompt)
+                continue
+
+            # 4b) OMP settings-change confirm ("Allow once" + "Always for this session" + "Deny").
+            if eng == "omp" and ("Allow once" in scr and "Always for this session" in scr and "Deny" in scr):
+                sig = f"omp_settings:{hash(scr.strip()[-400:])}"
                 if sig not in session._seen_tui_prompt_signatures:
                     session._seen_tui_prompt_signatures.add(sig)
                     self.register_pending_interaction(
                         session=session,
                         kind="approval_request",
-                        title="OMP TUI Tool Approval",
+                        title="OMP Settings Change Confirm",
                         prompt=scr.strip()[-600:],
                         options=["Allow once", "Always for this session", "Deny"],
                         source="omp_tui_screen_detector",
-                        metadata={"raw_options_count": 3},
+                        metadata={"raw_options_count": 3, "omp_prompt": "settings"},
                     )
                 continue
-
-    @staticmethod
-    def _apply_approval_mode_args(engine: str, base_args: List[str], approval_mode: str) -> List[str]:
-        """
-        Adjusts CLI launch flags according to `approval_mode`:
-        - `auto` (default): autonomous execution; interactive question tools (`ask`, `ask_user_question`, `request_user_input_async`) still delegate to Parent.
-        - `delegate_to_parent` (or `ask`): high-risk commands/edits AND interactive questions pause and delegate approval to Parent Agent!
-          * Kimi: replaces `--auto` (Never Ask) with `-y` (`--yolo` = Ask When Needed mode: routine commands run automatically, risky actions & `AskUserQuestion` ask!)
-          * Codex: replaces `--dangerously-bypass-approvals-and-sandbox` with `-a on-request -s workspace-write`
-          * AGY: replaces `--dangerously-skip-permissions` with `--mode accept-edits` (prompts before shell commands)
-        - `strict_ask`: prompts for every command/edit (`codex -a untrusted`, `kimi` without `--auto`/`-y`, `agy` without `--dangerously-skip-permissions`).
-        """
-        mode = (approval_mode or "auto").strip().lower()
-        args = list(base_args)
-        eng = (engine or "").lower()
-        if mode in ("auto", "default", ""):
-            return args
-
-        if eng == "kimi":
-            args = [a for a in args if a not in ("--auto", "--yolo", "-y")]
-            if mode in ("delegate_to_parent", "ask", "ask_high_risk"):
-                args.insert(0, "-y")
-        elif eng == "codex":
-            args = [a for a in args if a != "--dangerously-bypass-approvals-and-sandbox"]
-            if mode in ("delegate_to_parent", "ask", "ask_high_risk"):
-                args = ["-a", "on-request", "-s", "workspace-write"] + args
-            elif mode == "strict_ask":
-                args = ["-a", "on-request", "-s", "read-only"] + args
-        elif eng == "agy":
-            args = [a for a in args if a != "--dangerously-skip-permissions"]
-            if mode in ("delegate_to_parent", "ask", "ask_high_risk"):
-                args = ["--mode", "accept-edits"] + args
-        return args
 
     @staticmethod
     def _middle_level(levels) -> Optional[str]:
@@ -7825,6 +8566,19 @@ class HubSessionManager:
             args = injected + args
         # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
 
+        # D1 (2026-11-07): high-risk approval is on for every engine, with no opt-out. The profile's
+        # own bypass/mode flags (old files still carry --auto-approve, --auto, ...) are stripped.
+        ignored_approval = [
+            label for label in approval_flags_in_args(eng, base_args)
+            if label not in ("--settings", "--settings=")
+        ]
+        args = apply_approval_flags(eng, args)
+        if ignored_approval:
+            notes.append(
+                f"已忽略 Profile 参数里的审批相关参数（{'、'.join(ignored_approval)}）："
+                f"Hub 统一以高风险操作需审批的模式启动"
+            )
+
         # Rule 5: cwd.
         if cwd is None or str(cwd).strip() == '':
             work_dir = self.hub_default_cwd()
@@ -7884,7 +8638,6 @@ class HubSessionManager:
         hwnd: Optional[int] = None,
         model: Optional[str] = None,
         thinking_level: Optional[str] = None,
-        approval_mode: str = "auto",
     ) -> AgentSession:
         loop = asyncio.get_running_loop()
 
@@ -7933,8 +8686,6 @@ class HubSessionManager:
 
         # Q12: 8 hex characters, wide enough that a reused profile prefix never collides.
         session_id = f'{profile_id}-{uuid.uuid4().hex[:8]}'
-        effective_approval_mode = (approval_mode or prof.get('approval_mode') or 'auto').strip().lower()
-        args = self._apply_approval_mode_args(engine=engine, base_args=args, approval_mode=effective_approval_mode)
         # Archive spec §3: the resolved launch, as it will really run. The task itself is added below
         # by the task mode and is deliberately NOT part of the snapshot (a resume adds its own message).
         launch_args = list(args)
@@ -7984,7 +8735,6 @@ class HubSessionManager:
         sess.effective_model = effective_model
         sess.effective_thinking_level = effective_thinking
         sess.engine = engine
-        sess.approval_mode = effective_approval_mode
         sess.profile_snapshot = {
             "profile_id": profile_id,
             "engine": engine,
