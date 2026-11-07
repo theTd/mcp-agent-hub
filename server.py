@@ -106,7 +106,7 @@ def _session_can_receive(session) -> bool:
 
 
 INJECTION_PENDING_HINT = (
-    "文本将在 TUI 就绪后输入，调用尚未等到结果；"
+    "文本将在 TUI 就绪后（或前一条输入完成后）输入并确认提交，调用尚未等到结果；"
     "最终结果可用 get_subagent_status_and_trace 查看 last_injection。"
 )
 
@@ -120,6 +120,11 @@ def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
     helper must not guess it from task_mode, or a resume without text would claim a pending typing.
     """
     injection = getattr(session, "last_injection", None)
+    if isinstance(injection, dict) and injection.get("pending"):
+        # K6 (fix 9c): a live message is still being typed and proved in the background; the
+        # record says so ("submitting") and its real outcome replaces it.
+        return {"injection": "pending", "last_injection": injection,
+                "injection_hint": INJECTION_PENDING_HINT}
     if isinstance(injection, dict) and injection:
         return {"injection": "recorded", "last_injection": injection}
     if pending:

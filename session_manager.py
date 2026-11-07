@@ -706,8 +706,14 @@ TUI_INPUT_GLYPH_RE = re.compile(r"^\s*(?:[│┃|]\s*)?(?:[>❯›»])\s?(.*)$")
 # K2 (fix 9): how each engine draws its composer. "box" is a framed box whose first content row is
 # "│ > …" and whose height grows with the text (kimi's box is 12 rows tall for a task carrying the
 # worker-bridge hint at 120 columns); every other engine draws a bare prompt glyph row ("glyph").
+# K6 (fix 9c): the table is also the list of engines whose composer the hub KNOWS from real
+# captures. Only for these is a live message typed through the checked submit; any other TUI (pwsh,
+# a generic CLI, where a "> " output row is not a composer) keeps the old unchecked write + Enter.
 TUI_COMPOSER_SHAPES = {
     "kimi": "box",
+    "omp": "glyph",
+    "codex": "glyph",
+    "agy": "glyph",
 }
 TUI_BOX_TOP_RE = re.compile(r"^\s*╭─.*╮\s*$")
 TUI_BOX_BOTTOM_RE = re.compile(r"^\s*╰─.*╯\s*$")
@@ -730,6 +736,13 @@ TUI_TYPE_SETTLE_CAP_SEC = 10.0
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
+# K6 (fix 9c): a live message to a TUI whose composer the hub cannot locate (an engine it does not
+# know, or a screen without a composer) keeps the old unchecked delivery: the text, then Enter this
+# long after it, and last_injection says it was not checked.
+TUI_UNCHECKED_ENTER_DELAY_SEC = 0.25
+# K6 (fix 9c): a live message the engine refused (kimi "Error: LLM not set") is typed again after
+# this pause, within the same attempt limit.
+TUI_LIVE_RETYPE_PAUSE_SEC = 1.5
 # W2: engine input boxes do not live on the last line (kimi draws two status lines under its
 # composer), so the prompt is searched in the bottom rows of the screen, per engine.
 TUI_PROMPT_SCAN_ROWS = 10
@@ -1036,6 +1049,65 @@ class HubTerminalStream(pyte.Stream):
             return self._taking_plain_text
 
 
+class TuiWriterClaim:
+    """K6 (fix 9c): one writer's place in a session's TuiWriterQueue."""
+
+    def __init__(self, queue: "TuiWriterQueue", ahead: Optional["TuiWriterClaim"], mode: str):
+        self.queue = queue
+        self.ahead = ahead
+        self.behind: Optional["TuiWriterClaim"] = None
+        self.mode = mode
+        self.released = False
+        self.done = asyncio.Event()
+        if ahead is not None:
+            ahead.behind = self
+
+    @property
+    def first(self) -> bool:
+        """Nobody ahead of this claim is still typing, so it may type now."""
+        return self.ahead is None or self.ahead.done.is_set()
+
+    async def wait_turn(self) -> None:
+        while not self.first:
+            await self.ahead.done.wait()
+
+    def release(self) -> None:
+        """Ends this writer's turn. A claim released before its turn came (its wait was cancelled)
+        hands the turn on only once the writers ahead of it are done, so the order always holds."""
+        self.released = True
+        claim: Optional[TuiWriterClaim] = self
+        while claim is not None and claim.released and claim.first and not claim.done.is_set():
+            claim.done.set()
+            claim.ahead = None
+            claim.queue._open.discard(claim)
+            claim = claim.behind
+
+
+class TuiWriterQueue:
+    """K6 (fix 9c): one writer at a time types into a session's TUI, in the order they arrived.
+
+    The startup text and every live message with an Enter go through it, so two back-to-back
+    messages (or a message sent while the startup text is still waiting for readiness) can never
+    interleave their keystrokes. claim() is synchronous, so deliver_parent_message (not a coroutine)
+    takes its place in line at once and, when nobody is ahead, may type right away.
+    """
+
+    def __init__(self) -> None:
+        self._tail: Optional[TuiWriterClaim] = None
+        self._open: Set[TuiWriterClaim] = set()
+
+    def claim(self, mode: str) -> TuiWriterClaim:
+        ahead = self._tail if self._tail is not None and not self._tail.done.is_set() else None
+        claim = TuiWriterClaim(self, ahead, mode)
+        self._tail = claim
+        self._open.add(claim)
+        return claim
+
+    def busy(self, mode: Optional[str] = None) -> bool:
+        """A writer (of this mode) holds or waits for the TUI."""
+        return any(mode is None or c.mode == mode for c in self._open)
+
+
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -1125,6 +1197,8 @@ class AgentSession:
         self.completion_reported: bool = False
         # A10: the real outcome of typing a startup/resume text into the TUI (never guessed).
         self.last_injection: Optional[Dict[str, Any]] = None
+        # K6 (fix 9c): the startup text and the live messages type into the TUI one at a time.
+        self.tui_writer = TuiWriterQueue()
         self._scrollback_written_at: float = 0.0
         self._scrollback_rev_written: int = -1
         self._seen_tui_tool_lines: Set[str] = set()
@@ -4580,6 +4654,170 @@ class HubSessionManager:
         if status is not None:
             session.status = status
 
+    @staticmethod
+    def _tui_writer_queue(session: Any) -> TuiWriterQueue:
+        """K6 (fix 9c): the session's one-writer-at-a-time queue (made on first use)."""
+        writer = getattr(session, "tui_writer", None)
+        if writer is None:
+            writer = TuiWriterQueue()
+            session.tui_writer = writer
+        return writer
+
+    @staticmethod
+    def _unchecked_live_result() -> Dict[str, Any]:
+        """K6 (fix 9c): last_injection for a live message sent without any check of its submit."""
+        return {
+            "at": round(time.time(), 3),
+            "ok": None,
+            "reason": "live_write_unchecked",
+            "attempts": 1,
+            "mode": "parent_message",
+            "label": "未确认",
+        }
+
+    def _tui_composer_located(self, session: AgentSession) -> bool:
+        """K6 (fix 9c): the hub knows the engine's composer and finds it on the current screen."""
+        if getattr(session, "kind", "tui") != "tui":
+            return False
+        engine = str(getattr(session, "engine", "") or "").strip().lower()
+        if engine not in TUI_COMPOSER_SHAPES:
+            return False
+        screen = session.get_clean_screen_text(max_lines=40)
+        return self._tui_input_line(screen, session.engine) is not None
+
+    def _deliver_live_text_to_tui(
+        self, sess: AgentSession, text: str, turn_before: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """K6 (fix 9c): a live message with Enter to a TUI session; {pty_written, injection, queued}.
+
+        The message takes its place in the session's writer queue at once. Then:
+          - nobody ahead of it and no composer the hub can locate (an unknown engine, a screen
+            without a composer): today's unchecked delivery right now -- the text, Enter
+            TUI_UNCHECKED_ENTER_DELAY_SEC later, last_injection ok:null "live_write_unchecked";
+          - otherwise a background task waits for its turn and types it: through
+            _submit_text_to_tui (K5 settle -> Enter -> K3 proof -> retry/D3) when the composer is
+            located then, else the unchecked way. Its real outcome replaces the "submitting" record
+            in last_injection. The caller's reply is not held for it.
+        Outside a running event loop (scripts, tests) the old synchronous unchecked write stays.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            written = sess.write_input(text)
+            if written:
+                sess.last_injection = self._unchecked_live_result()
+            sess.write_input("\r")
+            return {"pty_written": written, "injection": "live_write" if written else "none",
+                    "queued": False}
+        claim = self._tui_writer_queue(sess).claim("parent_message")
+        if claim.first and not self._tui_composer_located(sess):
+            written = sess.write_input(text)
+            if not written:
+                claim.release()
+                return {"pty_written": False, "injection": "none", "queued": False}
+            sess.last_injection = self._unchecked_live_result()
+            loop.call_later(TUI_UNCHECKED_ENTER_DELAY_SEC, self._press_unchecked_enter, sess, claim)
+            return {"pty_written": True, "injection": "live_write", "queued": False}
+        submit_key = str((getattr(sess, "profile_snapshot", None) or {}).get("submit_key") or "\r")
+        sess.last_injection = self._live_submitting_record()
+        loop.create_task(self._submit_queued_live_text(sess, text, submit_key, claim, turn_before))
+        return {"pty_written": False, "injection": "pending", "queued": True}
+
+    @staticmethod
+    def _live_submitting_record() -> Dict[str, Any]:
+        """K6 (fix 9c): last_injection while a live message waits for its turn or is being proved."""
+        return {
+            "at": round(time.time(), 3),
+            "ok": None,
+            "reason": "submitting",
+            "pending": True,
+            "attempts": 0,
+            "mode": "parent_message",
+            "label": "提交中",
+        }
+
+    @staticmethod
+    def _press_unchecked_enter(sess: AgentSession, claim: TuiWriterClaim) -> None:
+        """K6 (fix 9c): the Enter of an unchecked live message; the next writer may type after it."""
+        try:
+            sess.write_input("\r")
+        finally:
+            claim.release()
+
+    async def _submit_queued_live_text(
+        self,
+        sess: AgentSession,
+        text: str,
+        submit_key: str,
+        claim: TuiWriterClaim,
+        turn_before: Optional[Dict[str, Any]],
+    ) -> None:
+        """K6 (fix 9c): type one live message once its turn in the writer queue comes, and record it.
+
+        The composer is looked for again when the turn comes (the startup text may have been ahead
+        of it). An Enter the engine refused (K3, kimi "Error: LLM not set") is typed again after a
+        short pause within the same attempt limit. A submit that failed for certain (ok:false) on a
+        message that had started a new turn puts the completed turn back, so the session is not
+        left "running" with no turn behind it.
+        """
+        result: Dict[str, Any]
+        try:
+            await claim.wait_turn()
+            # The writer ahead (the startup text, an earlier message) recorded its own outcome
+            # meanwhile; this message is the one being submitted now.
+            sess.last_injection = self._live_submitting_record()
+            if not sess.is_process_alive():
+                result = {"ok": False, "reason": "process_gone", "attempts": 0, "label": "失败"}
+            elif self._tui_composer_located(sess):
+                result = await self._submit_text_to_tui(sess, text, submit_key)
+                retypes = 0
+                while result.pop("retype", False) and sess.is_process_alive():
+                    retypes += 1
+                    logger.warning(
+                        "[%s] the engine refused a live message (%s) after %s Enter(s); typing it again",
+                        sess.session_id, result.get("rejected"), result.get("attempts"),
+                    )
+                    await asyncio.sleep(TUI_LIVE_RETYPE_PAUSE_SEC)
+                    result = await self._submit_text_to_tui(
+                        sess, text, submit_key, prior=dict(result, retyped=retypes)
+                    )
+            elif sess.write_input(text):
+                await asyncio.sleep(TUI_UNCHECKED_ENTER_DELAY_SEC)
+                sess.write_input("\r")
+                result = self._unchecked_live_result()
+            else:
+                result = {"ok": False, "reason": "write_failed", "attempts": 0, "label": "失败"}
+        except asyncio.CancelledError:
+            claim.release()
+            raise
+        except Exception as e:
+            logger.exception("[%s] live message submit failed", getattr(sess, "session_id", "?"))
+            result = {"ok": False, "reason": "submit_error", "detail": str(e)[:200], "attempts": 0,
+                      "label": "失败"}
+        try:
+            result["mode"] = "parent_message"
+            result["at"] = round(time.time(), 3)
+            if result.get("ok") is False and turn_before is not None:
+                self._restore_turn_after_failed_message(sess, turn_before)
+            self._record_tui_injection(sess, result)
+        finally:
+            claim.release()
+
+    def _restore_turn_after_failed_message(
+        self, sess: AgentSession, turn_before: Dict[str, Any]
+    ) -> None:
+        """K6 (fix 9c): undo begin_new_turn for a message that certainly never reached the engine.
+
+        Only while nothing has moved the session on since (still "running", no completion reported).
+        """
+        if sess.status != "running" or sess.completion_reported:
+            return
+        sess.status = turn_before["status"]
+        sess.completion_reported = bool(turn_before["completion_reported"])
+        sess.final_response_from_previous_turn = bool(turn_before["from_previous_turn"])
+
     def deliver_parent_message(
         self,
         session_id: str,
@@ -4594,6 +4832,16 @@ class HubSessionManager:
         # the end, only when the text really reached the session — a failed delivery must not leave
         # the session "running" with no turn behind it.
         starts_new_turn = bool(sess is not None and sess.status == "completed")
+        # K6 (fix 9c): what begin_new_turn changes, so a live message whose submit later fails for
+        # certain can put the completed turn back (see _submit_queued_live_text).
+        turn_before = (
+            {
+                "status": sess.status,
+                "completion_reported": sess.completion_reported,
+                "from_previous_turn": sess.final_response_from_previous_turn,
+            }
+            if starts_new_turn else None
+        )
         # If there is an active structured approval/question interaction on this session,
         # route through our engine-aware responder automatically!
         if sess and sess.pending_interaction:
@@ -4675,6 +4923,9 @@ class HubSessionManager:
         box.append(msg_rec)
 
         pty_written = False
+        # K6 (fix 9c): a live message handed to the background submit (typed and proved there).
+        live_queued = False
+        live_injection: Optional[str] = None
         dsh_error: Optional[str] = None
         if sess and sess.dsh_spec and not resolved_question_id and not dsh_replied:
             clean_txt = text.strip()
@@ -4736,24 +4987,35 @@ class HubSessionManager:
             if sess.kind == "desktop_gui" and sess.hwnd:
                 payload = text + ("\r" if press_enter and not text.endswith("\r") else "")
                 pty_written = Win32WindowHelper.send_text(sess.hwnd, payload)
+            elif (press_enter and sess.kind == "tui" and text.rstrip("\r\n").strip()
+                  and sess.is_process_alive()):
+                # K6 (fix 9c): a live message with Enter goes through the same checked submit as
+                # the startup text when the composer can be located, one writer at a time.
+                live = self._deliver_live_text_to_tui(sess, text.rstrip("\r\n"), turn_before)
+                pty_written = live["pty_written"]
+                live_injection = live["injection"]
+                live_queued = live["queued"]
             else:
                 clean_txt = text.rstrip("\r\n") if press_enter else text
                 pty_written = sess.write_input(clean_txt)
                 if pty_written and clean_txt:
                     # W11: a live steering write is the last injection too, so the tool result no
-                    # longer shows last_injection:null after a send_to_subagent.
-                    sess.last_injection = {
-                        "at": round(time.time(), 3),
-                        "ok": True,
-                        "reason": "live_write",
-                        "attempts": 1,
-                        "mode": "parent_message",
-                        "label": "已写入",
-                    }
+                    # longer shows last_injection:null after a send_to_subagent. K6 (fix 9c): a
+                    # text sent with Enter was never checked here, so it does not claim ok:true.
+                    sess.last_injection = (
+                        self._unchecked_live_result() if press_enter else {
+                            "at": round(time.time(), 3),
+                            "ok": True,
+                            "reason": "live_write",
+                            "attempts": 1,
+                            "mode": "parent_message",
+                            "label": "已写入",
+                        }
+                    )
                 if press_enter:
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.call_later(0.25, sess.write_input, "\r")
+                        loop.call_later(TUI_UNCHECKED_ENTER_DELAY_SEC, sess.write_input, "\r")
                     except Exception:
                         sess.write_input("\r")
 
@@ -4771,10 +5033,12 @@ class HubSessionManager:
                 "mailbox_message_id": msg_rec["id"],
             }
 
-        if sess and starts_new_turn and pty_written and not resolved_question_id:
+        if sess and starts_new_turn and (pty_written or live_queued) and not resolved_question_id:
             # T1: send_to_subagent's live write, the console's send and a parent reply all land
             # here. The completed turn's answer is cleared and the status goes back to running, so
             # the wait in send_to_subagent sees a turn in progress instead of status_completed.
+            # K6 (fix 9c): a message handed to the background submit starts the turn now too, so
+            # that wait does not return at once; a submit that then fails for certain undoes it.
             self.begin_new_turn(sess, status="running")
 
         if sess:
@@ -4785,7 +5049,9 @@ class HubSessionManager:
             "session_id": session_id,
             "resolved_question_id": resolved_question_id,
             "pty_written": pty_written,
-            "injection": "live_write" if pty_written else "none",
+            # K6 (fix 9c): "pending" = handed to the background submit; its outcome lands in
+            # last_injection (pty_written stays false until then, as for a pending startup text).
+            "injection": live_injection or ("live_write" if pty_written else "none"),
             "mailbox_message_id": msg_rec["id"],
         }
 
@@ -6047,6 +6313,9 @@ class HubSessionManager:
             "rejects": cls._tui_reject_count(screen_text, rules),
             "history": cls._tui_history_rows_holding(screen_text, rules.get("history_glyph") or "", probe),
             "user_seq": int(getattr(session, "transcript_user_seq", 0) or 0),
+            # K6 (fix 9c): a working indicator already up before the Enter (a live message to an
+            # agent mid-turn, codex's "Worked for" row of the last turn) proves nothing about it.
+            "active": cls._tui_agent_active(screen_text),
         }
 
     def _tui_transcript_proof(
@@ -6100,7 +6369,7 @@ class HubSessionManager:
               its box when it refuses an Enter;
           (b) the transcript: it grew, or (kimi) its watcher read a new user message with the text;
           (c) K3 (fix 9): a new submitted-message row ("❯ …") holding the text; or
-          (d) the engine's working indicator is on screen.
+          (d) the engine's working indicator is on screen (K6, fix 9c: and was not before the Enter).
         ("rejected", phrase) K3 (fix 9): a new refusal (kimi "Error: LLM not set") is on screen.
         ("unsubmitted", reason) only when the text is POSITIVELY still on the located input row.
         ("unknown", reason) when nothing decides it yet. D3 then lets the caller press Enter once
@@ -6139,7 +6408,7 @@ class HubSessionManager:
             glyph = rules.get("history_glyph") or ""
             if glyph and self._tui_history_rows_holding(screen, glyph, probe) > int(marks.get("history") or 0):
                 return "confirmed", "history_row"
-            if self._tui_agent_active(screen):
+            if not marks.get("active") and self._tui_agent_active(screen):
                 return "confirmed", "agent_active"
             if holds and (not echoed or (long_window and time.time() - started >= TUI_SUBMIT_CONFIRM_SEC)):
                 # K2: the text the hub typed is visibly sitting on the composer while nothing
@@ -6344,17 +6613,22 @@ class HubSessionManager:
         except Exception:
             return False
 
-    def _record_startup_injection(self, session: AgentSession, result: Dict[str, Any]) -> None:
-        """W3: last_injection, the pane's red/grey line and the persisted row for one startup text."""
+    def _record_tui_injection(self, session: AgentSession, result: Dict[str, Any]) -> None:
+        """W3/K6: last_injection, the pane's red/grey line and the persisted row for one typed text.
+
+        K6 (fix 9c): a live message (mode "parent_message") is recorded here too, under its own name;
+        an unchecked one (an unknown composer) gets no grey line, as nothing was checked.
+        """
         session.last_injection = result
+        what = "消息提交" if result.get("mode") == "parent_message" else "启动文本注入"
         if result.get("ok") is False:
             # W3: the red line is for a CONFIRMED failure only.
             session.emit_virtual_ansi(
-                f"\r\n\x1b[1;31m✖ 启动文本注入失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
+                f"\r\n\x1b[1;31m✖ {what}失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
             )
-        elif result.get("ok") is None:
+        elif result.get("ok") is None and result.get("reason") != "live_write_unchecked":
             session.emit_virtual_ansi(
-                "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
+                f"\r\n\x1b[90m… {what}未确认（unconfirmed）\x1b[0m\r\n"
             )
         try:
             self.persist_session(session)
@@ -6381,7 +6655,27 @@ class HubSessionManager:
         was answered (or after spawn), the gate warns and falls back to composer + busy + stable.
         K3 (fix 9): an Enter the engine refused is followed by a new wait for readiness and the
         whole text typed again, within the same attempt limit.
+        K6 (fix 9c): with a text to type, the startup holds the session's writer queue from the
+        start until that text's outcome is recorded, so a live message sent meanwhile is typed
+        after it, never into the middle of it or into a TUI that is still booting.
         """
+        claim = self._tui_writer_queue(session).claim("startup_task") if task_to_inject else None
+        try:
+            if claim is not None:
+                await claim.wait_turn()
+            await self._watch_tui_startup_and_type(session, task_to_inject, startup_delay, submit_key)
+        finally:
+            if claim is not None:
+                claim.release()
+
+    async def _watch_tui_startup_and_type(
+        self,
+        session: AgentSession,
+        task_to_inject: Optional[str],
+        startup_delay: float,
+        submit_key: str,
+    ):
+        """The startup window itself (see _auto_handle_tui_startup_and_trust)."""
         start = time.time()
         deadline = start + TUI_STARTUP_WINDOW_SEC
         typed = not task_to_inject
@@ -6478,7 +6772,7 @@ class HubSessionManager:
                     last_text = None
                     stable_since = time.time()
                     continue
-                self._record_startup_injection(session, result)
+                self._record_tui_injection(session, result)
                 # W4: the text is typed; the readiness wait it could have been lost in is over.
                 return
 
@@ -6495,9 +6789,9 @@ class HubSessionManager:
                             "label": "失败", "at": round(time.time(), 3), "ready": ready,
                             "detail": "not_ready_again_before_deadline",
                         })
-                        self._record_startup_injection(session, result)
+                        self._record_tui_injection(session, result)
                         return
-                    self._record_startup_injection(session, {
+                    self._record_tui_injection(session, {
                         "ok": None, "reason": "unconfirmed", "attempts": 0,
                         "mode": "startup_task", "at": round(time.time(), 3),
                         "label": "未确认", "ready": ready, "trust_dismissed": trust_dismissed,
@@ -7608,7 +7902,12 @@ class HubSessionManager:
                 self.persist_session(session)
                 return {"settled": True, "reason": f"status_{session.status}", "elapsed_sec": round(elapsed, 1)}
 
-            if has_seen_new_output and (now - session.last_output_at) >= quiet_window_sec and elapsed >= 3.0:
+            # K6 (fix 9c): a live message still being typed and proved in the background is not a
+            # settled screen: the K5 settle and the proof can leave the output quiet for a while
+            # before the Enter has even been pressed.
+            submitting = self._tui_writer_queue(session).busy("parent_message")
+            if (has_seen_new_output and not submitting
+                    and (now - session.last_output_at) >= quiet_window_sec and elapsed >= 3.0):
                 try:
                     self.summarize_transcript(session.session_id)
                 except Exception:
