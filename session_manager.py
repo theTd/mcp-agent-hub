@@ -4764,26 +4764,6 @@ class HubSessionManager:
             f'--after-seq {after_seq} --timeout {timeout} --hub-url "{hub_api_base_url()}"'
         )
 
-    def _build_session_mcp_config(self, session_id: str) -> Path:
-        # K3: same rule as build_poll_command -- the hub's own interpreter, never a guessed .venv.
-        python_exe = str(Path(sys.executable).resolve())
-        bridge_script = str((self.base_dir / "worker_bridge_mcp.py").resolve())
-        cfg = {
-            "mcpServers": {
-                "parent_bridge": {
-                    "command": python_exe,
-                    "args": [bridge_script],
-                    "env": {
-                        "HUB_SESSION_ID": session_id,
-                        "HUB_API_URL": hub_api_base_url(),
-                    },
-                }
-            }
-        }
-        cfg_path = self.runtime_configs_dir / f"worker-mcp-{session_id}.json"
-        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        return cfg_path
-
     def _transcript_watch_alive(self, session: AgentSession) -> bool:
         """F2: a transcript watcher follows the process, not the status label.
 
@@ -6530,19 +6510,6 @@ class HubSessionManager:
             f' (replace the placeholder with your own one-sentence result)\n'
         )
 
-    def _build_kimi_completion_hint(self, task: str) -> str:
-        """F1: kimi has no bridge system hint, so its task carries the completion command.
-
-        The argument is the agent's own one-sentence result, quoted. A literal copy of the
-        placeholder is dropped by is_placeholder_summary, never archived as final_response.
-        """
-        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
-        worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
-        return (
-            f'{task} (When done run: {python_exe} "{worker_cli}" '
-            f'complete "{COMPLETION_SUMMARY_PLACEHOLDER}")'
-        )
-
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
         """
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
@@ -7149,15 +7116,14 @@ class HubSessionManager:
                 prompt_to_send = task
                 if profile_id.startswith("kimi"):
                     if "hub_worker.py" not in task:
-                        # W10: same interpreter rule as the bridge hint; F1 lives in the helper.
-                        prompt_to_send = self._build_kimi_completion_hint(task)
-                    # Q2: unlike codex/agy/omp, kimi carries no bridge hint in its task, so the hub
-                    # session marker that makes transcript ownership unambiguous travels right here.
-                    # V1: this scope has no `session` variable (the object is `sess`); using it made
-                    # every kimi spawn with a task fail with "name 'session' is not defined".
-                    prompt_to_send = (
-                        f"{prompt_to_send}\n\n[Sub-Agent Bridge Info: session_id={sess.session_id}]"
-                    )
+                        # Kimi has no system-prompt flag, so the full worker-bridge hint (session
+                        # marker plus step / message / ask / complete) travels with the typed task,
+                        # as it does in the task text for codex and agy. Newlines become spaces
+                        # when typed. The marker inside it keeps transcript ownership unambiguous (Q2).
+                        prompt_to_send = task + "\n" + self._build_worker_bridge_system_hint(sess.session_id)
+                    else:
+                        # The caller wrote its own bridge instructions; only add the session marker.
+                        prompt_to_send = f"{task}\n\n[Sub-Agent Bridge Info: session_id={sess.session_id}]"
             asyncio.create_task(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
