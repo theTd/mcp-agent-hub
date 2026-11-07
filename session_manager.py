@@ -703,6 +703,15 @@ TUI_STARTUP_WINDOW_SEC = 90.0
 TUI_INPUT_BOX_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*[│┃|]\s*$")
 TUI_INPUT_BOX_OPEN_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*$")
 TUI_INPUT_GLYPH_RE = re.compile(r"^\s*(?:[│┃|]\s*)?(?:[>❯›»])\s?(.*)$")
+# K2 (fix 9): how each engine draws its composer. "box" is a framed box whose first content row is
+# "│ > …" and whose height grows with the text (kimi's box is 12 rows tall for a task carrying the
+# worker-bridge hint at 120 columns); every other engine draws a bare prompt glyph row ("glyph").
+TUI_COMPOSER_SHAPES = {
+    "kimi": "box",
+}
+TUI_BOX_TOP_RE = re.compile(r"^\s*╭─.*╮\s*$")
+TUI_BOX_BOTTOM_RE = re.compile(r"^\s*╰─.*╯\s*$")
+TUI_BOX_SIDE_RE = re.compile(r"^\s*[│┃]")
 TUI_SUBMIT_CONFIRM_SEC = 3.0
 TUI_SUBMIT_CONFIRM_POLL_SEC = 0.25
 TUI_SUBMIT_MAX_TRIES = 3
@@ -754,6 +763,51 @@ TUI_AGENT_ACTIVE_RE = re.compile(
 # final-response extraction can never disagree about what "busy" or "still starting" looks like.
 TUI_BUSY_PHRASES = ENGINE_BUSY_PHRASES
 TUI_BUSY_LINE_RES = ENGINE_BUSY_LINE_RES
+# K1 (fix 9): the banner an engine draws once a FRESH spawn can really take input. kimi draws a bare
+# composer ~10 s before that, then "Preparing Kimi Code…", then (22-48 s after spawn in the probes)
+# the Welcome box. An Enter before the Welcome box is swallowed or answered with "Error: LLM not
+# set" (runs hub-03, early-01/02); one Enter after it submitted every time (welcome-01/02/03).
+# A resume is not gated on it: kimi -S draws no composer until its Welcome box, the box scrolls off
+# within seconds, and an Enter typed right at Welcome was still swallowed (resume probes, fix 9),
+# while the ordinary composer + busy + stable gate submitted with one Enter.
+TUI_READY_BANNERS = {
+    "kimi": "Welcome to Kimi Code!",
+}
+# K1 (fix 9): a banner that never shows (a kimi update that changes the text) must not hang the
+# spawn: this long after the trust dialog was answered (or after spawn without one) the gate falls
+# back to composer + busy + stable, with a warning in the log. The fallback always leaves the
+# reserve below inside the startup window, so the old gate still gets its chance to type.
+TUI_READY_BANNER_FALLBACK_SEC = 60.0
+TUI_READY_BANNER_RESERVE_SEC = 10.0
+# K1 (fix 9): the banner may scroll above the visible screen before a poll sees it, so the recent
+# scrollback is searched too, this many rows deep.
+TUI_READY_BANNER_HISTORY_ROWS = 200
+# K3 (fix 9): what proves (or refutes) one Enter, per engine. The defaults are the W3/K2 proofs.
+#   cleared_composer  a composer that held the text and is now empty proves the submit. Not for
+#                     kimi: it clears its box when it REJECTS an Enter ("Error: LLM not set", and no
+#                     session is ever created -- early-01/02).
+#   transcript        "growth": the transcript file grew after the Enter. "user_message": the
+#                     transcript watcher recorded a new user message holding the text -- kimi's
+#                     resumed wire.jsonl grows by itself at startup (MCP tool lists), so growth alone
+#                     proves nothing there.
+#   history_glyph     a submitted message is redrawn as a history row starting with this glyph; a
+#                     new such row holding the text counts as screen evidence.
+#   reject_phrases    the engine's refusal of an Enter; a new one on screen means "not submitted, the
+#                     box was cleared" -- the caller waits for readiness and types the text again.
+TUI_DEFAULT_SUBMIT_PROOF = {
+    "cleared_composer": True,
+    "transcript": "growth",
+    "history_glyph": "",
+    "reject_phrases": (),
+}
+TUI_SUBMIT_PROOF_RULES = {
+    "kimi": {
+        "cleared_composer": False,
+        "transcript": "user_message",
+        "history_glyph": "❯",
+        "reject_phrases": ("LLM not set",),
+    },
+}
 # K2: how long a submit whose text was never seen on the composer keeps waiting for evidence. The
 # kimi spawn in evidence round 3 typed into a box that was still booting, so the first look proved
 # nothing; a redraw can also clear the bottom rows and put the text back a moment later.
@@ -941,6 +995,37 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
     return [str(a) for i, a in enumerate(args) if i not in drop]
 
 
+class HubTerminalScreen(pyte.HistoryScreen):
+    """K4 (fix 9): the hub's screen model of a PTY.
+
+    kimi sends a private status query (CSI ? 996 n). pyte dispatches every private CSI with
+    private=True, but its report_device_status takes no such flag, so the query raised a TypeError
+    in the middle of the PTY chunk. A private DSR asks the terminal something and draws nothing, so
+    the whole CSI ? … n family is ignored here.
+    """
+
+    def report_device_status(self, mode: int, **kwargs: Any) -> None:
+        if kwargs.get("private"):
+            return
+        super().report_device_status(mode)
+
+
+class HubTerminalStream(pyte.Stream):
+    """K4 (fix 9): one escape sequence pyte cannot handle costs only itself, not the rest of the chunk.
+
+    pyte resets its parser when a handler raises but re-raises, and Stream.feed then abandons every
+    byte after it (the raw scrollback kept them, the screen model did not). Here the failed
+    character is dropped and the next one is parsed by the fresh parser.
+    """
+
+    def _send_to_parser(self, data: str) -> Optional[bool]:
+        try:
+            return super()._send_to_parser(data)
+        except Exception:
+            # pyte's own handler already re-initialised the parser; report its plain-text state.
+            return self._taking_plain_text
+
+
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -1007,6 +1092,10 @@ class AgentSession:
         self.engine: str = "generic"
         self.approval_mode: str = "auto"
         self.transcript_path: Optional[Path] = None
+        # K3 (fix 9): user messages the transcript watcher has read from this session's transcript
+        # (a counter and the newest text), so a typed submit can be proved by the transcript itself.
+        self.transcript_user_seq: int = 0
+        self.transcript_user_text: str = ""
         self.effective_model: Optional[str] = None
         self.effective_thinking_level: Optional[str] = None
 
@@ -1032,8 +1121,9 @@ class AgentSession:
         self._seen_tui_prompt_signatures: Set[str] = set()
 
         # Headless VT100 terminal screen buffer WITH 3,000-line scrollback history!
-        self.screen = pyte.HistoryScreen(cols, rows, history=3000)
-        self.stream = pyte.Stream(self.screen)
+        # K4 (fix 9): the hub's subclasses keep one bad escape sequence from losing the rest of a chunk.
+        self.screen = HubTerminalScreen(cols, rows, history=3000)
+        self.stream = HubTerminalStream(self.screen)
 
         # Raw ANSI history buffer for Web Console xterm.js replay
         self.raw_history: List[str] = []
@@ -1348,6 +1438,11 @@ class AgentSession:
             if max_lines and len(lines) > max_lines:
                 lines = lines[-max_lines:]
             return "\n".join(lines)
+
+    def note_transcript_user_message(self, text: str) -> None:
+        """K3 (fix 9): the transcript watcher read a user message; a typed submit may cite it."""
+        self.transcript_user_seq += 1
+        self.transcript_user_text = str(text or "")
 
     def get_full_scrollback_text(self, max_lines: int = 300) -> str:
         """Returns combined scrollback history + active screen lines from pyte.HistoryScreen."""
@@ -5292,6 +5387,15 @@ class HubSessionManager:
                         self.clear_pending_interaction(session, str(obj.get("id") or ""))
                         continue
 
+                    if obj.get("type") == "turn.prompt" and (obj.get("origin") or {}).get("kind") == "user":
+                        # K3 (fix 9): kimi's record of a user message the TUI really accepted. The
+                        # typed-submit check reads it from the session; no second reader of the file.
+                        parts = obj.get("input") or []
+                        session.note_transcript_user_message(" ".join(
+                            str(p.get("text") or "") for p in parts if isinstance(p, dict)
+                        ))
+                        continue
+
                     if obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
                         if latest_assistant_text:
                             session.set_final_response(latest_assistant_text, "native_transcript")
@@ -5699,44 +5803,105 @@ class HubSessionManager:
 
     @classmethod
     def _tui_input_line(cls, screen_text: str, engine: str = "") -> Optional[str]:
-        """W2: the row the engine takes input on, searched in the bottom rows, or None.
+        """W2/K2: the text on the engine's composer ("" when it is empty), or None when none is drawn.
 
         The real captures show three different composers:
-          kimi   a boxed row     │ > …                                  │
+          kimi   a framed box: "│ > …" on its first row, the wrapped rest of the text on the rows
+                 below it, then "╰───╯" (12 rows tall for a task carrying the worker-bridge hint)
           omp    a bare ❯ row under a rule, with status lines below it
           codex  a bare › row (placeholder "Ask Codex to do anything") above its status line
         Looking only at the last non-empty line (the old code) always found a status line instead.
+        K2 (fix 9): a box is located by its frame, so the whole text of a composer of any height is
+        returned; the old bottom-rows search missed the "│ > " row of a tall box altogether.
         """
         lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
-        rows = lines[-TUI_PROMPT_SCAN_ROWS:]
+        span = cls._tui_composer_span(lines, engine)
+        return span[0] if span is not None else None
+
+    @classmethod
+    def _tui_composer_span(cls, lines: List[str], engine: str = "") -> Optional[tuple]:
+        """K2 (fix 9): (text, first_row, last_row, wrapped_rows) of the composer, or None.
+
+        first_row/last_row index `lines` and cover the composer's whole drawing (a box's borders
+        included); wrapped_rows counts the text rows below its first one, which is how much taller
+        it is than a one-line composer. The composer is searched from the bottom: its lowest row
+        (a box's bottom border) must lie in the bottom TUI_PROMPT_SCAN_ROWS rows, as before, while
+        the composer itself may reach any height above that.
+        """
         eng = (engine or "").strip().lower()
-        if eng == "kimi":
-            # Only the boxed composer is kimi's input row; a ❯ row above it is submitted history.
-            for line in reversed(rows):
-                match = TUI_INPUT_BOX_RE.match(line) or TUI_INPUT_BOX_OPEN_RE.match(line)
+        window = max(0, len(lines) - TUI_PROMPT_SCAN_ROWS)
+        if TUI_COMPOSER_SHAPES.get(eng) == "box":
+            framed = cls._tui_framed_box_composer(lines, window)
+            if framed is not None:
+                return framed
+            # An early or synthetic screen whose box is not closed yet: the "│ > " row in the
+            # bottom rows, plus the box rows that follow it.
+            for i in range(len(lines) - 1, window - 1, -1):
+                match = TUI_INPUT_BOX_RE.match(lines[i]) or TUI_INPUT_BOX_OPEN_RE.match(lines[i])
                 if match:
-                    return match.group(1).rstrip()
+                    last = i
+                    while last + 1 < len(lines) and TUI_BOX_SIDE_RE.match(lines[last + 1]):
+                        last += 1
+                    parts = [match.group(1).rstrip()] + [
+                        cls._tui_box_row_text(row) for row in lines[i + 1:last + 1]
+                    ]
+                    return " ".join(p for p in parts if p), i, last, last - i
+            # Only the boxed composer is kimi's input row; a ❯ row above it is submitted history.
             # A synthetic/early screen may show only a bare ❯ row. Accept the LAST ❯ row when
             # every non-empty row below it is wrapped text (a long task wraps onto the following
             # screen rows); never accept it when chrome follows, because then the ❯ is restored
             # history in the middle of the transcript.
-            for i in range(len(rows) - 1, -1, -1):
-                if not rows[i].strip():
+            for i in range(len(lines) - 1, window - 1, -1):
+                if not lines[i].strip():
                     continue
-                match = TUI_INPUT_GLYPH_RE.match(rows[i])
+                match = TUI_INPUT_GLYPH_RE.match(lines[i])
                 if match is None:
                     # Possibly a wrapped continuation row of a ❯ above it: keep scanning upward.
                     continue
-                below = [ln.strip() for ln in rows[i + 1:] if ln.strip()]
+                below = [ln.strip() for ln in lines[i + 1:] if ln.strip()]
                 if any(not cls._tui_plain_continuation(ln) for ln in below):
                     return None
-                return match.group(1).rstrip()
+                return match.group(1).rstrip(), i, i, 0
             return None
-        for line in reversed(rows):
-            match = TUI_INPUT_GLYPH_RE.match(line)
+        for i in range(len(lines) - 1, window - 1, -1):
+            match = TUI_INPUT_GLYPH_RE.match(lines[i])
             if match:
-                return match.group(1).rstrip()
+                return match.group(1).rstrip(), i, i, 0
         return None
+
+    @classmethod
+    def _tui_framed_box_composer(cls, lines: List[str], window: int) -> Optional[tuple]:
+        """K2 (fix 9): the lowest closed box whose first row is "│ > …", read from its frame.
+
+        Every bottom border inside the bottom rows is tried from the bottom up; a box whose first
+        row is not a "│ > " row (kimi's Welcome box) is skipped. Its text rows are joined with one
+        space: kimi wraps at spaces and drops the space it wrapped at.
+        """
+        for bottom in range(len(lines) - 1, window - 1, -1):
+            if not TUI_BOX_BOTTOM_RE.match(lines[bottom]):
+                continue
+            top = bottom - 1
+            while top >= 0 and TUI_BOX_SIDE_RE.match(lines[top]):
+                top -= 1
+            if top < 0 or top + 1 >= bottom or not TUI_BOX_TOP_RE.match(lines[top]):
+                continue
+            body = lines[top + 1:bottom]
+            first = TUI_INPUT_BOX_RE.match(body[0]) or TUI_INPUT_BOX_OPEN_RE.match(body[0])
+            if first is None:
+                continue
+            parts = [first.group(1).rstrip()] + [cls._tui_box_row_text(row) for row in body[1:]]
+            return " ".join(p for p in parts if p), top, bottom, len(body) - 1
+        return None
+
+    @staticmethod
+    def _tui_box_row_text(row: str) -> str:
+        """K2 (fix 9): the text inside one box row, without its side bars and padding."""
+        text = row.strip()
+        if text[:1] in ("│", "┃", "|"):
+            text = text[1:]
+        if text[-1:] in ("│", "┃", "|"):
+            text = text[:-1]
+        return text.strip()
 
     @staticmethod
     def _tui_plain_continuation(line: str) -> bool:
@@ -5751,17 +5916,26 @@ class HubSessionManager:
         """V2(a)/W2: the engine's input row is on screen, so typing lands in its composer."""
         return cls._tui_input_line(screen_text, engine) is not None
 
-    @staticmethod
-    def _tui_busy_indicator(screen_text: str, engine: str = "") -> str:
+    @classmethod
+    def _tui_busy_indicator(cls, screen_text: str, engine: str = "") -> str:
         """K1: the startup/busy indicator currently on screen, or "" when the engine is settled.
 
         Only the bottom rows are read: a startup banner still visible far above the composer (kimi's
         welcome box, omp's MCP list) does not mean the engine is still starting, and a transcript row
         that merely quotes "Working…" must not hold readiness back forever.
+        K2 (fix 9): the bottom rows are counted as if the composer were one line tall, so the rows
+        right above a tall composer ("⠋ Preparing Kimi Code…" over kimi's 12-row box) are still
+        read; the composer's own rows are not (they hold the typed text, not an indicator).
         """
         eng = (engine or "").strip().lower()
         lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
-        rows = lines[-TUI_PROMPT_SCAN_ROWS:]
+        span = cls._tui_composer_span(lines, eng)
+        wrapped = span[3] if span is not None else 0
+        first = max(0, len(lines) - TUI_PROMPT_SCAN_ROWS - wrapped)
+        rows = [
+            ln for idx, ln in enumerate(lines)
+            if idx >= first and (span is None or not span[1] <= idx <= span[2])
+        ]
         for phrase in TUI_BUSY_PHRASES.get(eng, ()):
             if any(phrase in ln for ln in rows):
                 return phrase
@@ -5813,10 +5987,87 @@ class HubSessionManager:
 
         A long task wraps: its START sits on the composer's first row, while a horizontally
         scrolled composer (codex) may instead show its END. Either proves the text is still there.
+        K2 (fix 9): whitespace is ignored on both sides, because a wrapped composer's rows are joined
+        with one space wherever the engine broke the line, which may not be where the text had one.
         """
         if line is None:
             return False
-        return bool((probe and probe in line) or (tail and tail in line))
+        flat = re.sub(r"\s+", "", line)
+        for part in (probe, tail):
+            key = re.sub(r"\s+", "", part or "")
+            if key and key in flat:
+                return True
+        return False
+
+    @staticmethod
+    def _tui_submit_proof_rules(engine: str = "") -> Dict[str, Any]:
+        """K3 (fix 9): the engine's submit-proof rules (TUI_SUBMIT_PROOF_RULES over the defaults)."""
+        eng = (engine or "").strip().lower()
+        return {**TUI_DEFAULT_SUBMIT_PROOF, **TUI_SUBMIT_PROOF_RULES.get(eng, {})}
+
+    @staticmethod
+    def _tui_reject_count(screen_text: str, rules: Dict[str, Any]) -> int:
+        """K3 (fix 9): how many of the engine's refusals of an Enter are on screen."""
+        text = str(screen_text or "")
+        return sum(text.count(phrase) for phrase in rules.get("reject_phrases") or ())
+
+    @classmethod
+    def _tui_history_rows_holding(cls, screen_text: str, glyph: str, probe: str) -> int:
+        """K3 (fix 9): submitted-message rows ("❯ …" for kimi) on screen holding the text's start."""
+        if not glyph or not probe:
+            return 0
+        count = 0
+        for row in str(screen_text or "").splitlines():
+            row = row.strip()
+            if row.startswith(glyph) and cls._composer_holds(row[len(glyph):], probe, ""):
+                count += 1
+        return count
+
+    @classmethod
+    def _tui_submit_marks(
+        cls, session: Any, screen_text: str, engine: str, probe: str
+    ) -> Dict[str, int]:
+        """K3 (fix 9): the evidence already present before an Enter; only what the Enter adds counts.
+
+        An "Error: LLM not set" line from an earlier refused Enter stays on kimi's screen, a resumed
+        kimi redraws the old "❯ …" rows, and the transcript may already hold user messages.
+        """
+        rules = cls._tui_submit_proof_rules(engine)
+        return {
+            "rejects": cls._tui_reject_count(screen_text, rules),
+            "history": cls._tui_history_rows_holding(screen_text, rules.get("history_glyph") or "", probe),
+            "user_seq": int(getattr(session, "transcript_user_seq", 0) or 0),
+        }
+
+    def _tui_transcript_proof(
+        self,
+        session: Any,
+        rules: Dict[str, Any],
+        size_before: int,
+        marks: Dict[str, Any],
+        probe: str,
+        tail: str,
+    ) -> str:
+        """K3 (fix 9): the transcript's proof of this submit ("" when it shows none yet)."""
+        if rules.get("transcript") == "user_message":
+            # The engine's transcript watcher (the only reader of the file) counts user messages;
+            # a new one holding the typed text is the proof.
+            seq = int(getattr(session, "transcript_user_seq", 0) or 0)
+            if seq > int(marks.get("user_seq") or 0) and self._composer_holds(
+                str(getattr(session, "transcript_user_text", "") or ""), probe, tail
+            ):
+                return "transcript_user_message"
+            return ""
+        if session.transcript_path:
+            try:
+                # transcript_grew also covers "the claimed conversation gained the user turn":
+                # on a resume the conversation was claimed before the text was typed, so only
+                # bytes appended after this Enter prove this turn arrived.
+                if Path(session.transcript_path).stat().st_size > size_before:
+                    return "transcript_grew"
+            except OSError:
+                pass
+        return ""
 
     async def _confirm_tui_submit(
         self,
@@ -5827,58 +6078,79 @@ class HubSessionManager:
         engine: str = "",
         echoed: bool = True,
         deadline: Optional[float] = None,
+        marks: Optional[Dict[str, Any]] = None,
     ) -> tuple:
-        """V2(b)/W3/K2: tri-state confirmation of one Enter, on positive evidence only.
+        """V2(b)/W3/K2/K3: confirmation of one Enter, on positive evidence only.
 
-        ("confirmed", reason) needs one of K2's three proofs:
+        ("confirmed", reason) needs one of these proofs (per engine, TUI_SUBMIT_PROOF_RULES):
           (a) the text was SEEN on the composer after typing (echoed) and that composer is now
               located and no longer holds it -- an empty composer proves nothing on its own when
               the text was never seen there, which is exactly how round 3 reported success while
-              the whole task still sat in kimi's box;
-          (b) the transcript grew; or
-          (c) the engine's working indicator is on screen.
+              the whole task still sat in kimi's box. K3 (fix 9): never for kimi, which clears
+              its box when it refuses an Enter;
+          (b) the transcript: it grew, or (kimi) its watcher read a new user message with the text;
+          (c) K3 (fix 9): a new submitted-message row ("❯ …") holding the text; or
+          (d) the engine's working indicator is on screen.
+        ("rejected", phrase) K3 (fix 9): a new refusal (kimi "Error: LLM not set") is on screen.
         ("unsubmitted", reason) only when the text is POSITIVELY still on the located input row.
         ("unknown", reason) when nothing decides it yet. D3 then lets the caller press Enter once
         more, but only with no known trust/update dialog on screen (see _submit_text_to_tui).
+        `marks` holds what was there before the Enter (_tui_submit_marks); the last screen read is
+        written back into it, as the next Enter's starting point.
         """
+        rules = self._tui_submit_proof_rules(engine)
+        marks = marks if marks is not None else {}
         # K2: when the text was never seen on the composer, an empty composer proves nothing, so the
-        # look keeps watching for ~15 s instead of deciding. A seen echo keeps the shorter W3 window.
+        # look keeps watching for ~15 s instead of deciding. A seen echo keeps the shorter W3 window,
+        # except where a cleared composer is no proof at all (K3): then only the transcript, a history
+        # row or activity can decide, and those take seconds to show (1.7-7 s for kimi's wire file).
         # The caller may pass a deadline, so retrying cannot stack one full window on top of another.
-        window = TUI_SUBMIT_CONFIRM_SEC if echoed else TUI_SUBMIT_EVIDENCE_SEC
-        limit = time.time() + window
+        long_window = (not echoed) or (not rules.get("cleared_composer"))
+        window = TUI_SUBMIT_EVIDENCE_SEC if long_window else TUI_SUBMIT_CONFIRM_SEC
+        started = time.time()
+        limit = started + window
         if deadline is not None:
             limit = min(limit, deadline)
         last_line: Optional[str] = None
         while time.time() < limit:
             await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
             screen = session.get_clean_screen_text(max_lines=40)
+            marks["screen"] = screen
             last_line = self._tui_input_line(screen, engine)
-            if echoed and last_line is not None and not self._composer_holds(last_line, probe, tail):
+            if self._tui_reject_count(screen, rules) > int(marks.get("rejects") or 0):
+                phrase = next((p for p in rules.get("reject_phrases") or () if p in screen), "rejected")
+                return "rejected", phrase
+            holds = self._composer_holds(last_line, probe, tail)
+            if echoed and rules.get("cleared_composer") and last_line is not None and not holds:
                 return "confirmed", "input_line_cleared"
-            if session.transcript_path:
-                try:
-                    # transcript_grew also covers "the claimed conversation gained the user turn":
-                    # on a resume the conversation was claimed before the text was typed, so only
-                    # bytes appended after this Enter prove this turn arrived.
-                    if Path(session.transcript_path).stat().st_size > size_before:
-                        return "confirmed", "transcript_grew"
-                except OSError:
-                    pass
+            proof = self._tui_transcript_proof(session, rules, size_before, marks, probe, tail)
+            if proof:
+                return "confirmed", proof
+            glyph = rules.get("history_glyph") or ""
+            if glyph and self._tui_history_rows_holding(screen, glyph, probe) > int(marks.get("history") or 0):
+                return "confirmed", "history_row"
             if self._tui_agent_active(screen):
                 return "confirmed", "agent_active"
-            if not echoed and self._composer_holds(last_line, probe, tail):
+            if holds and (not echoed or (long_window and time.time() - started >= TUI_SUBMIT_CONFIRM_SEC)):
                 # K2: the text the hub typed is visibly sitting on the composer while nothing
                 # indicates work -- "seen still unsent", so the caller may press Enter again (the
-                # first Enter was swallowed because the engine was still starting up).
+                # first Enter was swallowed because the engine was still starting up). A text that
+                # was seen before the Enter gets the W3 window first, as it always had.
                 return "unsubmitted", "still_in_input_line"
         if last_line is None:
-            last_line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
+            screen = session.get_clean_screen_text(max_lines=40)
+            marks["screen"] = screen
+            last_line = self._tui_input_line(screen, engine)
         if self._composer_holds(last_line, probe, tail):
             return "unsubmitted", "still_in_input_line"
         return "unknown", "unconfirmed"
 
     async def _submit_text_to_tui(
-        self, session: AgentSession, text: str, submit_key: str
+        self,
+        session: AgentSession,
+        text: str,
+        submit_key: str,
+        prior: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """V2(b)(c)/W3/K2: type the text, press Enter, and accept the submit only on evidence.
 
@@ -5894,6 +6166,11 @@ class HubSessionManager:
         TUI_SUBMIT_MAX_TRIES, is skipped entirely while a known trust/update dialog is on screen,
         and if the outcome is still unknown the result stays ok:null / "unconfirmed" with
         extra_press=true so last_injection shows that the extra press really happened.
+
+        K3 (fix 9): when the engine refuses an Enter (kimi "Error: LLM not set") the text is gone
+        from its composer. The result then carries retype=true while Enters remain: the caller waits
+        for readiness again and calls this once more with `prior` (the earlier result), so the
+        attempts, the one D3 extra press and the retype count all continue across the retype.
         """
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
@@ -5909,10 +6186,14 @@ class HubSessionManager:
         probe = clean[:30].strip()
         tail = clean[-30:].strip()
         engine = session.engine
-        line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), engine)
+        screen = session.get_clean_screen_text(max_lines=40)
+        line = self._tui_input_line(screen, engine)
         echoed = self._composer_holds(line, probe, tail)
-        attempts = 0
-        extra_press = False
+        prior = prior or {}
+        attempts = int(prior.get("attempts") or 0)
+        extra_press = bool(prior.get("extra_press"))
+        retyped = int(prior.get("retyped") or 0)
+        extra: Dict[str, Any] = {"retyped": retyped} if retyped else {}
         # K2: echoed is the FIRST look, right after typing, and it is what the result reports. The
         # later presses may additionally be judged by (a) once the text has really been seen sitting
         # on the composer -- that is what turns "the box looked empty while kimi was still booting"
@@ -5920,27 +6201,38 @@ class HubSessionManager:
         seen = echoed
         # K2: one evidence budget for the whole submit, not one per Enter.
         evidence_deadline = time.time() + TUI_SUBMIT_EVIDENCE_SEC
+        # K3 (fix 9): the screen last read before each Enter is that Enter's starting point.
+        marks: Dict[str, Any] = {"screen": screen}
         while attempts < TUI_SUBMIT_MAX_TRIES:
             attempts += 1
+            marks.update(self._tui_submit_marks(session, marks.get("screen") or "", engine, probe))
             session.write_input(submit_key)
             state, reason = await self._confirm_tui_submit(
                 session, probe, tail, size_before, engine, echoed=seen,
-                deadline=evidence_deadline,
+                deadline=evidence_deadline, marks=marks,
             )
             if state == "confirmed":
                 return {"ok": True, "reason": reason, "attempts": attempts, "echoed": echoed,
-                        "extra_press": extra_press, "label": "成功"}
+                        "extra_press": extra_press, "label": "成功", **extra}
+            if state == "rejected":
+                # K3 (fix 9): the engine refused this Enter and cleared its composer; the text is
+                # not on screen any more, so pressing Enter again would submit nothing.
+                result = {"ok": False, "reason": "rejected_by_engine", "rejected": reason,
+                          "attempts": attempts, "echoed": echoed, "extra_press": extra_press,
+                          "label": "失败", **extra}
+                if attempts < TUI_SUBMIT_MAX_TRIES:
+                    result["retype"] = True
+                return result
             if state == "unknown":
                 # D3: nothing proved either way. Press Enter once more and watch a short window --
                 # but never while a known trust/update dialog is on screen, because that Enter
                 # would answer the dialog instead of submitting the task.
-                dialog = self._tui_blocking_dialog(
-                    session.get_clean_screen_text(max_lines=40), session
-                )
+                marks["screen"] = session.get_clean_screen_text(max_lines=40)
+                dialog = self._tui_blocking_dialog(marks["screen"], session)
                 if extra_press or attempts >= TUI_SUBMIT_MAX_TRIES or dialog:
                     result = {"ok": None, "reason": "unconfirmed", "attempts": attempts,
                               "echoed": echoed, "extra_press": extra_press,
-                              "dialog": dialog or None, "label": "未确认"}
+                              "dialog": dialog or None, "label": "未确认", **extra}
                     if extra_press:
                         # The extra press was made and the short D3 window still proved nothing.
                         result["detail"] = "checked_after_extra_press"
@@ -5956,7 +6248,48 @@ class HubSessionManager:
             seen = True
             await asyncio.sleep(TUI_SUBMIT_RETRY_STEP_SEC * attempts)
         return {"ok": False, "reason": "text_still_in_input_line", "attempts": attempts,
-                "echoed": echoed, "extra_press": extra_press, "label": "失败"}
+                "echoed": echoed, "extra_press": extra_press, "label": "失败", **extra}
+
+    @staticmethod
+    def _tui_ready_banner(session: Any) -> str:
+        """K1 (fix 9): the banner this startup waits for ("" for none): fresh spawns only.
+
+        A resume is never gated on it (see TUI_READY_BANNERS): kimi -S draws no composer before its
+        Welcome box, which then scrolls away within seconds.
+        """
+        if int(getattr(session, "resume_count", 0) or 0) > 0:
+            return ""
+        return TUI_READY_BANNERS.get(str(getattr(session, "engine", "") or "").strip().lower(), "")
+
+    @staticmethod
+    def _tui_banner_visible(session: Any, screen_text: str, banner: str) -> bool:
+        """K1 (fix 9): the banner is on screen or in the recent scrollback (it may scroll off fast)."""
+        if banner in str(screen_text or ""):
+            return True
+        scrollback = getattr(session, "get_full_scrollback_text", None)
+        if scrollback is None:
+            return False
+        try:
+            return banner in scrollback(max_lines=TUI_READY_BANNER_HISTORY_ROWS)
+        except Exception:
+            return False
+
+    def _record_startup_injection(self, session: AgentSession, result: Dict[str, Any]) -> None:
+        """W3: last_injection, the pane's red/grey line and the persisted row for one startup text."""
+        session.last_injection = result
+        if result.get("ok") is False:
+            # W3: the red line is for a CONFIRMED failure only.
+            session.emit_virtual_ansi(
+                f"\r\n\x1b[1;31m✖ 启动文本注入失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
+            )
+        elif result.get("ok") is None:
+            session.emit_virtual_ansi(
+                "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
+            )
+        try:
+            self.persist_session(session)
+        except Exception:
+            pass
 
     async def _auto_handle_tui_startup_and_trust(
         self,
@@ -5972,6 +6305,12 @@ class HubSessionManager:
         its -i prompt behind the dialog forever). W4: the same watcher runs during the readiness
         wait, so a dialog that appears later is answered, and the task text is never typed while a
         known dialog is on screen. W3: the injection outcome is recorded honestly in last_injection.
+
+        K1 (fix 9): a fresh spawn of an engine with a ready banner (kimi's Welcome box) also waits
+        for that banner; if it has not shown TUI_READY_BANNER_FALLBACK_SEC after the trust dialog
+        was answered (or after spawn), the gate warns and falls back to composer + busy + stable.
+        K3 (fix 9): an Enter the engine refused is followed by a new wait for readiness and the
+        whole text typed again, within the same attempt limit.
         """
         start = time.time()
         deadline = start + TUI_STARTUP_WINDOW_SEC
@@ -5983,6 +6322,13 @@ class HubSessionManager:
         last_text: Optional[str] = None
         stable_since = time.time()
         ready: Dict[str, Any] = {"ready": False, "reason": "no_screen"}
+        banner = "" if typed else self._tui_ready_banner(session)
+        banner_anchor = start
+        banner_seen_at: Optional[float] = None
+        banner_fallback = False
+        # K3 (fix 9): the refused submit that is waiting to be typed again, if any.
+        rejected: Optional[Dict[str, Any]] = None
+        retypes = 0
 
         while session.status in ("starting", "running"):
             await asyncio.sleep(TUI_DIALOG_POLL_SEC)
@@ -5998,6 +6344,8 @@ class HubSessionManager:
                     trust_dismissed += 1
                 last_text = None
                 stable_since = time.time()
+                # K1 (fix 9): the banner's fallback clock starts when the last dialog is answered.
+                banner_anchor = time.time()
                 await asyncio.sleep(TUI_TRUST_CONFIRM_SETTLE_SEC)
                 continue
             last_dialog = None
@@ -6007,6 +6355,17 @@ class HubSessionManager:
             input_line = self._tui_input_line(screen_txt, session.engine)
             stable = (now - stable_since) >= TUI_READY_STABLE_SEC
             prompted, prompt_reason = self._tui_ready(screen_txt, session.engine)
+            if banner and banner_seen_at is None and not banner_fallback:
+                if self._tui_banner_visible(session, screen_txt, banner):
+                    banner_seen_at = now
+                elif now >= min(banner_anchor + TUI_READY_BANNER_FALLBACK_SEC,
+                                deadline - TUI_READY_BANNER_RESERVE_SEC):
+                    # K1 (fix 9): an engine update may have changed the banner; do not hang the spawn.
+                    banner_fallback = True
+                    logger.warning(
+                        "[%s] %r did not appear within %.0f s of startup; typing on the composer/busy/"
+                        "stable gate instead", session.session_id, banner, now - banner_anchor,
+                    )
             if not screen_txt.strip():
                 ready = {"ready": False, "reason": "no_screen"}
             elif not prompted:
@@ -6014,31 +6373,42 @@ class HubSessionManager:
                 # ("⠋ Preparing Kimi Code…", "Connecting to MCP servers:", "Starting MCP servers")
                 # and swallows the Enter typed then, so the reason names the indicator that is up.
                 ready = {"ready": False, "reason": prompt_reason}
+            elif banner and banner_seen_at is None and not banner_fallback:
+                # K1 (fix 9): kimi's bare composer before its Welcome box is not ready either.
+                ready = {"ready": False, "reason": "waiting_banner"}
             elif not stable:
                 ready = {"ready": False, "reason": "waiting_stable"}
             else:
                 ready = {"ready": True, "reason": "stable_prompt", "elapsed_sec": round(now - start, 1)}
+            if banner:
+                ready["banner"] = banner
+                ready["banner_seen_sec"] = (
+                    round(banner_seen_at - start, 1) if banner_seen_at is not None else None
+                )
+                if banner_fallback:
+                    ready["banner_fallback"] = True
 
             if not typed and ready["ready"] and (now - start) >= startup_delay:
-                result = await self._submit_text_to_tui(session, task_to_inject, submit_key)
+                prior = None if rejected is None else dict(rejected, retyped=retypes)
+                result = await self._submit_text_to_tui(session, task_to_inject, submit_key, prior=prior)
                 result["ready"] = ready
                 result["trust_dismissed"] = trust_dismissed
                 result["at"] = round(time.time(), 3)
                 result["mode"] = "startup_task"
-                session.last_injection = result
-                if result.get("ok") is False:
-                    # W3: the red line is for a CONFIRMED failure only.
-                    session.emit_virtual_ansi(
-                        f"\r\n\x1b[1;31m✖ 启动文本注入失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
+                if result.pop("retype", False):
+                    # K3 (fix 9): the engine refused the Enter and cleared its box. Wait for the
+                    # readiness gate again (a fresh stable period at least), then type it all anew.
+                    rejected = result
+                    retypes += 1
+                    logger.warning(
+                        "[%s] the engine refused the startup text (%s) after %s Enter(s); typing it "
+                        "again once ready", session.session_id, result.get("rejected"),
+                        result.get("attempts"),
                     )
-                elif result.get("ok") is None:
-                    session.emit_virtual_ansi(
-                        "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
-                    )
-                try:
-                    self.persist_session(session)
-                except Exception:
-                    pass
+                    last_text = None
+                    stable_since = time.time()
+                    continue
+                self._record_startup_injection(session, result)
                 # W4: the text is typed; the readiness wait it could have been lost in is over.
                 return
 
@@ -6048,18 +6418,20 @@ class HubSessionManager:
                 return
             if now >= deadline:
                 if not typed:
-                    session.last_injection = {
+                    if rejected is not None:
+                        # K3 (fix 9): refused, and never ready again for the retype: a real failure.
+                        result = dict(rejected)
+                        result.update({
+                            "label": "失败", "at": round(time.time(), 3), "ready": ready,
+                            "detail": "not_ready_again_before_deadline",
+                        })
+                        self._record_startup_injection(session, result)
+                        return
+                    self._record_startup_injection(session, {
                         "ok": None, "reason": "unconfirmed", "attempts": 0,
                         "mode": "startup_task", "at": round(time.time(), 3),
                         "label": "未确认", "ready": ready, "trust_dismissed": trust_dismissed,
-                    }
-                    session.emit_virtual_ansi(
-                        "\r\n\x1b[90m… 启动文本注入未确认（unconfirmed）\x1b[0m\r\n"
-                    )
-                    try:
-                        self.persist_session(session)
-                    except Exception:
-                        pass
+                    })
                 return
 
     def _crash_tail(self, sess: AgentSession) -> str:
