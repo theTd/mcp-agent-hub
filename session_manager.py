@@ -707,14 +707,20 @@ TUI_INPUT_GLYPH_RE = re.compile(r"^\s*(?:[│┃|]\s*)?(?:[>❯›»])\s?(.*)$")
 # "│ > …" and whose height grows with the text (kimi's box is 12 rows tall for a task carrying the
 # worker-bridge hint at 120 columns); every other engine draws a bare prompt glyph row ("glyph").
 # K6 (fix 9c): the table is also the list of engines whose composer the hub KNOWS from real
-# captures. Only for these is a live message typed through the checked submit; any other TUI (pwsh,
-# a generic CLI, where a "> " output row is not a composer) keeps the old unchecked write + Enter.
+# captures. A live message is typed through the checked submit only for an engine listed here AND in
+# TUI_LIVE_SUBMIT_CHECKED; any other TUI (pwsh, a generic CLI, where a "> " output row is not a
+# composer) keeps the old unchecked write + Enter.
 TUI_COMPOSER_SHAPES = {
     "kimi": "box",
     "omp": "glyph",
     "codex": "glyph",
     "agy": "glyph",
 }
+# Owner decision engines-checked (2026-11-06, decision page kimi-injection-2026-11-06): only these
+# engines type a LIVE message through the checked submit (K5 settle -> Enter -> K3 proof). kimi is the
+# one engine whose Enter was really lost; omp, codex and agy keep the old write + Enter, recorded as
+# ok:null "live_write_unchecked". Their composers stay in TUI_COMPOSER_SHAPES for reading the screen.
+TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi"})
 # K7 (fix 9d): a "glyph" composer wraps a long text onto the rows under its prompt row, and those
 # rows end at the engine's own closing row (real screens of the 22b0573 live check):
 #   omp    rule, "❯ …", wrapped rows indented two columns, rule, status line   (o1l2_screens.txt)
@@ -4762,6 +4768,12 @@ class HubSessionManager:
         screen = session.get_clean_screen_text(max_lines=40)
         return self._tui_input_line(screen, session.engine) is not None
 
+    def _live_submit_checked(self, session: AgentSession) -> bool:
+        """A live message goes through the checked submit: an engine in TUI_LIVE_SUBMIT_CHECKED
+        (owner decision engines-checked) whose composer is on the current screen."""
+        engine = str(getattr(session, "engine", "") or "").strip().lower()
+        return engine in TUI_LIVE_SUBMIT_CHECKED and self._tui_composer_located(session)
+
     def _deliver_live_text_to_tui(
         self, sess: AgentSession, text: str, turn_before: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -4789,7 +4801,7 @@ class HubSessionManager:
             return {"pty_written": written, "injection": "live_write" if written else "none",
                     "queued": False}
         claim = self._tui_writer_queue(sess).claim("parent_message")
-        if claim.first and not self._tui_composer_located(sess):
+        if claim.first and not self._live_submit_checked(sess):
             written = sess.write_input(text)
             if not written:
                 claim.release()
@@ -4858,7 +4870,7 @@ class HubSessionManager:
             sess.last_injection = self._live_submitting_record(submit_id)
             if not sess.is_process_alive():
                 result = {"ok": False, "reason": "process_gone", "attempts": 0, "label": "失败"}
-            elif self._tui_composer_located(sess):
+            elif self._live_submit_checked(sess):
                 result = await self._submit_text_to_tui(sess, text, submit_key)
                 retypes = 0
                 while result.pop("retype", False) and sess.is_process_alive():

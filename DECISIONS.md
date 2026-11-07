@@ -36,3 +36,14 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 | shutdown-ends-cli | A graceful hub shutdown ends each sub-agent's CLI process tree and cancels running dsh jobs, archiving them as `interrupted` (resumable). | yes |
 | dsh-one-event | A dsh turn emits one `turn_completed` event (no separate `completed`), like the other engines. | yes |
 | unconfirmed-injection | When the hub cannot confirm a typed task was submitted, it presses Enter once more (never while a known trust/update dialog is on screen); if still unknown, it records the injection as unconfirmed. | no (was: press nothing more) |
+
+## Kimi startup and message injection (2026-11-06, decision page kimi-injection-2026-11-06)
+
+| id | decision | default kept |
+|---|---|---|
+| live-checked | A live message with Enter to a running TUI session (send_to_subagent, console send) goes through the checked submit (type, wait until the text has settled on the composer, Enter, proof, retry), in the background, one writer per session; `last_injection` shows `submitting` until the outcome. | yes |
+| engines-checked | Only kimi uses the checked submit for live messages (`TUI_LIVE_SUBMIT_CHECKED`); omp, codex and agy keep write + Enter after 0.25 s, recorded `ok:null` `live_write_unchecked`. | no (was: kimi, omp, codex and agy) |
+| resume-gate | A resume (`kimi -S`) is not gated on `Welcome to Kimi Code!`; it keeps the composer + not busy + stable gate. Fresh kimi spawns wait for Welcome. | yes |
+| flatten-newlines | Text typed through the checked submit has its newlines replaced by spaces, the same as the startup task. | yes |
+| failed-message-turn | A live message whose submit failed for certain (`ok:false`) puts a completed session back to completed with its previous answer, if nothing else changed it meanwhile. | yes |
+| active-proof | The engine's working indicator proves a submit only if it was not on screen before the Enter. | yes |
