@@ -1,6 +1,9 @@
 import asyncio
+import hmac
 import json
 import os
+import signal
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +11,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from fastmcp import Context, FastMCP
 import uvicorn
 
@@ -1382,6 +1386,43 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
     finally:
         sess.detach_ws_queue(q)
         sender_task.cancel()
+
+
+# ============================================================================
+# 5. Desktop shell (desktop/): hub identity and a token-guarded graceful stop
+# ============================================================================
+HUB_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
+# Set only by a launcher that owns this hub (the desktop app). Read once at start and removed from
+# the environment, so no agent process the hub spawns inherits it. Never logged.
+_HUB_SHUTDOWN_TOKEN = os.environ.pop("HUB_SHUTDOWN_TOKEN", "")
+
+
+@app.get("/api/hub/info")
+async def api_hub_info():
+    return {
+        "service": "mcp-agent-hub",
+        "pid": os.getpid(),
+        "port": hub_port(),
+        "repo": str(BASE_DIR),
+        "started_at": HUB_STARTED_AT,
+        "shutdown_enabled": bool(_HUB_SHUTDOWN_TOKEN),
+    }
+
+
+def _stop_hub_like_ctrl_c() -> None:
+    # uvicorn's own SIGINT handler: graceful stop, then the lifespan archives every session.
+    signal.raise_signal(signal.SIGINT)
+
+
+@app.post("/api/hub/shutdown")
+async def api_hub_shutdown(req: Request):
+    if not _HUB_SHUTDOWN_TOKEN:
+        return not_found("此 Hub 未启用远程停止")
+    given = req.headers.get("x-hub-shutdown-token", "")
+    if not hmac.compare_digest(given.encode("utf-8"), _HUB_SHUTDOWN_TOKEN.encode("utf-8")):
+        return JSONResponse({"detail": "停止令牌无效"}, status_code=403)
+    # The answer goes out first; the stop runs after the response is sent.
+    return JSONResponse({"ok": True}, background=BackgroundTask(_stop_hub_like_ctrl_c))
 
 
 # Mount both Parent MCP (/mcp) and Narrow Worker MCP (/worker-mcp)
