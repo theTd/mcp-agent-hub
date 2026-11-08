@@ -1410,7 +1410,13 @@ async def api_hub_info():
 
 
 def _stop_hub_like_ctrl_c() -> None:
-    # uvicorn's own SIGINT handler: graceful stop, then the lifespan archives every session.
+    # Persist/archive every live session and unblock long-pollers before uvicorn begins tearing
+    # down HTTP/MCP streams, so even if an open stream hits timeout_graceful_shutdown no session
+    # record is ever lost.
+    try:
+        hub.archive_all_sessions_on_shutdown()
+    except Exception:
+        pass
     signal.raise_signal(signal.SIGINT)
 
 
@@ -1435,4 +1441,10 @@ for route in mcp_parent_app.routes:
 if __name__ == "__main__":
     port = hub_port()
     # B11: startup discovery runs in a thread, so the first /api/sessions poll answers at once.
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="info",
+        timeout_graceful_shutdown=2,
+    )

@@ -1080,7 +1080,16 @@ function openSessionOrHistory(id) {
   const session = state.sessions.find((s) => s.session_id === id);
   // S1: a session still in the live list but with no live process opens its record, not a dead pane.
   if (session && isLive(session)) {
+    $$('.modal-backdrop:not([hidden])').forEach((el) => {
+      if (el.id) closeModal(el.id, { force: true });
+    });
+    if (sessionsMode !== 'live') setSessionsMode('live');
+    if (state.layoutMode === 'matrix') emit('layout:set', 'single');
     setActiveSession(id);
+    requestAnimationFrame(() => {
+      cards.get(id)?.el?.scrollIntoView({ block: 'nearest' });
+      focusActiveSession();
+    });
     return;
   }
   openHistoryRecord(id);

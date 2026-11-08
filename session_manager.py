@@ -2534,6 +2534,7 @@ class HubSessionManager:
         self._worker_message_logs: Dict[str, List[Dict[str, Any]]] = {}
         self.pending_questions: Dict[str, Dict[str, Any]] = {}
         self._event_waiters: Set[asyncio.Event] = set()
+        self._shutting_down: bool = False
 
         # B11: the constructor must never shell out to five CLIs. It loads the profile file at once
         # (using whatever discovery already has) and finishes discovery on a background thread, so
@@ -4579,6 +4580,7 @@ class HubSessionManager:
         keeps its own reason. R6 terminates a live PTY's process tree, R5 cancels a live DSH job, and
         W7 closes the browser sockets. Each session is best effort and the whole loop is bounded.
         """
+        self._shutting_down = True
         archived = 0
         deadline = time.time() + SHUTDOWN_MAX_SEC
         for session_id, sess in list(self.sessions.items()):
@@ -4603,6 +4605,18 @@ class HubSessionManager:
         self.sessions.clear()
         with self._transcript_lock:
             self._claimed_transcripts.clear()
+        for waiter in list(self._event_waiters):
+            try:
+                waiter.set()
+            except Exception:
+                pass
+        for q_entry in list(self.pending_questions.values()):
+            ev = q_entry.get("event")
+            if isinstance(ev, asyncio.Event):
+                try:
+                    ev.set()
+                except Exception:
+                    pass
         return archived
 
     def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -6191,13 +6205,15 @@ class HubSessionManager:
         self._event_waiters.add(waiter)
         start = time.time()
         try:
-            while True:
+            while not self._shutting_down:
                 remaining = timeout_sec - (time.time() - start)
                 if remaining <= 0:
                     break
                 try:
                     await asyncio.wait_for(waiter.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
+                    break
+                if self._shutting_down:
                     break
                 waiter.clear()
                 found = self.get_worker_events(session_id=session_id, after_seq=after_seq)

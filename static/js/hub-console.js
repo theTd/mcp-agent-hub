@@ -15,6 +15,7 @@ let pollTimer = 0;
 let polling = false;
 let refreshQueued = false;
 let deepLinkHandled = false;
+let pendingOpenSessionId = null;
 
 // ------------------------------------------------------------------- polling
 async function refreshSessions() {
@@ -84,13 +85,40 @@ function updateConnBanner(ok) {
     : `${icon('info')}<span>正在连接 Hub…</span>`;
 }
 
-/** F3: ?session=<id> activates that session once the first poll has answered. */
+/** F3: ?session=<id> and window.openHubSession(id) activate that session and keep the URL in sync. */
 function handleDeepLink() {
-  if (deepLinkHandled || !state.sessionsLoaded) return;
-  deepLinkHandled = true;
-  const id = new URL(location.href).searchParams.get('session');
-  if (id) emit('session:open', id);
+  if (!state.sessionsLoaded) return;
+  if (!deepLinkHandled) {
+    deepLinkHandled = true;
+    const id = new URL(location.href).searchParams.get('session');
+    if (id) pendingOpenSessionId = id;
+  }
+  if (pendingOpenSessionId) {
+    const targetId = pendingOpenSessionId;
+    pendingOpenSessionId = null;
+    emit('session:open', targetId);
+  }
 }
+
+function openHubSession(id) {
+  const sessionId = String(id || '').trim();
+  if (!sessionId) return;
+  try {
+    const nextUrl = new URL(location.href);
+    nextUrl.searchParams.set('session', sessionId);
+    history.replaceState(null, '', nextUrl);
+  } catch { /* ignore history errors */ }
+  if (state.sessionsLoaded && state.sessions.some((s) => s.session_id === sessionId)) {
+    pendingOpenSessionId = null;
+    emit('session:open', sessionId);
+    requestRefresh();
+  } else {
+    pendingOpenSessionId = sessionId;
+    requestRefresh();
+  }
+}
+
+window.openHubSession = openHubSession;
 
 // -------------------------------------------------------------------- layout
 function setLayout(mode) {

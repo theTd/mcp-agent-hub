@@ -198,6 +198,9 @@ pub async fn run(app: AppHandle, shell: Arc<HubShell>) {
             continue;
         }
         cursor = Some((target.generation, reply.next_seq));
+        if !reply.events.is_empty() {
+            shell.refresh_counts_and_tray(&app).await;
+        }
         let toasts = toasts_for_events(&reply.events, &mut dedup);
         if toasts.is_empty() {
             continue;

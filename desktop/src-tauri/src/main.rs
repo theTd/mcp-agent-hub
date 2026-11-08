@@ -35,6 +35,13 @@ fn retry_hub(app: AppHandle, shell: State<'_, Arc<HubShell>>) {
 }
 
 fn main() {
+    // Allow a second instance (e.g. launched by a shortcut or toast activation) to transfer
+    // foreground activation rights to the running first instance before single-instance exits.
+    unsafe {
+        let _ = windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+            windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+        );
+    }
     let start_hidden = std::env::args().skip(1).any(|a| a == "--hidden");
     let log_dir = hub_config::log_dir();
     hub_log::rotate_desktop_log(&log_dir);
@@ -52,7 +59,17 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(
             move |app, argv, _cwd| {
                 instance_shell.log(&format!("second launch: {argv:?}"));
-                if !argv.iter().skip(1).any(|a| a == "--hidden") {
+                if let Some(click) = argv
+                    .iter()
+                    .skip(1)
+                    .find_map(|a| ToastClick::from_launch_arg(a))
+                {
+                    desktop_toast::dispatch_click(app, click, "single_instance");
+                } else if !argv
+                    .iter()
+                    .skip(1)
+                    .any(|a| a == "--hidden" || a == "--toast-activated")
+                {
                     reveal_main_window(app);
                 }
             },
@@ -67,6 +84,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![splash_state, retry_hub])
         .setup(move |app| {
             let handle = app.handle().clone();
+            desktop_toast::init(&handle);
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(url) = window.url() {
                     setup_shell.set_splash_url(url);

@@ -46,6 +46,7 @@ struct ShellState {
     owned: Option<OwnedHub>,
     splash: SplashView,
     counts: SessionCounts,
+    pending_session: Option<String>,
 }
 
 /// A hub that answers: who to talk to, and the generation the caller's cursor belongs to.
@@ -69,6 +70,28 @@ pub fn reveal_main_window(app: &AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        if let Ok(hwnd) = w.hwnd() {
+            let raw = hwnd.0;
+            // SAFETY: `raw` is the live main window HWND; restore if minimized and pulse topmost
+            // so Windows brings the window in front of other windows when activated from a toast/tray.
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    BringWindowToTop, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
+                    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+                    SW_RESTORE, SW_SHOW,
+                };
+                if IsIconic(raw) != 0 {
+                    ShowWindow(raw, SW_RESTORE);
+                } else {
+                    ShowWindow(raw, SW_SHOW);
+                }
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+                SetWindowPos(raw, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                SetForegroundWindow(raw);
+                BringWindowToTop(raw);
+                SetWindowPos(raw, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            }
+        }
     }
 }
 
@@ -105,6 +128,7 @@ impl HubShell {
                     log_path,
                 },
                 counts: SessionCounts::default(),
+                pending_session: None,
             }),
             ops: tokio::sync::Mutex::new(()),
             generation,
@@ -177,22 +201,35 @@ impl HubShell {
 
     /// Show the window; when the hub answers, load the console (optionally on one session).
     pub fn open_console(&self, app: &AppHandle, session_id: Option<&str>) {
+        if let Some(sid) = session_id {
+            self.st().pending_session = Some(sid.to_string());
+        }
         reveal_main_window(app);
         let Some(cfg) = self.ready_config() else {
             return;
         };
+        let target_session = self.st().pending_session.take();
+        let effective_session = session_id.or(target_session.as_deref());
         if let (Some(w), Ok(url)) = (
             app.get_webview_window("main"),
-            Url::parse(&cfg.console_url(session_id)),
+            Url::parse(&cfg.console_url(effective_session)),
         ) {
             let current = w.url().ok();
-            // Plain "open the console" keeps the page if it already shows it.
-            let same = session_id.is_none()
-                && current
-                    .as_ref()
-                    .map(|c| c.origin() == url.origin())
-                    .unwrap_or(false);
-            if !same {
+            let on_console = current
+                .as_ref()
+                .map(|c| c.origin() == url.origin())
+                .unwrap_or(false);
+            if on_console {
+                if let Some(sid) = effective_session {
+                    self.log(&format!("activate session in console: {sid}"));
+                    let script = format!(
+                        "if (typeof window.openHubSession === 'function') {{ window.openHubSession({sid:?}); }} else {{ location.href = {url_str:?}; }}",
+                        sid = sid,
+                        url_str = url.as_str()
+                    );
+                    let _ = w.eval(&script);
+                }
+            } else {
                 self.log(&format!("navigate main window: {url}"));
                 let _ = w.navigate(url);
             }
@@ -295,7 +332,7 @@ impl HubShell {
         );
         let api = HubApi::new(cfg.port);
         match owned_hub::probe_port(&api, cfg.port).await {
-            PortProbe::ExternalHub(info) => return self.attach_external(app, &cfg, &info),
+            PortProbe::ExternalHub(info) => return self.attach_external(app, &cfg, &info).await,
             PortProbe::Busy { pid, name } => {
                 let name = name.map(|n| format!("（{n}）")).unwrap_or_default();
                 return self.fail(
@@ -322,6 +359,7 @@ impl HubShell {
                     "hub ready on port {} (hub pid {})",
                     cfg.port, info.pid
                 ));
+                let _ = self.refresh_counts().await;
                 self.open_console_quietly(app, &cfg);
                 tray_menu::refresh(app);
             }
@@ -337,22 +375,24 @@ impl HubShell {
 
     /// Load the console without forcing a hidden window into view.
     fn open_console_quietly(&self, app: &AppHandle, cfg: &HubConfig) {
+        let pending = self.st().pending_session.take();
         if let (Some(w), Ok(url)) = (
             app.get_webview_window("main"),
-            Url::parse(&cfg.console_url(None)),
+            Url::parse(&cfg.console_url(pending.as_deref())),
         ) {
             self.log(&format!("navigate main window: {url}"));
             let _ = w.navigate(url);
         }
     }
 
-    fn attach_external(&self, app: &AppHandle, cfg: &HubConfig, info: &HubInfo) {
+    async fn attach_external(&self, app: &AppHandle, cfg: &HubConfig, info: &HubInfo) {
         self.st().mode = HubMode::External;
         self.bump_generation();
         self.log(&format!(
             "attached to an external hub on port {} (pid {}, repo {}, started {}, shutdown_enabled {})",
             cfg.port, info.pid, info.repo, info.started_at, info.shutdown_enabled
         ));
+        let _ = self.refresh_counts().await;
         self.open_console_quietly(app, cfg);
         tray_menu::refresh(app);
     }
@@ -567,6 +607,12 @@ impl HubShell {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    pub async fn refresh_counts_and_tray(&self, app: &AppHandle) {
+        if self.refresh_counts().await {
+            tray_menu::refresh_tooltip(app);
         }
     }
 

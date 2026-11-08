@@ -11,9 +11,11 @@ Run: <venv python> test_hub_desktop_api.py
 import io
 import os
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -111,17 +113,54 @@ def scenario_token(log_dir: Path) -> None:
         r = httpx.post(url, headers={"X-Hub-Shutdown-Token": token + "x"}, timeout=5.0)
         check("shutdown with wrong token -> 403", r.status_code == 403, str(r.status_code))
         check("hub still running after 403", proc.poll() is None)
+
+        # Create a live pwsh session and hold an open long-poll connection so shutdown must
+        # archive the session first and unblock/close open streams within the 10 s grace window.
+        sr = httpx.post(
+            f"http://127.0.0.1:{PORT_TOKEN}/api/sessions",
+            json={"profile_id": "pwsh", "title": "shutdown-archive-check"},
+            timeout=15.0,
+        )
+        session_id = (sr.json().get("session") or {}).get("session_id", "")
+        check("created live pwsh session before shutdown", bool(session_id), session_id)
+
+        poll_done = threading.Event()
+        def _hold_long_poll() -> None:
+            try:
+                httpx.get(
+                    f"http://127.0.0.1:{PORT_TOKEN}/api/mailbox/poll?session_id=all&after_seq=999999&timeout=60",
+                    timeout=65.0,
+                )
+            except Exception:
+                pass
+            finally:
+                poll_done.set()
+
+        threading.Thread(target=_hold_long_poll, daemon=True).start()
+        time.sleep(0.3)
+
         r = httpx.post(url, headers={"X-Hub-Shutdown-Token": token}, timeout=5.0)
         check("shutdown with right token -> 200 ok", r.status_code == 200 and r.json() == {"ok": True}, r.text)
+        check("open long-poll unblocked on shutdown", poll_done.wait(timeout=5.0))
         try:
-            code = proc.wait(timeout=20)
+            code = proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             code = None
-        check("hub exited by itself within 20 s", code is not None, f"exit={code}")
+        check("hub exited by itself within 10 s", code is not None, f"exit={code}")
         check("exit code 0", code == 0, f"exit={code}")
         log_text = log_path.read_bytes().decode("utf-8", errors="replace")
         check("lifespan shutdown ran", "Application shutdown complete" in log_text)
         check("token never logged", token not in log_text)
+        with sqlite3.connect(str(HUB_DIR / "hub_state.db")) as conn:
+            row = conn.execute(
+                "SELECT status, end_reason, archived_at IS NOT NULL FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        check(
+            "live session archived as interrupted on shutdown",
+            row == ("interrupted", "interrupted", 1),
+            repr(row),
+        )
     finally:
         stop(proc)
 
