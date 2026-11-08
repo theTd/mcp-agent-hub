@@ -152,10 +152,10 @@ mcp = FastMCP(
     instructions=(
         "统一的非无头 (Non-Headless) Sub-Agent 聚合网关，支持主从双向实时通信、全链路步骤/工具轨迹追踪与生命周期后持久化查询。\n"
         "核心能力：\n"
-        "1. `spawn_subagent(agent_type, task, wait_seconds)`：在统一总控台中以非无头模式拉起 Sub-Agent，返回 `session_id` 与后台阻塞命令 `background_poll_command`；\n"
+        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`），返回 `session_id` 与后台阻塞命令 `background_poll_command`；\n"
         "2. `get_subagent_status_and_trace(session_id)`：随时查询 Sub-Agent 当前执行到第几步 (`step_count`)、最近调用了哪些工具 (`recent_tool_calls`)、产生了哪些中间消息 (`intermediate_messages`)；\n"
         "3. `get_subagent_final_response(session_id)`：无论 Sub-Agent 仍在运行还是已经退出/销毁，均可从 SQLite 持久化库中获取其 `final_response`；\n"
-        "4. `send_to_subagent` / `reply_to_subagent` / `wait_subagent_events`：主从双向发消息、回答 Sub-Agent 提问与阻塞监听。"
+        "4. `send_to_subagent` / `reply_to_subagent` / `respond_to_subagent_approval_or_choice` / `resume_subagent` / `wait_subagent_events`：主从双向发消息、回答提问、高风险操作代批、归档会话恢复与阻塞监听。"
     ),
 )
 
@@ -163,11 +163,11 @@ mcp = FastMCP(
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
     """
-    列出网关中所有可作为 Sub-Agent 调用的 Agent 引擎配置（包含 omp、kimi、agy、codex、dsh 等）。
+    列出网关中所有已启用的 Sub-Agent 引擎与 Profile 配置（包含 omp、kimi、agy、codex、dsh 等）。
     返回内容包含：
-    1. `routing_guide_markdown`：用户编写的【Sub-Agent 调用与路由指南】，指导主 Agent 在什么场景下应该调用哪个 Sub-Agent Profile / 模型；
-    2. 每个 Profile 的 `when_to_use`（何时调用注释）、已启用模型列表 (`available_models`) 与思考等级 (`available_thinking_levels`)；
-    3. 已被用户禁用的模型 (`disabled_models`) 与 Profile (`disabled_profiles`) 不会在可用列表中暴露，请勿调用。
+    1. `routing_guide_markdown`：Sub-Agent 调用与路由指南，汇总已启用的 Profile、可用模型与思考等级；
+    2. `profiles`：每个已启用 Profile 的默认配置、`when_to_use`、可用模型列表 (`available_models`) 与思考等级 (`available_thinking_levels`)；
+    3. `engines_catalog`：各引擎已启用的模型与思考等级详情（已禁用的模型与 Profile 已自动过滤，不占用上下文）。
     """
     await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
     base_url = hub_api_base_url()
@@ -177,9 +177,8 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
         "hub_console_url": f"{base_url}/",
         "worker_mcp_http_url": f"{base_url}/worker-mcp",
         "worker_cli_script": str(BASE_DIR / "hub_worker.py"),
-        "engines_catalog": hub.engines_catalog,
-        "profiles": hub.get_enabled_profiles(),
-        "disabled_profiles": [k for k, v in hub.profiles.items() if not v.get("enabled", True)],
+        "engines_catalog": hub.get_mcp_engines_catalog(),
+        "profiles": hub.get_mcp_enabled_profiles(),
     }
 
 
@@ -187,14 +186,14 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
 async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Dict[str, Any]:
     """
     [自动探测模型与思考等级] 实时扫描宿主机上安装的所有 Sub-Agent 引擎（omp / kimi / agy / codex / dsh），
-    返回每个引擎当前已启用的模型列表 (`available_models`)、已禁用的模型列表 (`disabled_models`)、全部思考等级 (`available_thinking_levels`)，
-    以及用户编写的 `routing_guide_markdown`（指示何时调用何种 Agent 与模型）。
+    返回每个引擎当前已启用的模型列表 (`available_models`)、可用思考等级 (`available_thinking_levels`)，
+    以及 `routing_guide_markdown`。已禁用的模型会自动过滤。
     主 Agent 可将 `available_models` 中的任意 `model` 和 `thinking_level` 直接传入 `spawn_subagent(agent_type, task, model=..., thinking_level=...)`。
     """
     await ensure_profiles_loaded(refresh_discovery=refresh)
     return {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
-        "engines": hub.engines_catalog,
+        "engines": hub.get_mcp_engines_catalog(),
         "usage_hint": "Pass any enabled `model` (from `available_models`) and `thinking_level` directly to `spawn_subagent(agent_type, task, model=..., thinking_level=...)`. Follow `routing_guide_markdown` and each profile's `when_to_use` annotation when choosing an agent.",
     }
 

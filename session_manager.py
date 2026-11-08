@@ -2826,14 +2826,13 @@ class HubSessionManager:
 
         def _levels_for(mid: str) -> List[str]:
             d = detail_by_id.get(mid) or {}
-            if eng == "omp":
-                # The omp CLI accepts its own level names for every model it can reach.
-                omp_levels = d.get("omp_cli_thinking_levels")
-                if omp_levels:
-                    return [str(x) for x in omp_levels]
             supported = d.get("supported_thinking_levels")
             if supported:
                 return [str(x) for x in supported]
+            if eng == "omp":
+                omp_levels = d.get("omp_cli_thinking_levels")
+                if omp_levels:
+                    return [str(x) for x in omp_levels]
             return list(engine_levels)
 
         result: List[Dict[str, Any]] = []
@@ -2925,16 +2924,112 @@ class HubSessionManager:
             return {}
         return data if isinstance(data, dict) else {}
 
+    @staticmethod
+    def _default_engine_binary(engine: str) -> str:
+        home = Path(os.path.expanduser("~"))
+        if engine == "omp":
+            return shutil.which("omp") or str(home / "AppData" / "Local" / "omp" / "omp.exe")
+        if engine == "kimi":
+            return shutil.which("kimi") or str(home / ".kimi-code" / "bin" / "kimi.exe")
+        if engine == "agy":
+            return shutil.which("agy") or str(home / "AppData" / "Local" / "agy" / "bin" / "agy.EXE")
+        if engine == "codex":
+            return (
+                shutil.which("codex.cmd")
+                or shutil.which("codex")
+                or str(home / "AppData" / "Roaming" / "npm" / "codex.cmd")
+            )
+        return "pwsh.exe"
+
+    def _builtin_profiles(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            "omp": {
+                "id": "omp",
+                "name": "OMP（Oh-My-Pi）",
+                "engine": "omp",
+                "kind": "tui",
+                "command": self._default_engine_binary("omp"),
+                "args": [],
+                "task_mode": "omp_positional",
+                "startup_delay_sec": 2.0,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "Oh-My-Pi 终端 Agent，模型与思考等级在启动时传入（--model / --thinking）。",
+            },
+            "kimi": {
+                "id": "kimi",
+                "name": "Kimi Code",
+                "engine": "kimi",
+                "kind": "tui",
+                "command": self._default_engine_binary("kimi"),
+                "args": [],
+                "task_mode": "pty_input",
+                "startup_delay_sec": 3.5,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "Kimi Code CLI。模型用 -m 传入；思考等级通过环境变量 KIMI_MODEL_THINKING_EFFORT 只作用于本会话（Kimi 状态栏显示的仍是全局设置，实际请求按本会话等级）。",
+            },
+            "agy": {
+                "id": "agy",
+                "name": "Antigravity（AGY）",
+                "engine": "agy",
+                "kind": "tui",
+                "command": self._default_engine_binary("agy"),
+                "args": [],
+                "task_mode": "agy_interactive_flag",
+                "startup_delay_sec": 2.5,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "Antigravity CLI。思考等级是模型名后缀（如 gemini-4-argon-high），由 Hub 按所选等级拼接。",
+            },
+            "codex": {
+                "id": "codex",
+                "name": "Codex",
+                "engine": "codex",
+                "kind": "tui",
+                "command": self._default_engine_binary("codex"),
+                "args": ["-c", "check_for_update_on_startup=false"],
+                "task_mode": "codex_positional",
+                "startup_delay_sec": 2.5,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "OpenAI Codex CLI。模型用 -m 传入，思考等级用 -c model_reasoning_effort 传入。",
+            },
+            "dsh": {
+                "id": "dsh",
+                "name": "DeepSeek Harness",
+                "engine": "dsh",
+                "kind": "tui",
+                "command": "pwsh.exe",
+                "args": ["-NoLogo", "-NoProfile"],
+                "task_mode": "dsh_hub_api",
+                "startup_delay_sec": 0.5,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "通过 DSH Hub API 创建的原生会话，总控台显示其实时事件流。",
+                "gui_url": "http://127.0.0.1:3080",
+                "dsh_tier": "flash",
+            },
+            "pwsh": {
+                "id": "pwsh",
+                "name": "PowerShell 7",
+                "engine": "pwsh",
+                "kind": "tui",
+                "command": "pwsh.exe",
+                "args": ["-NoLogo"],
+                "startup_delay_sec": 1.0,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "交互式 PowerShell 7 终端（已注入 HUB_SESSION_ID 与 hub_worker.py 桥接）。",
+            },
+        }
+
     def _apply_profile_data(self, data: Dict[str, Any], discovery: Dict[str, Any]):
         """Rebuilds the in-memory catalog and profiles from one file document and one discovery snapshot."""
         raw_engines = (discovery or {}).get("engines", {}) or {}
 
         self.engine_policies = data.get("engine_policies") or {}
-        self.global_routing_instructions = data.get("global_routing_instructions") or (
-            "【主 Agent 调度总则】\n"
-            "1. 调用 Sub-Agent 前请参考各 Profile 的 `when_to_use` 注释，根据任务复杂度、延迟要求和上下文体量选择最合适的 Agent 与思考等级；\n"
-            "2. 已被用户禁用 (`disabled_models` 或 `enabled=false`) 的模型与 Profile 严禁调用。"
-        )
+        self.global_routing_instructions = str(data.get("global_routing_instructions") or "").strip()
 
         # Apply per-engine model enable/disable policies
         processed_engines: Dict[str, Any] = {}
@@ -2968,11 +3063,45 @@ class HubSessionManager:
                 model_notes=mod_notes,
                 details=details,
             )
+            e_copy["available_models"] = [
+                str(m.get("id")) for m in e_copy["models"] if m.get("enabled") and m.get("id")
+            ]
+            if e_copy["available_models"] and e_copy.get("default_model") not in e_copy["available_models"]:
+                first_enabled = next((m for m in e_copy["models"] if m.get("enabled")), None)
+                if first_enabled:
+                    e_copy["default_model"] = first_enabled.get("id")
+                    if first_enabled.get("default_thinking_level"):
+                        e_copy["default_thinking_level"] = first_enabled["default_thinking_level"]
+            enabled_level_union: List[str] = []
+            for m_opt in e_copy["models"]:
+                if not m_opt.get("enabled"):
+                    continue
+                for lvl in (m_opt.get("thinking_levels") or []):
+                    if lvl and str(lvl) not in enabled_level_union:
+                        enabled_level_union.append(str(lvl))
+            if enabled_level_union:
+                e_copy["available_thinking_levels"] = self._sorted_levels_by_engine_order(
+                    eng, enabled_level_union
+                )
             processed_engines[eng] = e_copy
 
         self.engines_catalog = processed_engines
 
-        raw_profiles = data.get("profiles", {})
+        file_profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+        deleted_ids = {str(x) for x in (data.get("deleted_profiles") or [])}
+        builtins = self._builtin_profiles()
+        raw_profiles: Dict[str, Dict[str, Any]] = {}
+        for pid, base_prof in builtins.items():
+            if pid in deleted_ids and pid not in file_profiles:
+                continue
+            merged_prof = dict(base_prof)
+            if isinstance(file_profiles.get(pid), dict):
+                merged_prof.update(file_profiles[pid])
+            raw_profiles[pid] = merged_prof
+        for pid, custom_prof in file_profiles.items():
+            if pid not in raw_profiles and isinstance(custom_prof, dict):
+                raw_profiles[pid] = dict(custom_prof)
+
         enriched: Dict[str, Dict[str, Any]] = {}
         for pid, p in raw_profiles.items():
             prof = dict(p)
@@ -2983,6 +3112,9 @@ class HubSessionManager:
             # Round 2: the console and the launch read a plain bool (a hand-edited non-bool is off).
             prof[BYPASS_APPROVALS_KEY] = profile_bypasses_approvals(prof)
             eng_info = self.engines_catalog.get(eng) or {}
+            file_entry = file_profiles.get(pid) if isinstance(file_profiles.get(pid), dict) else {}
+            if not file_entry.get("command") and eng in ("omp", "kimi", "agy", "codex") and eng_info.get("binary"):
+                prof["command"] = eng_info["binary"]
             # B4: remember whether the default came from the profile file or from the engine.
             explicit_model = str(prof.get("default_model") or "").strip()
             explicit_thinking = str(prof.get("default_thinking_level") or "").strip()
@@ -3004,17 +3136,33 @@ class HubSessionManager:
             prof["default_thinking_source"] = "profile" if explicit_thinking else "engine"
 
             all_mods = eng_info.get("all_discovered_models", [])
+            prof_extra_disabled = set(prof.get("disabled_models") or [])
             prof_disabled = list(
                 dict.fromkeys(list(eng_info.get("disabled_models", [])) + list(prof.get("disabled_models") or []))
             )
             prof["all_discovered_models"] = all_mods
             prof["disabled_models"] = prof_disabled
-            prof["available_models"] = [m for m in all_mods if m not in prof_disabled]
+            prof["available_models"] = [
+                str(m.get("id"))
+                for m in (eng_info.get("models") or [])
+                if m.get("enabled") and m.get("id") and str(m.get("id")) not in prof_extra_disabled
+            ]
             prof["available_thinking_levels"] = eng_info.get("available_thinking_levels") or prof.get(
                 "available_thinking_levels", []
             )
             prof["model_details"] = eng_info.get("model_details", [])
             enriched[pid] = prof
+
+        # Keep engines_catalog defaults aligned with each engine's canonical profile so MCP callers
+        # and the console's engine cards never see conflicting default_model / default_thinking_level.
+        for eng, e_copy in processed_engines.items():
+            canonical = enriched.get(eng)
+            if not canonical:
+                continue
+            if canonical.get("default_model"):
+                e_copy["default_model"] = canonical["default_model"]
+            if canonical.get("default_thinking_level"):
+                e_copy["default_thinking_level"] = canonical["default_thinking_level"]
 
         # B2: discovery may still report ~/.codex [profiles.*] and recent configurations in the
         # catalog, but they no longer synthesise profiles. A Profile is a launch recipe, not a combo.
@@ -3038,8 +3186,70 @@ class HubSessionManager:
             result[pid] = p
         return result
 
+    def _active_engine_ids(self) -> set[str]:
+        """Returns the set of engine IDs that have at least one enabled profile."""
+        return {
+            str(p.get("engine") or "").strip()
+            for p in self.get_enabled_profiles().values()
+            if p.get("engine")
+        }
+
+    def get_mcp_engines_catalog(self) -> Dict[str, Dict[str, Any]]:
+        """Returns a compact, enabled-only view of engines_catalog for MCP callers (only engines with an enabled profile)."""
+        active_engines = self._active_engine_ids()
+        result: Dict[str, Dict[str, Any]] = {}
+        for eng, info in self.engines_catalog.items():
+            if eng not in active_engines:
+                continue
+            enabled_models: List[Dict[str, Any]] = []
+            for m in (info.get("models") or []):
+                if not m.get("enabled"):
+                    continue
+                m_item: Dict[str, Any] = {
+                    "id": m.get("id"),
+                    "thinking_levels": list(m.get("thinking_levels") or []),
+                }
+                if m.get("default_thinking_level"):
+                    m_item["default_thinking_level"] = m["default_thinking_level"]
+                note = (m.get("note") or "").strip()
+                if note:
+                    m_item["note"] = note
+                enabled_models.append(m_item)
+            result[eng] = {
+                "engine": info.get("engine") or eng,
+                "name": info.get("name") or eng,
+                "installed": bool(info.get("installed", True)),
+                "default_model": info.get("default_model"),
+                "default_thinking_level": info.get("default_thinking_level"),
+                "available_models": list(info.get("available_models") or []),
+                "available_thinking_levels": list(info.get("available_thinking_levels") or []),
+                "models": enabled_models,
+            }
+        return result
+
+    def get_mcp_enabled_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """Returns a compact, enabled-only view of profiles for MCP callers (no disabled models or internal launch details)."""
+        result: Dict[str, Dict[str, Any]] = {}
+        for pid, p in self.get_enabled_profiles().items():
+            prof_item: Dict[str, Any] = {
+                "id": p.get("id") or pid,
+                "name": p.get("name") or pid,
+                "engine": p.get("engine"),
+                "kind": p.get("kind") or "agent",
+                "default_model": p.get("default_model"),
+                "default_thinking_level": p.get("default_thinking_level"),
+                "available_models": list(p.get("available_models") or []),
+                "available_thinking_levels": list(p.get("available_thinking_levels") or []),
+                "when_to_use": p.get("when_to_use") or "",
+                "description": p.get("description") or "",
+                BYPASS_APPROVALS_KEY: bool(p.get(BYPASS_APPROVALS_KEY, False)),
+            }
+            result[pid] = prof_item
+        return result
+
     def build_routing_guide_markdown(self) -> str:
-        """B12: the guide parent agents read. Only enabled profiles and enabled models appear."""
+        """B12: the guide parent agents read. Only enabled profiles and their engines' enabled models appear."""
+        active_engines = self._active_engine_ids()
         lines: List[str] = ["# Sub-Agent 调用与路由指南"]
         instructions = (self.global_routing_instructions or "").strip()
         if instructions:
@@ -3053,22 +3263,22 @@ class HubSessionManager:
             def_mod = p.get("default_model") or "无"
             def_thk = p.get("default_thinking_level") or "无"
             lines.append(f"- `{pid}` — {name}｜默认：{def_mod} · {def_thk}")
-            when = (p.get("when_to_use") or p.get("description") or "").strip()
-            if when:
-                lines.append(f"  何时用：{when}")
+            when_lines = [ln.strip() for ln in (p.get("when_to_use") or "").splitlines() if ln.strip()]
+            if when_lines:
+                lines.append("  何时用：" + "\n  ".join(when_lines))
         lines.append("")
         lines.append("## 可用模型与思考等级（model / thinking_level）")
         for eng, info in self.engines_catalog.items():
-            models = info.get("models") or []
+            if eng not in active_engines:
+                continue
+            models = [m for m in (info.get("models") or []) if m.get("enabled")]
             if not models:
                 continue
             header = f"### {eng}"
             if eng == "agy":
-                header += "（思考等级会拼成模型名后缀）"
+                header += '（思考等级会拼成模型名后缀：传 model="gemini-4-argon", thinking_level="high" 或直接传 model="gemini-4-argon-high" 均可）'
             lines.append(header)
             for m in models:
-                if not m.get("enabled"):
-                    continue
                 levels = ", ".join(m.get("thinking_levels") or []) or "无"
                 note = (m.get("note") or "").strip()
                 model_line = f"- `{(m.get('id') or '')}`"
@@ -3076,14 +3286,6 @@ class HubSessionManager:
                     model_line += f" — {note}"
                 model_line += f"｜思考等级：{levels}"
                 lines.append(model_line)
-        disabled_groups: List[str] = []
-        for eng, info in self.engines_catalog.items():
-            disabled_entries = [m.get("id") for m in (info.get("models") or []) if not m.get("enabled")]
-            if disabled_entries:
-                disabled_groups.append(f"{eng}: {', '.join(str(x) for x in disabled_entries)}")
-        if disabled_groups:
-            lines.append("")
-            lines.append("已停用（禁止调用）：" + "，".join(disabled_groups))
         return "\n".join(lines)
 
     # ---- B13: model enable/disable + per-model notes -------------------------------------
@@ -3328,9 +3530,15 @@ class HubSessionManager:
 
         raw_data = self._read_profiles_file()
         profiles_map = raw_data.setdefault("profiles", {})
-        existing = profiles_map.get(pid) or {}
-        if not isinstance(existing, dict):
-            existing = {}
+        builtins = self._builtin_profiles()
+        existing = dict(builtins.get(pid) or {})
+        if isinstance(profiles_map.get(pid), dict):
+            existing.update(profiles_map[pid])
+        deleted_list = [str(x) for x in (raw_data.get("deleted_profiles") or []) if str(x) != pid]
+        if deleted_list:
+            raw_data["deleted_profiles"] = deleted_list
+        else:
+            raw_data.pop("deleted_profiles", None)
 
         incoming = dict(profile_data)
         if BYPASS_APPROVALS_KEY in incoming and incoming[BYPASS_APPROVALS_KEY] is not None \
@@ -3420,9 +3628,17 @@ class HubSessionManager:
         pid = (profile_id or "").strip()
         raw_data = self._read_profiles_file()
         profiles_map = raw_data.get("profiles") or {}
-        if pid not in profiles_map:
+        builtins = self._builtin_profiles()
+        deleted_list = [str(x) for x in (raw_data.get("deleted_profiles") or [])]
+        in_file = pid in profiles_map
+        in_builtin = pid in builtins and pid not in deleted_list
+        if not in_file and not in_builtin:
             raise ValueError(f"找不到 Profile「{pid}」。")
-        del profiles_map[pid]
+        if in_file:
+            del profiles_map[pid]
+        if pid in builtins and pid not in deleted_list:
+            deleted_list.append(pid)
+            raw_data["deleted_profiles"] = deleted_list
         self._write_profiles_file(raw_data)
         self._reload_after_write(raw_data)
         return True

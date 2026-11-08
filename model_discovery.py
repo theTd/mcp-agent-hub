@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -61,7 +62,7 @@ class AgentModelDiscovery:
             return self._cache
 
     def _discover_omp(self) -> Dict[str, Any]:
-        omp_bin = Path(r"C:\Users\cui\AppData\Local\omp\omp.exe")
+        omp_bin = Path(shutil.which("omp") or (self.home / "AppData" / "Local" / "omp" / "omp.exe"))
         thinking_levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
         models: List[Dict[str, Any]] = []
         seen_ids = set()
@@ -104,7 +105,6 @@ class AgentModelDiscovery:
                                         "context_window": ctx,
                                         "max_output": max_out,
                                         "supported_thinking_levels": m_thinks,
-                                        "omp_cli_thinking_levels": thinking_levels,
                                     }
                                 )
             except Exception:
@@ -120,9 +120,15 @@ class AgentModelDiscovery:
                     "context_window": "1M",
                     "max_output": "393K",
                     "supported_thinking_levels": ["low", "high", "max"],
-                    "omp_cli_thinking_levels": thinking_levels,
                 }
             )
+
+        seen_levels = {
+            lvl
+            for m in models
+            for lvl in (m.get("supported_thinking_levels") or [])
+        }
+        available_levels = [lvl for lvl in thinking_levels if lvl in seen_levels] or thinking_levels
 
         default_model = "clay/deepseek-flash"
         default_thinking = "high"
@@ -147,7 +153,7 @@ class AgentModelDiscovery:
             "default_thinking_level": default_thinking,
             "available_models": [m["id"] for m in models],
             "model_details": models,
-            "available_thinking_levels": thinking_levels,
+            "available_thinking_levels": available_levels,
             "cli_flags_template": {
                 "model": "--model={model}",
                 "thinking_level": "--thinking={thinking_level}",
@@ -155,7 +161,7 @@ class AgentModelDiscovery:
         }
 
     def _discover_kimi(self) -> Dict[str, Any]:
-        kimi_bin = self.home / ".kimi-code" / "bin" / "kimi.exe"
+        kimi_bin = Path(shutil.which("kimi") or (self.home / ".kimi-code" / "bin" / "kimi.exe"))
         cfg_path = self.home / ".kimi-code" / "config.toml"
         models: List[Dict[str, Any]] = []
         default_model = "kimi-code/k3.1-pro"
@@ -189,9 +195,14 @@ class AgentModelDiscovery:
                     "id": "kimi-code/k3.1-pro",
                     "display_name": "K3.1 Pro",
                     "supported_thinking_levels": ["low", "high", "max"],
-                    "default_thinking_level": "low",
+                    "default_thinking_level": "high",
                 }
             ]
+
+        default_thinking = next(
+            (m.get("default_thinking_level") for m in models if m.get("id") == default_model and m.get("default_thinking_level")),
+            "high",
+        )
 
         return {
             "engine": "kimi",
@@ -199,7 +210,7 @@ class AgentModelDiscovery:
             "binary": str(kimi_bin),
             "installed": kimi_bin.exists(),
             "default_model": default_model,
-            "default_thinking_level": "low",
+            "default_thinking_level": default_thinking,
             "available_models": [m["id"] for m in models],
             "model_details": models,
             "available_thinking_levels": all_efforts,
@@ -211,7 +222,7 @@ class AgentModelDiscovery:
         }
 
     def _discover_agy(self) -> Dict[str, Any]:
-        agy_bin = Path(r"C:\Users\cui\AppData\Local\agy\bin\agy.EXE")
+        agy_bin = Path(shutil.which("agy") or (self.home / "AppData" / "Local" / "agy" / "bin" / "agy.EXE"))
         models: List[Dict[str, Any]] = []
         thinking_levels = ["low", "medium", "high"]
 
@@ -271,7 +282,7 @@ class AgentModelDiscovery:
             "name": "Antigravity CLI (AGY)",
             "binary": str(agy_bin),
             "installed": agy_bin.exists(),
-            "default_model": "gemini-3.8-flash-low",
+            "default_model": "gemini-3.8-flash",
             "default_thinking_level": "low",
             "available_models": [m["id"] for m in models],
             "model_details": models,
@@ -284,7 +295,11 @@ class AgentModelDiscovery:
         }
 
     def _discover_codex(self) -> Dict[str, Any]:
-        codex_cmd = Path(r"C:\Users\cui\AppData\Roaming\npm\codex.cmd")
+        codex_cmd = Path(
+            shutil.which("codex.cmd")
+            or shutil.which("codex")
+            or (self.home / "AppData" / "Roaming" / "npm" / "codex.cmd")
+        )
         cfg_path = self.home / ".codex" / "config.toml"
         global_state_path = self.home / ".codex" / ".codex-global-state.json"
         default_model = "gpt-6.1-sol"
@@ -434,7 +449,6 @@ class AgentModelDiscovery:
     def _discover_dsh(self) -> Dict[str, Any]:
         dsh_cfg_path = self.home / ".config" / "dsh-crew" / "config.json"
         thinking_levels = ["off", "low", "medium", "high", "max"]
-        tiers = ["flash", "pro"]
         default_model = "clay/deepseek-flash"
         default_effort = "high"
         providers_list: List[Dict[str, Any]] = []
@@ -465,11 +479,16 @@ class AgentModelDiscovery:
             "deepseek-official/deepseek-v4-pro",
             "clay/minimax-m3.1-flash",
         ]
-        for tier_name, b in bindings.items():
+        for _tier_name, b in bindings.items():
             if isinstance(b, dict) and b.get("provider") and b.get("model"):
                 cand = f"{b['provider']}/{b['model']}"
                 if cand not in available_models:
                     available_models.insert(0, cand)
+        if default_model and default_model not in available_models:
+            available_models.insert(0, default_model)
+        elif default_model in available_models:
+            available_models.remove(default_model)
+            available_models.insert(0, default_model)
 
         models = [
             {
@@ -477,7 +496,6 @@ class AgentModelDiscovery:
                 "provider": m_id.split("/")[0] if "/" in m_id else "clay",
                 "model": m_id.split("/", 1)[1] if "/" in m_id else m_id,
                 "supported_thinking_levels": thinking_levels,
-                "supported_tiers": tiers,
             }
             for m_id in available_models
         ]
@@ -492,9 +510,7 @@ class AgentModelDiscovery:
             "available_models": available_models,
             "model_details": models,
             "available_thinking_levels": thinking_levels,
-            "available_tiers": tiers,
             "providers": providers_list,
-            "tier_bindings": bindings,
             "cli_flags_template": {
                 "model": "JSON payload {provider, model}",
                 "thinking_level": "JSON payload {effort: thinking_level}",

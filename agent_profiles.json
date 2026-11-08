@@ -1,117 +1,6 @@
 {
-  "profiles": {
-    "omp": {
-      "id": "omp",
-      "name": "OMP（Oh-My-Pi）",
-      "engine": "omp",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe",
-      "args": [
-        "--auto-approve"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "high",
-      "task_mode": "omp_positional",
-      "startup_delay_sec": 2.0,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "通用快速执行入口：代码与日志检索、脚本编写、单文件小改动、批量或并发子任务。响应最快、适合高并发；也可指定 kimi-code/* 模型。",
-      "description": "Oh-My-Pi 终端 Agent，模型与思考等级在启动时传入（--model / --thinking）。"
-    },
-    "kimi": {
-      "id": "kimi",
-      "name": "Kimi Code",
-      "engine": "kimi",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe",
-      "args": [
-        "--auto"
-      ],
-      "default_model": "kimi-code/k3.1-pro",
-      "default_thinking_level": "high",
-      "task_mode": "pty_input",
-      "startup_delay_sec": 3.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "长上下文与中文语境任务：通读中大型文件或整个代码库、中文技术文档与策划对齐、深度代码审查、跨模块重构。",
-      "description": "Kimi Code CLI。模型用 -m 传入；思考等级通过环境变量 KIMI_MODEL_THINKING_EFFORT 只作用于本会话（Kimi 状态栏显示的仍是全局设置，实际请求按本会话等级）。"
-    },
-    "agy": {
-      "id": "agy",
-      "name": "Antigravity（AGY）",
-      "engine": "agy",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE",
-      "args": [
-        "--dangerously-skip-permissions"
-      ],
-      "default_model": "gemini-3.8-flash",
-      "default_thinking_level": "low",
-      "task_mode": "agy_interactive_flag",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "Gemini 与 Claude 系列模型入口：前端与全栈原型、多模态任务，或需要换一个模型家族给出第二意见时。",
-      "description": "Antigravity CLI。思考等级是模型名后缀（如 gemini-4-argon-high），由 Hub 按所选等级拼接。"
-    },
-    "codex": {
-      "id": "codex",
-      "name": "Codex",
-      "engine": "codex",
-      "kind": "tui",
-      "command": "C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd",
-      "args": [
-        "--dangerously-bypass-approvals-and-sandbox",
-        "-c",
-        "check_for_update_on_startup=false"
-      ],
-      "default_model": "gpt-6.1-sol",
-      "default_thinking_level": "medium",
-      "task_mode": "codex_positional",
-      "startup_delay_sec": 2.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "高标准代码工程主力：功能开发、重构、编写测试；多文件联动修改、复杂状态或并发逻辑、疑难 Bug 定位。",
-      "description": "OpenAI Codex CLI。模型用 -m 传入，思考等级用 -c model_reasoning_effort 传入。"
-    },
-    "dsh": {
-      "id": "dsh",
-      "name": "DeepSeek Harness",
-      "engine": "dsh",
-      "kind": "tui",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo",
-        "-NoProfile"
-      ],
-      "default_model": "clay/deepseek-flash",
-      "default_thinking_level": "high",
-      "task_mode": "dsh_hub_api",
-      "startup_delay_sec": 0.5,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "DeepSeek Harness 宿主会话：需要后台常驻热会话、实时流式遥测、原生的提问等待状态（任务进入 needs_input，由主 Agent 回答），或要在 DSH Web UI（127.0.0.1:3080）里可视化协同时。双向通信本身不是选 dsh 的理由：其他 Profile 也能向主 Agent 汇报和提问。",
-      "description": "通过 DSH Hub API 创建的原生会话，总控台显示其实时事件流。",
-      "gui_url": "http://127.0.0.1:3080",
-      "dsh_tier": "flash"
-    },
-    "pwsh": {
-      "id": "pwsh",
-      "name": "PowerShell 7",
-      "engine": "pwsh",
-      "kind": "tui",
-      "command": "pwsh.exe",
-      "args": [
-        "-NoLogo"
-      ],
-      "startup_delay_sec": 1.0,
-      "submit_key": "\r",
-      "enabled": true,
-      "when_to_use": "只需要一个受控的交互式 PowerShell 7 终端：长耗时构建、测试脚本、交互式命令行工具。",
-      "description": "交互式 PowerShell 7 终端（已注入 HUB_SESSION_ID 与 hub_worker.py 桥接）。"
-    }
-  },
-  "global_routing_instructions": "【主 Agent 调度总则（调用 spawn_subagent 前请阅读）】\n调用方式：spawn_subagent(agent_type=<Profile ID>, task=..., model=<可选>, thinking_level=<可选>)。不传 model / thinking_level 时使用该 Profile 的默认值；只能传该引擎“可用模型”里的模型，以及该模型支持的思考等级。\n1. 选 Profile：高频并发检索、快速脚本、批量子任务 → omp 或 dsh；高标准工程实现、多文件重构、疑难 Bug → codex（gpt-6.1-sol 或 gpt-6.1-terra）或 kimi（kimi-code/k3.1-pro）；需要 Gemini / Claude 视角 → agy；需要后台常驻热会话、原生的“等待主 Agent 回答”状态或 DSH Web UI 可视化协同 → dsh。所有 Profile 都能与主 Agent 双向通信：主 Agent 用 send_to_subagent / reply_to_subagent 发消息或回答；Sub-Agent 用桥接说明里的 hub_worker.py message / ask 汇报或提问（dsh 用自身的提问机制）。\n2. 选思考等级：简单检索与小改动用 low；常规开发、补测试、中等难度 Bug 用 high（codex 用 medium 或 high）；核心架构改动、极难复现的 Bug、复杂算法用 max。等级越高越慢、越贵。\n3. 已被用户停用的模型与 Profile 禁止调用。",
+  "profiles": {},
+  "global_routing_instructions": "",
   "engine_policies": {
     "omp": {
       "disabled_models": [
@@ -122,10 +11,7 @@
         "kimi-code/k3-256k",
         "kimi-code/k3"
       ],
-      "model_notes": {
-        "clay/deepseek-flash": "速度最快、并发友好，常规任务首选。",
-        "kimi-code/k3.1-pro": "Kimi 旗舰模型，长上下文推理更强，速度较慢。"
-      }
+      "model_notes": {}
     },
     "kimi": {
       "disabled_models": [
@@ -134,17 +20,11 @@
         "kimi-code/k3",
         "kimi-code/k3-256k"
       ],
-      "model_notes": {
-        "kimi-code/k3.1-pro": "旗舰：深度审查、跨模块重构、长上下文综合推理。",
-        "kimi-code/k3.1-pro-highspeed": "同代高速版：对延迟敏感的中大型文件阅读与常规开发。"
-      }
+      "model_notes": {}
     },
     "agy": {
       "disabled_models": [],
-      "model_notes": {
-        "gemini-4-argon": "旗舰：复杂系统设计、跨语言重构、深层逻辑推理。",
-        "gemini-3.8-flash": "快速：前端与全栈原型、工具脚本、轻量代码检视。"
-      }
+      "model_notes": {}
     },
     "codex": {
       "disabled_models": [
@@ -158,21 +38,14 @@
         "gpt-5.6-luna",
         "gpt-5.5"
       ],
-      "model_notes": {
-        "gpt-6.1-sol": "主力高速高智商代码模型，适合绝大多数编码与重构任务。",
-        "gpt-6.1-terra": "深度工程推理模型，适合复杂架构与疑难 Bug 定位。",
-        "gpt-6-astra": "前沿算法与高复杂度研发任务。"
-      }
+      "model_notes": {}
     },
     "dsh": {
       "disabled_models": [
         "deepseek-official/deepseek-v4-flash",
         "deepseek-official/deepseek-v4-pro"
       ],
-      "model_notes": {
-        "clay/deepseek-flash": "默认：速度快，适合多轮连续迭代。",
-        "clay/minimax-m3.1-flash": "换一个模型视角做对比，快速生成与审查。"
-      }
+      "model_notes": {}
     }
   }
 }
