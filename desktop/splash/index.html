@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MCP Agent Hub</title>
+  <link rel="stylesheet" href="splash.css" />
+</head>
+<body>
+  <main id="starting">
+    <img class="logo" src="hub-icon.svg" alt="" width="72" height="72" />
+    <h1 id="starting-message">正在启动 Hub…</h1>
+    <p id="starting-detail" class="detail"></p>
+    <div class="spinner" aria-hidden="true"></div>
+  </main>
+  <main id="error" hidden>
+    <img class="logo" src="hub-icon.svg" alt="" width="56" height="56" />
+    <h1>Hub 未能启动</h1>
+    <p id="error-message" class="message"></p>
+    <section id="log-section" hidden>
+      <h2>hub.log 最后 40 行</h2>
+      <pre id="error-log"></pre>
+    </section>
+    <p class="detail">日志：<span id="log-path"></span></p>
+    <button id="retry" type="button">重试</button>
+  </main>
+  <script src="splash.js"></script>
+</body>
+</html>

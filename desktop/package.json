@@ -1,0 +1,14 @@
+{
+  "name": "mcp-agent-hub-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri desktop shell for MCP Agent Hub: owns the hub process, tray, notifications.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
+  }
+}

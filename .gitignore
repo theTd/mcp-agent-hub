@@ -8,3 +8,5 @@ hub_state.db-shm
 hub_state.db-wal
 dsh_sec_test_dir/
 .stress_test_workspace/
+desktop/node_modules/
+desktop/src-tauri/target/
