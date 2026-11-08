@@ -21,6 +21,7 @@ from session_manager import (
     default_profiles_path,
     hub_api_base_url,
     hub_port,
+    strip_osc_terminal_replies,
 )
 from transcript_summarizer import sanitize_tui_screen_text
 
@@ -153,7 +154,7 @@ mcp = FastMCP(
     instructions=(
         "统一的非无头 (Non-Headless) Sub-Agent 聚合网关，支持主从双向实时通信、全链路步骤/工具轨迹追踪与生命周期后持久化查询。\n"
         "核心能力与【严禁前台阻塞等待规范】：\n"
-        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`），返回 `session_id` 与后台监听命令 `background_poll_command`；\n"
+        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`；**请务必传入简短可读的 `title`**，如 `\"编译错误排查\"`、`\"Codex 会话修复\"`，4~16 个汉字或 2~5 个英文词，严禁直接把长 prompt 当作名字），返回 `session_id` 与后台监听命令 `background_poll_command`；\n"
         "2. 【等待方式——严禁前台挂起 poll】：启动或发消息后，**绝对不要在前台同步执行 `background_poll_command`**，也**不要在主回合里循环调用 `wait_subagent_events` 死等**！正确做法：将返回的 `background_poll_command` 交给宿主 Shell 工具以**后台异步模式**运行（例如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`），然后立即结束当前回合等待系统自动唤醒（或继续并行处理其他工作）；\n"
         "3. `get_subagent_status_and_trace(session_id)`：随时非阻塞查询 Sub-Agent 当前执行到第几步 (`step_count`)、最近调用了哪些工具 (`recent_tool_calls`)、产生了哪些中间消息 (`intermediate_messages`)；\n"
         "4. `get_subagent_final_response(session_id)`：无论 Sub-Agent 仍在运行还是已经退出/销毁，均可从 SQLite 持久化库中获取其 `final_response`；\n"
@@ -213,6 +214,7 @@ async def spawn_subagent(
 ) -> Dict[str, Any]:
     """
     以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台监听命令 `background_poll_command`。
+    - 【可读名称规范 (`title`)】：派发 Sub-Agent 时**请务必通过 `title` 参数传入一个简短可读的名字**（建议 4~16 个汉字或 2~5 个英文词，概括该 Sub-Agent 的职责或任务主题，如 `"排查构建失败"`、`"前端侧栏布局修复"`、`"API 接口联调"`），取代直接截取长 prompt 前端作为会话名称。
     - 【异步等待规范（严禁前台挂 poll）】：若本次调用返回时任务尚未完成，**请勿在前台同步执行 `background_poll_command`，也请勿前台循环调用 `wait_subagent_events`**。请使用宿主命令工具的**后台异步模式**（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后直接结束当前回合等待后台任务完成唤醒（或并行执行其他工作）。
     - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
     - 引擎默认以「高风险操作需审批」模式运行：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
@@ -262,6 +264,7 @@ async def spawn_subagent(
 
     return {
         "session_id": session.session_id,
+        "title": session.title,
         "agent_type": session.profile_id,
         "engine": session.engine,
         "effective_model": session.effective_model,
@@ -1393,14 +1396,28 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
             live = hub.sessions.get(session_id)
             try:
                 msg = json.loads(raw_msg)
-                mtype = msg.get("type")
-                if mtype == "input" and live is not None:
-                    live.write_input(msg.get("data", ""))
-                elif mtype == "resize" and live is not None:
-                    live.resize(int(msg.get("cols", 120)), int(msg.get("rows", 36)))
             except Exception:
-                if live is not None:
-                    live.write_input(raw_msg)
+                msg = None
+            if isinstance(msg, dict):
+                mtype = msg.get("type")
+                try:
+                    if mtype == "input" and live is not None:
+                        cleaned_input = strip_osc_terminal_replies(str(msg.get("data") or ""))
+                        if cleaned_input:
+                            live.write_input(cleaned_input)
+                    elif mtype == "resize":
+                        hub.resize_session_from_client(
+                            session_id,
+                            int(msg.get("cols", 120)),
+                            int(msg.get("rows", 36)),
+                            propagate_background=bool(msg.get("propagate", True)),
+                        )
+                except Exception:
+                    pass
+            elif live is not None:
+                cleaned_raw = strip_osc_terminal_replies(raw_msg)
+                if cleaned_raw:
+                    live.write_input(cleaned_raw)
     except WebSocketDisconnect:
         pass
     finally:

@@ -128,9 +128,99 @@ function setLayout(mode) {
   emit('layout:changed');
 }
 
+const SIDEBAR_MIN_W = 220;
+const SIDEBAR_DEFAULT_W = 320;
+const SIDEBAR_MAX_W = 680;
+
+function clampSidebarWidth(px) {
+  const maxByViewport = Math.max(SIDEBAR_MIN_W, Math.floor((window.innerWidth || 1200) * 0.65));
+  const upper = Math.min(SIDEBAR_MAX_W, maxByViewport);
+  const val = Number(px);
+  if (!Number.isFinite(val)) return SIDEBAR_DEFAULT_W;
+  return Math.max(SIDEBAR_MIN_W, Math.min(upper, Math.round(val)));
+}
+
+function applySidebarWidth(px, { persist = false, notify = true } = {}) {
+  const w = clampSidebarWidth(px);
+  document.documentElement.style.setProperty('--sidebar-w', `${w}px`);
+  if (persist) savePrefs({ sidebarWidth: w });
+  if (notify) emit('layout:resized');
+  return w;
+}
+
 function setSidebarCollapsed(collapsed) {
   document.body.classList.toggle('sidebar-collapsed', collapsed);
   savePrefs({ sidebarCollapsed: collapsed });
+  emit('layout:resized');
+  setTimeout(() => emit('layout:resized'), 220);
+}
+
+function initSidebarResizer() {
+  const resizer = $('#sidebarResizer');
+  const sidebar = $('#sidebar');
+  if (!resizer || !sidebar) return;
+
+  sidebar.addEventListener('transitionend', (ev) => {
+    if (ev.propertyName === 'margin-left' || ev.propertyName === 'width') {
+      emit('layout:resized');
+    }
+  });
+
+  let dragging = false;
+  let pointerId = null;
+
+  const finishDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('is-resizing-sidebar');
+    if (pointerId !== null) {
+      try { resizer.releasePointerCapture(pointerId); } catch { /* ignore */ }
+      pointerId = null;
+    }
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w'), 10);
+    applySidebarWidth(current || prefs.sidebarWidth || SIDEBAR_DEFAULT_W, { persist: true, notify: true });
+  };
+
+  resizer.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    dragging = true;
+    pointerId = ev.pointerId;
+    document.body.classList.add('is-resizing-sidebar');
+    try { resizer.setPointerCapture(ev.pointerId); } catch { /* ignore */ }
+  });
+
+  resizer.addEventListener('pointermove', (ev) => {
+    if (!dragging) return;
+    const rect = sidebar.getBoundingClientRect();
+    applySidebarWidth(ev.clientX - rect.left, { persist: false, notify: true });
+  });
+
+  resizer.addEventListener('pointerup', finishDrag);
+  resizer.addEventListener('pointercancel', finishDrag);
+  window.addEventListener('blur', finishDrag);
+
+  resizer.addEventListener('dblclick', () => {
+    applySidebarWidth(SIDEBAR_DEFAULT_W, { persist: true, notify: true });
+  });
+
+  resizer.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    ev.preventDefault();
+    const step = ev.shiftKey ? 40 : 16;
+    const delta = ev.key === 'ArrowRight' ? step : -step;
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w'), 10)
+      || prefs.sidebarWidth
+      || SIDEBAR_DEFAULT_W;
+    applySidebarWidth(current + delta, { persist: true, notify: true });
+  });
+
+  window.addEventListener('resize', () => {
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-w'), 10)
+      || prefs.sidebarWidth
+      || SIDEBAR_DEFAULT_W;
+    applySidebarWidth(current, { persist: false, notify: true });
+  });
 }
 
 // ------------------------------------------------------------ global commands
@@ -172,7 +262,9 @@ async function init() {
 
   state.layoutMode = prefs.layoutMode === 'matrix' ? 'matrix' : 'single';
   $$('[data-layout]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.layout === state.layoutMode)));
+  applySidebarWidth(prefs.sidebarWidth || SIDEBAR_DEFAULT_W, { persist: false, notify: false });
   document.body.classList.toggle('sidebar-collapsed', !!prefs.sidebarCollapsed);
+  initSidebarResizer();
 
   initSessionLauncher();
   initSessionWorkspace();
@@ -183,7 +275,10 @@ async function init() {
   on('sessions:refresh-request', requestRefresh);
   on('layout:set', setLayout);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) requestRefresh();
+    if (!document.hidden) {
+      requestRefresh();
+      emit('layout:resized');
+    }
   });
 
   updateConnBanner(null); // 正在连接 Hub…

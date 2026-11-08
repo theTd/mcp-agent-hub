@@ -2,6 +2,7 @@
 import { state, prefs, savePrefs, on, emit, setActiveSession } from './console-state.js';
 import { $, escapeHtml, formatClock } from './ui-kit.js';
 import { activityLabel, eventTypeLabel, eventTypeTone, isLifecycleSentence } from './session-status-text.js';
+import { sessionTitle } from './session-workspace.js';
 
 const MAX_EVENTS = 30;
 
@@ -73,7 +74,7 @@ function eventKey(ev) {
 function sourceNames() {
   const names = new Map();
   for (const rec of [...state.persistedSessions, ...state.sessions]) {
-    if (!names.has(rec.session_id)) names.set(rec.session_id, rec.profile_name || rec.profile_id || rec.session_id);
+    if (!names.has(rec.session_id)) names.set(rec.session_id, sessionTitle(rec));
   }
   return names;
 }

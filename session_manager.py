@@ -636,7 +636,9 @@ TRANSCRIPT_SCAN_FAST_WINDOW_SEC = 60.0
 TRANSCRIPT_SCAN_FAST_INTERVAL_SEC = 1.0
 TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC = 5.0
 # Q2: the hub session marker travels in the task text, i.e. near the beginning of the transcript.
-TRANSCRIPT_MARKER_SCAN_BYTES = 128 * 1024
+# Codex 0.167+ writes ~160 KB of tool schemas, skills, and AGENTS.md before the first user message,
+# so scan up to 512 KB to never miss the session_id marker.
+TRANSCRIPT_MARKER_SCAN_BYTES = 512 * 1024
 TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
 
 # ---- Archive & resume (spec archive-spec.md §1-§5) ------------------------------------------
@@ -957,6 +959,82 @@ def agy_brain_root() -> Path:
     if (cli_root / "brain").is_dir():
         return cli_root / "brain"
     return Path(os.path.expanduser("~")) / ".gemini" / "antigravity" / "brain"
+
+
+_READ_EXEC_RE = re.compile(
+    r"^read\s+(?:[\"'`]?[A-Za-z]:[\\/][^\s\"'`]+[\"'`]?|[\"'`]?[^\s\"'`:]+[\"'`]?)"
+    r"(?:\s+whole)?\s+and\s+(?:execute|run|implement|verify|fix|complete)\b\s*[:：]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_LEADING_QUOTED_SUBJECT_RE = re.compile(r"^[\"'“”‘’《》]([^\"'“”‘’《》\r\n]{2,36})[\"'“”‘’《》]")
+_INLINE_PATH_RE = re.compile(r"[\"'`]?(?:[A-Za-z]:[\\/]|/[A-Za-z0-9._-]+/)[^\s\"'`，,。；;)]+[\"'`]?")
+_POLITE_PREFIX_RE = re.compile(
+    r"^(?:请你|请帮我|帮我|麻烦你|麻烦|请先|现在请|请|你需要|需要你|任务[:：]|目标[:：]|背景[:：]|please\s+(?:help\s+me\s+)?)\s*",
+    re.IGNORECASE,
+)
+
+
+def derive_readable_session_title(
+    title: Optional[str],
+    task: Optional[str],
+    prof_name: str = "",
+    session_id: str = "",
+    max_len: int = 24,
+) -> str:
+    """Returns a short, human-readable session title instead of raw prompt prefixes or bare IDs."""
+    raw_title = " ".join(str(title or "").splitlines()).strip()
+    auto_default = f"{prof_name} ({session_id})".strip() if (prof_name or session_id) else ""
+    if (
+        raw_title
+        and raw_title != auto_default
+        and raw_title != session_id
+        and not (session_id and raw_title.endswith(f"({session_id})"))
+        and not re.search(r"\([a-z0-9_-]+-[0-9a-f]{6,}\)\s*$", raw_title, re.IGNORECASE)
+    ):
+        if len(raw_title) > 40:
+            return raw_title[:39].rstrip() + "…"
+        return raw_title
+
+    raw_task = re.sub(r"\[Sub-Agent Bridge Info[\s\S]*$", "", str(task or ""), flags=re.IGNORECASE).strip()
+    if not raw_task:
+        return prof_name or "交互会话"
+
+    m_exec = _READ_EXEC_RE.match(raw_task.strip())
+    if m_exec:
+        rest = (m_exec.group(1) or "").strip()
+        m_quote = _LEADING_QUOTED_SUBJECT_RE.match(rest)
+        if m_quote:
+            subject = m_quote.group(1).strip()
+            return subject[: max_len - 1].rstrip() + "…" if len(subject) > max_len else subject
+        if rest:
+            raw_task = rest
+
+    chosen = ""
+    for line in raw_task.splitlines():
+        cleaned = re.sub(r"^[#>*\-\d.)\s`]+", "", line.strip()).replace("`", "").strip()
+        if not cleaned:
+            continue
+        m_line_exec = _READ_EXEC_RE.match(cleaned)
+        if m_line_exec:
+            rest = (m_line_exec.group(1) or "").strip()
+            m_quote = _LEADING_QUOTED_SUBJECT_RE.match(rest)
+            if m_quote:
+                chosen = m_quote.group(1).strip()
+                break
+            cleaned = rest
+        cleaned = _INLINE_PATH_RE.sub("", cleaned).strip(" ，,。；;:-—·")
+        cleaned = _POLITE_PREFIX_RE.sub("", cleaned).strip(" ，,。；;:-—·")
+        if cleaned:
+            chosen = cleaned
+            break
+
+    if not chosen:
+        chosen = _INLINE_PATH_RE.sub("", re.sub(r"\s+", " ", raw_task)).strip()
+
+    first_clause = re.split(r"[。！？!?；;\n]|，|,\s+", chosen, maxsplit=1)[0].strip() or chosen
+    if len(first_clause) > max_len:
+        return first_clause[: max_len - 1].rstrip() + "…"
+    return first_clause or prof_name or "交互会话"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1675,6 +1753,31 @@ class HubTerminalScreen(pyte.HistoryScreen):
             return
         super().report_device_status(mode)
 
+    @property
+    def display(self) -> List[str]:
+        """Safe display renderer that tolerates orphaned wide-char stubs (Char.data == '').
+
+        When a TUI cursor-positions over the first cell of a 2-column CJK character without writing
+        the second cell, pyte leaves Char(data='') in the second cell while is_wide_char is False.
+        Stock pyte.Screen.display indexes char[0] unconditionally and raises IndexError.
+        """
+        wcwidth = pyte.screens.wcwidth
+
+        def render(line):
+            is_wide_char = False
+            for x in range(self.columns):
+                if is_wide_char:
+                    is_wide_char = False
+                    continue
+                char = line[x].data
+                if not char:
+                    yield " "
+                    continue
+                is_wide_char = wcwidth(char[0]) == 2
+                yield char
+
+        return ["".join(render(self.buffer[y])) for y in range(self.lines)]
+
 
 class HubTerminalStream(pyte.Stream):
     """K4 (fix 9): one escape sequence pyte cannot handle costs only itself, not the rest of the chunk.
@@ -1690,6 +1793,75 @@ class HubTerminalStream(pyte.Stream):
         except Exception:
             # pyte's own handler already re-initialised the parser; report its plain-text state.
             return self._taking_plain_text
+
+
+# OSC 10/11/12/4 color queries emitted by TUI apps (e.g. Codex CLI) at startup, and the OSC
+# replies xterm.js generates when it parses them. Forwarding late OSC replies into a ConPTY
+# session triggers TUI "esc to interrupt" via the leading ESC and types "]10;rgb:..." into the
+# prompt composer.
+OSC_COLOR_QUERY_RE = re.compile(r"\x1b\](?:4;\d+|1[0-9]);\?(?:\x07|\x1b\\)")
+OSC_TERMINAL_REPLY_RE = re.compile(r"\x1b\](?:4;\d+|1[0-9]|52|1[01]\d);[^\x07\x1b]*(?:\x07|\x1b\\)")
+NPM_CMD_SHIM_JS_RE = re.compile(r'"%(?:~dp0|dp0%)\\([^"]+?\.m?c?js)"\s+%\*', re.IGNORECASE)
+
+
+def strip_osc_terminal_replies(text: str) -> str:
+    """Removes automatic xterm OSC color/selection replies from browser-forwarded input."""
+    if not text or "\x1b]" not in text:
+        return text
+    return OSC_TERMINAL_REPLY_RE.sub("", text)
+
+
+def unwrap_windows_cmd_shim(
+    command: str,
+    args: List[str],
+    env: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Unwraps Windows npm .cmd/.bat shims (e.g. codex.cmd) into direct [node.exe, script.js, *args].
+
+    When winpty spawns a .cmd/.bat file, Windows wraps it in `cmd.exe /c ...`, whose `%*` batch
+    expansion truncates multiline arguments at the first `\\n` (losing everything after line 1 of a
+    multiline task and the Hub's `[Sub-Agent Bridge Info]` footer). Launching `node.exe` directly
+    bypasses `cmd.exe /c` so `CreateProcessW` preserves newlines verbatim. For non-npm .cmd/.bat
+    scripts that cannot be unwrapped, newlines in arguments are collapsed to spaces so `cmd.exe`
+    never drops trailing lines.
+    """
+    cmd_str = str(command or "").strip()
+    arg_list = [str(a) for a in (args or [])]
+    if os.name != "nt" or not cmd_str:
+        return [cmd_str] + arg_list
+
+    path_env = (env or os.environ).get("PATH", os.defpath)
+    resolved = cmd_str
+    if not os.path.isabs(resolved) or not os.path.exists(resolved):
+        found = shutil.which(resolved, path=path_env)
+        if found:
+            resolved = found
+
+    suffix = Path(resolved).suffix.lower()
+    if suffix not in (".cmd", ".bat"):
+        return [cmd_str] + arg_list
+
+    cmd_path = Path(resolved)
+    if cmd_path.is_file():
+        try:
+            content = cmd_path.read_text(encoding="utf-8", errors="replace")
+            m = NPM_CMD_SHIM_JS_RE.search(content)
+            if m:
+                rel_js = m.group(1).replace("\\", os.sep)
+                script_path = (cmd_path.parent / rel_js).resolve()
+                local_node = cmd_path.parent / "node.exe"
+                node_exe = (
+                    str(local_node)
+                    if local_node.is_file()
+                    else (shutil.which("node.exe", path=path_env) or shutil.which("node", path=path_env))
+                )
+                if node_exe and script_path.is_file():
+                    return [str(node_exe), str(script_path)] + arg_list
+        except OSError:
+            pass
+
+    safe_args = [re.sub(r"[\r\n]+", " ", a) for a in arg_list]
+    return [cmd_str] + safe_args
 
 
 class TuiWriterClaim:
@@ -1931,6 +2103,8 @@ class AgentSession:
     ):
         self._loop = loop
         env = os.environ.copy()
+        # Prevent broken host PYTHONHOME from poisoning child agent shells (e.g. `py -3` inside Codex).
+        env.pop("PYTHONHOME", None)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
         env["HUB_SESSION_ID"] = self.session_id
@@ -1938,7 +2112,10 @@ class AgentSession:
         if env_overrides:
             env.update(env_overrides)
 
-        cmd_list = [self.command] + list(self.args)
+        if PtyProcess is REAL_PTY_PROCESS:
+            cmd_list = unwrap_windows_cmd_shim(self.command, list(self.args), env=env)
+        else:
+            cmd_list = [self.command] + list(self.args)
         # Q2: immediately before the process is spawned, so a transcript created at (or after) this
         # instant can be this session's and nothing older can.
         self.spawned_at = time.time()
@@ -1980,10 +2157,13 @@ class AgentSession:
             self.exit_code = 0
 
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
-        scrollback = self.get_full_scrollback_text(max_lines=80)
-        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-        if clean_lines:
-            self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+        try:
+            scrollback = self.get_full_scrollback_text(max_lines=80)
+            clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
+            if clean_lines:
+                self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+        except Exception:
+            pass
 
         # Archive spec §1.4/§2: the process's end gets a named reason. A user termination already
         # decided its status in terminate(); the reader thread must not overwrite it.
@@ -2006,6 +2186,8 @@ class AgentSession:
         # erase-saved-lines half never reaches the history or a client.
         if self.resume_count:
             data = self._strip_saved_lines_erase(data)
+        if "\x1b]" in data:
+            data = OSC_COLOR_QUERY_RE.sub("", data)
         with self._lock:
             self.last_output_at = time.time()
             try:
@@ -2014,16 +2196,19 @@ class AgentSession:
                 pass
 
             # Heuristic detection of TUI tool lines for agents without native hooks
-            for line in self.screen.display:
-                clean = line.strip()
-                if not clean or clean in self._seen_tui_tool_lines:
-                    continue
-                m = TUI_TOOL_PATTERN.match(clean)
-                if m:
-                    self._seen_tui_tool_lines.add(clean)
-                    t_name = m.group(1)
-                    t_arg = (m.group(2) or m.group(3) or "").strip()
-                    detected_tools.append((t_name, t_arg))
+            try:
+                for line in self.screen.display:
+                    clean = line.strip()
+                    if not clean or clean in self._seen_tui_tool_lines:
+                        continue
+                    m = TUI_TOOL_PATTERN.match(clean)
+                    if m:
+                        self._seen_tui_tool_lines.add(clean)
+                        t_name = m.group(1)
+                        t_arg = (m.group(2) or m.group(3) or "").strip()
+                        detected_tools.append((t_name, t_arg))
+            except Exception:
+                pass
 
             self.raw_history.append(data)
             # W9: count UTF-8 bytes (the cap is 512 KB, not 512k characters) and trim the JOINED
@@ -2103,6 +2288,8 @@ class AgentSession:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
         with self._lock:
             replay = "".join(self.raw_history)
+            if "\x1b]" in replay:
+                replay = OSC_COLOR_QUERY_RE.sub("", replay)
             self.ws_queues.add(q)
         return replay, q
 
@@ -2166,7 +2353,10 @@ class AgentSession:
 
     def get_clean_screen_text(self, max_lines: int = 80) -> str:
         with self._lock:
-            lines = [line.rstrip() for line in self.screen.display]
+            try:
+                lines = [line.rstrip() for line in self.screen.display]
+            except Exception:
+                lines = []
             while lines and not lines[-1]:
                 lines.pop()
             if max_lines and len(lines) > max_lines:
@@ -2188,7 +2378,10 @@ class AgentSession:
                     hist_lines.append(chars)
             except Exception:
                 pass
-            curr_lines = [line.rstrip() for line in self.screen.display]
+            try:
+                curr_lines = [line.rstrip() for line in self.screen.display]
+            except Exception:
+                curr_lines = []
             all_lines = hist_lines + curr_lines
             while all_lines and not all_lines[-1]:
                 all_lines.pop()
@@ -2231,10 +2424,13 @@ class AgentSession:
         """
         was_alive = self.is_process_alive()
         self.ended_at = time.time()
-        scrollback = self.get_full_scrollback_text(max_lines=80)
-        clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-        if clean_lines:
-            self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+        try:
+            scrollback = self.get_full_scrollback_text(max_lines=80)
+            clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
+            if clean_lines:
+                self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+        except Exception:
+            pass
         if was_alive:
             # R14: a live process always ends as terminated, even when telemetry had already marked it
             # completed. V-5: remember the cause so the PTY reader does not also emit an `exited` event.
@@ -2533,6 +2729,8 @@ class HubSessionManager:
         self.engine_policies: Dict[str, Dict[str, Any]] = {}
         self.global_routing_instructions: str = ""
         self.sessions: Dict[str, AgentSession] = {}
+        self.default_cols: int = 120
+        self.default_rows: int = 36
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
         # the same conversation, and a file that existed before a session started is not its own.
         self._claimed_transcripts: Dict[str, str] = {}
@@ -2592,6 +2790,35 @@ class HubSessionManager:
     def wait_for_discovery(self, timeout: float = 60.0) -> bool:
         """Blocks until the startup discovery thread finished (used by scripts and tests)."""
         return self._discovery_ready.wait(timeout)
+
+    def resize_session_from_client(
+        self,
+        session_id: str,
+        cols: int,
+        rows: int,
+        propagate_background: bool = True,
+    ) -> None:
+        """Resizes the target session and tracks the console's viewport dimensions.
+
+        When the console is in single-window mode (`propagate_background=True`), all live TUI
+        sessions share the same single-pane viewport dimensions so background sessions stay sized
+        to the main window instead of remaining at the initial 120x36 default.
+        """
+        c = max(20, int(cols or 120))
+        r = max(5, int(rows or 36))
+        self.default_cols = c
+        self.default_rows = r
+        target = self.sessions.get(session_id)
+        if target is not None:
+            target.resize(c, r)
+        if propagate_background:
+            for sid, sess in list(self.sessions.items()):
+                if sid == session_id or sess is None:
+                    continue
+                if sess.kind == "tui" and (
+                    sess.is_process_alive() or sess.status in ("starting", "running", "waiting_parent")
+                ):
+                    sess.resize(c, r)
 
     # ---- V2: transcript ownership ---------------------------------------------------------
 
@@ -3282,7 +3509,10 @@ class HubSessionManager:
         if instructions:
             lines.append(instructions)
         lines.append("")
-        lines.append("## 异步等待规范（严禁前台挂起 Poll）")
+        lines.append("## 异步等待规范与命名规范")
+        lines.append(
+            "- **必填简短可读名称 (`title`)**：调用 `spawn_subagent` 派发 Sub-Agent 时，**请务必为其起一个简短可读的 `title`**（建议 4～16 个字或 2～5 个词，例如 `\"修复终端断连\"`、`\"前端侧边栏改造\"`、`\"实机光影巡检\"`），概括该 Sub-Agent 的核心职责，取代截取长 Prompt 前端作为名称。"
+        )
         lines.append(
             "- 启动 (`spawn_subagent`)、发消息 (`send_to_subagent`) 或恢复 (`resume_subagent`) 后，若任务尚未结束，返回值会提供 `background_poll_command`。"
         )
@@ -4073,16 +4303,21 @@ class HubSessionManager:
         profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
         prof = self.profiles.get(profile_id) or {}
         count = int(record.get("resume_count") or 0) + 1
+        prof_name = str(record.get("profile_name") or prof.get("name") or profile_id)
         sess = AgentSession(
             session_id=session_id,
             profile_id=profile_id,
-            profile_name=str(record.get("profile_name") or prof.get("name") or profile_id),
+            profile_name=prof_name,
             kind=str(snapshot.get("kind") or record.get("kind") or "tui"),
-            title=str(record.get("title") or f"{prof.get('name', profile_id)} ({session_id})"),
+            title=derive_readable_session_title(
+                record.get("title"), record.get("last_task"), prof_name, session_id
+            ),
             cwd=str(built.get("cwd") or snapshot.get("cwd") or record.get("cwd") or self.hub_default_cwd()),
             command=str(built.get("command") or snapshot.get("command") or ""),
             args=list(built.get("args") or []),
             gui_url=prof.get("gui_url"),
+            cols=self.default_cols,
+            rows=self.default_rows,
             on_exit_cb=self._on_session_exit,
             on_tui_tool_cb=self._on_tui_tool_detected,
         )
@@ -6550,7 +6785,18 @@ class HubSessionManager:
                 if not self._transcript_watch_alive(session):
                     break
                 candidates = []
-                for candidate in codex_root.rglob("rollout-*.jsonl"):
+                date_dirs = [
+                    d for d in self._codex_date_dirs(
+                        codex_root, self._session_spawn_anchor(session), time.time()
+                    )
+                    if d.is_dir()
+                ]
+                rollout_iter = (
+                    (p for d in date_dirs for p in d.glob("rollout-*.jsonl"))
+                    if date_dirs
+                    else codex_root.rglob("rollout-*.jsonl")
+                )
+                for candidate in rollout_iter:
                     try:
                         # V2/Q2: only a rollout created after this session's process started. The marker
                         # check and the launch-order fallback live in _claim_conversation.
@@ -6573,6 +6819,11 @@ class HubSessionManager:
                 switched = self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
                 if switched is not None:
                     target_file = switched
+                    offset = 0
+            elif session.session_id not in self._transcript_marker_ids(target_file):
+                upgraded = self._codex_upgrade_to_marked_rollout(session, codex_root, target_file, scan_start)
+                if upgraded is not None:
+                    target_file = upgraded
                     offset = 0
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -6690,6 +6941,24 @@ class HubSessionManager:
                                     "content": str(last_msg),
                                 },
                             )
+                    elif otype == "event_msg" and ptype == "turn_aborted":
+                        abort_reason = str(payload.get("reason") or "interrupted")
+                        self.db.complete_latest_tool_call(
+                            session.session_id, None, f"Turn aborted ({abort_reason})"
+                        )
+                        if session.status == "running":
+                            session.status = "waiting_parent"
+                        session.current_activity = f"Turn aborted ({abort_reason}) — idle at prompt"
+                        self.persist_session(session)
+                        self.record_worker_event(
+                            session.session_id,
+                            {
+                                "type": "turn_aborted",
+                                "category": "turn_completed",
+                                "status": "waiting_parent",
+                                "content": f"Codex turn aborted ({abort_reason})",
+                            },
+                        )
             except Exception:
                 pass
             await asyncio.sleep(1.0)
@@ -6753,6 +7022,36 @@ class HubSessionManager:
         session.conversation_ref = {"session_id": sid, "rollout_path": str(chosen)}
         self.persist_session(session)
         return chosen
+
+    def _codex_upgrade_to_marked_rollout(
+        self, session: AgentSession, root: Path, current: Path, scan_start: float
+    ) -> Optional[Path]:
+        """If an unmarked rollout was claimed before Codex flushed the prompt containing our session_id,
+        upgrade to the rollout that explicitly carries our session_id marker once it appears."""
+        if (time.time() - scan_start) > 120.0:
+            return None
+        for folder in self._codex_date_dirs(
+            Path(root), self._session_spawn_anchor(session), time.time()
+        ):
+            if not folder.is_dir():
+                continue
+            for candidate in folder.glob("rollout-*.jsonl"):
+                try:
+                    if candidate == Path(current) or not self._conversation_created_after(candidate, session):
+                        continue
+                    if session.session_id not in self._transcript_marker_ids(candidate):
+                        continue
+                    if self._transcript_claimed_by_other(candidate, session):
+                        continue
+                    with self._transcript_lock:
+                        old_key = self._transcript_key(current)
+                        if self._claimed_transcripts.get(old_key) == session.session_id:
+                            self._claimed_transcripts.pop(old_key, None)
+                        if self._claim_transcript(session, candidate):
+                            return candidate
+                except OSError:
+                    continue
+        return None
 
     def _mark_codex_archived(self, session: AgentSession) -> None:
         reason = CODEX_ARCHIVED_MESSAGE.format(sid=(session.conversation_ref or {}).get("session_id") or "")
@@ -8391,13 +8690,16 @@ class HubSessionManager:
         effort = spec.get("effort", "high")
 
         dsh_host = dsh_base_url().split("://", 1)[-1]
+        box_w = max(60, min(int(session.cols or 120) - 2, 140))
+        inner_w = max(40, box_w - 18)
         banner_head = f"╭─── DeepSeek Harness (In-Host Session @ {dsh_host}) "
+        model_info = f"{provider} / {model} (tier={tier}, effort={effort})"
         banner = (
-            f"\x1b[1;36m{banner_head}{'─' * max(1, 79 - len(banner_head))}╮\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Hub Session : \x1b[1;33m{session.session_id:<62}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Model Route : \x1b[1;32m{provider} / {model} (tier={tier}, effort={effort}){'':<23}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Workspace   : {session.cwd[:62]:<62}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m╰──────────────────────────────────────────────────────────────────────────────╯\x1b[0m\r\n"
+            f"\x1b[1;36m{banner_head}{'─' * max(1, box_w - len(banner_head))}╮\x1b[0m\r\n"
+            f"\x1b[1;36m│\x1b[0m Hub Session : \x1b[1;33m{session.session_id:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
+            f"\x1b[1;36m│\x1b[0m Model Route : \x1b[1;32m{model_info[:inner_w]:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
+            f"\x1b[1;36m│\x1b[0m Workspace   : {session.cwd[:inner_w]:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
+            f"\x1b[1;36m╰{'─' * (box_w - 1)}╯\x1b[0m\r\n"
         )
         session.emit_virtual_ansi(banner)
 
@@ -8689,6 +8991,7 @@ class HubSessionManager:
                                         "final_assistant_text": full_res,
                                     },
                                 )
+                            session.ended_at = time.time()
                             if jstatus == "done":
                                 session.status = "completed"
                                 session.end_reason = "exited"
@@ -8709,10 +9012,12 @@ class HubSessionManager:
                                 f"tokens={tokens_info.get('input', 0)}/{tokens_info.get('output', 0)})"
                             )
                             formatted_res = full_res.replace("\r\n", "\n").replace("\n", "\r\n")
+                            done_w = max(60, min(int(session.cols or 120) - 2, 140))
+                            done_head = f"╭─── DSH Turn Completed ({jstatus.upper()}) "
                             session.emit_virtual_ansi(
-                                f"\r\n\x1b[1;32m╭─── DSH Turn Completed ({jstatus.upper()}) ────────────────────────────────────╮\x1b[0m\r\n"
+                                f"\r\n\x1b[1;32m{done_head}{'─' * max(1, done_w - len(done_head))}╮\x1b[0m\r\n"
                                 f"{formatted_res}\r\n"
-                                f"\x1b[1;32m╰──────────────────────────────────────────────────────────────────────────────╯\x1b[0m\r\n"
+                                f"\x1b[1;32m╰{'─' * (done_w - 1)}╯\x1b[0m\r\n"
                                 f"\x1b[90m(Session {session.dsh_session_id} stays warm in DSH Host — send input to continue)\x1b[0m\r\n> "
                             )
                             self.persist_session(session)
@@ -8739,11 +9044,18 @@ class HubSessionManager:
                 await asyncio.sleep(0.4)
 
     def _build_worker_bridge_system_hint(self, session_id: str, engine: Optional[str] = None) -> str:
-        if (engine or "").strip().lower() == "agy":
+        eng = (engine or "").strip().lower()
+        if eng == "agy":
             return self._build_agy_bridge_hint(session_id)
         # W10: the hub may run on an interpreter that has no <repo>/.venv (this worktree does not);
         # the hint must name the interpreter the hub itself runs on, or every bridge command fails.
-        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
+        # In Codex's Windows restricted-token sandbox, %APPDATA%\uv\python and .venv uv trampolines
+        # are blocked with "permission denied (os error 5)", whereas `python` in PATH runs stdlib-only
+        # hub_worker.py directly on the first attempt without triggering an approval modal.
+        if eng == "codex":
+            python_exe = "python"
+        else:
+            python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
         worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
         return (
             f"\n[Sub-Agent Bridge Info: session_id={session_id}]\n"
@@ -9419,18 +9731,21 @@ class HubSessionManager:
                 args.extend(["-i", task + "\n" + self._build_worker_bridge_system_hint(session_id, engine)])
         elif task_mode == "codex_positional":
             if task:
-                args.append(task + "\n" + self._build_worker_bridge_system_hint(session_id))
+                args.append(task + "\n" + self._build_worker_bridge_system_hint(session_id, engine))
 
+        prof_name = str(prof.get("name", profile_id))
         sess = AgentSession(
             session_id=session_id,
             profile_id=profile_id,
-            profile_name=prof.get("name", profile_id),
+            profile_name=prof_name,
             kind=kind,
-            title=title or f"{prof.get('name', profile_id)} ({session_id})",
+            title=derive_readable_session_title(title, task, prof_name, session_id),
             cwd=work_dir,
             command=prof["command"],
             args=args,
             gui_url=prof.get("gui_url"),
+            cols=self.default_cols,
+            rows=self.default_rows,
             on_exit_cb=self._on_session_exit,
             on_tui_tool_cb=self._on_tui_tool_detected,
         )

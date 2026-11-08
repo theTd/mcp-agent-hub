@@ -17,9 +17,12 @@ const QUICK_KEYS = {
   interrupt: { text: '\x03', label: '^C', title: '发送 Ctrl+C（中断）' },
 };
 
-// V3: xterm answers device-attribute / cursor-position queries found in replayed history through
-// onData. Those answers are replies, not typing, and must never be forwarded into the PTY.
-const TERMINAL_REPLY_RE = /^\x1b\[[?>]?[0-9;]*[cRn]$/;
+// V3: xterm answers device-attribute / cursor-position / OSC color queries found in replayed
+// history through onData. Those answers are replies, not typing, and must never be forwarded
+// into the PTY (where a late OSC reply's leading ESC triggers TUI "esc to interrupt").
+const OSC_COLOR_QUERY_RE = /\x1b\](?:4;\d+|1[0-9]);\?(?:\x07|\x1b\\)/g;
+const OSC_TERMINAL_REPLY_RE = /\x1b\](?:4;\d+|1[0-9]|52|1[01]\d);[^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const TERMINAL_REPLY_RE = /^(?:\x1b\[[?>]?[0-9;]*[cRn]|\x1b\](?:4;\d+|1[0-9]|52|1[01]\d);[^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\)+$/;
 
 /** The server's explicit end-of-replay marker; every other frame is raw terminal output. */
 function isReplayEndFrame(data) {
@@ -55,14 +58,18 @@ function withResumeGap(text, rows) {
 
 function finishReplay(t) {
   clearTimeout(t.replayTimer);
-  const pending = t.replayChunks.join('');
+  const pending = t.replayChunks.join('').replace(OSC_COLOR_QUERY_RE, '');
   t.replayChunks = [];
   t.replayPending = false;
   if (!pending) {
     t.replaying = false;
+    if (t.sessionId) scheduleFit(t.sessionId);
     return;
   }
-  t.term.write(withResumeGap(pending, t.term.rows), () => { t.replaying = false; });
+  t.term.write(withResumeGap(pending, t.term.rows), () => {
+    t.replaying = false;
+    if (t.sessionId) scheduleFit(t.sessionId);
+  });
 }
 
 const TERMINAL_THEME = {
@@ -159,9 +166,26 @@ export function initSessionWorkspace() {
     focusActiveSession();
   });
   on('layout:changed', renderWorkspace);
+  on('layout:resized', scheduleFitAll);
   on('session:open', openSessionOrHistory);
   on('history:open', openHistoryRecord);
   window.addEventListener('resize', scheduleFitAll);
+  window.addEventListener('focus', scheduleFitAll);
+  document.fonts?.ready?.then(() => scheduleFitAll()).catch(() => {});
+  if (window.ResizeObserver) {
+    const gridRo = new ResizeObserver(() => scheduleFitAll());
+    gridRo.observe($('#gridContainer'));
+    const historyHost = $('#historyTermHost');
+    if (historyHost) {
+      const historyRo = new ResizeObserver(() => {
+        if (historyTerm?.fit && $('#historyTermBox')?.open) {
+          try { historyTerm.fit.fit(); } catch { /* ignore */ }
+        }
+      });
+      historyRo.observe(historyHost);
+    }
+  }
+  setInterval(tickSessionDurations, 1000);
   // Alt+↑ / Alt+↓ also works while the terminal has focus (capture phase sees it first).
   document.addEventListener('keydown', onGlobalKeydown, true);
   renderAll();
@@ -187,9 +211,85 @@ const isLive = (s) => (typeof s.process_alive === 'boolean' ? s.process_alive : 
 const engineKey = (s) => (s.kind === 'desktop_gui' ? 'desktop' : s.engine || s.kind || 'tui');
 const profileLabel = (s) => s.profile_name || s.profile_id || '会话';
 
-function sessionTitle(s) {
-  const task = firstLine(s.last_task);
-  return `${profileLabel(s)} · ${task || '交互会话'}`;
+const LEGACY_TITLE_ID_SUFFIX_RE = /\s*\([a-z0-9_-]+-[0-9a-f]{6,}\)\s*$/i;
+
+function summarizeTaskForTitle(taskText, maxLen = 24) {
+  if (!taskText) return '';
+  let text = String(taskText).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  text = text.replace(/\[Sub-Agent Bridge Info[\s\S]*$/i, '').trim();
+  const readExec = text.match(/^Read\s+(?:["'`]?[A-Za-z]:[\\/][^\s"'`]+["'`]?|["'`]?[^\s"'`:]+["'`]?)(?:\s+whole)?\s+and\s+(?:execute|run|implement|verify|fix|complete)\b\s*[:：]?\s*([\s\S]*)$/i);
+  if (readExec) {
+    const rest = (readExec[1] || '').trim();
+    const quoted = rest.match(/^["'“”‘’《》]([^"'“”‘’《》\n]{2,36})["'“”‘’《》]/);
+    if (quoted) {
+      const q = quoted[1].trim();
+      return q.length > maxLen ? `${q.slice(0, maxLen - 1).trimEnd()}…` : q;
+    }
+    if (rest) text = rest;
+    else {
+      const m = text.match(/([^\s\\/]+)\.(?:md|txt|json|py|js|ts)/i);
+      text = m ? `执行 ${m[1]}` : '执行任务文档';
+    }
+  }
+  const candidates = [];
+  for (const rawLine of text.split('\n')) {
+    let line = rawLine.trim().replace(/^[#*>\-\d.)\s`]+/, '').trim();
+    if (!line || line.startsWith('```')) continue;
+    line = line.replace(/["'`]?(?:[A-Za-z]:[\\/]|\/[A-Za-z0-9._-]+\/)[^\s"'`，,。；;)]+["'`]?/g, '').trim();
+    line = line.replace(/^(?:请你|请帮我|帮我|麻烦你|麻烦|请先|现在请|请|你需要|需要你|任务[:：]|目标[:：]|背景[:：])\s*/g, '').trim();
+    if (line) candidates.push(line);
+  }
+  if (!candidates.length) return '';
+  const first = candidates[0];
+  const clauses = first.split(/[。！？!?；;\n]|，|,\s+/).map((c) => c.trim()).filter(Boolean);
+  let chosen = clauses[0] || first;
+  if (chosen.length < 4 && clauses.length > 1) {
+    chosen = `${chosen} ${clauses[1]}`.trim();
+  }
+  chosen = chosen.replace(/\s+/g, ' ').replace(/^[:：,，.。;；\-—\s]+|[:：,，.。;；\-—\s]+$/g, '');
+  if (!chosen) return '';
+  return chosen.length > maxLen ? `${chosen.slice(0, maxLen - 1).trimEnd()}…` : chosen;
+}
+
+export function sessionTitle(s) {
+  const label = profileLabel(s);
+  const rawTitle = firstLine(s.title);
+  if (rawTitle && !LEGACY_TITLE_ID_SUFFIX_RE.test(rawTitle) && rawTitle !== s.session_id) {
+    if (rawTitle === label) {
+      const taskSummary = summarizeTaskForTitle(s.last_task);
+      return `${label} · ${taskSummary || '交互会话'}`;
+    }
+    if (rawTitle.startsWith(`${label} · `) || rawTitle.startsWith(`${label} - `) || rawTitle.startsWith(`${label}:`)) {
+      return rawTitle;
+    }
+    return `${label} · ${rawTitle}`;
+  }
+  const taskSummary = summarizeTaskForTitle(s.last_task);
+  return `${label} · ${taskSummary || '交互会话'}`;
+}
+
+function formatRuntimeHms(s) {
+  const created = Number(s?.created_at);
+  if (!Number.isFinite(created) || created <= 0) return '00:00:00';
+  const live = isLive(s);
+  const endTs = live
+    ? Date.now() / 1000
+    : Number(s?.ended_at || s?.last_output_at || s?.archived_at || Date.now() / 1000);
+  const elapsed = Math.max(0, Math.floor(endTs - created));
+  const hh = Math.floor(elapsed / 3600);
+  const mm = Math.floor((elapsed % 3600) / 60);
+  const ss = elapsed % 60;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
+function tickSessionDurations() {
+  if (sessionsMode !== 'live' || document.hidden) return;
+  for (const s of state.sessions) {
+    const card = cards.get(s.session_id);
+    if (!card) continue;
+    const durEl = card.el.querySelector('[data-ref="duration"]');
+    if (durEl) durEl.textContent = formatRuntimeHms(s);
+  }
 }
 
 function cwdBase(cwd) {
@@ -290,6 +390,8 @@ function renderSessionList() {
     card.el.setAttribute('aria-selected', String(s.session_id === state.activeSessionId));
     card.el.querySelector('[data-ref="activity"]').textContent = activityText(s);
     card.el.querySelector('[data-ref="idle"]').textContent = idleText(s);
+    const durEl = card.el.querySelector('[data-ref="duration"]');
+    if (durEl) durEl.textContent = formatRuntimeHms(s);
     if (list.children[index] !== card.el) list.insertBefore(card.el, list.children[index] || null);
   });
 }
@@ -300,14 +402,16 @@ function modelMetaHtml(s) {
   return model ? `<span class="sc-meta-model" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` : '';
 }
 
-/** Folder + short id on the line below the model (V-2). */
+/** Runtime duration (fixed xx:xx:xx) + folder + short id on the line below the model (V-2). */
 function pathMetaHtml(s) {
-  const bits = [];
+  const bits = [
+    `<span class="sc-meta-duration" data-ref="duration" title="运行时长">${escapeHtml(formatRuntimeHms(s))}</span>`,
+  ];
   const folder = cwdBase(s.cwd);
   if (folder) bits.push(`<span class="sc-meta-text" title="${escapeHtml(s.cwd || '')}">${icon('folder', 'icon-xs')}${escapeHtml(folder)}</span>`);
   const tail = String(s.session_id || '').slice(-6);
   if (tail) bits.push(`<span class="sc-meta-id" title="${escapeHtml(s.session_id || '')}">${escapeHtml(tail)}</span>`);
-  return bits.map((bit) => `<span class="dot-sep"></span>${bit}`).join('');
+  return bits.join('<span class="dot-sep"></span>');
 }
 
 /** Round 2: a session launched with the profile's bypass_approvals on (no high-risk approval). */
@@ -785,14 +889,26 @@ function createTerminal(sessionId) {
   term.loadAddon(fit);
 
   const t = {
+    sessionId,
     term, fit, host, ws: null, ro: null, opened: false, disposed: false, retries: 0, retryTimer: 0,
     wsOpen: false, replaying: false, replayPending: false, replayChunks: [], replayTimer: 0,
+    lastSentCols: 0, lastSentRows: 0, lastSentLayoutMode: '', sendResize: null,
   };
-  const sendResize = () => {
-    if (t.opened && t.ws?.readyState === WebSocket.OPEN) {
-      t.ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  const sendResize = (force = false) => {
+    if (!t.opened || t.ws?.readyState !== WebSocket.OPEN) return;
+    const cols = term.cols;
+    const rows = term.rows;
+    if (!Number.isFinite(cols) || !Number.isFinite(rows) || cols < 2 || rows < 2) return;
+    const propagate = state.layoutMode === 'single';
+    if (!force && t.lastSentCols === cols && t.lastSentRows === rows && t.lastSentLayoutMode === state.layoutMode) {
+      return;
     }
+    t.lastSentCols = cols;
+    t.lastSentRows = rows;
+    t.lastSentLayoutMode = state.layoutMode;
+    t.ws.send(JSON.stringify({ type: 'resize', cols, rows, propagate }));
   };
+  t.sendResize = sendResize;
   const connect = () => {
     const ws = new WebSocket(hubApi.ptySocketUrl(sessionId));
     t.ws = ws;
@@ -801,6 +917,9 @@ function createTerminal(sessionId) {
       if (t.retries > 0) term.reset();
       t.retries = 0;
       t.wsOpen = true;
+      t.lastSentCols = 0;
+      t.lastSentRows = 0;
+      t.lastSentLayoutMode = '';
       // V3: the replay arrives first, then a replay_end marker. While the terminal is parsing the
       // history, the query replies xterm generates (DA / DSR) must not be typed into the session.
       t.replaying = true;
@@ -809,7 +928,11 @@ function createTerminal(sessionId) {
       clearTimeout(t.replayTimer);
       // A hub that predates the marker never sends one; write what arrived and leave replay mode.
       t.replayTimer = setTimeout(() => finishReplay(t), 1500);
-      sendResize();
+      if (t.opened && t.host.isConnected && t.host.clientWidth && t.host.clientHeight) {
+        try { t.fit.fit(); } catch { /* ignore */ }
+      }
+      sendResize(true);
+      scheduleFit(sessionId);
       refreshPaneHead(sessionId);
     };
     ws.onmessage = (ev) => {
@@ -846,9 +969,11 @@ function createTerminal(sessionId) {
   };
   term.onData((data) => {
     // V3: terminal queries in the replayed history make xterm answer by itself; those answers are
-    // not user input. Live output still needs its answers, so only the replay window drops replies.
+    // not user input. OSC color replies are always stripped so they never send ESC into a running TUI.
     if (t.replaying && TERMINAL_REPLY_RE.test(data)) return;
-    if (t.ws?.readyState === WebSocket.OPEN) t.ws.send(JSON.stringify({ type: 'input', data }));
+    const cleaned = data.replace(OSC_TERMINAL_REPLY_RE, '');
+    if (!cleaned) return;
+    if (t.ws?.readyState === WebSocket.OPEN) t.ws.send(JSON.stringify({ type: 'input', data: cleaned }));
   });
   term.onResize(sendResize);
   connect();
@@ -890,12 +1015,28 @@ function scheduleFitAll() {
 
 function flushFits() {
   fitFrame = 0;
+  const retryIds = [];
   for (const id of fitQueue) {
     const t = terminals.get(id);
     if (!t || !t.opened || !t.host.isConnected || !t.host.clientWidth || !t.host.clientHeight) continue;
-    try { t.fit.fit(); } catch { /* terminal not measurable yet */ }
+    try {
+      const dims = t.fit.proposeDimensions?.();
+      if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows) || dims.cols < 2 || dims.rows < 2) {
+        retryIds.push(id);
+        continue;
+      }
+      t.fit.fit();
+      t.sendResize?.();
+    } catch {
+      retryIds.push(id);
+    }
   }
   fitQueue.clear();
+  if (retryIds.length) {
+    setTimeout(() => {
+      for (const id of retryIds) scheduleFit(id);
+    }, 60);
+  }
 }
 
 function focusActiveSession() {

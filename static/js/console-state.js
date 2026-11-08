@@ -47,6 +47,7 @@ const PREFS_KEY = 'subAgentHub.console.prefs.v1';
 const PREF_DEFAULTS = {
   layoutMode: 'single',
   sidebarCollapsed: false,
+  sidebarWidth: 320,
   launcherCollapsed: true,
   eventsCollapsed: false,
   lastProfileId: '',
