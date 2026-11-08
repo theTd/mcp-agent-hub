@@ -6672,13 +6672,30 @@ class HubSessionManager:
             results.append(ev)
         return results
 
+    def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
+        """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
+        target_ids = None
+        if session_id and session_id != "all":
+            target_ids = {s.strip() for s in session_id.split(",") if s.strip()}
+        pending: List[Dict[str, Any]] = []
+        for sid, sess in list(self.sessions.items()):
+            if target_ids and sid not in target_ids:
+                continue
+            if sess is not None and sess.status == "waiting_parent" and sess.pending_interaction:
+                item = dict(sess.pending_interaction)
+                item.setdefault("session_id", sid)
+                pending.append(item)
+        return pending
+
     async def poll_worker_events(
         self,
         session_id: str = "all",
         after_seq: int = 0,
         timeout_sec: float = 25.0,
+        wake_on_pending: bool = False,
     ) -> Dict[str, Any]:
         immediate = self.get_worker_events(session_id=session_id, after_seq=after_seq)
+        pending_now = self.get_pending_interactions(session_id=session_id)
         if immediate:
             next_seq = immediate[-1]["seq"]
             return {
@@ -6687,6 +6704,18 @@ class HubSessionManager:
                 "after_seq": after_seq,
                 "next_seq": next_seq,
                 "events": immediate,
+                "pending_interactions": pending_now,
+                "next_poll_command": self.build_poll_command(session_id, next_seq),
+            }
+        if wake_on_pending and pending_now:
+            next_seq = max(after_seq, self.global_seq)
+            return {
+                "woke_reason": "pending_interaction_waiting",
+                "session_id": session_id,
+                "after_seq": after_seq,
+                "next_seq": next_seq,
+                "events": [],
+                "pending_interactions": pending_now,
                 "next_poll_command": self.build_poll_command(session_id, next_seq),
             }
 
@@ -6706,6 +6735,7 @@ class HubSessionManager:
                     break
                 waiter.clear()
                 found = self.get_worker_events(session_id=session_id, after_seq=after_seq)
+                pending_after = self.get_pending_interactions(session_id=session_id)
                 if found:
                     next_seq = found[-1]["seq"]
                     return {
@@ -6714,6 +6744,18 @@ class HubSessionManager:
                         "after_seq": after_seq,
                         "next_seq": next_seq,
                         "events": found,
+                        "pending_interactions": pending_after,
+                        "next_poll_command": self.build_poll_command(session_id, next_seq),
+                    }
+                if wake_on_pending and pending_after:
+                    next_seq = max(after_seq, self.global_seq)
+                    return {
+                        "woke_reason": "pending_interaction_waiting",
+                        "session_id": session_id,
+                        "after_seq": after_seq,
+                        "next_seq": next_seq,
+                        "events": [],
+                        "pending_interactions": pending_after,
                         "next_poll_command": self.build_poll_command(session_id, next_seq),
                     }
         finally:
@@ -6725,6 +6767,7 @@ class HubSessionManager:
             "after_seq": after_seq,
             "next_seq": max(after_seq, self.global_seq),
             "events": [],
+            "pending_interactions": self.get_pending_interactions(session_id=session_id),
             "next_poll_command": self.build_poll_command(session_id, after_seq),
         }
 
@@ -8922,15 +8965,23 @@ class HubSessionManager:
                                     session.emit_virtual_ansi(
                                         f"\r\n\x1b[1;34m📨 [DSH Worker Message to Parent]: {mtext}\x1b[0m\r\n"
                                     )
-                                    self.record_worker_event(
-                                        session.session_id,
-                                        {
-                                            "type": "message_to_parent",
-                                            "category": "message",
-                                            "status": "running",
-                                            "content": mtext,
-                                        },
-                                    )
+                                    if mtext.lstrip().startswith("[approval granted without asking"):
+                                        self.db.add_intermediate_message(
+                                            session.session_id,
+                                            session.step_count,
+                                            mtext.strip(),
+                                            source="dsh_auto_approval_notice",
+                                        )
+                                    else:
+                                        self.record_worker_event(
+                                            session.session_id,
+                                            {
+                                                "type": "message_to_parent",
+                                                "category": "message",
+                                                "status": "running",
+                                                "content": mtext,
+                                            },
+                                        )
                 except Exception:
                     pass
 

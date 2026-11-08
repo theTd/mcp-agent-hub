@@ -2,8 +2,9 @@
 """
 主 Agent 后台阻塞监听器 (Parent Agent Blocking Poll CLI).
 
-用法示例（主 Agent 在后台运行此命令，当 Sub-Agent 发来消息、提问或完成任务时，此命令会立即打印 JSON 并退出，从而第一时间唤醒主 Agent）：
+用法示例（主 Agent 在后台运行此命令，当 Sub-Agent 发来消息、提问、请求审批或完成任务时，此命令会立即打印 JSON 并退出，从而第一时间唤醒主 Agent）：
   python hub_poll.py --session <session_id> --after-seq 0 --timeout 1800
+  python hub_poll.py --session <id1>,<id2>,<id3> --after-seq 0 --timeout 1800
   python hub_poll.py --session all --after-seq 0 --timeout 1800
 
 K3: 这里不要再写死 <repo>/.venv 的解释器路径。后台轮询命令由 session_manager.build_poll_command()
@@ -22,7 +23,11 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 def main():
     parser = argparse.ArgumentParser(description="Blocking long-poll waiter for Sub-Agent events")
-    parser.add_argument("--session", default="all", help="Sub-Agent session_id (or 'all' for any active session)")
+    parser.add_argument(
+        "--session",
+        default="all",
+        help="Sub-Agent session_id, comma-separated session_ids (id1,id2,...), or 'all' for any active session",
+    )
     parser.add_argument("--after-seq", type=int, default=0, help="Only return events with seq > after_seq")
     parser.add_argument("--timeout", type=float, default=1800.0, help="Max total seconds to block before returning")
     parser.add_argument("--hub-url", default=os.environ.get("HUB_API_URL", "http://127.0.0.1:4444"), help="Hub base URL")
@@ -30,6 +35,8 @@ def main():
 
     deadline = time.time() + args.timeout
     slice_sec = 25.0  # Each HTTP long-poll slice is at most 25s to avoid socket idle drops
+    cur_seq = args.after_seq
+    first_slice = True
 
     while True:
         remaining = deadline - time.time()
@@ -37,18 +44,21 @@ def main():
             out = {
                 "woke_reason": "timeout",
                 "session": args.session,
-                "after_seq": args.after_seq,
+                "after_seq": cur_seq,
                 "events": [],
-                "next_seq": args.after_seq,
+                "pending_interactions": [],
+                "next_seq": cur_seq,
             }
             print(json.dumps(out, ensure_ascii=False, indent=2))
             sys.exit(0)
 
-        wait_slice = min(slice_sec, max(1.0, remaining))
+        wait_slice = min(1.0 if first_slice else slice_sec, max(0.5, remaining))
+        first_slice = False
         params = urllib.parse.urlencode({
             "session_id": args.session,
-            "after_seq": args.after_seq,
+            "after_seq": cur_seq,
             "timeout": round(wait_slice, 1),
+            "wake_on_pending": "1",
         })
         url = f"{args.hub_url}/api/mailbox/poll?{params}"
 
@@ -56,13 +66,39 @@ def main():
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=wait_slice + 10.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                events = data.get("events", [])
-                if events:
+                raw_events = data.get("events", [])
+                if raw_events:
+                    cur_seq = max(cur_seq, int(data.get("next_seq") or raw_events[-1].get("seq") or cur_seq))
+                events = [
+                    ev for ev in raw_events
+                    if not str(ev.get("content") or "").lstrip().startswith("[approval granted without asking")
+                ]
+                pending_interactions = data.get("pending_interactions")
+                if pending_interactions is None and args.session != "all":
+                    target_ids = {s.strip() for s in args.session.split(",") if s.strip()}
+                    try:
+                        with urllib.request.urlopen(f"{args.hub_url}/api/sessions", timeout=5.0) as sresp:
+                            sdata = json.loads(sresp.read().decode("utf-8"))
+                        pending_interactions = [
+                            s["pending_interaction"]
+                            for s in (sdata.get("sessions") or [])
+                            if s.get("session_id") in target_ids
+                            and s.get("status") == "waiting_parent"
+                            and s.get("pending_interaction")
+                        ]
+                    except Exception:
+                        pending_interactions = []
+                else:
+                    pending_interactions = pending_interactions or []
+                if events or pending_interactions:
+                    data["events"] = events
+                    data["pending_interactions"] = pending_interactions
+                    data["next_seq"] = cur_seq
                     print(json.dumps(data, ensure_ascii=False, indent=2))
                     sys.exit(0)
         except KeyboardInterrupt:
             sys.exit(130)
-        except Exception as e:
+        except Exception:
             time.sleep(1.0)
 
 

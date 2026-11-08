@@ -288,6 +288,7 @@ async def spawn_subagent(
         "background_poll_hint": (
             "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
             "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
+            "若并行派发了多个 Sub-Agent，可将多个 session_id 以英文逗号拼接传给同一个 hub_poll.py（如 `--session id1,id2,id3`），切勿自行编写轮询脚本。"
         ),
         "worker_events": events,
         "wait_result": settle_info,
@@ -973,11 +974,13 @@ async def api_mailbox_poll(
     session_id: str = Query("all"),
     after_seq: int = Query(0),
     timeout: float = Query(25.0),
+    wake_on_pending: bool = Query(False),
 ):
     return await hub.poll_worker_events(
         session_id=session_id,
         after_seq=after_seq,
         timeout_sec=min(max(0.1, timeout), 120.0),
+        wake_on_pending=wake_on_pending,
     )
 
 
@@ -1152,6 +1155,17 @@ async def api_list_sessions():
         "default_cwd": hub.hub_default_cwd(),
         "hub_port": hub_port(),
     }
+
+
+@app.get("/api/sessions/{session_id}")
+async def api_get_session(session_id: str):
+    sess = hub.sessions.get(session_id)
+    if sess is not None:
+        return sess.to_dict()
+    rec = hub.get_archive_record(session_id)
+    if rec:
+        return rec
+    return not_found(f"找不到会话 {session_id}")
 
 
 # Archive spec §6: the console's archive list, one record, its raw scrollback, revive and delete.
