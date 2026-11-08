@@ -3,10 +3,9 @@
 //! external one, and keep a 5 s watch for the tray and for a hub that died.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Url};
@@ -15,13 +14,10 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use crate::hub_api::{count_sessions, HubApi, HubInfo, SessionCounts};
 use crate::hub_config::{self, HubConfig};
 use crate::hub_log;
+use crate::owned_hub::{self, OwnedHub, PortProbe, ReadyError, PORT_RELEASE_WAIT};
 use crate::tray_menu;
-use crate::windows_process::{self, HubJob};
+use crate::windows_process;
 
-const READY_POLL: Duration = Duration::from_millis(500);
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
-const GRACEFUL_STOP_WAIT: Duration = Duration::from_secs(10);
-const PORT_RELEASE_WAIT: Duration = Duration::from_secs(10);
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const EXTERNAL_MISSES_BEFORE_ERROR: u32 = 3;
 
@@ -44,12 +40,6 @@ pub struct SplashView {
     pub log_path: String,
 }
 
-struct OwnedHub {
-    child: Child,
-    job: HubJob,
-    token: String,
-}
-
 struct ShellState {
     mode: HubMode,
     config: Option<HubConfig>,
@@ -64,11 +54,6 @@ pub struct ReadyTarget {
     pub api: HubApi,
 }
 
-enum ReadyError {
-    Cancelled,
-    Failed(String),
-}
-
 pub struct HubShell {
     state: Mutex<ShellState>,
     ops: tokio::sync::Mutex<()>,
@@ -77,14 +62,6 @@ pub struct HubShell {
     close_hint_shown: AtomicBool,
     splash_url: Mutex<Option<Url>>,
     log_dir: PathBuf,
-}
-
-fn exit_text(status: std::process::ExitStatus) -> String {
-    match status.code() {
-        Some(c) if c < 0 => format!("{c} / 0x{:08X}", c as u32),
-        Some(c) => c.to_string(),
-        None => "?".to_string(),
-    }
 }
 
 pub fn reveal_main_window(app: &AppHandle) {
@@ -281,12 +258,7 @@ impl HubShell {
     }
 
     fn owned_exit(&self) -> Option<String> {
-        let mut st = self.st();
-        let owned = st.owned.as_mut()?;
-        match owned.child.try_wait() {
-            Ok(Some(status)) => Some(exit_text(status)),
-            _ => None,
-        }
+        self.st().owned.as_mut()?.exit_text()
     }
 
     pub async fn start(self: &Arc<Self>, app: &AppHandle) {
@@ -322,33 +294,29 @@ impl HubShell {
             &format!("127.0.0.1:{} · {}", cfg.port, cfg.repo_dir.display()),
         );
         let api = HubApi::new(cfg.port);
-        if let Ok(info) = api.info(Duration::from_millis(1500)).await {
-            if info.is_agent_hub() {
-                return self.attach_external(app, &cfg, &info);
+        match owned_hub::probe_port(&api, cfg.port).await {
+            PortProbe::ExternalHub(info) => return self.attach_external(app, &cfg, &info),
+            PortProbe::Busy { pid, name } => {
+                let name = name.map(|n| format!("（{n}）")).unwrap_or_default();
+                return self.fail(
+                    app,
+                    &format!(
+                        "端口 {} 已被另一个程序占用：PID {pid}{name}，它不是 MCP Agent Hub。请关闭它，或用 AGENT_HUB_PORT / config.json 换一个端口。",
+                        cfg.port
+                    ),
+                    false,
+                );
             }
+            PortProbe::Free => {}
         }
-        if let Some(pid) = windows_process::listening_pid(cfg.port) {
-            let name = windows_process::process_name(pid)
-                .map(|n| format!("（{n}）"))
-                .unwrap_or_default();
-            return self.fail(
-                app,
-                &format!(
-                    "端口 {} 已被另一个程序占用：PID {pid}{name}，它不是 MCP Agent Hub。请关闭它，或用 AGENT_HUB_PORT / config.json 换一个端口。",
-                    cfg.port
-                ),
-                false,
-            );
+        let log = |line: &str| self.log(line);
+        match OwnedHub::launch(&cfg, &self.log_dir, &log) {
+            Ok(owned) => self.st().owned = Some(owned),
+            Err(e) => return self.fail(app, &format!("无法启动 Hub：{e}"), true),
         }
-        if let Err(e) = self.spawn_owned(&cfg) {
-            return self.fail(app, &format!("无法启动 Hub：{e}"), true);
-        }
-        match self.wait_ready(&api).await {
+        match owned_hub::wait_ready(&api, &self.cancel_start, || self.owned_exit()).await {
             Ok(info) => {
-                {
-                    let mut st = self.st();
-                    st.mode = HubMode::Owned;
-                }
+                self.st().mode = HubMode::Owned;
                 self.bump_generation();
                 self.log(&format!(
                     "hub ready on port {} (hub pid {})",
@@ -360,7 +328,7 @@ impl HubShell {
             Err(ReadyError::Cancelled) => self.log("start cancelled by a stop"),
             Err(ReadyError::Failed(msg)) => {
                 if let Some(owned) = self.st().owned.take() {
-                    owned.job.terminate();
+                    owned.terminate();
                 }
                 self.fail(app, &msg, true);
             }
@@ -389,81 +357,10 @@ impl HubShell {
         tray_menu::refresh(app);
     }
 
-    fn spawn_owned(&self, cfg: &HubConfig) -> Result<(), String> {
-        let log_path = hub_log::hub_log_path(&self.log_dir);
-        std::fs::create_dir_all(&self.log_dir)
-            .map_err(|e| format!("无法创建日志目录 {}：{e}", self.log_dir.display()))?;
-        if let Ok(true) = hub_log::rotate_if_needed(&log_path, hub_log::ROTATE_LIMIT_BYTES) {
-            self.log("hub.log passed 10 MB: kept as hub.log.1");
-        }
-        let mut out = hub_log::open_append(&log_path)
-            .map_err(|e| format!("无法打开 {}：{e}", log_path.display()))?;
-        hub_log::write_launch_banner(&mut out, cfg.port);
-        let err = out.try_clone().map_err(|e| e.to_string())?;
-        let token = windows_process::random_token().map_err(|e| e.to_string())?;
-        let job = HubJob::new_kill_on_close().map_err(|e| format!("无法创建 Job Object：{e}"))?;
-        let mut cmd = Command::new(&cfg.python);
-        cmd.arg(cfg.server_py())
-            .current_dir(&cfg.repo_dir)
-            .env("HUB_PORT", cfg.port.to_string())
-            .env("HUB_SHUTDOWN_TOKEN", &token)
-            .stdin(Stdio::null())
-            .stdout(out)
-            .stderr(err);
-        let child = windows_process::spawn_in_job(&mut cmd, &job).map_err(|e| {
-            format!(
-                "{} {}：{e}",
-                cfg.python.display(),
-                cfg.server_py().display()
-            )
-        })?;
-        self.log(&format!(
-            "hub launched: pid {} = {} {} (cwd {}, port {})",
-            child.id(),
-            cfg.python.display(),
-            cfg.server_py().display(),
-            cfg.repo_dir.display(),
-            cfg.port
-        ));
-        self.st().owned = Some(OwnedHub { child, job, token });
-        Ok(())
-    }
-
-    async fn wait_ready(&self, api: &HubApi) -> Result<HubInfo, ReadyError> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            if self.cancel_start.load(Ordering::SeqCst) {
-                return Err(ReadyError::Cancelled);
-            }
-            if let Some(code) = self.owned_exit() {
-                return Err(ReadyError::Failed(format!(
-                    "Hub 进程启动后退出了（退出码 {code}）。"
-                )));
-            }
-            if let Ok(info) = api.info(Duration::from_secs(2)).await {
-                if info.is_agent_hub() {
-                    return Ok(info);
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(ReadyError::Failed(format!(
-                    "Hub 在 {} 秒内没有响应 /api/hub/info。",
-                    READY_TIMEOUT.as_secs()
-                )));
-            }
-            tokio::time::sleep(READY_POLL).await;
-        }
-    }
-
-    /// Graceful stop of an owned hub: shutdown request with the token, up to 10 s for the process
-    /// to exit, then terminate the job (whatever is left, including agents that outlived the hub).
+    /// Graceful stop of an owned hub (owned_hub::OwnedHub::stop_gracefully): shutdown request with
+    /// the token, up to 10 s for the process to exit, then terminate the job.
     async fn stop_owned_locked(&self, app: &AppHandle) {
-        let (owned, port) = {
-            let mut st = self.st();
-            let port = st.config.as_ref().map(|c| c.port);
-            (st.owned.take(), port)
-        };
-        let Some(mut owned) = owned else {
+        let Some(owned) = self.st().owned.take() else {
             return;
         };
         {
@@ -474,50 +371,13 @@ impl HubShell {
         // Ends the notifier's long-poll, so the hub has no open request holding up its shutdown.
         self.bump_generation();
         tray_menu::refresh(app);
-        let pid = owned.child.id();
-        self.log(&format!("stopping hub pid {pid}"));
-        if let Some(port) = port {
-            match HubApi::new(port).shutdown(&owned.token).await {
-                Ok(()) => self.log("shutdown requested (graceful)"),
-                Err(e) => self.log(&format!("shutdown request failed: {e}")),
-            }
-        }
-        let deadline = Instant::now() + GRACEFUL_STOP_WAIT;
-        let mut exited = None;
-        while Instant::now() < deadline {
-            if let Ok(Some(status)) = owned.child.try_wait() {
-                exited = Some(status);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        match exited {
-            Some(status) => self.log(&format!("hub exited ({})", exit_text(status))),
-            None => self.log("hub still running after 10 s: terminating the job"),
-        }
-        owned.job.terminate();
-        for _ in 0..50 {
-            if let Ok(Some(_)) = owned.child.try_wait() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        drop(owned);
-        if let Some(port) = port {
-            self.wait_port_free(port).await;
-        }
-        self.log("hub stopped");
-    }
-
-    async fn wait_port_free(&self, port: u16) -> bool {
-        let deadline = Instant::now() + PORT_RELEASE_WAIT;
-        while Instant::now() < deadline {
-            if windows_process::listening_pid(port).is_none() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        false
+        let log = |line: &str| self.log(line);
+        let report = owned.stop_gracefully(&log).await;
+        self.log(&format!(
+            "stop finished: graceful={}, exit={}",
+            report.graceful,
+            report.exit.as_deref().unwrap_or("terminated by the job")
+        ));
     }
 
     async fn live_session_count(&self) -> usize {
@@ -632,7 +492,7 @@ impl HubShell {
         } else {
             port
         };
-        if port != 0 && !self.wait_port_free(port).await {
+        if port != 0 && !owned_hub::wait_port_free(port, PORT_RELEASE_WAIT).await {
             let holder = windows_process::listening_pid(port)
                 .map(|p| p.to_string())
                 .unwrap_or_default();
@@ -660,7 +520,7 @@ impl HubShell {
                     if let Ok(_guard) = self.ops.try_lock() {
                         if let Some(code) = self.owned_exit() {
                             if let Some(owned) = self.st().owned.take() {
-                                owned.job.terminate();
+                                owned.terminate();
                             }
                             self.fail(
                                 &app,
@@ -714,7 +574,7 @@ impl HubShell {
     pub fn terminate_on_exit(&self) {
         if let Some(owned) = self.st().owned.take() {
             self.log("app exit: terminating the owned hub's job");
-            owned.job.terminate();
+            owned.terminate();
         }
     }
 }

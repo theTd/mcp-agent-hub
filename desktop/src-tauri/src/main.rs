@@ -10,6 +10,7 @@ mod hub_api;
 mod hub_config;
 mod hub_log;
 mod hub_supervisor;
+mod owned_hub;
 mod tray_menu;
 mod waiting_notifier;
 mod windows_process;

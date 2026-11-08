@@ -263,12 +263,21 @@ pub fn process_tree(
     out
 }
 
-/// Kill `root` and its process tree. Returns how many processes were terminated.
-pub fn kill_process_tree(root: u32) -> io::Result<usize> {
+/// `root` and its live descendants right now (root first).
+pub fn live_process_tree(root: u32) -> io::Result<Vec<ProcessEntry>> {
     let procs = list_processes()?;
     let tree = process_tree(root, &procs, &creation_time);
+    Ok(tree
+        .into_iter()
+        .filter_map(|pid| procs.iter().find(|p| p.pid == pid).cloned())
+        .collect())
+}
+
+/// Kill `root` and its process tree. Returns how many processes were terminated.
+pub fn kill_process_tree(root: u32) -> io::Result<usize> {
+    let tree = live_process_tree(root)?;
     let mut killed = 0;
-    for pid in tree {
+    for pid in tree.into_iter().map(|p| p.pid) {
         // SAFETY: terminate-only handle, closed right after use.
         unsafe {
             let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
