@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .runtime_mcp_configs/
+agent_profiles.json
 hub_state.db
 hub_state.db-journal
 hub_state.db-shm

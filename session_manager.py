@@ -991,6 +991,32 @@ def hub_api_base_url() -> str:
     return os.environ.get("HUB_API_URL") or f"http://127.0.0.1:{hub_port()}"
 
 
+def default_profiles_path(base_dir: Optional[Path] = None) -> Path:
+    """User-local profile storage path outside the git repo (`%APPDATA%\\mcp-agent-hub\\agent_profiles.json`).
+
+    `HUB_PROFILES_PATH` overrides the path for tests. On first run (when the user-local file does
+    not exist yet), seeds it from `<repo>/agent_profiles.json` if present so existing local edits
+    migrate seamlessly without dirtying the git working tree.
+    """
+    override = (os.environ.get("HUB_PROFILES_PATH") or "").strip()
+    if override:
+        target = Path(override).expanduser().resolve()
+    else:
+        appdata = os.environ.get("APPDATA")
+        config_root = Path(appdata) if appdata else (Path.home() / ".config")
+        target = config_root / "mcp-agent-hub" / "agent_profiles.json"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    repo_root = (base_dir or Path(__file__).parent).resolve()
+    legacy_seed = repo_root / "agent_profiles.json"
+    if not target.exists() and legacy_seed.exists() and legacy_seed.resolve() != target.resolve():
+        try:
+            shutil.copyfile(legacy_seed, target)
+        except OSError:
+            pass
+    return target
+
+
 def split_agy_model_id(model_id: str) -> tuple:
     """`gpt-oss-120b-medium` -> ("gpt-oss-120b", "medium"); a bare base id keeps a None level."""
     mid = model_id or ""
@@ -2492,9 +2518,10 @@ class Win32WindowHelper:
 class HubSessionManager:
     """Central manager for Sub-Agent profiles, ConPTY sessions, 4-Layer Telemetry, and SQLite Post-Lifecycle Persistence."""
 
-    def __init__(self, profiles_path: Path):
-        self.profiles_path = profiles_path
-        self.base_dir = profiles_path.parent
+    def __init__(self, profiles_path: Optional[Path] = None, base_dir: Optional[Path] = None):
+        self.base_dir = (base_dir or Path(__file__).parent).resolve()
+        self.profiles_path = (profiles_path or default_profiles_path(self.base_dir)).resolve()
+        self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
         self.runtime_configs_dir = self.base_dir / ".runtime_mcp_configs"
         self.runtime_configs_dir.mkdir(exist_ok=True)
 

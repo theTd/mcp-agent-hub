@@ -12,12 +12,12 @@ import { initRoutingGuide, refreshRoutingGuide, saveRoutingGuide, isRoutingDirty
 
 const MODAL_ID = 'profileModal';
 
-// Last-resort launch commands for a new profile when no existing profile of that engine exists yet.
+// Last-resort launch commands for a new profile when no existing profile or catalog binary is available.
 const FALLBACK_COMMANDS = {
-  omp: 'C:\\Users\\cui\\AppData\\Local\\omp\\omp.exe',
-  kimi: 'C:\\Users\\cui\\.kimi-code\\bin\\kimi.exe',
-  agy: 'C:\\Users\\cui\\AppData\\Local\\agy\\bin\\agy.EXE',
-  codex: 'C:\\Users\\cui\\AppData\\Roaming\\npm\\codex.cmd',
+  omp: 'omp.exe',
+  kimi: 'kimi.exe',
+  agy: 'agy.exe',
+  codex: 'codex.cmd',
   dsh: 'pwsh.exe',
   pwsh: 'pwsh.exe',
 };
@@ -466,7 +466,7 @@ function engineDefaults(engine) {
     return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
   };
   return {
-    command: mostCommon((p) => p.command) || FALLBACK_COMMANDS[engine] || '',
+    command: mostCommon((p) => p.command) || state.enginesCatalog[engine]?.binary || FALLBACK_COMMANDS[engine] || '',
     task_mode: mostCommon((p) => p.task_mode) || '',
     argsText: mostCommon((p) => (Array.isArray(p.args) ? p.args.join('\n') : '')) || '',
     // S3: a new profile starts from the delay an existing profile of the same engine uses.

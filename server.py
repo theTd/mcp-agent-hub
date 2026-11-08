@@ -18,17 +18,18 @@ import uvicorn
 from session_manager import (
     HubSessionManager,
     Win32WindowHelper,
+    default_profiles_path,
     hub_api_base_url,
     hub_port,
 )
 from transcript_summarizer import sanitize_tui_screen_text
 
 BASE_DIR = Path(__file__).parent.resolve()
-PROFILES_PATH = BASE_DIR / "agent_profiles.json"
+PROFILES_PATH = default_profiles_path(BASE_DIR)
 STATIC_DIR = BASE_DIR / "static"
 STATIC_INDEX = STATIC_DIR / "index.html"
 
-hub = HubSessionManager(PROFILES_PATH)
+hub = HubSessionManager(PROFILES_PATH, base_dir=BASE_DIR)
 
 
 # B11: discovery shells out to five CLIs and talks to the DSH host over HTTP, so it never runs on
