@@ -151,11 +151,12 @@ mcp = FastMCP(
     "SubAgent-NonHeadless-Hub",
     instructions=(
         "统一的非无头 (Non-Headless) Sub-Agent 聚合网关，支持主从双向实时通信、全链路步骤/工具轨迹追踪与生命周期后持久化查询。\n"
-        "核心能力：\n"
-        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`），返回 `session_id` 与后台阻塞命令 `background_poll_command`；\n"
-        "2. `get_subagent_status_and_trace(session_id)`：随时查询 Sub-Agent 当前执行到第几步 (`step_count`)、最近调用了哪些工具 (`recent_tool_calls`)、产生了哪些中间消息 (`intermediate_messages`)；\n"
-        "3. `get_subagent_final_response(session_id)`：无论 Sub-Agent 仍在运行还是已经退出/销毁，均可从 SQLite 持久化库中获取其 `final_response`；\n"
-        "4. `send_to_subagent` / `reply_to_subagent` / `respond_to_subagent_approval_or_choice` / `resume_subagent` / `wait_subagent_events`：主从双向发消息、回答提问、高风险操作代批、归档会话恢复与阻塞监听。"
+        "核心能力与【严禁前台阻塞等待规范】：\n"
+        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`），返回 `session_id` 与后台监听命令 `background_poll_command`；\n"
+        "2. 【等待方式——严禁前台挂起 poll】：启动或发消息后，**绝对不要在前台同步执行 `background_poll_command`**，也**不要在主回合里循环调用 `wait_subagent_events` 死等**！正确做法：将返回的 `background_poll_command` 交给宿主 Shell 工具以**后台异步模式**运行（例如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`），然后立即结束当前回合等待系统自动唤醒（或继续并行处理其他工作）；\n"
+        "3. `get_subagent_status_and_trace(session_id)`：随时非阻塞查询 Sub-Agent 当前执行到第几步 (`step_count`)、最近调用了哪些工具 (`recent_tool_calls`)、产生了哪些中间消息 (`intermediate_messages`)；\n"
+        "4. `get_subagent_final_response(session_id)`：无论 Sub-Agent 仍在运行还是已经退出/销毁，均可从 SQLite 持久化库中获取其 `final_response`；\n"
+        "5. `send_to_subagent` / `reply_to_subagent` / `respond_to_subagent_approval_or_choice` / `resume_subagent`：主从双向发消息、回答提问、高风险操作代批与归档会话恢复。"
     ),
 )
 
@@ -210,7 +211,8 @@ async def spawn_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台阻塞监听命令 `background_poll_command`。
+    以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台监听命令 `background_poll_command`。
+    - 【异步等待规范（严禁前台挂 poll）】：若本次调用返回时任务尚未完成，**请勿在前台同步执行 `background_poll_command`，也请勿前台循环调用 `wait_subagent_events`**。请使用宿主命令工具的**后台异步模式**（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后直接结束当前回合等待后台任务完成唤醒（或并行执行其他工作）。
     - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
     - 引擎默认以「高风险操作需审批」模式运行：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
     - 只有用户在总控台给某个 Profile 打开 `bypass_approvals`（全自动）时才不审批；返回值 `high_risk_approval` 为 `false` 即表示本次为全自动（`null` 表示该引擎没有 Hub 审批，如 dsh / pwsh），`launch_notes` 会写明。
@@ -279,6 +281,10 @@ async def spawn_subagent(
         "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
+        "background_poll_hint": (
+            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
+            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
+        ),
         "worker_events": events,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
@@ -406,6 +412,10 @@ async def send_to_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
+        "background_poll_hint": (
+            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
+            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
+        ),
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -474,6 +484,10 @@ async def resume_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
+        "background_poll_hint": (
+            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
+            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
+        ),
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -590,6 +604,10 @@ async def respond_to_subagent_approval_or_choice(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
+        "background_poll_hint": (
+            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
+            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
+        ),
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -603,8 +621,10 @@ async def wait_subagent_events(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    [主 Agent 阻塞监听工具] 阻塞等待指定 Sub-Agent（或 'all' 所有 Sub-Agent）发来新消息（`message_parent`）、
-    提问（`ask_parent`）、回合完成（`turn_completed`）、任务完成报告（`report_complete`）或进程退出事件。
+    [同步兜底工具 —— 默认请勿使用] 同步阻塞当前 MCP 工具调用，等待指定 Sub-Agent（或 'all'）发来事件。
+    ⚠️ 重要提示：此工具会在前台同步卡住主 Agent 的当前回合！
+    - 只要宿主支持后台命令（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`），**请始终在后台异步运行 `spawn_subagent` / `send_to_subagent` 返回的 `background_poll_command`** 并结束当前回合等待唤醒，**严禁在前台调用本工具或在前台跑 `hub_poll.py` 轮询**。
+    - 仅在纯 MCP 客户端完全没有 Shell 工具或不支持后台任务时，才将本工具作为兜底使用。
     """
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     elapsed = 0.0

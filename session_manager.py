@@ -3255,6 +3255,17 @@ class HubSessionManager:
         if instructions:
             lines.append(instructions)
         lines.append("")
+        lines.append("## 异步等待规范（严禁前台挂起 Poll）")
+        lines.append(
+            "- 启动 (`spawn_subagent`)、发消息 (`send_to_subagent`) 或恢复 (`resume_subagent`) 后，若任务尚未结束，返回值会提供 `background_poll_command`。"
+        )
+        lines.append(
+            "- **严禁在前台同步执行 `background_poll_command`**，也**严禁在主回合里循环调用 `wait_subagent_events` 死等**。"
+        )
+        lines.append(
+            "- 正确做法：使用宿主 Shell 工具的**后台异步模式**（如 `run_in_background=true` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后立即结束当前回合等待后台命令退出唤醒（或继续并行处理其他工作）。"
+        )
+        lines.append("")
         lines.append("## Profile（agent_type）")
         for pid, p in self.profiles.items():
             if not p.get("enabled", True):
@@ -6459,11 +6470,14 @@ class HubSessionManager:
         # K3: the interpreter the hub itself runs on, exactly as the bridge hint already does. A
         # worktree (or any checkout without a local .venv) has no <repo>/.venv, and the parent was
         # handed a path that did not exist.
-        python_exe = Path(sys.executable)
-        poll_script = self.base_dir / "hub_poll.py"
+        # Use forward slashes and only quote paths when they contain spaces, so the command runs
+        # directly as a command in both bash and PowerShell without needing a PowerShell-only `&`.
+        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
+        poll_script = str((self.base_dir / "hub_poll.py").resolve()).replace("\\", "/")
+        py_token = f'"{python_exe}"' if " " in python_exe else python_exe
         # R9: the poll command must reach the hub that issued it, not a hard-coded default port.
         return (
-            f'& "{python_exe}" "{poll_script}" --session {session_id} '
+            f'{py_token} "{poll_script}" --session {session_id} '
             f'--after-seq {after_seq} --timeout {timeout} --hub-url "{hub_api_base_url()}"'
         )
 
