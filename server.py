@@ -166,7 +166,7 @@ mcp = FastMCP(
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
     """
-    列出网关中所有已启用的 Sub-Agent 引擎与 Profile 配置（包含 omp、kimi、agy、codex、dsh 等）。
+    列出网关中所有已启用的 Sub-Agent 引擎与 Profile 配置（包含 omp、kimi、agy、codex、claude、dsh 等）。
     返回内容包含：
     1. `routing_guide_markdown`：Sub-Agent 调用与路由指南，汇总已启用的 Profile、可用模型与思考等级；
     2. `profiles`：每个已启用 Profile 的默认配置、`when_to_use`、可用模型列表 (`available_models`) 与思考等级 (`available_thinking_levels`)；
@@ -188,7 +188,7 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
 @mcp.tool()
 async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Dict[str, Any]:
     """
-    [自动探测模型与思考等级] 实时扫描宿主机上安装的所有 Sub-Agent 引擎（omp / kimi / agy / codex / dsh），
+    [自动探测模型与思考等级] 实时扫描宿主机上安装的所有 Sub-Agent 引擎（omp / kimi / agy / codex / claude / dsh），
     返回每个引擎当前已启用的模型列表 (`available_models`)、可用思考等级 (`available_thinking_levels`)，
     以及 `routing_guide_markdown`。已禁用的模型会自动过滤。
     主 Agent 可将 `available_models` 中的任意 `model` 和 `thinking_level` 直接传入 `spawn_subagent(agent_type, task, model=..., thinking_level=...)`。
@@ -395,6 +395,20 @@ async def send_to_subagent(
             progress_cb=_progress,
         )
 
+    if delivery.get("injection") == "pending":
+        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 3.5), 8.0)
+        while time.time() < inj_deadline:
+            cur_inj = getattr(session, "last_injection", None)
+            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+                break
+            await asyncio.sleep(0.15)
+        cur_inj = getattr(session, "last_injection", None)
+        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+            delivery = dict(delivery)
+            delivery["injection"] = "recorded"
+            if cur_inj.get("ok") is True:
+                delivery["pty_written"] = True
+
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
     transcript_summary = hub.summarize_transcript(session_id)
@@ -435,7 +449,7 @@ async def resume_subagent(
 ) -> Dict[str, Any]:
     """
     [会话恢复工具] 恢复一个已经结束或已归档的 Sub-Agent 会话，沿用同一个 `session_id`（主 Agent 的引用继续有效）：
-    - 按引擎的恢复配方重新启动 CLI 并接上原来的对话（omp / kimi / agy / codex / dsh），工作目录、模型与思考等级沿用归档记录；
+    - 按引擎的恢复配方重新启动 CLI 并接上原来的对话（omp / kimi / agy / codex / claude / dsh），工作目录、模型与思考等级沿用归档记录；
     - 传入 `text` 时，恢复后按该引擎的初始任务方式把消息交给它；不传则只恢复会话；
     - 会话仍在运行时不重复启动，直接返回当前状态；
     - 不可恢复时会抛出中文原因（例如 `PowerShell 会话结束后无法找回上下文`）。
@@ -468,6 +482,15 @@ async def resume_subagent(
             quiet_window_sec=2.5,
             progress_cb=_progress,
         )
+
+    if isinstance(delivery, dict) and delivery.get("injection") in ("argv", "pending"):
+        cur_inj = getattr(session, "last_injection", None)
+        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+            delivery = dict(delivery)
+            if delivery.get("injection") == "pending":
+                delivery["injection"] = "recorded"
+            if cur_inj.get("ok") is True and delivery.get("injection") == "recorded":
+                delivery["pty_written"] = True
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -532,12 +555,35 @@ async def reply_to_subagent(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 提出的问题或审批请求，立即解除 Sub-Agent 的等待阻塞。"""
-    return hub.deliver_parent_message(
+    delivery = hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
         request_id=request_id,
         also_write_pty=True,
     )
+    session = hub.sessions.get(session_id)
+    if session and isinstance(delivery, dict) and delivery.get("injection") == "pending":
+        inj_deadline = time.time() + 4.0
+        while time.time() < inj_deadline:
+            cur_inj = getattr(session, "last_injection", None)
+            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+                break
+            await asyncio.sleep(0.15)
+        cur_inj = getattr(session, "last_injection", None)
+        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+            delivery = dict(delivery)
+            delivery["injection"] = "recorded"
+            if cur_inj.get("ok") is True:
+                delivery["pty_written"] = True
+    if session and isinstance(delivery, dict):
+        return {
+            **delivery,
+            **_injection_report(
+                session,
+                bool(delivery.get("injection") == "pending" and session.last_injection is None),
+            ),
+        }
+    return delivery
 
 
 @mcp.tool()
@@ -554,7 +600,7 @@ async def respond_to_subagent_approval_or_choice(
     [主 Agent 代批高风险操作 & 代选交互选项工具]
     引擎默认以「高风险操作需审批」模式运行（Profile 打开 `bypass_approvals` 时为全自动，不会出现审批请求）：Sub-Agent 要执行高风险操作时，会话进入 `waiting_parent` 状态并发出 `approval_request` 事件
     （`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
-    主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
+    主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / claude / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
     - `decision`：审批决定，`"approve"`（只允许这一次）、`"approve_session"`（本会话内同类操作不再询问）、`"deny"`（拒绝）；
       审批请求必须给出明确决定，不传任何参数不会默认放行。
     - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（agy、omp 会写入全局设置的「永久允许/永久拒绝」选项和 agy「本对话内一律拒绝」选项不会出现在列表里；codex 的 p 选项会出现，见下）；
@@ -606,6 +652,7 @@ async def respond_to_subagent_approval_or_choice(
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
         "action_result": action_result,
+        **_injection_report(session, False),
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
@@ -660,7 +707,7 @@ async def wait_subagent_events(
 @mcp.tool()
 async def summarize_subagent_transcript(session_id: str) -> Dict[str, Any]:
     """
-    [CLI 专属 Transcript 总结器] 针对不同 CLI 应用程序（omp / kimi / codex / agy / dsh）解析其原生结构化会话日志，
+    [CLI 专属 Transcript 总结器] 针对不同 CLI 应用程序（omp / kimi / codex / claude / agy / dsh）解析其原生结构化会话日志，
     过滤掉所有 TUI 边框、动画 Spinner、状态栏等视觉噪音，仅向主 Agent 返回最核心的思考摘要 (`key_thoughts`)、
     工具调用链 (`recent_actions`)、最新结论 (`latest_conclusion`) 与高信噪比 Markdown 简报 (`digest_markdown`)。
     """

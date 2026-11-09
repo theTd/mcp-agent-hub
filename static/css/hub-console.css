@@ -312,6 +312,7 @@ textarea { resize: vertical; min-height: 64px; line-height: 1.55; }
 [data-engine="kimi"] { --engine-color: #b08cff; }
 [data-engine="agy"] { --engine-color: #3cc7d6; }
 [data-engine="codex"] { --engine-color: #3fcf8e; }
+[data-engine="claude"] { --engine-color: #d97757; }
 [data-engine="dsh"] { --engine-color: #f2b347; }
 [data-engine="pwsh"] { --engine-color: #8e9ab0; }
 [data-engine="desktop"] { --engine-color: #f28fb5; }

@@ -52,6 +52,7 @@ class AgentModelDiscovery:
                 "kimi": self._discover_kimi(),
                 "agy": self._discover_agy(),
                 "codex": self._discover_codex(),
+                "claude": self._discover_claude(),
                 "dsh": self._discover_dsh(),
             }
             self._cache = {
@@ -443,6 +444,162 @@ class AgentModelDiscovery:
             "cli_flags_template": {
                 "model": "-m {model}",
                 "thinking_level": '-c model_reasoning_effort="{thinking_level}"',
+            },
+        }
+
+    def _discover_claude(
+        self,
+        binary_override: Optional[str] = None,
+        config_dir_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        raw_bin = (binary_override or os.environ.get("CLAUDE_BIN") or "").strip()
+        fallback_exe = self.home / ".local" / "bin" / "claude.exe"
+        fallback_cmd = self.home / "AppData" / "Roaming" / "npm" / "claude.cmd"
+        if raw_bin:
+            expanded_bin = os.path.expandvars(os.path.expanduser(raw_bin))
+            candidate_bin = Path(expanded_bin)
+            if candidate_bin.exists():
+                claude_bin = candidate_bin
+            else:
+                which_bin = shutil.which(expanded_bin)
+                claude_bin = Path(which_bin) if which_bin else candidate_bin
+        else:
+            claude_bin_str = (
+                shutil.which("claude.exe")
+                or shutil.which("claude")
+                or shutil.which("claude.cmd")
+            )
+            if claude_bin_str:
+                claude_bin = Path(claude_bin_str)
+            elif fallback_exe.exists():
+                claude_bin = fallback_exe
+            elif fallback_cmd.exists():
+                claude_bin = fallback_cmd
+            else:
+                claude_bin = fallback_exe
+
+        raw_cfg_dir = (config_dir_override or os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+        if raw_cfg_dir:
+            claude_cfg_dir = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(raw_cfg_dir))))
+        else:
+            claude_cfg_dir = self.home / ".claude"
+
+        thinking_levels: List[str] = ["low", "medium", "high", "xhigh", "max"]
+        default_model = "sonnet"
+        default_effort = "high"
+        discovered_models: List[str] = []
+        models: List[Dict[str, Any]] = []
+
+        def _add_model(m_id: str, display_name: Optional[str] = None) -> None:
+            m_id = (m_id or "").strip()
+            if not m_id or m_id in discovered_models:
+                return
+            discovered_models.append(m_id)
+            models.append(
+                {
+                    "id": m_id,
+                    "display_name": display_name or m_id,
+                    "default_thinking_level": default_effort,
+                    "supported_thinking_levels": thinking_levels,
+                }
+            )
+
+        settings_path = claude_cfg_dir / "settings.json"
+        if settings_path.exists():
+            try:
+                cfg = json.loads(settings_path.read_text(encoding="utf-8", errors="replace"))
+                env_cfg = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
+                cfg_model = (
+                    cfg.get("model")
+                    or env_cfg.get("ANTHROPIC_MODEL")
+                    or env_cfg.get("CLAUDE_MODEL")
+                )
+                if isinstance(cfg_model, str) and cfg_model.strip():
+                    default_model = cfg_model.strip()
+                cfg_effort = (
+                    cfg.get("effortLevel")
+                    or env_cfg.get("CLAUDE_CODE_EFFORT_LEVEL")
+                )
+                if isinstance(cfg_effort, str) and cfg_effort.strip() in thinking_levels:
+                    default_effort = cfg_effort.strip()
+                for env_key in (
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                ):
+                    val = env_cfg.get(env_key)
+                    if isinstance(val, str) and val.strip():
+                        _add_model(val.strip())
+                avail = cfg.get("availableModels")
+                if isinstance(avail, list):
+                    for item in avail:
+                        if isinstance(item, str) and item.strip():
+                            _add_model(item.strip())
+            except Exception:
+                pass
+
+        # Extract embedded canonical model constants from claude.exe if present
+        if claude_bin.exists() and claude_bin.suffix.lower() == ".exe":
+            try:
+                raw_bytes = claude_bin.read_bytes()
+                marker = raw_bytes.find(b"OPUS_ID:")
+                if marker != -1:
+                    snippet = raw_bytes[max(0, marker - 240) : marker + 480].decode("ascii", errors="ignore")
+                    pairs = re.findall(
+                        r'([A-Z_]+)_ID:"(claude-(?:opus|sonnet|haiku)-[a-z0-9.\-]+)",\1_NAME:"([^"]+)"',
+                        snippet,
+                    )
+                    for _prefix, m_id, m_label in pairs:
+                        _add_model(m_id, m_label)
+            except Exception:
+                pass
+
+        for m_id, label in [
+            ("sonnet", "Claude Sonnet (Latest Alias)"),
+            ("opus", "Claude Opus (Latest Alias)"),
+            ("haiku", "Claude Haiku (Latest Alias)"),
+            ("opusplan", "Claude Opus Plan + Sonnet Execution"),
+            ("sonnet[1m]", "Claude Sonnet (1M Context)"),
+            ("opus[1m]", "Claude Opus (1M Context)"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-haiku-5-5", "Claude Haiku 5.5"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-6", "Claude Opus 4.6"),
+            ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        ]:
+            _add_model(m_id, label)
+
+        if default_model and default_model not in discovered_models:
+            discovered_models.insert(0, default_model)
+            models.insert(
+                0,
+                {
+                    "id": default_model,
+                    "display_name": default_model,
+                    "default_thinking_level": default_effort,
+                    "supported_thinking_levels": thinking_levels,
+                },
+            )
+        elif default_model in discovered_models:
+            discovered_models.remove(default_model)
+            discovered_models.insert(0, default_model)
+
+        return {
+            "engine": "claude",
+            "name": "Claude Code CLI",
+            "binary": str(claude_bin),
+            "config_dir": str(claude_cfg_dir),
+            "installed": claude_bin.exists(),
+            "default_model": default_model,
+            "default_thinking_level": default_effort,
+            "available_models": discovered_models,
+            "model_details": models,
+            "available_thinking_levels": thinking_levels,
+            "cli_flags_template": {
+                "model": "--model {model}",
+                "thinking_level": "--effort {thinking_level}",
             },
         }
 

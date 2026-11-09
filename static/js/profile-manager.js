@@ -18,20 +18,21 @@ const FALLBACK_COMMANDS = {
   kimi: 'kimi.exe',
   agy: 'agy.exe',
   codex: 'codex.cmd',
+  claude: 'claude.exe',
   dsh: 'pwsh.exe',
   pwsh: 'pwsh.exe',
 };
 
-const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'dsh', 'pwsh'];
+const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'claude', 'dsh', 'pwsh'];
 
 // Keys the editor renders itself, so the read-only "高级" box shows only what is left.
 const SHOWN_KEYS = new Set([
-  'id', 'name', 'engine', 'kind', 'command', 'args', 'default_model', 'default_thinking_level',
+  'id', 'name', 'engine', 'kind', 'command', 'config_dir', 'args', 'default_model', 'default_thinking_level',
   'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'gui_url', 'dsh_tier',
   'bypass_approvals',
 ]);
 // Engines whose launch the hub injects approval flags into; bypass_approvals does nothing elsewhere.
-const APPROVAL_ENGINES = new Set(['omp', 'kimi', 'codex', 'agy']);
+const APPROVAL_ENGINES = new Set(['omp', 'kimi', 'codex', 'claude', 'agy']);
 const BYPASS_HELP = '打开后递归删除、强推、发布等高风险操作会直接执行，不再交给主 Agent 审批；已归档会话恢复时也按此开关的当前值启动。';
 // Values the hub computes on the way out; they are not stored keys.
 const COMPUTED_KEYS = new Set([
@@ -198,6 +199,7 @@ function profileDraft(id, p) {
     model_source: defaultModelSource(p),
     thinking_source: defaultThinkingSource(p),
     command: p.command || '',
+    config_dir: p.config_dir || '',
     argsText: (Array.isArray(p.args) ? p.args : []).join('\n'),
     task_mode: p.task_mode || '',
     delayText: p.startup_delay_sec ?? '',
@@ -227,6 +229,7 @@ function readDraft() {
     model_source: modelChoice ? 'profile' : 'engine',
     thinking_source: thinkingChoice ? 'profile' : 'engine',
     command: $('#editCommand').value.trim(),
+    config_dir: ($('#editConfigDir')?.value || '').trim(),
     argsText: $('#editArgs').value,
     task_mode: $('#editTaskMode').value,
     delayText: $('#editDelay').value,
@@ -257,6 +260,7 @@ function writeDraft(d) {
   setEngineSelect(d.engine);
   $('#editKind').value = d.kind === 'web_gui' ? 'web_gui' : 'tui';
   $('#editCommand').value = d.command;
+  if ($('#editConfigDir')) $('#editConfigDir').value = d.config_dir || '';
   $('#editArgs').value = d.argsText;
   ensureOption($('#editTaskMode'), d.task_mode);
   $('#editTaskMode').value = d.task_mode || '';
@@ -298,6 +302,7 @@ function renderEngineGroups(engine) {
   const isDsh = engine === 'dsh';
   $('#groupLaunch').hidden = isDsh;
   $('#groupDsh').hidden = !isDsh;
+  if ($('#fieldConfigDir')) $('#fieldConfigDir').hidden = engine !== 'claude';
   // V-7: pwsh (and any engine the catalog knows no models for) has no model / thinking defaults.
   const hasModels = !!engine && engineModels(engine).length > 0;
   $('#groupDefaults').hidden = !hasModels;
@@ -409,6 +414,11 @@ function renderEngineInfo(engine) {
   const enabled = cat.available_models || [];
   const all = cat.all_discovered_models || enabled;
   const levels = cat.available_thinking_levels || [];
+  const activeBin = ($('#editCommand')?.value || '').trim() || cat.binary || 'N/A';
+  const activeCfgDir = ($('#editConfigDir')?.value || '').trim() || cat.config_dir || '';
+  const cfgRow = engine === 'claude' && activeCfgDir
+    ? `<dt>配置目录</dt><dd><code>${escapeHtml(activeCfgDir)}</code></dd>`
+    : '';
   card.innerHTML = `
     <div class="info-card-head">
       ${icon('cpu')}<strong>${escapeHtml(cat.name || engine)}</strong>
@@ -416,7 +426,8 @@ function renderEngineInfo(engine) {
       <span class="muted" style="margin-left:auto;font-size:11.5px">引擎自动识别信息</span>
     </div>
     <dl class="kv-list">
-      <dt>可执行文件</dt><dd><code>${escapeHtml(cat.binary || 'N/A')}</code></dd>
+      <dt>可执行文件</dt><dd><code>${escapeHtml(activeBin)}</code></dd>
+      ${cfgRow}
       <dt>模型参数</dt><dd><code>${escapeHtml(flags.model || '自动')}</code></dd>
       <dt>思考等级参数</dt><dd><code>${escapeHtml(flags.thinking_level || '自动')}</code></dd>
       <dt>已启用模型</dt><dd>${enabled.length} / ${all.length}<a href="#" data-goto-tab="catalog" style="margin-left:8px">管理模型开关</a></dd>
@@ -467,6 +478,7 @@ function engineDefaults(engine) {
   };
   return {
     command: mostCommon((p) => p.command) || state.enginesCatalog[engine]?.binary || FALLBACK_COMMANDS[engine] || '',
+    config_dir: mostCommon((p) => p.config_dir) || '',
     task_mode: mostCommon((p) => p.task_mode) || '',
     argsText: mostCommon((p) => (Array.isArray(p.args) ? p.args.join('\n') : '')) || '',
     // S3: a new profile starts from the delay an existing profile of the same engine uses.
@@ -477,6 +489,7 @@ function engineDefaults(engine) {
 function applyEngineDefaults(engine) {
   const defaults = engineDefaults(engine);
   $('#editCommand').value = defaults.command;
+  if ($('#editConfigDir')) $('#editConfigDir').value = defaults.config_dir || '';
   ensureOption($('#editTaskMode'), defaults.task_mode);
   $('#editTaskMode').value = defaults.task_mode;
   $('#editArgs').value = defaults.argsText;
@@ -503,7 +516,7 @@ function injectedFlag(engine, args) {
     } else if (engine === 'kimi') {
       if (arg === '-m' || arg === '--model') return arg;
       if (arg.startsWith('--model=')) return '--model';
-    } else if (engine === 'agy') {
+    } else if (engine === 'agy' || engine === 'claude') {
       if (arg === '--model' || arg === '--effort') return arg;
       if (arg.startsWith('--model=')) return '--model';
       if (arg.startsWith('--effort=')) return '--effort';
@@ -612,6 +625,7 @@ async function startNewProfile() {
     model_source: 'engine',
     thinking_source: 'engine',
     command: '',
+    config_dir: '',
     argsText: '',
     task_mode: '',
     delayText: 2.5,
@@ -688,6 +702,7 @@ async function saveProfile() {
     default_model: d.default_model || null,
     default_thinking_level: d.default_thinking_level || null,
     command,
+    config_dir: d.engine === 'claude' ? (d.config_dir || null) : null,
     args,
     task_mode: d.task_mode || null,
     startup_delay_sec: Number.isFinite(delay) ? delay : null,

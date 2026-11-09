@@ -243,6 +243,7 @@
                       <option value="kimi">kimi · Kimi Code CLI</option>
                       <option value="agy">agy · Antigravity CLI</option>
                       <option value="codex">codex · OpenAI Codex CLI</option>
+                      <option value="claude">claude · Claude Code CLI</option>
                       <option value="dsh">dsh · DeepSeek Harness</option>
                       <option value="pwsh">pwsh · PowerShell 终端</option>
                     </select>
@@ -281,7 +282,12 @@
                 <div class="form-grid">
                   <label class="field full">
                     <span class="field-label">命令 <code>command</code></span>
-                    <input id="editCommand" type="text" class="mono-input" placeholder="例如 C:\Users\me\.local\bin\omp.exe" spellcheck="false" />
+                    <input id="editCommand" type="text" class="mono-input" placeholder="例如 C:\Users\me\.local\bin\claude.exe" spellcheck="false" />
+                  </label>
+                  <label class="field full" id="fieldConfigDir" hidden>
+                    <span class="field-label">配置目录 <code>config_dir</code></span>
+                    <input id="editConfigDir" type="text" class="mono-input" placeholder="留空使用默认 ~/.claude；填写后注入 CLAUDE_CONFIG_DIR" spellcheck="false" />
+                    <span class="field-help">Claude Code 的配置与会话目录（读取该目录下的 settings.json、.claude.json 与 projects/）。</span>
                   </label>
                   <div class="field full">
                     <label class="field-label" for="editArgs">参数 <code>args</code></label>
@@ -293,6 +299,7 @@
                     <select id="editTaskMode">
                       <option value="">未设置（默认 pty_input）</option>
                       <option value="omp_positional">omp_positional · OMP 位置参数 + 会话目录</option>
+                      <option value="claude_positional">claude_positional · Claude 位置参数 + 系统提示词</option>
                       <option value="codex_positional">codex_positional · Codex 位置参数</option>
                       <option value="agy_interactive_flag">agy_interactive_flag · AGY -i 交互参数</option>
                       <option value="pty_input">pty_input · 进入 TUI 后自动注入</option>

@@ -617,7 +617,7 @@ TUI_TOOL_PATTERN = re.compile(
 )
 
 DEFAULT_HUB_PORT = 4444
-KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "dsh", "pwsh")
+KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh", "pwsh")
 AGY_THINKING_LEVELS = ("low", "medium", "high")
 AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
 # A profile with an absurdly long argument list is a mistake, not a launch recipe.
@@ -658,7 +658,7 @@ TERMINATED_MESSAGES = {
     "mcp": "主 Agent 终止了会话",
 }
 # Engines with a revive recipe (spec §4). Anything else cannot be resumed.
-RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "dsh")
+RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh")
 ENGINE_RESUME_BLOCK_REASONS = {
     "pwsh": "PowerShell 会话结束后无法找回上下文",
     "desktop_gui": "桌面窗口会话结束后无法找回上下文",
@@ -719,6 +719,7 @@ TUI_COMPOSER_SHAPES = {
     "omp": "glyph",
     "codex": "glyph",
     "agy": "glyph",
+    "claude": "glyph",
 }
 # Owner decision engines-checked (2026-11-06, decision page kimi-injection-2026-11-06; revised
 # 2026-11-07 to kimi + codex): only these engines type a LIVE message through the checked submit
@@ -726,7 +727,7 @@ TUI_COMPOSER_SHAPES = {
 # saw codex leave a live message in its composer 2 of 5 times. omp and agy keep the old write +
 # Enter, recorded as ok:null "live_write_unchecked". Their composers stay in TUI_COMPOSER_SHAPES for
 # reading the screen.
-TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi", "codex"})
+TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi", "codex", "claude", "omp", "agy"})
 # K7 (fix 9d): a "glyph" composer wraps a long text onto the rows under its prompt row, and those
 # rows end at the engine's own closing row (real screens of the 22b0573 live check):
 #   omp    rule, "❯ …", wrapped rows indented two columns, rule, status line   (o1l2_screens.txt)
@@ -741,6 +742,7 @@ TUI_GLYPH_COMPOSER_FRAMES = {
     "omp": {"top": "rule", "bottom": "rule"},
     "agy": {"top": "rule", "bottom": "rule"},
     "codex": {"top": "", "bottom": "blank"},
+    "claude": {"top": "rule", "bottom": "rule", "require_frame": True},
 }
 TUI_RULE_ROW_RE = re.compile(r"^\s*[─━═]{8,}")
 # K7 (fix 9d): a row under a glyph composer's closing row that starts an answer or a tool line
@@ -752,6 +754,7 @@ TUI_GLYPH_HISTORY_BELOW_RE = re.compile(r"^\s*[•●✗⏺]")
 # 1,027-char longc.txt).
 TUI_PASTE_PLACEHOLDER_RES = {
     "codex": re.compile(r"\[Pasted Content (\d+) chars\]"),
+    "claude": re.compile(r"\[Pasted (?:text|Content)[^\]]*?(\d+)\s*(?:chars|lines)\]", re.IGNORECASE),
 }
 TUI_PASTE_PLACEHOLDER_SLACK_CHARS = 4
 TUI_BOX_TOP_RE = re.compile(r"^\s*╭─.*╮\s*$")
@@ -801,7 +804,16 @@ TUI_TRUST_DIALOG_PHRASES = (
     "Do you trust the authors of the files in this folder?",
     "Do you trust the files in this folder?",
     "Yes, I trust this folder",
+    "Yes, I trust these settings",
+    "Allow external CLAUDE.md file imports?",
+    "WARNING: Claude Code running in Bypass Permissions mode",
 )
+# Claude Code 2.1+ startup dialogs (workspace trust, external CLAUDE.md imports, bypass permissions
+# warning) render `Jn` with `cancelFirst: true, focus: "cancel"` so the cursor `❯` starts on row 0
+# ("No, exit" / "No, continue..." / "No, disable...") and also remount `Jn` 150ms after opening
+# (`remountKey: "held" -> "settled"`), resetting focus to "cancel" if Down was pressed too early.
+TUI_TRUST_NO_FOCUSED_RE = re.compile(r"^\s*[❯>›▶]\s*(?:\d+\.\s*)?No\b", re.MULTILINE | re.IGNORECASE)
+TUI_TRUST_OPEN_GUARD_SEC = 0.35
 # D3: a known dialog must never receive the extra Enter. The omp ready capture carries this banner
 # right above the composer ("Update Available / New version 18.17.0 is available"), so it counts.
 TUI_UPDATE_DIALOG_PHRASES = (
@@ -871,6 +883,30 @@ TUI_SUBMIT_PROOF_RULES = {
         "transcript": "user_message",
         "history_glyph": "❯",
         "reject_phrases": ("LLM not set",),
+    },
+    "claude": {
+        "cleared_composer": True,
+        "transcript": "growth",
+        "history_glyph": "❯",
+        "reject_phrases": (),
+    },
+    "omp": {
+        "cleared_composer": True,
+        "transcript": "growth",
+        "history_glyph": "❯",
+        "reject_phrases": (),
+    },
+    "agy": {
+        "cleared_composer": True,
+        "transcript": "growth",
+        "history_glyph": ">",
+        "reject_phrases": (),
+    },
+    "codex": {
+        "cleared_composer": True,
+        "transcript": "growth",
+        "history_glyph": "›",
+        "reject_phrases": (),
     },
 }
 # K2: how long a submit whose text was never seen on the composer keeps waiting for evidence. The
@@ -944,6 +980,22 @@ def codex_sessions_root() -> Path:
 
 def kimi_store_root() -> Path:
     return _store_root("HUB_KIMI_STORE_ROOT", Path(os.path.expanduser("~")) / ".kimi-code")
+
+
+def claude_config_dir(override: Optional[str] = None) -> Path:
+    raw = (override or os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if raw:
+        return Path(os.path.abspath(os.path.expandvars(os.path.expanduser(raw))))
+    return Path(os.path.expanduser("~")) / ".claude"
+
+
+def claude_projects_root(config_dir: Optional[str] = None) -> Path:
+    env_override = (os.environ.get("HUB_CLAUDE_PROJECTS_ROOT") or "").strip()
+    if env_override:
+        return Path(os.path.expanduser(env_override))
+    if config_dir and str(config_dir).strip():
+        return claude_config_dir(str(config_dir)) / "projects"
+    return claude_config_dir() / "projects"
 
 
 def agy_brain_root() -> Path:
@@ -1144,6 +1196,17 @@ def _injected_flag_tokens(engine: str, args: List[str]):
                     yield i + 1, "-c"
                     i += 2
                     continue
+        elif eng == "claude":
+            if a in ("--model", "--effort"):
+                yield i, a
+                if i + 1 < total:
+                    yield i + 1, a
+                i += 2
+                continue
+            if a.startswith("--model=") or a.startswith("--effort="):
+                yield i, a.split("=", 1)[0] + "="
+                i += 1
+                continue
         i += 1
 
 
@@ -1228,6 +1291,17 @@ def _approval_flag_tokens(engine: str, args: List[str]):
                 width = 2
             elif a.startswith("--mode=") or a.startswith("--settings="):
                 width, label = 1, a.split("=", 1)[0]
+        elif eng == "claude":
+            if a in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
+                width = 1
+            elif a == "--permission-mode":
+                width = 2
+            elif a.startswith("--permission-mode="):
+                width, label = 1, "--permission-mode"
+            elif a.startswith(("--allowedTools=", "--allowed-tools=")) and "hub_worker.py" in a:
+                width, label = 1, "--allowedTools="
+            elif a in ("--allowedTools", "--allowed-tools") and "hub_worker.py" in nxt(i):
+                width = 2
         if width:
             for k in range(i, min(i + width, total)):
                 yield k, label
@@ -1279,6 +1353,9 @@ def _agy_profile_settings(args: List[str]) -> Dict[str, Any]:
     return merged
 
 
+CLAUDE_WORKER_ALLOWED_TOOLS = "Bash(*hub_worker.py*),PowerShell(*hub_worker.py*)"
+
+
 def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -> List[str]:
     """The flags the hub injects so `engine` runs with high-risk approval on (D2-D5)."""
     eng = (engine or "").strip().lower()
@@ -1288,6 +1365,8 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
         return ["-y"]
     if eng == "codex":
         return ["-a", "on-request", "-s", "workspace-write"]
+    if eng == "claude":
+        return ["--permission-mode", "acceptEdits", f"--allowedTools={CLAUDE_WORKER_ALLOWED_TOOLS}"]
     if eng == "agy":
         settings = _agy_profile_settings(list(profile_args or []))
         settings.update(AGY_SESSION_SETTINGS)
@@ -1298,7 +1377,7 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
 # Round 2 (owner, decision page approval-by-default-2026-11-07): a profile may switch approval off
 # with `bypass_approvals: true`. The hub then injects that engine's full-bypass flag instead of the
 # approval flags. Only the engines below have approval flags; dsh and pwsh ignore the key.
-APPROVAL_ENGINES = ("omp", "kimi", "codex", "agy")
+APPROVAL_ENGINES = ("omp", "kimi", "codex", "claude", "agy")
 BYPASS_APPROVALS_KEY = "bypass_approvals"
 BYPASS_ON_NOTE = "bypass_approvals is on for this profile：该 Profile 已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
 BYPASS_NO_EFFECT_NOTE = "bypass_approvals 对 {engine} 引擎不适用（该引擎没有 Hub 注入的审批参数），已忽略"
@@ -1327,6 +1406,8 @@ def bypass_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -
         return ["--auto"]
     if eng == "codex":
         return ["--dangerously-bypass-approvals-and-sandbox"]
+    if eng == "claude":
+        return ["--dangerously-skip-permissions"]
     if eng == "agy":
         # The profile's own --settings keys survive; agentMode is the bypass flag's business now.
         settings = _agy_profile_settings(list(profile_args or []))
@@ -1468,7 +1549,7 @@ def classify_approval_label(label: str) -> str:
         if "always deny" in low:
             return "deny_session"
         return "deny"
-    if ("for this session" in low or "in this conversation" in low
+    if ("for this session" in low or "during this session" in low or "in this conversation" in low
             or "don't ask again for these files" in low):
         return "approve_session"
     if "always" in low or "don't ask again" in low:
@@ -1728,6 +1809,76 @@ def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
 def kimi_panel_command(screen: str) -> str:
     """The `$ <command>` of kimi's approval panel, wrapped lines joined (empty when there is none)."""
     return _dollar_command(str(screen or "").splitlines())
+
+
+_CLAUDE_APPROVAL_HEADERS = (
+    "Do you want to proceed?",
+    "Do you want to make this edit",
+    "Do you want to create",
+    "Do you want to overwrite",
+    "Do you want to delete",
+    "Do you want to run",
+    "Do you want to allow",
+)
+
+
+def parse_claude_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
+    """Claude Code's permission prompt (`Do you want to proceed?` + numbered options, digits act at once).
+
+    Returns {header, reason, command, options:[{key,label,action}]} or None.
+    """
+    lines = str(screen or "").splitlines()
+    head = None
+    for idx, line in enumerate(lines):
+        s = line.strip().strip("│┃║").strip()
+        if any(s.startswith(h) for h in _CLAUDE_APPROVAL_HEADERS):
+            head = idx
+    if head is None:
+        return None
+    body_after_head: List[str] = []
+    for raw in lines[head + 1:]:
+        s = raw.strip()
+        if s.startswith(("╰", "└", "┗")) or (s and set(s) <= set("─━-═╭╮╰╯┌┐└┘")):
+            break
+        body_after_head.append(s.strip("│┃║").strip())
+    opts = _numbered_options(body_after_head)
+    if not opts:
+        return None
+    for o in opts:
+        low_lbl = o["label"].lower()
+        if "tell claude what to do differently" in low_lbl and not low_lbl.startswith("no"):
+            o["action"] = "deny"
+        else:
+            o["action"] = classify_approval_label(o["label"])
+    if not any(o["action"] == "approve_once" for o in opts) or not any(
+        o["action"] in ("deny", "deny_feedback") for o in opts
+    ):
+        return None
+    header = lines[head].strip().strip("│┃║").strip()
+    command = _dollar_command(lines[:head])
+    reason = ""
+    if not command:
+        subject: List[str] = []
+        for raw in reversed(lines[:head]):
+            s = raw.strip().strip("│┃║").strip()
+            if not s:
+                if subject:
+                    break
+                continue
+            if set(s) <= set("─━-═╭╮╰╯┌┐└┘") or s.startswith(("╭", "╰", "┌", "└")):
+                break
+            if s.lower() in ("bash command", "command", "edit file", "create file", "tool use"):
+                break
+            subject.insert(0, s)
+            if len(subject) >= 4:
+                break
+        command = " ".join(subject).strip()
+    return {
+        "header": header,
+        "reason": reason,
+        "command": command,
+        "options": opts,
+    }
 
 
 def _collapsed(text: str) -> str:
@@ -2439,6 +2590,16 @@ class AgentSession:
             self.end_reason = "terminated"
             self.current_activity = "Terminated by parent/user"
         if self.pty and was_alive:
+            pid = getattr(self.pty, "pid", None)
+            if pid and isinstance(self.pty, REAL_PTY_PROCESS):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=1.5,
+                    )
+                except Exception:
+                    pass
             try:
                 self.pty.terminate(force=True)
             except Exception:
@@ -2958,6 +3119,8 @@ class HubSessionManager:
             if eng == "codex":
                 sid = cls._codex_session_id_from_rollout(p)
                 return {"session_id": sid or "", "rollout_path": str(p)}
+            if eng == "claude":
+                return {"session_id": p.stem, "transcript_path": str(p)}
         except Exception:
             return {}
         return {}
@@ -3054,7 +3217,7 @@ class HubSessionManager:
         if prof.get("engine"):
             return str(prof["engine"]).lower()
         pid = profile_id.lower()
-        for prefix in ("omp", "kimi", "agy", "codex", "dsh", "pwsh"):
+        for prefix in ("omp", "kimi", "agy", "codex", "claude", "dsh", "pwsh"):
             if pid.startswith(prefix):
                 return prefix
         return "generic"
@@ -3193,6 +3356,13 @@ class HubSessionManager:
                 or shutil.which("codex")
                 or str(home / "AppData" / "Roaming" / "npm" / "codex.cmd")
             )
+        if engine == "claude":
+            return (
+                shutil.which("claude.exe")
+                or shutil.which("claude")
+                or shutil.which("claude.cmd")
+                or str(home / ".local" / "bin" / "claude.exe")
+            )
         return "pwsh.exe"
 
     def _builtin_profiles(self) -> Dict[str, Dict[str, Any]]:
@@ -3249,6 +3419,19 @@ class HubSessionManager:
                 "enabled": True,
                 "description": "OpenAI Codex CLI。模型用 -m 传入，思考等级用 -c model_reasoning_effort 传入。",
             },
+            "claude": {
+                "id": "claude",
+                "name": "Claude Code",
+                "engine": "claude",
+                "kind": "tui",
+                "command": self._default_engine_binary("claude"),
+                "args": [],
+                "task_mode": "claude_positional",
+                "startup_delay_sec": 2.0,
+                "submit_key": "\r",
+                "enabled": True,
+                "description": "Anthropic Claude Code CLI。模型与思考等级在启动时传入（--model / --effort），高风险命令默认暂停审批。",
+            },
             "dsh": {
                 "id": "dsh",
                 "name": "DeepSeek Harness",
@@ -3280,7 +3463,22 @@ class HubSessionManager:
 
     def _apply_profile_data(self, data: Dict[str, Any], discovery: Dict[str, Any]):
         """Rebuilds the in-memory catalog and profiles from one file document and one discovery snapshot."""
-        raw_engines = (discovery or {}).get("engines", {}) or {}
+        raw_engines = dict((discovery or {}).get("engines", {}) or {})
+        file_profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+        claude_prof = file_profiles.get("claude") if isinstance(file_profiles.get("claude"), dict) else None
+        if claude_prof is None:
+            for p_entry in file_profiles.values():
+                if isinstance(p_entry, dict) and str(p_entry.get("engine") or "").strip().lower() == "claude":
+                    claude_prof = p_entry
+                    break
+        if isinstance(claude_prof, dict) and (claude_prof.get("command") or claude_prof.get("config_dir")) and "claude" in raw_engines:
+            try:
+                raw_engines["claude"] = self.model_discovery._discover_claude(
+                    binary_override=str(claude_prof.get("command") or "").strip() or None,
+                    config_dir_override=str(claude_prof.get("config_dir") or "").strip() or None,
+                )
+            except Exception:
+                pass
 
         self.engine_policies = data.get("engine_policies") or {}
         self.global_routing_instructions = str(data.get("global_routing_instructions") or "").strip()
@@ -3367,7 +3565,7 @@ class HubSessionManager:
             prof[BYPASS_APPROVALS_KEY] = profile_bypasses_approvals(prof)
             eng_info = self.engines_catalog.get(eng) or {}
             file_entry = file_profiles.get(pid) if isinstance(file_profiles.get(pid), dict) else {}
-            if not file_entry.get("command") and eng in ("omp", "kimi", "agy", "codex") and eng_info.get("binary"):
+            if not file_entry.get("command") and eng in ("omp", "kimi", "agy", "codex", "claude") and eng_info.get("binary"):
                 prof["command"] = eng_info["binary"]
             # B4: remember whether the default came from the profile file or from the engine.
             explicit_model = str(prof.get("default_model") or "").strip()
@@ -3564,6 +3762,7 @@ class HubSessionManager:
         "engine",
         "kind",
         "command",
+        "config_dir",
         "args",
         "default_model",
         "default_thinking_level",
@@ -4153,6 +4352,19 @@ class HubSessionManager:
                 return False, "未记录到 codex 会话 ID，无法恢复"
             if not path or not os.path.isfile(path):
                 return False, f"codex 会话记录已不存在：{path}"
+        elif engine == "claude":
+            sid = str(ref.get("session_id") or "")
+            path = str(ref.get("transcript_path") or "")
+            if not sid:
+                return False, "未记录到 claude 会话 ID，无法恢复"
+            if not path or not os.path.isfile(path):
+                return False, f"claude 会话文件已不存在：{path}"
+            with self._transcript_lock:
+                owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            if owner and owner != session_id:
+                live = self.sessions.get(owner)
+                if live is not None and live.is_process_alive():
+                    return False, "该 claude 会话正被另一个运行中的会话使用"
         elif engine == "dsh":
             if not ref.get("dsh_job_id"):
                 return False, "DSH 任务 ID 缺失，无法恢复"
@@ -4223,6 +4435,26 @@ class HubSessionManager:
         elif engine == "codex":
             built["args"] = ["resume", str(ref.get("session_id")), "-C", cwd] + base_args
             built["message_mode"] = "positional"
+        elif engine == "claude":
+            prof_cur = self.profiles.get(profile_id) or {}
+            if prof_cur.get("command"):
+                built["command"] = os.path.expandvars(os.path.expanduser(str(prof_cur["command"]).strip()))
+            cfg_dir = str(prof_cur.get("config_dir") or snapshot.get("config_dir") or "").strip()
+            if cfg_dir:
+                built["env"]["CLAUDE_CONFIG_DIR"] = os.path.abspath(
+                    os.path.expandvars(os.path.expanduser(cfg_dir))
+                )
+            hint_args: List[str] = []
+            if str(snapshot.get("task_mode") or "") == "claude_positional" and not any(
+                str(a) == "--append-system-prompt" or str(a).startswith("--append-system-prompt=")
+                for a in base_args
+            ):
+                hint_args = [
+                    "--append-system-prompt",
+                    self._build_worker_bridge_system_hint(str(record.get("session_id") or ""), "claude"),
+                ]
+            built["args"] = ["--resume", str(ref.get("session_id"))] + hint_args + base_args
+            built["message_mode"] = "positional"
         elif engine == "dsh":
             built["args"] = []
             built["message_mode"] = "dsh_continue"
@@ -4244,6 +4476,8 @@ class HubSessionManager:
             path = os.path.join(brain, ".system_generated", "logs", "transcript.jsonl") if brain else ""
         elif engine == "codex":
             path = str(ref.get("rollout_path") or "")
+        elif engine == "claude":
+            path = str(ref.get("transcript_path") or "")
         try:
             return os.path.getsize(path) if path else 0
         except OSError:
@@ -4325,16 +4559,31 @@ class HubSessionManager:
         sess.effective_model = snapshot.get("model") or record.get("effective_model")
         sess.effective_thinking_level = snapshot.get("thinking_level") or record.get("effective_thinking_level")
         sess.last_task = str(record.get("last_task") or "")
+        sess.step_count = int(record.get("step_count") or 0)
         sess.created_at = float(record.get("created_at") or time.time())
         sess.profile_snapshot = dict(snapshot)
         # Round 2: the resume ran with the profile's current switch; record that, not the old one.
         sess.profile_snapshot[BYPASS_APPROVALS_KEY] = bool(built.get("bypass_approvals"))
         sess.launch_notes = list(built.get("notes") or [])
         sess.conversation_ref = dict(ref)
+        known_tp = (
+            ref.get("transcript_path")
+            or ref.get("session_file")
+            or ref.get("rollout_path")
+            or record.get("transcript_path")
+        )
+        if known_tp and os.path.isfile(str(known_tp)):
+            sess.transcript_path = Path(str(known_tp))
         sess.resume_attach = True
         sess.attach_offset = int(built.get("attach_offset") or 0)
         sess.resume_count = count
         sess.last_resumed_at = time.time()
+        old_live = self.sessions.get(session_id)
+        if old_live is not None:
+            if old_live.recent_injections:
+                sess._recent_injections = list(old_live.recent_injections)
+            if old_live.last_injection:
+                sess.__dict__["_last_injection"] = dict(old_live.last_injection)
         # D2: the ended turn's answer comes back with the revived object, and begin_new_turn marks it
         # as from_previous_turn at the resume call site. It is kept only until the revived turn
         # writes its own; set_final_response lets that first source win whatever its rank. The
@@ -4485,6 +4734,15 @@ class HubSessionManager:
             # D10: (re)write the bridge config the built args point at (--add-dir).
             self._write_agy_bridge_config(session_id)
         sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
+        if message and injection == "argv":
+            sess.last_injection = {
+                "at": round(time.time(), 3),
+                "ok": True,
+                "reason": "argv_positional",
+                "attempts": 1,
+                "mode": "resume_task",
+                "label": "成功",
+            }
         startup_delay = 2.5
         try:
             startup_delay = float(snapshot.get("startup_delay_sec") or 2.5)
@@ -4538,6 +4796,8 @@ class HubSessionManager:
             asyncio.create_task(self._watch_kimi_session(sess))
         elif engine == "agy":
             asyncio.create_task(self._watch_agy_transcript(sess))
+        elif engine == "claude":
+            asyncio.create_task(self._watch_claude_session(sess))
 
         if sess.kind == "tui":
             asyncio.create_task(self._watch_tui_interactive_prompts(sess))
@@ -5138,6 +5398,10 @@ class HubSessionManager:
 
         if hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected"):
             if sess:
+                if sess.status == "completed":
+                    self.begin_new_turn(sess, status="running")
+                elif sess.status == "starting":
+                    sess.status = "running"
                 sess.step_count += 1
                 step_num = sess.step_count
                 if step_title:
@@ -5166,6 +5430,9 @@ class HubSessionManager:
         if final_text and str(final_text).strip():
             f_source = "native_transcript"
             if sess:
+                if sess.step_count == 0:
+                    sess.step_count = 1
+                    step_num = 1
                 sess.set_final_response(str(final_text).strip(), f_source)
                 if hook_event in ("Stop", "SubagentStop", "TurnComplete"):
                     sess.current_activity = f"Step {sess.step_count}: Turn completed (final response captured)"
@@ -5232,12 +5499,21 @@ class HubSessionManager:
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
                 self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
-            if ev_type == "turn_completed" and content:
-                # K4: every engine's turn_completed carries the end-of-turn answer (agy "OK", kimi
-                # "PELICAN-7", codex/omp task_complete, dsh's result). It is this turn's final
-                # response unless a better source already wrote one: set_final_response keeps the
-                # higher-priority source, so report_complete / codex_task_complete are never lost.
-                sess.set_final_response(content, "turn_completed")
+            if ev_type == "turn_completed":
+                if sess.step_count == 0:
+                    sess.step_count = 1
+                if content:
+                    # K4: every engine's turn_completed carries the end-of-turn answer (agy "OK", kimi
+                    # "PELICAN-7", codex/omp task_complete, dsh's result). It is this turn's final
+                    # response unless a better source already wrote one: set_final_response keeps the
+                    # higher-priority source, so report_complete / codex_task_complete are never lost.
+                    sess.set_final_response(content, "turn_completed")
+                if sess.status in ("starting", "running") and sess.pending_interaction is None:
+                    sess.status = "completed"
+                    if not str(sess.current_activity or "").startswith(
+                        ("Task completed", "Turn completed", f"Step {sess.step_count}: Turn completed")
+                    ):
+                        sess.current_activity = f"Step {sess.step_count}: Turn completed (final response captured)"
             if ev_type in ("completed", "turn_completed"):
                 # Spec §1.4: the agent reported completion, so a later exit is a clean one.
                 sess.completion_reported = True
@@ -5307,9 +5583,16 @@ class HubSessionManager:
         # turn's; letting it "overwrite" would both lose the kept answer and clear from_previous_turn
         # before the new turn produced anything. The new turn's own sources (turn_completed, the
         # native transcript, report_complete) still replace the kept answer through set_final_response.
-        if sess and summary.get("latest_conclusion") and not sess.final_response_from_previous_turn:
-            sess.set_final_response(summary["latest_conclusion"], "transcript_summarizer")
-            self.persist_session(sess)
+        if sess:
+            changed = False
+            if int(summary.get("step_count") or 0) > sess.step_count:
+                sess.step_count = int(summary["step_count"])
+                changed = True
+            if summary.get("latest_conclusion") and not sess.final_response_from_previous_turn:
+                sess.set_final_response(summary["latest_conclusion"], "transcript_summarizer")
+                changed = True
+            if changed:
+                self.persist_session(sess)
 
         return summary
 
@@ -5343,7 +5626,9 @@ class HubSessionManager:
 
         return {
             "session_id": session_id,
-            "is_alive_in_memory": sess is not None and sess.status in ("starting", "running", "waiting_parent"),
+            "is_alive_in_memory": sess is not None and (
+                sess.is_process_alive() or sess.status in ("starting", "running", "waiting_parent")
+            ),
             "lifecycle_status": meta.get("status"),
             "profile_id": meta.get("profile_id"),
             "engine": meta.get("engine"),
@@ -5843,6 +6128,45 @@ class HubSessionManager:
             trace += f" + feedback as next message {feedback!r}"
         return trace, note
 
+    def _answer_claude_approval(
+        self,
+        sess: AgentSession,
+        loop,
+        meta: Dict[str, Any],
+        action: str,
+        chosen_label: str,
+        custom_input: Optional[str],
+    ) -> tuple:
+        """Claude Code permission prompt: digits select an option at once; Escape cancels.
+        Options that persist rules to settings.local.json are filtered out unless no other choice exists."""
+        feedback = (custom_input or "").strip()
+        opts = [o for o in (meta.get("claude_options") or []) if isinstance(o, dict)]
+        if not opts:
+            opts = [
+                {"key": "1", "label": "Yes", "action": "approve_once"},
+                {"key": "2", "label": "Yes, allow for this session", "action": "approve_session"},
+                {"key": "3", "label": "No, and tell Claude what to do differently (esc)", "action": "deny"},
+            ]
+        sendable = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
+        want = "deny" if action == "deny_feedback" else action
+        chosen = next((o for o in sendable if o.get("label") == chosen_label and o.get("action") == want), None)
+        if chosen is None:
+            chosen = next((o for o in sendable if o.get("action") == want), None)
+        note = ""
+        if chosen is None and want == "approve_session":
+            chosen = next((o for o in sendable if o.get("action") == "approve_once"), None)
+            note = "这个 claude 提示没有「本会话允许」选项（或该选项会写入持久化配置）：本次只允许了一次"
+        if chosen is None and want == "deny":
+            chosen = {"key": "\x1b", "label": "esc to cancel", "action": "deny"}
+        if chosen is None:
+            raise ValueError("claude 审批提示里没有可用的允许选项，未发送任何按键")
+        key_to_send = "\x1b" if action == "deny_feedback" else str(chosen["key"])
+        sess.write_input(key_to_send)
+        trace = f"Claude permission prompt key {key_to_send!r} ({chosen.get('label')})"
+        if action == "deny_feedback" and feedback:
+            trace += f" + feedback as next message {feedback!r}"
+        return trace, note
+
     def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
         """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
 
@@ -5896,7 +6220,7 @@ class HubSessionManager:
         # approve for the session, deny, deny with feedback), mapped to that engine's own keys.
         approval_action: Optional[str] = None
         notes: List[str] = []
-        if kind == "approval_request" and eng in ("kimi", "omp", "codex", "agy") and not sess.dsh_spec:
+        if kind == "approval_request" and eng in ("kimi", "omp", "codex", "claude", "agy") and not sess.dsh_spec:
             approval_action, chosen_label, chosen_idx_1based = self._resolve_approval_choice(
                 dec_norm, option_index, custom_input, options, meta.get("option_actions")
             )
@@ -6173,6 +6497,28 @@ class HubSessionManager:
                     action_trace = f"AGY ask_question clamp_top + {target_0_idx}xDown + '\\r' ({chosen_label})"
                 delivered = True
 
+        # ── Engine 6: Claude Code CLI (Permission prompt & `AskUserQuestion` selector) ──────
+        elif eng == "claude":
+            if kind == "approval_request":
+                action_trace, note = self._answer_claude_approval(
+                    sess, loop, meta, approval_action, chosen_label, custom_input
+                )
+                if note:
+                    notes.append(note)
+                delivered = True
+            else:
+                raw_opts_count = int(meta.get("raw_options_count") or max(1, len(options) - 1))
+                if custom_input and (chosen_idx_1based is None or chosen_idx_1based > raw_opts_count):
+                    other_key = str(raw_opts_count + 1)
+                    steps = [(0.0, other_key), (0.2, custom_input.strip() + "\r")]
+                    self._write_keys_scheduled(sess, loop, steps)
+                    action_trace = f"Claude AskUserQuestion Other key {other_key!r} + {custom_input.strip()!r}"
+                else:
+                    key_num = str(chosen_idx_1based or 1)
+                    self._write_keys_scheduled(sess, loop, [(0.0, key_num), (0.2, "\r")])
+                    action_trace = f"Claude AskUserQuestion option key {key_num!r} ({chosen_label}) + '\\r'"
+                delivered = True
+
         # ── Generic / Fallback TUI or Worker MCP `ask_parent` ─────────────────────────────────
         else:
             if q_entry and not q_entry.get("answered"):
@@ -6196,11 +6542,22 @@ class HubSessionManager:
             f"[Parent Delegated Response -> {chosen_label}] ({action_trace})",
             source="parent_approval_proxy",
         )
+        self._record_tui_injection(
+            sess,
+            {
+                "at": round(time.time(), 3),
+                "ok": bool(delivered),
+                "reason": f"interaction_{kind}",
+                "attempts": 1,
+                "mode": "interaction_response",
+                "label": "成功" if delivered else "失败",
+            },
+        )
         self.persist_session(sess)
 
-        if eng == "agy" and approval_action == "deny_feedback" and (custom_input or "").strip():
-            # D7: agy ends the turn on a deny; the feedback goes in as the next message once the
-            # composer is back (after the interaction above is cleared, never into the prompt).
+        if eng in ("agy", "claude") and approval_action == "deny_feedback" and (custom_input or "").strip():
+            # D7: agy and claude end the turn on a deny; the feedback goes in as the next message once
+            # the composer is back (after the interaction above is cleared, never into the prompt).
             feedback_text = (custom_input or "").strip()
             if loop is not None:
                 loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, self._deliver_deny_feedback, session_id, feedback_text)
@@ -6302,7 +6659,8 @@ class HubSessionManager:
             return {"pty_written": written, "injection": "live_write" if written else "none",
                     "queued": False}
         claim = self._tui_writer_queue(sess).claim("parent_message")
-        if claim.first and not self._live_submit_checked(sess):
+        eng = str(getattr(sess, "engine", "") or "").strip().lower()
+        if claim.first and eng not in TUI_LIVE_SUBMIT_CHECKED and not self._live_submit_checked(sess):
             written = sess.write_input(text)
             if not written:
                 claim.release()
@@ -6385,9 +6743,43 @@ class HubSessionManager:
                         sess, text, submit_key, prior=dict(result, retyped=retypes)
                     )
             elif sess.write_input(text):
+                clean = str(text).replace("\r", " ").replace("\n", " ").strip()
+                probe = clean[:30].strip()
+                tail = clean[-30:].strip()
+                eng = str(getattr(sess, "engine", "") or "").strip().lower()
+                size_before = 0
+                if sess.transcript_path:
+                    try:
+                        size_before = Path(sess.transcript_path).stat().st_size
+                    except OSError:
+                        size_before = 0
+                marks = self._tui_submit_marks(sess, sess.get_clean_screen_text(max_lines=40), eng, probe)
                 await asyncio.sleep(TUI_UNCHECKED_ENTER_DELAY_SEC)
-                sess.write_input("\r")
-                result = self._unchecked_live_result()
+                sess.write_input(submit_key or "\r")
+                if eng in TUI_LIVE_SUBMIT_CHECKED and clean:
+                    state, reason = await self._confirm_tui_submit(
+                        sess,
+                        probe,
+                        tail,
+                        size_before,
+                        eng,
+                        echoed=False,
+                        deadline=time.time() + TUI_SUBMIT_CONFIRM_SEC,
+                        marks=marks,
+                        typed_len=len(clean),
+                    )
+                    if state == "confirmed":
+                        result = {
+                            "ok": True,
+                            "reason": reason,
+                            "attempts": 1,
+                            "echoed": False,
+                            "label": "成功",
+                        }
+                    else:
+                        result = self._unchecked_live_result()
+                else:
+                    result = self._unchecked_live_result()
             else:
                 result = {"ok": False, "reason": "write_failed", "attempts": 0, "label": "失败"}
         except asyncio.CancelledError:
@@ -6855,6 +7247,7 @@ class HubSessionManager:
         if not target_file:
             return
 
+        turn_has_step = False
         while self._transcript_watch_alive(session):
             if session.resume_attach:
                 # A resumed codex may start a new rollout for the same session id; accept it when it
@@ -6887,6 +7280,7 @@ class HubSessionManager:
 
                     if otype == "response_item":
                         if ptype in ("custom_tool_call", "function_call"):
+                            turn_has_step = True
                             tname = payload.get("name") or payload.get("tool_name") or ptype
                             targs = payload.get("arguments") or payload.get("input") or ""
                             self.record_telemetry(
@@ -6922,6 +7316,20 @@ class HubSessionManager:
                                     request_id=payload.get("call_id") or f"codex-q-{uuid.uuid4().hex[:6]}",
                                     metadata={"raw_options_count": len(opt_labels)},
                                 )
+                        elif ptype == "message" and payload.get("role") == "user":
+                            parts = payload.get("content") or []
+                            user_txts = [
+                                str(p.get("text") or "")
+                                for p in parts
+                                if isinstance(p, dict)
+                                and p.get("text")
+                                and "<environment_context>" not in str(p.get("text"))
+                            ]
+                            if user_txts:
+                                session.note_transcript_user_message(" ".join(user_txts).strip())
+                                turn_has_step = False
+                                if session.status == "completed":
+                                    self.begin_new_turn(session, status="running")
                         elif ptype == "message" and payload.get("role") == "assistant":
                             parts = payload.get("content") or []
                             texts = [
@@ -6931,6 +7339,17 @@ class HubSessionManager:
                             ]
                             if texts:
                                 msg_txt = "\n".join(texts).strip()
+                                if not turn_has_step:
+                                    turn_has_step = True
+                                    self.record_telemetry(
+                                        session.session_id,
+                                        {
+                                            "source": "codex_jsonl",
+                                            "hook_event": "ReportStep",
+                                            "tool_name": "llm_inference",
+                                            "tool_input": msg_txt[:200],
+                                        },
+                                    )
                                 self.record_telemetry(
                                     session.session_id,
                                     {
@@ -6974,6 +7393,17 @@ class HubSessionManager:
                     elif otype == "event_msg" and ptype == "task_complete":
                         last_msg = payload.get("last_agent_message")
                         if last_msg:
+                            if not turn_has_step:
+                                turn_has_step = True
+                                self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "codex_jsonl",
+                                        "hook_event": "ReportStep",
+                                        "tool_name": "llm_inference",
+                                        "tool_input": str(last_msg)[:200],
+                                    },
+                                )
                             session.set_final_response(str(last_msg), "codex_task_complete")
                             self.record_worker_event(
                                 session.session_id,
@@ -7138,6 +7568,7 @@ class HubSessionManager:
         if not target_file:
             return
 
+        turn_has_step = False
         while self._transcript_watch_alive(session):
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -7155,6 +7586,7 @@ class HubSessionManager:
                     otype = obj.get("type")
                     ctype = obj.get("customType")
                     if otype == "custom" and ctype == "tool_execution_start":
+                        turn_has_step = True
                         data = obj.get("data") or {}
                         tname = data.get("toolName", "tool")
                         targs = data.get("args") or {}
@@ -7196,7 +7628,20 @@ class HubSessionManager:
                         msg = obj.get("message") or {}
                         role = msg.get("role")
                         content = msg.get("content") or []
-                        if role == "toolResult":
+                        if role == "user":
+                            user_txts = []
+                            if isinstance(content, list):
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                                        user_txts.append(str(part["text"]))
+                            elif isinstance(content, str) and content.strip():
+                                user_txts.append(content.strip())
+                            if user_txts:
+                                session.note_transcript_user_message(" ".join(user_txts).strip())
+                            turn_has_step = False
+                            if session.status == "completed":
+                                self.begin_new_turn(session, status="running")
+                        elif role == "toolResult":
                             if msg.get("toolName") == "ask":
                                 self.clear_pending_interaction(session)
                             self.record_telemetry(
@@ -7222,6 +7667,7 @@ class HubSessionManager:
                                     texts.append(str(part["text"]).strip())
                                 elif ptype in ("toolCall", "tool_use"):
                                     has_tool_use = True
+                                    turn_has_step = True
                                     if part.get("name") == "ask" and isinstance(part.get("arguments"), dict):
                                         targs = part["arguments"]
                                         qs = targs.get("questions") or []
@@ -7250,6 +7696,17 @@ class HubSessionManager:
                                         )
                             inter = thoughts + texts
                             final_txt = "\n".join(texts).strip() if (texts and not has_tool_use) else None
+                            if final_txt and not turn_has_step:
+                                turn_has_step = True
+                                self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "omp_jsonl",
+                                        "hook_event": "ReportStep",
+                                        "tool_name": "llm_inference",
+                                        "tool_input": final_txt[:200],
+                                    },
+                                )
                             self.record_telemetry(
                                 session.session_id,
                                 {
@@ -7339,6 +7796,7 @@ class HubSessionManager:
         self.persist_session(session)
 
         latest_assistant_text: Optional[str] = None
+        turn_has_step = False
         while self._transcript_watch_alive(session):
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -7426,10 +7884,24 @@ class HubSessionManager:
                         session.note_transcript_user_message(" ".join(
                             str(p.get("text") or "") for p in parts if isinstance(p, dict)
                         ))
+                        turn_has_step = False
+                        if session.status == "completed":
+                            self.begin_new_turn(session, status="running")
                         continue
 
                     if obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
                         if latest_assistant_text:
+                            if not turn_has_step:
+                                turn_has_step = True
+                                self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "kimi_wire_jsonl",
+                                        "hook_event": "ReportStep",
+                                        "tool_name": "llm_inference",
+                                        "tool_input": latest_assistant_text[:200],
+                                    },
+                                )
                             session.set_final_response(latest_assistant_text, "native_transcript")
                             self.record_worker_event(
                                 session.session_id,
@@ -7469,6 +7941,7 @@ class HubSessionManager:
                                     },
                                 )
                         elif ev_type == "tool.call":
+                            turn_has_step = True
                             self.record_telemetry(
                                 session.session_id,
                                 {
@@ -7524,6 +7997,7 @@ class HubSessionManager:
                                 },
                             )
                         for tc in tool_calls:
+                            turn_has_step = True
                             fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
                             tname = fn.get("name") or tc.get("name") or "kimi_tool"
                             targs = fn.get("arguments") or tc.get("arguments") or ""
@@ -7633,6 +8107,7 @@ class HubSessionManager:
         resume_confirmed = not session.resume_attach
         # A3: the stray scan is bounded to the first 30 s after the resume spawn; past that it stops.
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
+        turn_has_step = False
         while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
                 try:
@@ -7657,6 +8132,14 @@ class HubSessionManager:
                     try:
                         obj = json.loads(line)
                     except Exception:
+                        continue
+                    if obj.get("type") == "USER_INPUT":
+                        user_txt = str(obj.get("content") or "").strip()
+                        if user_txt:
+                            session.note_transcript_user_message(user_txt)
+                        turn_has_step = False
+                        if session.status == "completed":
+                            self.begin_new_turn(session, status="running")
                         continue
                     if obj.get("type") == "PLANNER_RESPONSE":
                         thinking = (obj.get("thinking") or "").strip()
@@ -7684,6 +8167,7 @@ class HubSessionManager:
                             )
                         for tc in tcalls:
                             if isinstance(tc, dict):
+                                turn_has_step = True
                                 tname = tc.get("name") or tc.get("tool_name") or "agy_tool"
                                 targs = tc.get("args") or tc.get("arguments") or ""
                                 self.record_telemetry(
@@ -7726,6 +8210,17 @@ class HubSessionManager:
                             # here belongs to a new turn and only one is emitted per turn.
                             final_text = content or thinking
                             if final_text:
+                                if not turn_has_step:
+                                    turn_has_step = True
+                                    self.record_telemetry(
+                                        session.session_id,
+                                        {
+                                            "source": "agy_transcript",
+                                            "hook_event": "ReportStep",
+                                            "tool_name": "llm_inference",
+                                            "tool_input": final_text[:200],
+                                        },
+                                    )
                                 session.set_final_response(final_text, "native_transcript")
                                 self.record_worker_event(
                                     session.session_id,
@@ -7833,6 +8328,378 @@ class HubSessionManager:
             },
         )
 
+    def _claude_session_projects_root(self, session: Optional[AgentSession] = None) -> Path:
+        if session is not None:
+            snap = getattr(session, "profile_snapshot", None) or {}
+            env_map = snap.get("env") if isinstance(snap.get("env"), dict) else {}
+            prof = self.profiles.get(session.profile_id) or {}
+            cfg = (
+                snap.get("config_dir")
+                or env_map.get("CLAUDE_CONFIG_DIR")
+                or prof.get("config_dir")
+            )
+            if cfg and str(cfg).strip():
+                return claude_projects_root(str(cfg).strip())
+        return claude_projects_root()
+
+    async def _watch_claude_session(self, session: AgentSession, root: Optional[Path] = None):
+        """Live tails Claude Code CLI's session JSONL (`~/.claude/projects/<slug>/<session-uuid>.jsonl`).
+
+        `root` points the watcher at a synthetic copy of the layout for tests; production uses
+        `claude_projects_root()` (honoring the profile's `config_dir` / `CLAUDE_CONFIG_DIR`).
+        """
+        claude_root = Path(root) if root is not None else self._claude_session_projects_root(session)
+
+        target_file: Optional[Path] = None
+        offset = 0
+        scan_start = time.time()
+
+        if session.resume_attach and session.conversation_ref:
+            ref_path = str(session.conversation_ref.get("transcript_path") or "")
+            if ref_path and os.path.isfile(ref_path):
+                target_file = Path(ref_path)
+                offset = int(session.attach_offset or 0)
+                self._claim_transcript(session, target_file)
+
+        while target_file is None and self._transcript_watch_alive(session):
+            await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
+            if not self._transcript_watch_alive(session):
+                break
+            if not claude_root.exists():
+                continue
+
+            expected_uuid = str((session.conversation_ref or {}).get("session_id") or "").strip()
+            if expected_uuid:
+                try:
+                    exact = list(claude_root.rglob(f"{expected_uuid}.jsonl"))
+                except OSError:
+                    exact = []
+                if exact and exact[0].is_file() and self._claim_transcript(session, exact[0]):
+                    target_file = exact[0]
+                    break
+
+            candidates: List[Path] = []
+            try:
+                for p in claude_root.rglob("*.jsonl"):
+                    try:
+                        if not self._conversation_created_after(p, session, levels_up=0):
+                            continue
+                        candidates.append(p)
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+            target_file = self._claim_conversation(session, candidates, levels_up=0)
+            if target_file:
+                break
+
+        if not target_file:
+            return
+
+        turn_last_text: Optional[str] = None
+        turn_completed_emitted: bool = False
+        turn_has_step: bool = False
+        seen_topics: Set[str] = set()
+        seen_stream_snippets: Set[str] = set()
+        last_screen_probe_at: float = 0.0
+        spinner_stat_re = re.compile(
+            r"[✻✽✢✳✶·]\s+([^\n(]{2,45}?)\s*\(([^)]*(?:tokens|thought|\ds\b)[^)]*)\)"
+        )
+
+        while self._transcript_watch_alive(session):
+            try:
+                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(offset)
+                    lines = f.readlines()
+                    offset = f.tell()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    otype = obj.get("type")
+                    if otype == "user":
+                        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                        content = msg.get("content")
+                        if isinstance(content, str) and content.strip():
+                            turn_last_text = None
+                            turn_completed_emitted = False
+                            turn_has_step = False
+                            if session.status == "completed":
+                                self.begin_new_turn(session, status="running")
+                                self.persist_session(session)
+                            session.note_transcript_user_message(content.strip())
+                        elif isinstance(content, list):
+                            user_texts = [
+                                str(b.get("text") or "")
+                                for b in content
+                                if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                            ]
+                            if user_texts:
+                                turn_last_text = None
+                                turn_completed_emitted = False
+                                turn_has_step = False
+                                if session.status == "completed":
+                                    self.begin_new_turn(session, status="running")
+                                    self.persist_session(session)
+                                session.note_transcript_user_message(" ".join(user_texts))
+                            for b in content:
+                                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                                    continue
+                                res_content = b.get("content")
+                                if isinstance(res_content, list):
+                                    res_content = "\n".join(
+                                        str(x.get("text") or x) if isinstance(x, dict) else str(x)
+                                        for x in res_content
+                                    )
+                                self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "claude_jsonl",
+                                        "hook_event": "PostToolUse",
+                                        "tool_response": res_content or "",
+                                    },
+                                )
+                    elif otype == "queue-operation":
+                        op = obj.get("operation")
+                        if op == "enqueue" and obj.get("content"):
+                            q_txt = str(obj["content"]).strip()
+                            if q_txt:
+                                session.note_transcript_user_message(q_txt)
+                                self.db.add_intermediate_message(
+                                    session.session_id,
+                                    max(1, session.step_count),
+                                    f"[Steer queued mid-turn] {q_txt[:240]}",
+                                    source="claude_jsonl",
+                                )
+                                session.current_activity = (
+                                    f"Step {max(1, session.step_count)}: Steer message queued ({q_txt[:70]})"
+                                )
+                                self.persist_session(session)
+                        elif op == "dequeue":
+                            turn_last_text = None
+                            turn_completed_emitted = False
+                            turn_has_step = False
+                            self.db.add_intermediate_message(
+                                session.session_id,
+                                max(1, session.step_count),
+                                "[Steer dequeued] Processing queued parent instruction",
+                                source="claude_jsonl",
+                            )
+                            session.current_activity = (
+                                f"Step {max(1, session.step_count)}: Processing queued steer message"
+                            )
+                            self.persist_session(session)
+                    elif otype == "ai-title" and obj.get("aiTitle"):
+                        ai_title = str(obj["aiTitle"]).strip()
+                        if ai_title and ai_title not in seen_topics:
+                            seen_topics.add(ai_title)
+                            self.db.add_intermediate_message(
+                                session.session_id,
+                                max(1, session.step_count),
+                                f"[Topic] {ai_title}",
+                                source="claude_jsonl",
+                            )
+                    elif otype == "api-request":
+                        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+                        req_model = str(params.get("model") or session.effective_model or "claude")
+                        out_cfg = (
+                            params.get("output_config")
+                            if isinstance(params.get("output_config"), dict)
+                            else {}
+                        )
+                        req_effort = str(out_cfg.get("effort") or session.effective_thinking_level or "")
+                        turn_has_step = True
+                        turn_completed_emitted = False
+                        step_desc = f"LLM inference ({req_model}{':' + req_effort if req_effort else ''})"
+                        self.record_telemetry(
+                            session.session_id,
+                            {
+                                "source": "claude_jsonl",
+                                "hook_event": "ReportStep",
+                                "tool_name": "llm_inference",
+                                "tool_input": {
+                                    "model": req_model,
+                                    **({"effort": req_effort} if req_effort else {}),
+                                },
+                                "step_title": step_desc,
+                            },
+                        )
+                    elif otype == "assistant":
+                        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+                        stop_reason = msg.get("stop_reason")
+                        think_dur_ms = obj.get("thinkingDurationMs")
+                        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+                        out_details = (
+                            usage.get("output_tokens_details")
+                            if isinstance(usage.get("output_tokens_details"), dict)
+                            else {}
+                        )
+                        think_toks = out_details.get("thinking_tokens")
+                        out_toks = usage.get("output_tokens")
+                        thoughts: List[str] = []
+                        texts: List[str] = []
+                        has_tool_use = False
+                        for part in content:
+                            if not isinstance(part, dict):
+                                continue
+                            ptype = part.get("type")
+                            if ptype == "thinking":
+                                if part.get("thinking"):
+                                    thoughts.append(str(part["thinking"]).strip())
+                                else:
+                                    meta_parts: List[str] = []
+                                    if think_dur_ms is not None:
+                                        meta_parts.append(f"{int(think_dur_ms)}ms")
+                                    if think_toks is not None:
+                                        meta_parts.append(f"thinking_tokens={think_toks}")
+                                    if out_toks is not None:
+                                        meta_parts.append(f"output_tokens={out_toks}")
+                                    thoughts.append(
+                                        f"[Thinking completed ({', '.join(meta_parts) or 'encrypted signature'})]"
+                                    )
+                            elif ptype == "text" and part.get("text"):
+                                texts.append(str(part["text"]).strip())
+                            elif ptype == "tool_use":
+                                has_tool_use = True
+                                turn_has_step = True
+                                tname = str(part.get("name") or "claude_tool")
+                                tinput = part.get("input") if isinstance(part.get("input"), dict) else (part.get("input") or {})
+                                self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "claude_jsonl",
+                                        "hook_event": "PreToolUse",
+                                        "tool_name": tname,
+                                        "tool_input": tinput,
+                                    },
+                                )
+                                if tname == "AskUserQuestion" and isinstance(tinput, dict):
+                                    qs = tinput.get("questions") or []
+                                    q0 = qs[0] if qs and isinstance(qs[0], dict) else tinput
+                                    q_header = str(q0.get("header") or "Claude Question")
+                                    q_prompt = str(q0.get("question") or "Claude Sub-Agent is asking a question")
+                                    raw_opts = q0.get("options") or []
+                                    opt_labels = [
+                                        str(o.get("label") or o) if isinstance(o, dict) else str(o)
+                                        for o in raw_opts
+                                    ]
+                                    self.register_pending_interaction(
+                                        session=session,
+                                        kind="question",
+                                        title=q_header,
+                                        prompt=q_prompt,
+                                        options=opt_labels + ["Other (custom text input)"],
+                                        source="claude_jsonl_ask_user_question",
+                                        request_id=str(part.get("id") or f"claude-q-{uuid.uuid4().hex[:6]}"),
+                                        metadata={
+                                            "raw_options_count": len(opt_labels),
+                                            "multi_select": bool(q0.get("multiSelect", False)),
+                                        },
+                                    )
+                        if not turn_has_step and (thoughts or texts):
+                            turn_has_step = True
+                            req_model = str(msg.get("model") or session.effective_model or "claude")
+                            self.record_telemetry(
+                                session.session_id,
+                                {
+                                    "source": "claude_jsonl",
+                                    "hook_event": "ReportStep",
+                                    "tool_name": "llm_inference",
+                                    "tool_input": {"model": req_model},
+                                    "step_title": f"LLM inference ({req_model})",
+                                },
+                            )
+                        if texts:
+                            turn_last_text = "\n".join(texts).strip()
+                        elif thoughts and session.status == "running":
+                            session.current_activity = (
+                                f"Step {max(1, session.step_count)}: {thoughts[-1].strip('[]')} — streaming response"
+                            )
+                        inter = thoughts + texts
+                        is_end_turn = (
+                            bool(texts)
+                            and not has_tool_use
+                            and stop_reason in ("end_turn", "stop_sequence")
+                        )
+                        if is_end_turn:
+                            turn_completed_emitted = True
+                        final_txt = "\n".join(texts).strip() if is_end_turn else None
+                        if inter or final_txt:
+                            self.record_telemetry(
+                                session.session_id,
+                                {
+                                    "source": "claude_jsonl",
+                                    "hook_event": "TurnComplete" if is_end_turn else "AssistantMessage",
+                                    "intermediate_messages": inter,
+                                    "final_assistant_text": final_txt,
+                                },
+                            )
+                    elif otype == "system" and obj.get("subtype") == "turn_duration":
+                        dur_ms = obj.get("durationMs")
+                        if not turn_completed_emitted and session.pending_interaction is None:
+                            turn_completed_emitted = True
+                            fallback_final = turn_last_text or session.final_response or "Turn completed"
+                            self.record_telemetry(
+                                session.session_id,
+                                {
+                                    "source": "claude_jsonl",
+                                    "hook_event": "TurnComplete",
+                                    "intermediate_messages": [],
+                                    "final_assistant_text": fallback_final,
+                                },
+                            )
+                        if dur_ms is not None and session.status == "completed":
+                            session.current_activity = (
+                                f"Step {max(1, session.step_count)}: Turn completed in {float(dur_ms) / 1000.0:.1f}s (final response captured)"
+                            )
+                            self.persist_session(session)
+
+                now_ts = time.time()
+                if (
+                    session.status == "running"
+                    and not turn_completed_emitted
+                    and (now_ts - last_screen_probe_at) >= 2.4
+                ):
+                    last_screen_probe_at = now_ts
+                    scr_txt = session.get_clean_screen_text(max_lines=35)
+                    if scr_txt:
+                        sp_match = spinner_stat_re.search(scr_txt)
+                        clean_lines = [
+                            ln.strip()
+                            for ln in sanitize_tui_screen_text(scr_txt, max_lines=10, engine="claude")
+                            if ln.strip() and not ln.strip().startswith((">", "❯"))
+                        ]
+                        latest_line = clean_lines[-1] if clean_lines else ""
+                        for ln in clean_lines:
+                            if (ln.startswith("#") or len(ln) >= 24) and ln not in seen_stream_snippets:
+                                seen_stream_snippets.add(ln)
+                                if len(seen_stream_snippets) <= 15:
+                                    self.db.add_intermediate_message(
+                                        session.session_id,
+                                        max(1, session.step_count),
+                                        f"[Streaming preview] {ln[:220]}",
+                                        source="claude_tui_stream",
+                                    )
+                        if sp_match:
+                            verb = sp_match.group(1).strip()
+                            stats = sp_match.group(2).strip()
+                            tail_preview = f" — {latest_line[:60]}" if latest_line else ""
+                            session.current_activity = (
+                                f"Step {max(1, session.step_count)}: {verb} ({stats}){tail_preview}"
+                            )
+                        elif latest_line:
+                            session.current_activity = (
+                                f"Step {max(1, session.step_count)}: Streaming response — {latest_line[:70]}"
+                            )
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+
     @classmethod
     def _tui_input_line(cls, screen_text: str, engine: str = "") -> Optional[str]:
         """W2/K2: the text on the engine's composer ("" when it is empty), or None when none is drawn.
@@ -7929,19 +8796,29 @@ class HubSessionManager:
             if match is None or len(lines[i]) - len(lines[i].lstrip()) >= 2:
                 continue
             indent = max(2, match.start(1))
+            opened = not frame.get("top") or (i > 0 and cls._tui_frame_row_is(lines[i - 1], frame["top"]))
             j = i + 1
-            while j < len(lines) and cls._tui_glyph_wrapped_row(lines[j], indent):
-                j += 1
+            if opened and frame.get("require_frame") and frame.get("bottom") == "rule":
+                while (
+                    j < len(lines)
+                    and (j - i) <= 15
+                    and bool(lines[j].strip())
+                    and not TUI_RULE_ROW_RE.match(lines[j])
+                    and not TUI_GLYPH_HISTORY_BELOW_RE.match(lines[j])
+                ):
+                    j += 1
+            else:
+                while j < len(lines) and cls._tui_glyph_wrapped_row(lines[j], indent):
+                    j += 1
             closed = (
                 j < len(lines)
                 and cls._tui_frame_row_is(lines[j], frame.get("bottom") or "")
                 and not any(TUI_GLYPH_HISTORY_BELOW_RE.match(ln) for ln in lines[j + 1:])
             )
-            opened = not frame.get("top") or (i > 0 and cls._tui_frame_row_is(lines[i - 1], frame["top"]))
-            if closed and (i >= window or (opened and j >= window)):
+            if closed and (not frame.get("require_frame") or opened) and (i >= window or (opened and j >= window)):
                 parts = [match.group(1).rstrip()] + [ln.strip() for ln in lines[i + 1:j]]
                 return " ".join(p for p in parts if p), i, j - 1, j - 1 - i
-            if i >= window:
+            if i >= window and not frame.get("require_frame"):
                 return match.group(1).rstrip(), i, i, 0
             return None
         return None
@@ -8166,14 +9043,12 @@ class HubSessionManager:
         tail: str,
     ) -> str:
         """K3 (fix 9): the transcript's proof of this submit ("" when it shows none yet)."""
+        seq = int(getattr(session, "transcript_user_seq", 0) or 0)
+        if seq > int(marks.get("user_seq") or 0) and self._composer_holds(
+            str(getattr(session, "transcript_user_text", "") or ""), probe, tail
+        ):
+            return "transcript_user_message"
         if rules.get("transcript") == "user_message":
-            # The engine's transcript watcher (the only reader of the file) counts user messages;
-            # a new one holding the typed text is the proof.
-            seq = int(getattr(session, "transcript_user_seq", 0) or 0)
-            if seq > int(marks.get("user_seq") or 0) and self._composer_holds(
-                str(getattr(session, "transcript_user_text", "") or ""), probe, tail
-            ):
-                return "transcript_user_message"
             return ""
         if session.transcript_path:
             try:
@@ -8549,7 +9424,23 @@ class HubSessionManager:
             screen_txt = session.get_clean_screen_text(max_lines=40)
             if any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES):
                 # R1/W4: answer it wherever it appears in the window; never type behind it.
-                if screen_txt != last_dialog:
+                if TUI_TRUST_NO_FOCUSED_RE.search(screen_txt):
+                    # Wait past Claude's 150ms held->settled remount guard before moving focus down
+                    # from "No, exit" to "Yes, I trust this folder", and NEVER press Enter while
+                    # "No" is still the focused option.
+                    await asyncio.sleep(TUI_TRUST_OPEN_GUARD_SEC)
+                    if session.status not in ("starting", "running"):
+                        return
+                    session.write_input("\x1b[B")
+                    await asyncio.sleep(0.25)
+                    if session.status not in ("starting", "running"):
+                        return
+                    screen_txt = session.get_clean_screen_text(max_lines=40)
+                if (
+                    any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES)
+                    and not TUI_TRUST_NO_FOCUSED_RE.search(screen_txt)
+                    and screen_txt != last_dialog
+                ):
                     session.write_input("\r")
                     last_dialog = screen_txt
                     trust_dismissed += 1
@@ -8625,7 +9516,12 @@ class HubSessionManager:
 
             # R1: stop early only once the agent is clearly past the dialogs (prompt visible or
             # conversation claimed). With text still to type the ready branch above owns the exit.
-            if typed and (input_line is not None or session.conversation_ref):
+            # For claude, conversation_ref is pre-seeded with --session-id before launch, so only a
+            # claimed transcript file (or visible composer) proves it has passed startup dialogs.
+            if typed and (
+                input_line is not None
+                or (session.conversation_ref and (session.engine != "claude" or self._session_has_transcript(session)))
+            ):
                 return
             if now >= deadline:
                 if not typed:
@@ -9267,6 +10163,32 @@ class HubSessionManager:
             },
         )
 
+    def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+        """Claude Code permission prompt: options are offered by label; persistent allow rules are filtered out."""
+        opts = [dict(o) for o in parsed.get("options") or []]
+        offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
+        offered = [o["label"] for o in offered_opts]
+        lines: List[str] = []
+        if parsed.get("reason"):
+            lines.append(f"Reason: {parsed['reason']}")
+        if parsed.get("command"):
+            lines.append(f"Command: {parsed['command']}")
+        if parsed.get("header"):
+            lines.append(parsed["header"])
+        return self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title="Claude Code Permission Prompt",
+            prompt="\n".join(lines) if lines else scr.strip()[-600:],
+            options=offered,
+            source="claude_tui_screen_detector",
+            metadata={
+                "claude_options": opts,
+                "option_actions": [o.get("action") for o in offered_opts],
+                "command": parsed.get("command") or "",
+            },
+        )
+
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
         """
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
@@ -9389,6 +10311,15 @@ class HubSessionManager:
                         source="omp_tui_screen_detector",
                         metadata={"raw_options_count": 3, "omp_prompt": "settings"},
                     )
+                continue
+
+            # 5) Claude Code TUI permission prompt ("Do you want to proceed?" + numbered options).
+            claude_prompt = parse_claude_approval_prompt(scr) if eng == "claude" else None
+            if claude_prompt is not None:
+                sig = f"claude_appr:{hash(scr.strip()[-400:])}"
+                if sig not in session._seen_tui_prompt_signatures:
+                    session._seen_tui_prompt_signatures.add(sig)
+                    self._register_claude_screen_approval(session, claude_prompt, scr)
                 continue
 
     @staticmethod
@@ -9610,6 +10541,20 @@ class HubSessionManager:
             if resolved_level:
                 injected.extend(['-c', f'model_reasoning_effort="{resolved_level}"'])
             args = injected + args
+        elif eng == 'claude':
+            if command:
+                command = os.path.expandvars(os.path.expanduser(command))
+            raw_cfg_dir = str(prof.get('config_dir') or '').strip()
+            if raw_cfg_dir:
+                env['CLAUDE_CONFIG_DIR'] = os.path.abspath(
+                    os.path.expandvars(os.path.expanduser(raw_cfg_dir))
+                )
+            injected = []
+            if resolved_model:
+                injected.extend(['--model', resolved_model])
+            if resolved_level:
+                injected.extend(['--effort', resolved_level])
+            args = injected + args
         # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
 
         # D1 (2026-11-07): high-risk approval is on for every engine unless the profile switches it
@@ -9671,6 +10616,7 @@ class HubSessionManager:
             'engine': eng,
             'kind': kind,
             'command': command,
+            'config_dir': env.get('CLAUDE_CONFIG_DIR') if eng == 'claude' else None,
             'args': args,
             'env': env,
             'cwd': work_dir,
@@ -9759,6 +10705,7 @@ class HubSessionManager:
         submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
         agy_bridge_dir: Optional[Path] = None
+        claude_session_uuid: Optional[str] = None
 
         if engine == "agy":
             # D10: the per-session MCP bridge (config file + --add-dir + session-only settings).
@@ -9777,6 +10724,16 @@ class HubSessionManager:
             ])
             if task:
                 args.append(task)
+        elif task_mode == "claude_positional":
+            claude_session_uuid = str(uuid.uuid4())
+            args.extend([
+                "--session-id",
+                claude_session_uuid,
+                "--append-system-prompt",
+                self._build_worker_bridge_system_hint(session_id, engine),
+            ])
+            if task:
+                args.append(task)
         elif task_mode == "agy_interactive_flag":
             if task:
                 args.extend(["-i", task + "\n" + self._build_worker_bridge_system_hint(session_id, engine)])
@@ -9792,7 +10749,7 @@ class HubSessionManager:
             kind=kind,
             title=derive_readable_session_title(title, task, prof_name, session_id),
             cwd=work_dir,
-            command=prof["command"],
+            command=launch["command"],
             args=args,
             gui_url=prof.get("gui_url"),
             cols=self.default_cols,
@@ -9803,11 +10760,14 @@ class HubSessionManager:
         sess.effective_model = effective_model
         sess.effective_thinking_level = effective_thinking
         sess.engine = engine
+        if claude_session_uuid:
+            sess.conversation_ref = {"session_id": claude_session_uuid}
         sess.profile_snapshot = {
             "profile_id": profile_id,
             "engine": engine,
             "kind": kind,
-            "command": prof["command"],
+            "command": launch["command"],
+            "config_dir": launch.get("config_dir"),
             "args": launch_args,
             "env": dict(launch.get("env") or {}),
             "model": launch.get("model"),
@@ -9836,6 +10796,15 @@ class HubSessionManager:
             # B9: last_task is the initial task and is never overwritten afterwards.
             sess.last_task = task
             sess.current_activity = f"Running initial task: {task[:80]}"
+            if task_mode in ("claude_positional", "omp_positional", "agy_interactive_flag", "codex_positional"):
+                sess.last_injection = {
+                    "at": round(time.time(), 3),
+                    "ok": True,
+                    "reason": "argv_positional",
+                    "attempts": 1,
+                    "mode": "startup_task",
+                    "label": "成功",
+                }
 
         if task_mode == "dsh_hub_api":
             # B6 rule 4 / V-3: dsh injects no args. resolve_launch already built the dsh spec
@@ -9867,6 +10836,8 @@ class HubSessionManager:
             asyncio.create_task(self._watch_kimi_session(sess))
         elif engine == "agy":
             asyncio.create_task(self._watch_agy_transcript(sess))
+        elif engine == "claude":
+            asyncio.create_task(self._watch_claude_session(sess))
 
         if kind == "tui":
             asyncio.create_task(self._watch_tui_interactive_prompts(sess))
@@ -9921,14 +10892,14 @@ class HubSessionManager:
                 except Exception:
                     pass
 
-            if session.status in ("completed", "waiting_parent", "exited", "terminated"):
-                self.persist_session(session)
-                return {"settled": True, "reason": f"status_{session.status}", "elapsed_sec": round(elapsed, 1)}
-
             # K6 (fix 9c): a live message still being typed and proved in the background is not a
             # settled screen: the K5 settle and the proof can leave the output quiet for a while
             # before the Enter has even been pressed.
             submitting = self._tui_writer_queue(session).busy("parent_message")
+            if not submitting and session.status in ("completed", "waiting_parent", "exited", "terminated"):
+                self.persist_session(session)
+                return {"settled": True, "reason": f"status_{session.status}", "elapsed_sec": round(elapsed, 1)}
+
             if (has_seen_new_output and not submitting
                     and (now - session.last_output_at) >= quiet_window_sec and elapsed >= 3.0):
                 try:

@@ -82,7 +82,9 @@ const ACTIVITY_RULES = [
   // F2 addition: the worker's exit message carries the parent-call hint after the code.
   [/^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=(-?\d+)\s*[)）][\s\S]*$/i, (m) => `进程已退出（退出码 ${m[1]}）`],
   [/^Task completed/i, () => '任务已完成'],
+  [/^(?:Step\s+\d+:\s*)?Turn completed(?:\s*\(final response captured\))?/i, () => '本轮已完成（已捕获最终回复）'],
   [/^Waiting for parent answer:?\s*(.*)$/i, (m) => (m[1] ? `等待主 Agent 回复：${m[1]}` : '等待主 Agent 回复')],
+  [/^Waiting for parent approval:?\s*(.*)$/i, (m) => (m[1] ? `等待主 Agent 审批：${m[1]}` : '等待主 Agent 审批')],
   [/^Terminated by/i, () => '已终止'],
   [/^Running initial task:\s*(.*)$/i, (m) => (m[1] ? `正在执行初始任务：${m[1]}` : '正在执行初始任务')],
 ];
@@ -103,8 +105,9 @@ const WHOLE_LIFECYCLE_RULES = [
   /^Session exited \(exit_code=-?\d+\)$/i,
   /^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=-?\d+\s*[)）]\s*。?$/i,
   /^Task completed(?:\s*\([^()\n]*\))?$/i,
+  /^(?:Step\s+\d+:\s*)?Turn completed(?:\s*\([^()\n]*\))?$/i,
   /^Terminated by[^\n]{0,40}$/i,
-  /^Waiting for parent answer:?[\s\S]{0,200}$/i,
+  /^Waiting for parent (?:answer|approval):?[\s\S]{0,200}$/i,
   /^Running initial task:[\s\S]{0,200}$/i,
 ];
 
