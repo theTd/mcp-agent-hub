@@ -622,6 +622,63 @@ AGY_THINKING_LEVELS = ("low", "medium", "high")
 AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
 # A profile with an absurdly long argument list is a mistake, not a launch recipe.
 MAX_LAUNCH_ARGS = 4096
+MAX_ENV_VARS = 256
+_ENV_KEY_INVALID_RE = re.compile(r"[\s=\x00]")
+
+
+def normalize_env_map(raw_env: Any, *, field_label: str = "环境变量（env）") -> Dict[str, str]:
+    """Normalizes and validates a profile or launch environment variable map.
+
+    Accepts a `Dict[str, str]` (or scalar values), a list of `KEY=VALUE` strings, or a multiline
+    `KEY=VALUE` string (ignoring empty lines and `#` comment lines). Raises a Chinese ValueError on
+    malformed keys or unsupported value types.
+    """
+    if raw_env is None or raw_env == "" or raw_env == {} or raw_env == []:
+        return {}
+
+    pairs: List[tuple[Any, Any]] = []
+    if isinstance(raw_env, dict):
+        pairs = list(raw_env.items())
+    elif isinstance(raw_env, (str, list)):
+        lines = raw_env.splitlines() if isinstance(raw_env, str) else list(raw_env)
+        for raw_line in lines:
+            if not isinstance(raw_line, str):
+                raise ValueError(f"{field_label} 的每一项都必须是 KEY=VALUE 字符串。")
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError(f"{field_label} 格式无效（缺少 '='，应为 KEY=VALUE）：{line}")
+            k_part, v_part = line.split("=", 1)
+            pairs.append((k_part.strip(), v_part.strip()))
+    else:
+        raise ValueError(f"{field_label} 必须是键值字典（Dict[str, str]）或每行一个 KEY=VALUE。")
+
+    if len(pairs) > MAX_ENV_VARS:
+        raise ValueError(f"{field_label} 数量过多（最多 {MAX_ENV_VARS} 项）。")
+
+    result: Dict[str, str] = {}
+    for raw_key, raw_val in pairs:
+        if not isinstance(raw_key, str):
+            raise ValueError(f"{field_label} 的变量名必须是字符串：{raw_key!r}")
+        key = raw_key.strip()
+        if not key:
+            raise ValueError(f"{field_label} 的变量名不能为空。")
+        if _ENV_KEY_INVALID_RE.search(key):
+            raise ValueError(f"{field_label} 的变量名「{key}」不能包含空格、等号或空字符。")
+        if raw_val is None:
+            result.pop(key, None)
+            continue
+        if isinstance(raw_val, bool):
+            val = "true" if raw_val else "false"
+        elif isinstance(raw_val, (str, int, float)):
+            val = str(raw_val)
+        else:
+            raise ValueError(f"{field_label} 中「{key}」的值必须是字符串。")
+        if "\x00" in val:
+            raise ValueError(f"{field_label} 中「{key}」的值不能包含空字符（\\0）。")
+        result[key] = val
+    return result
 
 # Q6: Windows refuses `os.replace` / an open-for-write while another process holds the file. A short
 # retry covers the millisecond window of a concurrent reader; a lock that survives it is reported as
@@ -754,7 +811,15 @@ TUI_GLYPH_HISTORY_BELOW_RE = re.compile(r"^\s*[•●✗⏺]")
 # 1,027-char longc.txt).
 TUI_PASTE_PLACEHOLDER_RES = {
     "codex": re.compile(r"\[Pasted Content (\d+) chars\]"),
-    "claude": re.compile(r"\[Pasted (?:text|Content)[^\]]*?(\d+)\s*(?:chars|lines)\]", re.IGNORECASE),
+    "claude": re.compile(
+        r"\[(?:Pasted (?:text|Content)|\.{3}Truncated text)\s*#\d+(?:\s+\+\d+\s*(?:lines|chars)(?:\.{3})?)?\]"
+        r"|\[Pasted (?:text|Content)[^\]]*?(\d+)\s*(?:chars|lines)\]",
+        re.IGNORECASE,
+    ),
+    "agy": re.compile(
+        r"\[Pasted text #\d+(?:\s+(?:(\d+)\s*chars|\+\d+\s*lines))?\]",
+        re.IGNORECASE,
+    ),
 }
 TUI_PASTE_PLACEHOLDER_SLACK_CHARS = 4
 TUI_BOX_TOP_RE = re.compile(r"^\s*╭─.*╮\s*$")
@@ -829,7 +894,7 @@ TUI_UPDATE_DIALOG_PHRASES = (
 # kimi "⠋ Working…" / "⠋ thinking…", omp "⎋ Working…", agy "⣷  Generating...",
 # codex "Worked for 35s" / "esc to interrupt".
 TUI_AGENT_ACTIVE_RE = re.compile(
-    r"(?:Working…|Working \(|Generating|Running a command|esc to interrupt|Worked for"
+    r"(?:Working…|Working\.\.\.|Working \(|Generating|Running a command|esc to interrupt|esc to cancel|Worked for"
     r"|thinking…|thinking\.\.\.)",
     re.IGNORECASE,
 )
@@ -1233,6 +1298,7 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
 # profile's own `bypass_approvals: true` (round 2, see bypass_launch_flags below).
 ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
 OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
+CLAUDE_APPROVAL_SETTINGS_NAME = "claude-approval.json"
 # D5: agy's `--mode auto` falls back to `default` at launch (its check runs before sign-in ends);
 # `--settings` (this session only, never saved) applies agentMode after sign-in, before turn one.
 AGY_SESSION_SETTINGS: Dict[str, Any] = {"agentMode": "auto"}
@@ -1243,9 +1309,48 @@ def omp_approval_overlay_path() -> Path:
     return ENGINE_POLICIES_DIR / OMP_APPROVAL_OVERLAY_NAME
 
 
+def claude_approval_settings_path() -> Path:
+    """The Claude Code settings overlay shipped in the repo (high-risk PowerShell/Bash patterns ask)."""
+    template_path = ENGINE_POLICIES_DIR / CLAUDE_APPROVAL_SETTINGS_NAME
+    hook_script = ENGINE_POLICIES_DIR / "claude_pre_tool_hook.py"
+    if template_path.is_file() and hook_script.is_file():
+        expected_cmd = f'"{sys.executable}" "{hook_script}"'
+        try:
+            data = json.loads(template_path.read_text(encoding="utf-8"))
+            hooks_map = data.setdefault("hooks", {})
+            for event_key, default_matcher in (("PreToolUse", "Bash|PowerShell"), ("PermissionRequest", "")):
+                entries = hooks_map.get(event_key)
+                if not isinstance(entries, list) or not entries:
+                    hooks_map[event_key] = [
+                        {
+                            "matcher": default_matcher,
+                            "hooks": [{"type": "command", "command": expected_cmd}],
+                        }
+                    ]
+                elif isinstance(entries[0], dict):
+                    inner = entries[0].get("hooks") or []
+                    if inner and isinstance(inner[0], dict):
+                        inner[0]["command"] = expected_cmd
+            runtime_dir = ENGINE_POLICIES_DIR.parent / ".runtime_mcp_configs"
+            runtime_dir.mkdir(exist_ok=True)
+            runtime_path = runtime_dir / CLAUDE_APPROVAL_SETTINGS_NAME
+            rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            if not runtime_path.is_file() or runtime_path.read_text(encoding="utf-8", errors="replace") != rendered:
+                runtime_path.write_text(rendered, encoding="utf-8")
+            return runtime_path
+        except Exception:
+            pass
+    return template_path
+
+
 def _is_omp_overlay_path(value: str) -> bool:
     raw = str(value or "").strip().strip('"').strip("'")
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_OVERLAY_NAME
+
+
+def _is_claude_approval_settings_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == CLAUDE_APPROVAL_SETTINGS_NAME
 
 
 def _approval_flag_tokens(engine: str, args: List[str]):
@@ -1301,6 +1406,10 @@ def _approval_flag_tokens(engine: str, args: List[str]):
             elif a.startswith(("--allowedTools=", "--allowed-tools=")) and "hub_worker.py" in a:
                 width, label = 1, "--allowedTools="
             elif a in ("--allowedTools", "--allowed-tools") and "hub_worker.py" in nxt(i):
+                width = 2
+            elif a.startswith("--settings=") and _is_claude_approval_settings_path(a.split("=", 1)[1]):
+                width, label = 1, "--settings="
+            elif a == "--settings" and _is_claude_approval_settings_path(nxt(i)):
                 width = 2
         if width:
             for k in range(i, min(i + width, total)):
@@ -1366,7 +1475,12 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
     if eng == "codex":
         return ["-a", "on-request", "-s", "workspace-write"]
     if eng == "claude":
-        return ["--permission-mode", "acceptEdits", f"--allowedTools={CLAUDE_WORKER_ALLOWED_TOOLS}"]
+        return [
+            "--permission-mode",
+            "acceptEdits",
+            f"--settings={claude_approval_settings_path()}",
+            f"--allowedTools={CLAUDE_WORKER_ALLOWED_TOOLS}",
+        ]
     if eng == "agy":
         settings = _agy_profile_settings(list(profile_args or []))
         settings.update(AGY_SESSION_SETTINGS)
@@ -1536,7 +1650,14 @@ _OPTION_LINE_RE = re.compile(r"^\s*[>❯›▶]?\s*(\d+)\.\s+(.*\S)\s*$")
 
 def classify_approval_label(label: str) -> str:
     """approve_once | approve_session | persist | deny | deny_feedback for one option label."""
-    low = str(label or "").strip().lower()
+    low = (
+        str(label or "")
+        .strip()
+        .lower()
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u02bc", "'")
+    )
     if "with feedback" in low or "deny and send" in low:
         return "deny_feedback"
     # Round 3: checked before the deny prefixes, because agy also has deny options that persist
@@ -1820,12 +1941,29 @@ _CLAUDE_APPROVAL_HEADERS = (
     "Do you want to run",
     "Do you want to allow",
 )
+_CLAUDE_SOLID_RULE_CHARS = set("─━-═╭╮╰╯┌┐└┘")
+_CLAUDE_DASHED_RULE_CHARS = set("╌╍┄┅┈┉")
+_CLAUDE_ALL_RULE_CHARS = _CLAUDE_SOLID_RULE_CHARS | _CLAUDE_DASHED_RULE_CHARS
+_CLAUDE_TOOL_TITLES = (
+    "powershell command",
+    "bash command",
+    "command",
+    "edit file",
+    "create file",
+    "tool use",
+)
+_CLAUDE_REASON_PREFIXES = (
+    "permission rule ",
+    "command contains ",
+    "command invokes ",
+    "this command ",
+)
 
 
 def parse_claude_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     """Claude Code's permission prompt (`Do you want to proceed?` + numbered options, digits act at once).
 
-    Returns {header, reason, command, options:[{key,label,action}]} or None.
+    Returns {header, reason, command, options:[{key,label,action,persists?}]} or None.
     """
     lines = str(screen or "").splitlines()
     head = None
@@ -1838,41 +1976,101 @@ def parse_claude_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     body_after_head: List[str] = []
     for raw in lines[head + 1:]:
         s = raw.strip()
-        if s.startswith(("╰", "└", "┗")) or (s and set(s) <= set("─━-═╭╮╰╯┌┐└┘")):
+        if (
+            s.startswith(("╰", "└", "┗", "Esc to cancel", "esc to cancel"))
+            or "Tab to amend" in s
+            or (s and set(s) <= _CLAUDE_ALL_RULE_CHARS)
+        ):
             break
         body_after_head.append(s.strip("│┃║").strip())
     opts = _numbered_options(body_after_head)
-    if not opts:
-        return None
     for o in opts:
         low_lbl = o["label"].lower()
         if "tell claude what to do differently" in low_lbl and not low_lbl.startswith("no"):
             o["action"] = "deny"
         else:
-            o["action"] = classify_approval_label(o["label"])
-    if not any(o["action"] == "approve_once" for o in opts) or not any(
-        o["action"] in ("deny", "deny_feedback") for o in opts
-    ):
-        return None
+            act = classify_approval_label(o["label"])
+            if act == "persist":
+                # M4: Claude Code's option 2 (`Yes, and don't ask again for: <cmd>`) is its session/local
+                # allow choice (writes to `.claude/settings.local.json`), analogous to codex's `p`.
+                o["action"] = "approve_session"
+                o["persists"] = True
+            else:
+                o["action"] = act
+
+    # N1: tolerate partially rendered / clipped option lists when the header is already visible
+    # (e.g. a 6-line wrapped option 2 pushes `3. No` onto the footer row on a 36-row terminal, or
+    # cursor redraws overwrite `1. Yes` leaving only `2. No`).
+    if not opts:
+        opts = [
+            {"key": "1", "label": "Yes", "action": "approve_once"},
+            {"key": "2", "label": "No", "action": "deny"},
+        ]
+    else:
+        if not any(o["action"] == "approve_once" for o in opts):
+            has_key_3 = any(str(o.get("key")) == "3" for o in opts)
+            has_key_2 = any(str(o.get("key")) == "2" for o in opts)
+            if has_key_3 and not has_key_2:
+                opts.insert(0, {
+                    "key": "2",
+                    "label": "Yes, and don't ask again",
+                    "action": "approve_session",
+                    "persists": True,
+                })
+            opts.insert(0, {"key": "1", "label": "Yes", "action": "approve_once"})
+        if not any(o["action"] in ("deny", "deny_feedback") for o in opts):
+            numeric_keys = [int(o["key"]) for o in opts if str(o.get("key", "")).isdigit()]
+            next_key = str((max(numeric_keys) if numeric_keys else len(opts)) + 1)
+            opts.append({"key": next_key, "label": "No", "action": "deny"})
+
     header = lines[head].strip().strip("│┃║").strip()
-    command = _dollar_command(lines[:head])
+    box_top: Optional[int] = None
+    for idx in range(head - 1, -1, -1):
+        s = lines[idx].strip()
+        if s and set(s) <= _CLAUDE_SOLID_RULE_CHARS:
+            box_top = idx
+            break
+
+    region = lines[(box_top + 1 if box_top is not None else max(0, head - 22)):head]
+    sections: List[List[str]] = [[]]
+    for raw in region:
+        s_raw = raw.strip()
+        if s_raw and set(s_raw) <= _CLAUDE_DASHED_RULE_CHARS:
+            sections.append([])
+            continue
+        s = s_raw.strip("│┃║").strip()
+        if not s or s.startswith("/permissions to update rules"):
+            continue
+        if s.lower() in _CLAUDE_TOOL_TITLES:
+            continue
+        sections[-1].append(s)
+
+    command = ""
     reason = ""
+    non_empty_secs = [sec for sec in sections if sec]
+    if len(sections) >= 3:
+        cmd_sec = sections[1]
+        reason_sec = [ln for sec in sections[2:] for ln in sec]
+        command = " ".join(cmd_sec).strip()
+        reason = " ".join(reason_sec).strip()
+    elif len(sections) == 2 and sections[1]:
+        cmd_parts: List[str] = []
+        reason_parts: List[str] = []
+        in_reason = False
+        for ln in sections[1]:
+            if not in_reason and ln.lower().startswith(_CLAUDE_REASON_PREFIXES):
+                in_reason = True
+            if in_reason:
+                reason_parts.append(ln)
+            else:
+                cmd_parts.append(ln)
+        command = " ".join(cmd_parts).strip()
+        reason = " ".join(reason_parts).strip()
+    elif non_empty_secs:
+        command = " ".join(non_empty_secs[-1]).strip()
+
     if not command:
-        subject: List[str] = []
-        for raw in reversed(lines[:head]):
-            s = raw.strip().strip("│┃║").strip()
-            if not s:
-                if subject:
-                    break
-                continue
-            if set(s) <= set("─━-═╭╮╰╯┌┐└┘") or s.startswith(("╭", "╰", "┌", "└")):
-                break
-            if s.lower() in ("bash command", "command", "edit file", "create file", "tool use"):
-                break
-            subject.insert(0, s)
-            if len(subject) >= 4:
-                break
-        command = " ".join(subject).strip()
+        command = _dollar_command(lines[:head])
     return {
         "header": header,
         "reason": reason,
@@ -2176,6 +2374,9 @@ class AgentSession:
         # moment until which the screen detector leaves a just-answered prompt alone.
         self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
         self._prompt_quiet_until: float = 0.0
+        self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
+        self._claude_hook_offset: int = 0
+        self._kimi_wire_interaction_offset: int = 0
 
         # Headless VT100 terminal screen buffer WITH 3,000-line scrollback history!
         # K4 (fix 9): the hub's subclasses keep one bad escape sequence from losing the rest of a chunk.
@@ -2258,10 +2459,10 @@ class AgentSession:
         env.pop("PYTHONHOME", None)
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
-        env["HUB_SESSION_ID"] = self.session_id
-        env["HUB_API_URL"] = hub_api_base_url()
         if env_overrides:
             env.update(env_overrides)
+        env["HUB_SESSION_ID"] = self.session_id
+        env["HUB_API_URL"] = hub_api_base_url()
 
         if PtyProcess is REAL_PTY_PROCESS:
             cmd_list = unwrap_windows_cmd_shim(self.command, list(self.args), env=env)
@@ -2346,20 +2547,21 @@ class AgentSession:
             except Exception:
                 pass
 
-            # Heuristic detection of TUI tool lines for agents without native hooks
-            try:
-                for line in self.screen.display:
-                    clean = line.strip()
-                    if not clean or clean in self._seen_tui_tool_lines:
-                        continue
-                    m = TUI_TOOL_PATTERN.match(clean)
-                    if m:
-                        self._seen_tui_tool_lines.add(clean)
-                        t_name = m.group(1)
-                        t_arg = (m.group(2) or m.group(3) or "").strip()
-                        detected_tools.append((t_name, t_arg))
-            except Exception:
-                pass
+            # Heuristic detection of TUI tool lines only for generic terminals without native transcript watchers
+            if (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy"):
+                try:
+                    for line in self.screen.display:
+                        clean = line.strip()
+                        if not clean or clean in self._seen_tui_tool_lines:
+                            continue
+                        m = TUI_TOOL_PATTERN.match(clean)
+                        if m:
+                            self._seen_tui_tool_lines.add(clean)
+                            t_name = m.group(1)
+                            t_arg = (m.group(2) or m.group(3) or "").strip()
+                            detected_tools.append((t_name, t_arg))
+                except Exception:
+                    pass
 
             self.raw_history.append(data)
             # W9: count UTF-8 bytes (the cap is 512 KB, not 512k characters) and trim the JOINED
@@ -3471,14 +3673,20 @@ class HubSessionManager:
                 if isinstance(p_entry, dict) and str(p_entry.get("engine") or "").strip().lower() == "claude":
                     claude_prof = p_entry
                     break
-        if isinstance(claude_prof, dict) and (claude_prof.get("command") or claude_prof.get("config_dir")) and "claude" in raw_engines:
-            try:
-                raw_engines["claude"] = self.model_discovery._discover_claude(
-                    binary_override=str(claude_prof.get("command") or "").strip() or None,
-                    config_dir_override=str(claude_prof.get("config_dir") or "").strip() or None,
-                )
-            except Exception:
-                pass
+        if isinstance(claude_prof, dict) and "claude" in raw_engines:
+            claude_env = claude_prof.get("env") if isinstance(claude_prof.get("env"), dict) else {}
+            claude_cfg_override = str(
+                claude_prof.get("config_dir") or claude_env.get("CLAUDE_CONFIG_DIR") or ""
+            ).strip() or None
+            claude_bin_override = str(claude_prof.get("command") or "").strip() or None
+            if claude_bin_override or claude_cfg_override:
+                try:
+                    raw_engines["claude"] = self.model_discovery._discover_claude(
+                        binary_override=claude_bin_override,
+                        config_dir_override=claude_cfg_override,
+                    )
+                except Exception:
+                    pass
 
         self.engine_policies = data.get("engine_policies") or {}
         self.global_routing_instructions = str(data.get("global_routing_instructions") or "").strip()
@@ -3561,6 +3769,10 @@ class HubSessionManager:
             prof["engine"] = eng
             prof["enabled"] = bool(prof.get("enabled", True))
             prof["when_to_use"] = prof.get("when_to_use") or ""
+            try:
+                prof["env"] = normalize_env_map(prof.get("env"))
+            except ValueError:
+                prof["env"] = {}
             # Round 2: the console and the launch read a plain bool (a hand-edited non-bool is off).
             prof[BYPASS_APPROVALS_KEY] = profile_bypasses_approvals(prof)
             eng_info = self.engines_catalog.get(eng) or {}
@@ -3694,6 +3906,7 @@ class HubSessionManager:
                 "available_thinking_levels": list(p.get("available_thinking_levels") or []),
                 "when_to_use": p.get("when_to_use") or "",
                 "description": p.get("description") or "",
+                "env": dict(p.get("env") or {}),
                 BYPASS_APPROVALS_KEY: bool(p.get(BYPASS_APPROVALS_KEY, False)),
             }
             result[pid] = prof_item
@@ -3710,6 +3923,9 @@ class HubSessionManager:
         lines.append("## 异步等待规范与命名规范")
         lines.append(
             "- **必填简短可读名称 (`title`)**：调用 `spawn_subagent` 派发 Sub-Agent 时，**请务必为其起一个简短可读的 `title`**（建议 4～16 个字或 2～5 个词，例如 `\"修复终端断连\"`、`\"前端侧边栏改造\"`、`\"实机光影巡检\"`），概括该 Sub-Agent 的核心职责，取代截取长 Prompt 前端作为名称。"
+        )
+        lines.append(
+            "- **环境变量注入 (`env`)**：调用 `spawn_subagent(..., env={\"KEY\": \"VALUE\"})` 可为该会话注入专属环境变量（与 Profile 内置 `env` 合并，同名变量由本次 `env` 覆盖），并在会话恢复（`resume_subagent`）时自动保留。"
         )
         lines.append(
             "- 启动 (`spawn_subagent`)、发消息 (`send_to_subagent`) 或恢复 (`resume_subagent`) 后，若任务尚未结束，返回值会提供 `background_poll_command`。"
@@ -3764,6 +3980,7 @@ class HubSessionManager:
         "command",
         "config_dir",
         "args",
+        "env",
         "default_model",
         "default_thinking_level",
         "task_mode",
@@ -4020,7 +4237,9 @@ class HubSessionManager:
                 continue
             value = incoming[key]
             if key not in self.PROFILE_REQUIRED_KEYS and (
-                value is None or (isinstance(value, str) and not value.strip())
+                value is None
+                or (isinstance(value, str) and not value.strip())
+                or (key == "env" and value == {})
             ):
                 merged.pop(key, None)
                 continue
@@ -4044,6 +4263,12 @@ class HubSessionManager:
         args = [a for a in raw_args]
         if len(args) > MAX_LAUNCH_ARGS:
             raise ValueError("参数（args）过多。")
+
+        env_map = normalize_env_map(merged.get("env"), field_label="环境变量（env）")
+        if env_map:
+            merged["env"] = env_map
+        else:
+            merged.pop("env", None)
 
         kind = str(merged.get("kind") or "tui")
         default_model = merged.get("default_model")
@@ -4071,6 +4296,8 @@ class HubSessionManager:
         clean_entry["id"] = pid
         clean_entry["engine"] = eng
         clean_entry["args"] = args
+        if not clean_entry.get("env"):
+            clean_entry.pop("env", None)
         # R11: a key the caller cleared is not written back. The readers below default what is missing:
         # load_profiles fills enabled / when_to_use, resolve_launch defaults kind, create_session `\r`
         # for submit_key and 2.5 for a missing startup_delay_sec.
@@ -4382,7 +4609,10 @@ class HubSessionManager:
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
         command = str(snapshot.get("command") or "")
         base_args = [str(a) for a in (snapshot.get("args") or [])]
-        env = {str(k): str(v) for k, v in (snapshot.get("env") or {}).items()}
+        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
+        prof_cur = self.profiles.get(profile_id) or {}
+        env = normalize_env_map(prof_cur.get("env"))
+        env.update({str(k): str(v) for k, v in (snapshot.get("env") or {}).items()})
         built: Dict[str, Any] = {
             "command": command, "args": [], "env": env, "cwd": cwd,
             "message_mode": "none", "attach_offset": 0,
@@ -4392,8 +4622,7 @@ class HubSessionManager:
         # the safe mode too. omp's in-memory "approve for this session" is gone after a resume anyway.
         # Round 2: the profile's CURRENT bypass_approvals decides, not the value at the first launch,
         # so switching it off makes resumed sessions safe again (and on makes them full-auto).
-        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
-        bypass = profile_bypasses_approvals(self.profiles.get(profile_id))
+        bypass = profile_bypasses_approvals(prof_cur)
         built["bypass_approvals"] = bypass
         built["notes"] = []
         if engine in APPROVAL_ENGINES:
@@ -4758,12 +4987,21 @@ class HubSessionManager:
         # A7: install the new object before the spawn. A resume that dies immediately then reports
         # its own exit (the callback carries the object), never the old dead object's.
         self.sessions[session_id] = sess
+        resume_env = dict(built.get("env") or {})
+        if engine == "claude":
+            hook_log = self._claude_hook_log_path(sess)
+            if hook_log is not None:
+                resume_env.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
+                try:
+                    sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
+                except OSError:
+                    sess._claude_hook_offset = 0
         try:
             # A9: a failed spawn (bad command, missing binary) must leave the archived record exactly
             # as it was — no zombie row, and the old ended object back in the live list.
             sess.start_pty(
                 loop,
-                env_overrides=dict(built.get("env") or {}) or None,
+                env_overrides=resume_env or None,
                 ws_prefix=resume_banner(sess.resume_count) if old is not None else None,
             )
         except Exception as e:
@@ -5605,6 +5843,8 @@ class HubSessionManager:
         """Queries full live OR post-lifecycle telemetry, tool execution trace, intermediate messages, and CLI-specific transcript summary."""
         sess = self.sessions.get(session_id)
         if sess:
+            if sess.kind == "tui" and sess.status in LIVE_STATUSES:
+                self.poll_tui_screen_interactions_once(sess)
             self.persist_session(sess)
             meta = sess.to_dict()
         else:
@@ -5929,6 +6169,7 @@ class HubSessionManager:
                 self.pending_questions[qid]["event"].set()
         # D7: the answered prompt may still be drawn for a moment; the screen detector waits.
         session._prompt_quiet_until = time.time() + TUI_PROMPT_REDETECT_QUIET_SEC
+        session._seen_tui_prompt_signatures.clear()
         if session.status == "waiting_parent":
             session.status = "running"
         self.persist_session(session)
@@ -6137,8 +6378,7 @@ class HubSessionManager:
         chosen_label: str,
         custom_input: Optional[str],
     ) -> tuple:
-        """Claude Code permission prompt: digits select an option at once; Escape cancels.
-        Options that persist rules to settings.local.json are filtered out unless no other choice exists."""
+        """Claude Code permission prompt: digits select an option at once; Escape cancels."""
         feedback = (custom_input or "").strip()
         opts = [o for o in (meta.get("claude_options") or []) if isinstance(o, dict)]
         if not opts:
@@ -6153,9 +6393,13 @@ class HubSessionManager:
         if chosen is None:
             chosen = next((o for o in sendable if o.get("action") == want), None)
         note = ""
+        downgraded = False
         if chosen is None and want == "approve_session":
             chosen = next((o for o in sendable if o.get("action") == "approve_once"), None)
-            note = "这个 claude 提示没有「本会话允许」选项（或该选项会写入持久化配置）：本次只允许了一次"
+            downgraded = True
+            note = "这个 claude 提示没有「本会话允许/不再询问」选项（由高风险审批规则触发的提示只有 Yes / No）：本次只允许了一次"
+        elif chosen is not None and want == "approve_session" and chosen.get("persists"):
+            note = f"已发送 {str(chosen['key'])!r}（不再询问该命令）：claude 已将该放行规则写入项目 .claude/settings.local.json"
         if chosen is None and want == "deny":
             chosen = {"key": "\x1b", "label": "esc to cancel", "action": "deny"}
         if chosen is None:
@@ -6165,7 +6409,7 @@ class HubSessionManager:
         trace = f"Claude permission prompt key {key_to_send!r} ({chosen.get('label')})"
         if action == "deny_feedback" and feedback:
             trace += f" + feedback as next message {feedback!r}"
-        return trace, note
+        return trace, note, downgraded
 
     def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
         """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
@@ -6219,11 +6463,13 @@ class HubSessionManager:
         # D7: an approval prompt of a TUI engine is answered by what the choice does (approve once,
         # approve for the session, deny, deny with feedback), mapped to that engine's own keys.
         approval_action: Optional[str] = None
+        requested_approval_action: Optional[str] = None
         notes: List[str] = []
         if kind == "approval_request" and eng in ("kimi", "omp", "codex", "claude", "agy") and not sess.dsh_spec:
             approval_action, chosen_label, chosen_idx_1based = self._resolve_approval_choice(
                 dec_norm, option_index, custom_input, options, meta.get("option_actions")
             )
+            requested_approval_action = approval_action
 
         # Map semantic decision or custom_input matching onto 1-based option_index
         if approval_action is not None:
@@ -6382,6 +6628,8 @@ class HubSessionManager:
             action_trace, note = self._answer_omp_approval(sess, loop, inter, meta, approval_action, custom_input)
             if note:
                 notes.append(note)
+                if approval_action == "approve_session":
+                    approval_action = "approve_once"
             delivered = True
 
         elif eng == "omp":
@@ -6445,6 +6693,7 @@ class HubSessionManager:
                     sess.write_input("y")
                     action_trace = "Codex approval key 'y' (Approve once)"
                     if approval_action == "approve_session":
+                        approval_action = "approve_once"
                         notes.append(
                             "这个 codex 提示上没有读到「不再询问」选项：本次只允许了一次"
                         )
@@ -6469,6 +6718,8 @@ class HubSessionManager:
                 )
                 if note:
                     notes.append(note)
+                    if approval_action == "approve_session":
+                        approval_action = "approve_once"
                 delivered = True
             else:
                 clamp_ups = "\x1b[A" * (len(options) + 3)
@@ -6500,11 +6751,13 @@ class HubSessionManager:
         # ── Engine 6: Claude Code CLI (Permission prompt & `AskUserQuestion` selector) ──────
         elif eng == "claude":
             if kind == "approval_request":
-                action_trace, note = self._answer_claude_approval(
+                action_trace, note, downgraded = self._answer_claude_approval(
                     sess, loop, meta, approval_action, chosen_label, custom_input
                 )
                 if note:
                     notes.append(note)
+                if downgraded and approval_action == "approve_session":
+                    approval_action = "approve_once"
                 delivered = True
             else:
                 raw_opts_count = int(meta.get("raw_options_count") or max(1, len(options) - 1))
@@ -6575,6 +6828,11 @@ class HubSessionManager:
             "chosen_option_index": chosen_idx_1based,
             "chosen_label": chosen_label,
             "approval_action": approval_action,
+            **(
+                {"requested_approval_action": requested_approval_action}
+                if requested_approval_action and requested_approval_action != approval_action
+                else {}
+            ),
             "action_trace": action_trace,
             "notes": notes,
         }
@@ -6592,6 +6850,7 @@ class HubSessionManager:
         """
         session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
+        session._seen_tui_prompt_signatures.clear()
         if status is not None:
             session.status = status
 
@@ -6742,7 +7001,11 @@ class HubSessionManager:
                     result = await self._submit_text_to_tui(
                         sess, text, submit_key, prior=dict(result, retyped=retypes)
                     )
-            elif sess.write_input(text):
+            elif sess.write_input(
+                f"\x1b[200~{str(text).replace(chr(13), ' ').replace(chr(10), ' ').strip()}\x1b[201~"
+                if str(getattr(sess, "engine", "") or "").strip().lower() in ("claude", "agy")
+                else text
+            ):
                 clean = str(text).replace("\r", " ").replace("\n", " ").strip()
                 probe = clean[:30].strip()
                 tail = clean[-30:].strip()
@@ -7073,6 +7336,8 @@ class HubSessionManager:
         for sid, sess in list(self.sessions.items()):
             if target_ids and sid not in target_ids:
                 continue
+            if sess is not None and sess.kind == "tui" and sess.pending_interaction is None and sess.status in LIVE_STATUSES:
+                self.poll_tui_screen_interactions_once(sess)
             if sess is not None and sess.status == "waiting_parent" and sess.pending_interaction:
                 item = dict(sess.pending_interaction)
                 item.setdefault("session_id", sid)
@@ -7316,6 +7581,23 @@ class HubSessionManager:
                                     request_id=payload.get("call_id") or f"codex-q-{uuid.uuid4().hex[:6]}",
                                     metadata={"raw_options_count": len(opt_labels)},
                                 )
+                        elif ptype in ("custom_tool_call_output", "function_call_output"):
+                            out_val = payload.get("output") or ""
+                            self.record_telemetry(
+                                session.session_id,
+                                {
+                                    "source": "codex_jsonl",
+                                    "hook_event": "PostToolUse",
+                                    "tool_name": payload.get("name") or payload.get("call_id") or ptype,
+                                    "tool_response": out_val,
+                                },
+                            )
+                            if (
+                                ptype == "custom_tool_call_output"
+                                and session.pending_interaction
+                                and session.pending_interaction.get("kind") == "approval_request"
+                            ):
+                                self.clear_pending_interaction(session)
                         elif ptype == "message" and payload.get("role") == "user":
                             parts = payload.get("content") or []
                             user_txts = [
@@ -7327,6 +7609,8 @@ class HubSessionManager:
                             ]
                             if user_txts:
                                 session.note_transcript_user_message(" ".join(user_txts).strip())
+                                if session.pending_interaction:
+                                    self.clear_pending_interaction(session)
                                 turn_has_step = False
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
@@ -7416,6 +7700,8 @@ class HubSessionManager:
                             )
                     elif otype == "event_msg" and ptype == "turn_aborted":
                         abort_reason = str(payload.get("reason") or "interrupted")
+                        if session.pending_interaction:
+                            self.clear_pending_interaction(session)
                         self.db.complete_latest_tool_call(
                             session.session_id, None, f"Turn aborted ({abort_reason})"
                         )
@@ -7590,6 +7876,23 @@ class HubSessionManager:
                         data = obj.get("data") or {}
                         tname = data.get("toolName", "tool")
                         targs = data.get("args") or {}
+                        cmd_val = ""
+                        if isinstance(targs, dict):
+                            cmd_val = str(
+                                targs.get("command")
+                                or targs.get("cmd")
+                                or targs.get("path")
+                                or targs.get("file_path")
+                                or ""
+                            )
+                        elif isinstance(targs, str):
+                            cmd_val = targs
+                        session._inflight_transcript_tool = {
+                            "tool_name": str(tname or "tool"),
+                            "command": cmd_val,
+                            "args": targs,
+                            "call_id": str(data.get("toolCallId") or ""),
+                        }
                         self.record_telemetry(
                             session.session_id,
                             {
@@ -7638,11 +7941,15 @@ class HubSessionManager:
                                 user_txts.append(content.strip())
                             if user_txts:
                                 session.note_transcript_user_message(" ".join(user_txts).strip())
+                            session._inflight_transcript_tool = None
+                            if session.pending_interaction:
+                                self.clear_pending_interaction(session)
                             turn_has_step = False
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
                         elif role == "toolResult":
-                            if msg.get("toolName") == "ask":
+                            session._inflight_transcript_tool = None
+                            if session.pending_interaction:
                                 self.clear_pending_interaction(session)
                             self.record_telemetry(
                                 session.session_id,
@@ -7735,6 +8042,92 @@ class HubSessionManager:
                 ids.add(str(obj["id"]))
         return ids
 
+    def _drain_kimi_wire_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+        """Synchronously drains Kimi's wire.jsonl for interaction.request / interaction.resolved."""
+        tpath = getattr(session, "transcript_path", None)
+        if not tpath:
+            return session.pending_interaction
+        target_file = Path(tpath)
+        if not target_file.is_file():
+            return session.pending_interaction
+        offset = int(getattr(session, "_kimi_wire_interaction_offset", 0) or 0)
+        try:
+            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(offset)
+                lines = f.readlines()
+                session._kimi_wire_interaction_offset = f.tell()
+            if not lines:
+                return session.pending_interaction
+            resolved_in_batch = self._kimi_resolved_interaction_ids(lines)
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "interaction.request":
+                    req_id = str(obj.get("id") or f"kimi-int-{uuid.uuid4().hex[:6]}")
+                    ikind = obj.get("kind") or "question"
+                    req_obj = obj.get("request") or {}
+                    if req_id in resolved_in_batch:
+                        cand = getattr(session, "_unadopted_screen_interaction", None)
+                        if cand and session.pending_interaction is not cand and cand.get("kind") == (
+                            "approval_request" if ikind == "approval" else "question"
+                        ):
+                            session._unadopted_screen_interaction = None
+                        continue
+                    if ikind == "approval":
+                        disp = req_obj.get("display") or {}
+                        cmd_str = disp.get("command") or req_obj.get("description") or req_obj.get("action") or "action"
+                        self.register_pending_interaction(
+                            session=session,
+                            kind="approval_request",
+                            title=f"Kimi Approval: {req_obj.get('toolName') or 'Shell'} ({req_obj.get('action') or 'run'})",
+                            prompt=f"Command/Action requiring approval: {cmd_str}",
+                            options=[
+                                "Approve once",
+                                "Approve for this session",
+                                "Reject",
+                                "Reject with feedback",
+                            ],
+                            source="kimi_wire_jsonl_interaction_request",
+                            request_id=req_id,
+                            metadata={"command": str(disp.get("command") or "")},
+                        )
+                    else:
+                        qs = req_obj.get("questions") or []
+                        q0 = qs[0] if qs and isinstance(qs[0], dict) else req_obj
+                        q_header = str(q0.get("header") or "Kimi Question")
+                        q_prompt = str(q0.get("question") or "Sub-Agent is asking a question")
+                        raw_opts = q0.get("options") or []
+                        opt_labels = [
+                            f"{o.get('label', '')}" + (f" — {o.get('description')}" if o.get("description") else "")
+                            if isinstance(o, dict)
+                            else str(o)
+                            for o in raw_opts
+                        ]
+                        display_opts = list(opt_labels) + ["Other (custom text input)"]
+                        self.register_pending_interaction(
+                            session=session,
+                            kind="question",
+                            title=q_header,
+                            prompt=q_prompt,
+                            options=display_opts,
+                            source="kimi_wire_jsonl_interaction_request",
+                            request_id=req_id,
+                            metadata={
+                                "raw_options_count": len(opt_labels),
+                                "multi_select": bool(q0.get("multi_select", False)),
+                            },
+                        )
+                elif obj.get("type") == "interaction.resolved":
+                    self.clear_pending_interaction(session, str(obj.get("id") or ""))
+        except Exception:
+            pass
+        return session.pending_interaction
+
     async def _watch_kimi_session(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended.
 
@@ -7793,17 +8186,18 @@ class HubSessionManager:
         if not target_file:
             return
         session.transcript_path = target_file
+        session._kimi_wire_interaction_offset = offset
         self.persist_session(session)
 
         latest_assistant_text: Optional[str] = None
         turn_has_step = False
         while self._transcript_watch_alive(session):
             try:
+                self._drain_kimi_wire_interactions_once(session)
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
                     lines = f.readlines()
                     offset = f.tell()
-                resolved_in_batch = self._kimi_resolved_interaction_ids(lines)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -7813,68 +8207,7 @@ class HubSessionManager:
                     except Exception:
                         continue
 
-                    if obj.get("type") == "interaction.request":
-                        req_id = str(obj.get("id") or f"kimi-int-{uuid.uuid4().hex[:6]}")
-                        ikind = obj.get("kind") or "question"
-                        req_obj = obj.get("request") or {}
-                        if req_id in resolved_in_batch:
-                            # D7: requested and resolved before this read (answered in the console,
-                            # or answered by the parent through the screen registration): nothing
-                            # is waiting. A screen registration of it is consumed, not left behind.
-                            cand = getattr(session, "_unadopted_screen_interaction", None)
-                            if cand and session.pending_interaction is not cand and cand.get("kind") == (
-                                "approval_request" if ikind == "approval" else "question"
-                            ):
-                                session._unadopted_screen_interaction = None
-                            continue
-                        if ikind == "approval":
-                            disp = req_obj.get("display") or {}
-                            cmd_str = disp.get("command") or req_obj.get("description") or req_obj.get("action") or "action"
-                            self.register_pending_interaction(
-                                session=session,
-                                kind="approval_request",
-                                title=f"Kimi Approval: {req_obj.get('toolName') or 'Shell'} ({req_obj.get('action') or 'run'})",
-                                prompt=f"Command/Action requiring approval: {cmd_str}",
-                                options=[
-                                    "Approve once",
-                                    "Approve for this session",
-                                    "Reject",
-                                    "Reject with feedback",
-                                ],
-                                source="kimi_wire_jsonl_interaction_request",
-                                request_id=req_id,
-                                metadata={"command": str(disp.get("command") or "")},
-                            )
-                        else:
-                            qs = req_obj.get("questions") or []
-                            q0 = qs[0] if qs and isinstance(qs[0], dict) else req_obj
-                            q_header = str(q0.get("header") or "Kimi Question")
-                            q_prompt = str(q0.get("question") or "Sub-Agent is asking a question")
-                            raw_opts = q0.get("options") or []
-                            opt_labels = [
-                                f"{o.get('label', '')}" + (f" — {o.get('description')}" if o.get("description") else "")
-                                if isinstance(o, dict)
-                                else str(o)
-                                for o in raw_opts
-                            ]
-                            display_opts = list(opt_labels) + ["Other (custom text input)"]
-                            self.register_pending_interaction(
-                                session=session,
-                                kind="question",
-                                title=q_header,
-                                prompt=q_prompt,
-                                options=display_opts,
-                                source="kimi_wire_jsonl_interaction_request",
-                                request_id=req_id,
-                                metadata={
-                                    "raw_options_count": len(opt_labels),
-                                    "multi_select": bool(q0.get("multi_select", False)),
-                                },
-                            )
-                        continue
-
-                    if obj.get("type") == "interaction.resolved":
-                        self.clear_pending_interaction(session, str(obj.get("id") or ""))
+                    if obj.get("type") in ("interaction.request", "interaction.resolved"):
                         continue
 
                     if obj.get("type") == "turn.prompt" and (obj.get("origin") or {}).get("kind") == "user":
@@ -8137,9 +8470,26 @@ class HubSessionManager:
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
                             session.note_transcript_user_message(user_txt)
+                        session._inflight_transcript_tool = None
+                        if session.pending_interaction is not None:
+                            self.clear_pending_interaction(session)
                         turn_has_step = False
                         if session.status == "completed":
                             self.begin_new_turn(session, status="running")
+                        continue
+                    if obj.get("type") == "GENERIC":
+                        session._inflight_transcript_tool = None
+                        if session.pending_interaction is not None:
+                            self.clear_pending_interaction(session)
+                        gen_content = str(obj.get("content") or "").strip()
+                        self.record_telemetry(
+                            session.session_id,
+                            {
+                                "source": "agy_transcript",
+                                "hook_event": "PostToolUse",
+                                "tool_response": gen_content[:2000],
+                            },
+                        )
                         continue
                     if obj.get("type") == "PLANNER_RESPONSE":
                         thinking = (obj.get("thinking") or "").strip()
@@ -8170,6 +8520,28 @@ class HubSessionManager:
                                 turn_has_step = True
                                 tname = tc.get("name") or tc.get("tool_name") or "agy_tool"
                                 targs = tc.get("args") or tc.get("arguments") or ""
+                                parsed_tc_args = targs if isinstance(targs, dict) else {}
+                                if isinstance(targs, str):
+                                    try:
+                                        parsed_tc_args = json.loads(targs) if targs.strip() else {}
+                                    except Exception:
+                                        parsed_tc_args = {}
+                                if not isinstance(parsed_tc_args, dict):
+                                    parsed_tc_args = {}
+                                tc_cmd = str(
+                                    parsed_tc_args.get("CommandLine")
+                                    or parsed_tc_args.get("command")
+                                    or parsed_tc_args.get("Path")
+                                    or parsed_tc_args.get("path")
+                                    or (targs if isinstance(targs, str) else "")
+                                    or ""
+                                )
+                                session._inflight_transcript_tool = {
+                                    "tool_name": str(tname),
+                                    "command": tc_cmd,
+                                    "args": parsed_tc_args or targs,
+                                    "call_id": str(tc.get("id") or obj.get("step_index") or ""),
+                                }
                                 self.record_telemetry(
                                     session.session_id,
                                     {
@@ -8333,10 +8705,12 @@ class HubSessionManager:
             snap = getattr(session, "profile_snapshot", None) or {}
             env_map = snap.get("env") if isinstance(snap.get("env"), dict) else {}
             prof = self.profiles.get(session.profile_id) or {}
+            prof_env = prof.get("env") if isinstance(prof.get("env"), dict) else {}
             cfg = (
                 snap.get("config_dir")
                 or env_map.get("CLAUDE_CONFIG_DIR")
                 or prof.get("config_dir")
+                or prof_env.get("CLAUDE_CONFIG_DIR")
             )
             if cfg and str(cfg).strip():
                 return claude_projects_root(str(cfg).strip())
@@ -8400,7 +8774,6 @@ class HubSessionManager:
         turn_completed_emitted: bool = False
         turn_has_step: bool = False
         seen_topics: Set[str] = set()
-        seen_stream_snippets: Set[str] = set()
         last_screen_probe_at: float = 0.0
         spinner_stat_re = re.compile(
             r"[✻✽✢✳✶·]\s+([^\n(]{2,45}?)\s*\(([^)]*(?:tokens|thought|\ds\b)[^)]*)\)"
@@ -8408,6 +8781,7 @@ class HubSessionManager:
 
         while self._transcript_watch_alive(session):
             try:
+                self._drain_claude_hook_events(session)
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
                     lines = f.readlines()
@@ -8425,6 +8799,9 @@ class HubSessionManager:
                         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
                         content = msg.get("content")
                         if isinstance(content, str) and content.strip():
+                            session._inflight_transcript_tool = None
+                            if session.pending_interaction is not None:
+                                self.clear_pending_interaction(session)
                             turn_last_text = None
                             turn_completed_emitted = False
                             turn_has_step = False
@@ -8439,6 +8816,9 @@ class HubSessionManager:
                                 if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
                             ]
                             if user_texts:
+                                session._inflight_transcript_tool = None
+                                if session.pending_interaction is not None:
+                                    self.clear_pending_interaction(session)
                                 turn_last_text = None
                                 turn_completed_emitted = False
                                 turn_has_step = False
@@ -8449,6 +8829,9 @@ class HubSessionManager:
                             for b in content:
                                 if not isinstance(b, dict) or b.get("type") != "tool_result":
                                     continue
+                                session._inflight_transcript_tool = None
+                                if session.pending_interaction is not None:
+                                    self.clear_pending_interaction(session)
                                 res_content = b.get("content")
                                 if isinstance(res_content, list):
                                     res_content = "\n".join(
@@ -8569,6 +8952,21 @@ class HubSessionManager:
                                 turn_has_step = True
                                 tname = str(part.get("name") or "claude_tool")
                                 tinput = part.get("input") if isinstance(part.get("input"), dict) else (part.get("input") or {})
+                                cmd_val = ""
+                                if isinstance(tinput, dict):
+                                    cmd_val = str(
+                                        tinput.get("command")
+                                        or tinput.get("file_path")
+                                        or tinput.get("path")
+                                        or tinput.get("url")
+                                        or ""
+                                    )
+                                session._inflight_transcript_tool = {
+                                    "tool_name": tname,
+                                    "command": cmd_val,
+                                    "args": tinput,
+                                    "call_id": str(part.get("id") or ""),
+                                }
                                 self.record_telemetry(
                                     session.session_id,
                                     {
@@ -8675,16 +9073,6 @@ class HubSessionManager:
                             if ln.strip() and not ln.strip().startswith((">", "❯"))
                         ]
                         latest_line = clean_lines[-1] if clean_lines else ""
-                        for ln in clean_lines:
-                            if (ln.startswith("#") or len(ln) >= 24) and ln not in seen_stream_snippets:
-                                seen_stream_snippets.add(ln)
-                                if len(seen_stream_snippets) <= 15:
-                                    self.db.add_intermediate_message(
-                                        session.session_id,
-                                        max(1, session.step_count),
-                                        f"[Streaming preview] {ln[:220]}",
-                                        source="claude_tui_stream",
-                                    )
                         if sp_match:
                             verb = sp_match.group(1).strip()
                             stats = sp_match.group(2).strip()
@@ -8798,10 +9186,10 @@ class HubSessionManager:
             indent = max(2, match.start(1))
             opened = not frame.get("top") or (i > 0 and cls._tui_frame_row_is(lines[i - 1], frame["top"]))
             j = i + 1
-            if opened and frame.get("require_frame") and frame.get("bottom") == "rule":
+            if opened and frame.get("bottom") == "rule":
                 while (
                     j < len(lines)
-                    and (j - i) <= 15
+                    and (j - i) <= 40
                     and bool(lines[j].strip())
                     and not TUI_RULE_ROW_RE.match(lines[j])
                     and not TUI_GLYPH_HISTORY_BELOW_RE.match(lines[j])
@@ -8818,9 +9206,42 @@ class HubSessionManager:
             if closed and (not frame.get("require_frame") or opened) and (i >= window or (opened and j >= window)):
                 parts = [match.group(1).rstrip()] + [ln.strip() for ln in lines[i + 1:j]]
                 return " ".join(p for p in parts if p), i, j - 1, j - 1 - i
+            # C3: when a tall wrapped message (e.g. agy 29-row paste with `> ↑ 58 more lines`) has a
+            # valid top rule (`opened`) and fills all remaining rows to the bottom of the screen
+            # (`j == len(lines)`), its closing bottom rule has scrolled below the last visible row.
+            if (
+                not closed
+                and opened
+                and frame.get("bottom") == "rule"
+                and j == len(lines)
+                and (j - 1 - i) >= 3
+                and j >= window
+            ):
+                parts = [match.group(1).rstrip()] + [ln.strip() for ln in lines[i + 1:j]]
+                return " ".join(p for p in parts if p), i, j - 1, j - 1 - i
             if i >= window and not frame.get("require_frame"):
                 return match.group(1).rstrip(), i, i, 0
-            return None
+            break
+
+        # C3: when a tall wrapped message (>36 rows) overflows the 40-row screen, the opening rule
+        # and prompt row scroll above row 0 while the closing rule row still sits in the bottom
+        # `window` rows and every row above it is a wrapped continuation row of the composer.
+        if frame.get("bottom") == "rule":
+            for j in range(len(lines) - 1, max(window - 1, 9), -1):
+                if not cls._tui_frame_row_is(lines[j], "rule"):
+                    continue
+                if any(TUI_GLYPH_HISTORY_BELOW_RE.match(ln) for ln in lines[j + 1:]):
+                    break
+                all_wrapped = all(
+                    bool(lines[k].strip())
+                    and not TUI_RULE_ROW_RE.match(lines[k])
+                    and not TUI_GLYPH_HISTORY_BELOW_RE.match(lines[k])
+                    for k in range(j)
+                )
+                if all_wrapped:
+                    parts = [ln.strip() for ln in lines[:j] if ln.strip()]
+                    return " ".join(parts), 0, j - 1, j - 1
+                break
         return None
 
     @staticmethod
@@ -8963,7 +9384,7 @@ class HubSessionManager:
         flat = re.sub(r"\s+", "", line)
         for part in (probe, tail):
             key = re.sub(r"\s+", "", part or "")
-            if key and key in flat:
+            if key and (key in flat or (len(key) >= 12 and key[:-2] in flat)):
                 return True
         return False
 
@@ -8973,12 +9394,26 @@ class HubSessionManager:
 
         codex draws a long typed burst as "[Pasted Content N chars]"; N summed over every such
         placeholder on the composer must be within TUI_PASTE_PLACEHOLDER_SLACK_CHARS of the length
-        the hub typed (after its newline flattening). Engines without a placeholder never match.
+        the hub typed (after its newline flattening). claude draws bracketed paste bursts > 800
+        chars as "[Pasted text #1]" (single-line) or "[Pasted text #1 +N lines]" without a char
+        count. Engines without a placeholder never match.
         """
-        pattern = TUI_PASTE_PLACEHOLDER_RES.get((engine or "").strip().lower())
+        eng = (engine or "").strip().lower()
+        pattern = TUI_PASTE_PLACEHOLDER_RES.get(eng)
         if pattern is None or line is None or typed_len <= 0:
             return False
-        counts = [int(n) for n in pattern.findall(line)]
+        if eng == "claude":
+            return bool(pattern.search(line))
+        if eng == "agy":
+            if not pattern.search(line):
+                return False
+            counts = [int(n) for n in pattern.findall(line) if str(n).isdigit()]
+            return (
+                not counts
+                or any(abs(c - typed_len) <= max(TUI_PASTE_PLACEHOLDER_SLACK_CHARS, 16) for c in counts)
+                or abs(sum(counts) - typed_len) <= max(TUI_PASTE_PLACEHOLDER_SLACK_CHARS, 16)
+            )
+        counts = [int(n) for n in pattern.findall(line) if str(n).isdigit()]
         return bool(counts) and abs(sum(counts) - typed_len) <= TUI_PASTE_PLACEHOLDER_SLACK_CHARS
 
     @classmethod
@@ -9033,6 +9468,101 @@ class HubSessionManager:
             "active": cls._tui_agent_active(screen_text),
         }
 
+    def _probe_transcript_for_user_submit(
+        self,
+        session: Any,
+        size_before: int,
+        probe: str,
+        tail: str,
+    ) -> bool:
+        """Directly scans bytes appended to session.transcript_path since size_before for a matching user message."""
+        tpath = getattr(session, "transcript_path", None)
+        if not tpath:
+            return False
+        try:
+            p = Path(tpath)
+            if not p.is_file() or p.stat().st_size <= max(0, int(size_before)):
+                return False
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(max(0, int(size_before)))
+                lines = f.readlines()
+        except OSError:
+            return False
+
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            otype = obj.get("type")
+            candidates: List[str] = []
+            # 1) Claude: type == "user" or queue-operation enqueue
+            if otype == "user":
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                c = msg.get("content")
+                if isinstance(c, str) and c.strip():
+                    candidates.append(c.strip())
+                elif isinstance(c, list):
+                    txts = [
+                        str(b.get("text") or "")
+                        for b in c
+                        if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                    ]
+                    if txts:
+                        candidates.append(" ".join(txts).strip())
+            elif otype == "queue-operation" and obj.get("operation") == "enqueue" and obj.get("content"):
+                candidates.append(str(obj.get("content")).strip())
+            # 2) AGY: type == "USER_INPUT"
+            elif otype == "USER_INPUT" and obj.get("content"):
+                candidates.append(str(obj.get("content")).strip())
+            # 3) OMP: type == "message" and message.role == "user"
+            elif otype == "message":
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                if msg.get("role") == "user":
+                    c = msg.get("content")
+                    if isinstance(c, str) and c.strip():
+                        candidates.append(c.strip())
+                    elif isinstance(c, list):
+                        txts = [
+                            str(b.get("text") or "")
+                            for b in c
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                        ]
+                        if txts:
+                            candidates.append(" ".join(txts).strip())
+            # 4) Codex: type == "response_item" and payload.type == "message" and payload.role == "user"
+            elif otype == "response_item":
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                if payload.get("type") == "message" and payload.get("role") == "user":
+                    parts = payload.get("content") or []
+                    txts = [
+                        str(b.get("text") or "")
+                        for b in parts
+                        if isinstance(b, dict)
+                        and b.get("text")
+                        and "<environment_context>" not in str(b.get("text"))
+                    ]
+                    if txts:
+                        candidates.append(" ".join(txts).strip())
+            # 5) Kimi: type == "turn.prompt" and origin.kind == "user"
+            elif otype == "turn.prompt" and (obj.get("origin") or {}).get("kind") == "user":
+                parts = obj.get("input") or []
+                txts = [str(b.get("text") or "") for b in parts if isinstance(b, dict) and b.get("text")]
+                if txts:
+                    candidates.append(" ".join(txts).strip())
+
+            for txt in candidates:
+                if txt and self._composer_holds(txt, probe, tail):
+                    if hasattr(session, "note_transcript_user_message"):
+                        session.note_transcript_user_message(txt)
+                    return True
+        return False
+
     def _tui_transcript_proof(
         self,
         session: Any,
@@ -9047,6 +9577,8 @@ class HubSessionManager:
         if seq > int(marks.get("user_seq") or 0) and self._composer_holds(
             str(getattr(session, "transcript_user_text", "") or ""), probe, tail
         ):
+            return "transcript_user_message"
+        if self._probe_transcript_for_user_submit(session, size_before, probe, tail):
             return "transcript_user_message"
         if rules.get("transcript") == "user_message":
             return ""
@@ -9154,7 +9686,8 @@ class HubSessionManager:
         if span is None or not key:
             return False
         below = "".join(lines[span[2] + 1:])
-        return key in re.sub(r"\s+", "", span[0] + below)
+        haystack = re.sub(r"\s+", "", span[0] + below)
+        return key in haystack or (len(key) >= 12 and key[:-2] in haystack)
 
     async def _await_typed_text_settled(
         self, session: AgentSession, engine: str, probe: str, tail: str, typed_len: int = 0
@@ -9239,10 +9772,15 @@ class HubSessionManager:
                 size_before = Path(session.transcript_path).stat().st_size
             except OSError:
                 size_before = 0
-        session.write_input(clean)
+        engine = session.engine
+        payload_to_write = (
+            f"\x1b[200~{clean}\x1b[201~"
+            if str(engine or "").strip().lower() in ("claude", "agy")
+            else clean
+        )
+        session.write_input(payload_to_write)
         probe = clean[:30].strip()
         tail = clean[-30:].strip()
-        engine = session.engine
         # K5 (fix 9b): the first Enter waits for the typed text to settle on the composer.
         screen, echoed, settled, waited = await self._await_typed_text_settled(
             session, engine, probe, tail, typed_len=len(clean)
@@ -10120,13 +10658,17 @@ class HubSessionManager:
         # not offered either; the parent's choices are approve once / for this conversation / deny.
         offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
         offered = [o["label"] for o in offered_opts]
+        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
+        inflight_cmd = str(inflight.get("command") or "").strip()
+        screen_cmd = str(parsed.get("command") or "").strip()
+        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
-        if parsed.get("command"):
+        if best_cmd:
             what = "MCP tool" if str(parsed.get("header") or "").startswith("Allow calling this tool") \
                 else "Requesting permission for"
-            lines.append(f"{what}: {parsed['command']}")
+            lines.append(f"{what}: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
         return self.register_pending_interaction(
@@ -10139,18 +10681,25 @@ class HubSessionManager:
             metadata={
                 "agy_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
-                "command": parsed.get("command") or "",
+                "command": best_cmd,
+                "transcript_tool": inflight.get("tool_name") if inflight else None,
             },
         )
 
     def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
         """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered."""
         offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
-        lines = [f"Allow tool: {parsed.get('tool') or '?'}"] + list(parsed.get("details") or [])
+        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
+        inflight_cmd = str(inflight.get("command") or "").strip()
+        screen_cmd = str(parsed.get("command") or "").strip()
+        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
+        lines = [f"Allow tool: {parsed.get('tool') or inflight.get('tool_name') or '?'}"] + list(parsed.get("details") or [])
+        if best_cmd and best_cmd not in "\n".join(lines):
+            lines.append(f"Command: {best_cmd}")
         return self.register_pending_interaction(
             session=session,
             kind="approval_request",
-            title=f"OMP Tool Approval ({parsed.get('tool') or 'tool'})",
+            title=f"OMP Tool Approval ({parsed.get('tool') or inflight.get('tool_name') or 'tool'})",
             prompt="\n".join(lines),
             options=offered,
             source="omp_tui_screen_detector",
@@ -10159,22 +10708,36 @@ class HubSessionManager:
                 "omp_options": list(parsed.get("options") or []),
                 "selected_index": int(parsed.get("selected_index") or 0),
                 "session_label": parsed.get("session_label"),
-                "command": parsed.get("command") or "",
+                "command": best_cmd,
+                "transcript_tool": inflight.get("tool_name") if inflight else None,
             },
         )
 
     def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
-        """Claude Code permission prompt: options are offered by label; persistent allow rules are filtered out."""
+        """Claude Code permission prompt fallback: options are offered by label."""
         opts = [dict(o) for o in parsed.get("options") or []]
         offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
         offered = [o["label"] for o in offered_opts]
+        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
+        inflight_cmd = str(inflight.get("command") or "").strip()
+        screen_cmd = str(parsed.get("command") or "").strip()
+        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
-        if parsed.get("command"):
-            lines.append(f"Command: {parsed['command']}")
+        if best_cmd:
+            lines.append(f"Command: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
+        persists_opt = next((o for o in offered_opts if o.get("action") == "approve_session" and o.get("persists")), None)
+        has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
+        if persists_opt is not None:
+            lines.append(
+                f"（approve_session = 发送 {persists_opt.get('key', '2')}：不再询问该命令，"
+                "claude 会把该放行规则写入项目 .claude/settings.local.json）"
+            )
+        elif not has_session_opt:
+            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
         return self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -10185,142 +10748,301 @@ class HubSessionManager:
             metadata={
                 "claude_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
-                "command": parsed.get("command") or "",
+                "command": best_cmd,
             },
         )
+
+    def _claude_hook_log_path(self, session: AgentSession) -> Optional[Path]:
+        snap = getattr(session, "profile_snapshot", None) or {}
+        env_map = snap.get("env") if isinstance(snap.get("env"), dict) else {}
+        env_log = str(env_map.get("HUB_CLAUDE_HOOK_LOG") or "").strip()
+        if env_log:
+            return Path(env_log)
+        claude_uuid = str((session.conversation_ref or {}).get("session_id") or "").strip()
+        if not claude_uuid and getattr(session, "transcript_path", None):
+            try:
+                claude_uuid = Path(session.transcript_path).stem
+            except Exception:
+                claude_uuid = ""
+        if claude_uuid and re.match(r"^[A-Za-z0-9_.\-]+$", claude_uuid):
+            return self.runtime_configs_dir / f"claude_hooks_{claude_uuid}.jsonl"
+        return None
+
+    def _register_claude_hook_approval(self, session: AgentSession, hook_ev: Dict[str, Any]):
+        """Registers a Claude Code permission prompt directly from the native PermissionRequest hook."""
+        tname = str(hook_ev.get("tool_name") or "Tool").strip()
+        tinput = hook_ev.get("tool_input") if isinstance(hook_ev.get("tool_input"), dict) else {}
+        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
+        cmd = str(
+            tinput.get("command")
+            or tinput.get("file_path")
+            or tinput.get("path")
+            or tinput.get("url")
+            or inflight.get("command")
+            or ""
+        ).strip()
+        if not cmd and tinput:
+            cmd = json.dumps(tinput, ensure_ascii=False)
+        desc = str(tinput.get("description") or "").strip()
+        suggestions = (
+            hook_ev.get("permission_suggestions")
+            if isinstance(hook_ev.get("permission_suggestions"), list)
+            else []
+        )
+        rule_parts: List[str] = []
+        for s in suggestions:
+            if not isinstance(s, dict):
+                continue
+            for r in (s.get("rules") or []):
+                if isinstance(r, dict):
+                    rc = str(r.get("ruleContent") or r.get("toolName") or "").strip()
+                    if rc and rc not in rule_parts:
+                        rule_parts.append(rc)
+            if not rule_parts and s.get("type"):
+                rule_parts.append(str(s.get("type")))
+        if suggestions:
+            rule_desc = ", ".join(rule_parts) if rule_parts else (f"{cmd.split()[0]}:*" if cmd else tname)
+            opts = [
+                {"key": "1", "label": "Yes", "action": "approve_once"},
+                {
+                    "key": "2",
+                    "label": f"Yes, and don't ask again for: {rule_desc}",
+                    "action": "approve_session",
+                    "persists": True,
+                },
+                {"key": "3", "label": "No", "action": "deny"},
+            ]
+        else:
+            opts = [
+                {"key": "1", "label": "Yes", "action": "approve_once"},
+                {"key": "2", "label": "No", "action": "deny"},
+            ]
+        offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
+        offered = [o["label"] for o in offered_opts]
+        lines: List[str] = [f"Tool: {tname}"]
+        if desc:
+            lines.append(f"Reason: {desc}")
+        if cmd:
+            lines.append(f"Command: {cmd}")
+        lines.append("Do you want to proceed?")
+        persists_opt = next(
+            (o for o in offered_opts if o.get("action") == "approve_session" and o.get("persists")),
+            None,
+        )
+        has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
+        if persists_opt is not None:
+            lines.append(
+                f"（approve_session = 发送 {persists_opt.get('key', '2')}：不再询问该命令，"
+                "claude 会把该放行规则写入项目 .claude/settings.local.json）"
+            )
+        elif not has_session_opt:
+            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
+        req_id = (
+            str(hook_ev.get("tool_use_id") or "").strip()
+            or f"claude-perm-{int(float(hook_ev.get('timestamp') or time.time()) * 1000)}"
+        )
+        return self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title=f"Claude Code Permission Prompt ({tname})",
+            prompt="\n".join(lines),
+            options=offered,
+            source="claude_permission_request_hook",
+            request_id=req_id,
+            metadata={
+                "claude_options": opts,
+                "option_actions": [o.get("action") for o in offered_opts],
+                "command": cmd,
+                "tool_name": tname,
+                "permission_suggestions": suggestions,
+            },
+        )
+
+    def _drain_claude_hook_events(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+        """Reads any newly appended PermissionRequest records from claude_hooks_<uuid>.jsonl."""
+        log_path = self._claude_hook_log_path(session)
+        if log_path is None or not log_path.is_file():
+            return session.pending_interaction
+        offset = int(getattr(session, "_claude_hook_offset", 0) or 0)
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(offset)
+                lines = f.readlines()
+                session._claude_hook_offset = f.tell()
+            for raw in lines:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("hook_event_name") == "PermissionRequest":
+                    if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
+                        session._prompt_quiet_until = 0.0
+                    self._register_claude_hook_approval(session, ev)
+        except Exception:
+            pass
+        return session.pending_interaction
+
+    def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+        """Synchronously checks a live TUI session's hooks/transcript/screen once for approval or multi-choice prompts."""
+        eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
+        if eng == "claude":
+            self._drain_claude_hook_events(session)
+        elif eng == "kimi":
+            self._drain_kimi_wire_interactions_once(session)
+        if session.pending_interaction is not None:
+            return session.pending_interaction
+        # D7: an answered prompt can stay on screen for a moment; it is not a new one.
+        if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
+            return None
+        max_rows = max(38, int(getattr(session, "rows", 38) or 38))
+        scr = session.get_clean_screen_text(max_lines=max_rows)
+        if not scr.strip():
+            return None
+
+        # 1) Codex TUI approval modal: a command prompt (y / p / esc) or an edit prompt (y / a / esc).
+        codex_prompt = parse_codex_approval_prompt(scr) if eng == "codex" else None
+        if codex_prompt is not None:
+            sig = f"codex_appr:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self._register_codex_screen_approval(session, codex_prompt, scr)
+            return None
+
+        # 2) AGY TUI permission prompt ("Run this command?" + numbered options, mapped by label)
+        agy_prompt = parse_agy_approval_prompt(scr) if eng == "agy" else None
+        if agy_prompt is not None:
+            sig = f"agy_appr:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self._register_agy_screen_approval(session, agy_prompt, scr)
+            return None
+
+        # 2b) AGY TUI `ask_question` multi-choice selector ("Question 1/" or "Navigate · enter Select").
+        # Only used if transcript.jsonl has not been claimed yet; once session.transcript_path is bound,
+        # _watch_agy_transcript handles ask_question from PLANNER_RESPONSE.tool_calls losslessly.
+        if eng == "agy" and not session.transcript_path and (
+            "Question 1/" in scr
+            or "Navigate · enter Select" in scr
+            or "Write-in..." in scr
+        ):
+            sig = f"agy_q:{hash(scr.strip()[-350:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                q_text = "AGY Sub-Agent Question"
+                opts: List[str] = []
+                for sline in scr.splitlines():
+                    sclean = sline.strip()
+                    if sclean.startswith("Question 1/") and ":" in sclean:
+                        q_text = sclean.split(":", 1)[1].strip()
+                    elif sclean.startswith("? ") and len(sclean) > 4:
+                        q_text = sclean[2:].strip()
+                    m_opt = re.match(r"^[>\s]*(\d+)\.\s+(.+)$", sclean)
+                    if m_opt:
+                        opt_lbl = m_opt.group(2).strip()
+                        # Clean any pyte line-overlap artifacts from long prompt lines
+                        for noise_tok in ("mini/antigravity", "complete:", "hub_worker.py"):
+                            if noise_tok in opt_lbl:
+                                opt_lbl = opt_lbl.split(noise_tok)[0].strip()
+                        opts.append(opt_lbl)
+                if not opts:
+                    opts = ["Option 1", "Option 2", "Write-in..."]
+                return self.register_pending_interaction(
+                    session=session,
+                    kind="question",
+                    title="AGY TUI ask_question",
+                    prompt=q_text,
+                    options=opts,
+                    source="agy_tui_screen_detector",
+                    metadata={"raw_options_count": max(1, len(opts) - 1)},
+                )
+            return None
+
+        # 3) Kimi TUI ApprovalPanel fallback ("Approve once" + "Approve for this session").
+        # Only used if wire.jsonl has not been claimed yet; once session.transcript_path is bound,
+        # _drain_kimi_wire_interactions_once handles Kimi approvals and questions directly from wire.jsonl.
+        if eng == "kimi" and not session.transcript_path and ("Approve once" in scr and "Approve for this session" in scr):
+            sig = f"kimi_appr:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self.register_pending_interaction(
+                    session=session,
+                    kind="approval_request",
+                    title="Kimi TUI Approval Panel",
+                    prompt=scr.strip()[-600:],
+                    options=[
+                        "Approve once",
+                        "Approve for this session",
+                        "Reject",
+                        "Reject with feedback",
+                    ],
+                    source="kimi_tui_screen_detector",
+                    metadata={"command": kimi_panel_command(scr)},
+                )
+            return None
+
+        # 4) OMP tool approval box ("Allow tool: <name>" + "Approve…" rows + "Deny").
+        omp_prompt = parse_omp_approval_prompt(scr) if eng == "omp" else None
+        if omp_prompt is not None:
+            sig = f"omp_appr:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self._register_omp_screen_approval(session, omp_prompt)
+            return None
+
+        # 4b) OMP settings-change confirm ("Allow once" + "Always for this session" + "Deny").
+        if eng == "omp" and ("Allow once" in scr and "Always for this session" in scr and "Deny" in scr):
+            sig = f"omp_settings:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self.register_pending_interaction(
+                    session=session,
+                    kind="approval_request",
+                    title="OMP Settings Change Confirm",
+                    prompt=scr.strip()[-600:],
+                    options=["Allow once", "Always for this session", "Deny"],
+                    source="omp_tui_screen_detector",
+                    metadata={"raw_options_count": 3, "omp_prompt": "settings"},
+                )
+            return None
+
+        # 5) Claude Code TUI permission prompt fallback ("Do you want to proceed?" + numbered options).
+        # Primary path is _drain_claude_hook_events above (native PermissionRequest hook); screen
+        # parsing only runs if no hook log file exists for this session.
+        hook_log = self._claude_hook_log_path(session)
+        claude_prompt = (
+            parse_claude_approval_prompt(scr)
+            if (eng == "claude" and (hook_log is None or not hook_log.is_file()))
+            else None
+        )
+        if claude_prompt is not None:
+            sig = f"claude_appr:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                return self._register_claude_screen_approval(session, claude_prompt, scr)
+            return None
+
+        # N1: when no interactive prompt is on screen anymore, clear seen signatures so a later
+        # identical command prompt in the same or next turn is never suppressed.
+        if session._seen_tui_prompt_signatures:
+            session._seen_tui_prompt_signatures.clear()
+        return None
 
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
         """
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
-        across Codex, Kimi, OMP, and AGY (catches prompts that only render in the TUI without a separate JSONL event).
+        across Codex, Kimi, OMP, Claude, and AGY (catches prompts that only render in the TUI without a separate JSONL event).
         """
         # Round 3 live check: "completed" (the worker reported completion, the TUI is still alive)
         # keeps the watch going. Leaving the loop there stopped all prompt detection for the rest
         # of the session, so a follow-up turn's risky command sat at agy's prompt unseen.
         while session.status in LIVE_STATUSES:
             await asyncio.sleep(0.9)
-            if session.pending_interaction is not None:
-                continue
-            # D7: an answered prompt can stay on screen for a moment; it is not a new one.
-            if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
-                continue
-            scr = session.get_clean_screen_text(max_lines=38)
-            if not scr.strip():
-                continue
-
-            eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
-
-            # 1) Codex TUI approval modal: a command prompt (y / p / esc) or an edit prompt (y / a / esc).
-            codex_prompt = parse_codex_approval_prompt(scr) if eng == "codex" else None
-            if codex_prompt is not None:
-                sig = f"codex_appr:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self._register_codex_screen_approval(session, codex_prompt, scr)
-                continue
-
-            # 2) AGY TUI permission prompt ("Run this command?" + numbered options, mapped by label)
-            agy_prompt = parse_agy_approval_prompt(scr) if eng == "agy" else None
-            if agy_prompt is not None:
-                sig = f"agy_appr:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self._register_agy_screen_approval(session, agy_prompt, scr)
-                continue
-
-            # 2b) AGY TUI `ask_question` multi-choice selector ("Question 1/" or "Navigate · enter Select")
-            if eng == "agy" and (
-                "Question 1/" in scr
-                or "Navigate · enter Select" in scr
-                or "Write-in..." in scr
-            ):
-                sig = f"agy_q:{hash(scr.strip()[-350:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    q_text = "AGY Sub-Agent Question"
-                    opts: List[str] = []
-                    for sline in scr.splitlines():
-                        sclean = sline.strip()
-                        if sclean.startswith("Question 1/") and ":" in sclean:
-                            q_text = sclean.split(":", 1)[1].strip()
-                        elif sclean.startswith("? ") and len(sclean) > 4:
-                            q_text = sclean[2:].strip()
-                        m_opt = re.match(r"^[>\s]*(\d+)\.\s+(.+)$", sclean)
-                        if m_opt:
-                            opt_lbl = m_opt.group(2).strip()
-                            # Clean any pyte line-overlap artifacts from long prompt lines
-                            for noise_tok in ("mini/antigravity", "complete:", "hub_worker.py"):
-                                if noise_tok in opt_lbl:
-                                    opt_lbl = opt_lbl.split(noise_tok)[0].strip()
-                            opts.append(opt_lbl)
-                    if not opts:
-                        opts = ["Option 1", "Option 2", "Write-in..."]
-                    self.register_pending_interaction(
-                        session=session,
-                        kind="question",
-                        title="AGY TUI ask_question",
-                        prompt=q_text,
-                        options=opts,
-                        source="agy_tui_screen_detector",
-                        metadata={"raw_options_count": max(1, len(opts) - 1)},
-                    )
-                continue
-
-            # 3) Kimi TUI ApprovalPanel fallback ("Approve once" + "Approve for this session").
-            # The wire record of the same prompt adopts this registration (D7, one prompt = one).
-            if eng == "kimi" and ("Approve once" in scr and "Approve for this session" in scr):
-                sig = f"kimi_appr:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self.register_pending_interaction(
-                        session=session,
-                        kind="approval_request",
-                        title="Kimi TUI Approval Panel",
-                        prompt=scr.strip()[-600:],
-                        options=[
-                            "Approve once",
-                            "Approve for this session",
-                            "Reject",
-                            "Reject with feedback",
-                        ],
-                        source="kimi_tui_screen_detector",
-                        metadata={"command": kimi_panel_command(scr)},
-                    )
-                continue
-
-            # 4) OMP tool approval box ("Allow tool: <name>" + "Approve…" rows + "Deny").
-            omp_prompt = parse_omp_approval_prompt(scr) if eng == "omp" else None
-            if omp_prompt is not None:
-                sig = f"omp_appr:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self._register_omp_screen_approval(session, omp_prompt)
-                continue
-
-            # 4b) OMP settings-change confirm ("Allow once" + "Always for this session" + "Deny").
-            if eng == "omp" and ("Allow once" in scr and "Always for this session" in scr and "Deny" in scr):
-                sig = f"omp_settings:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self.register_pending_interaction(
-                        session=session,
-                        kind="approval_request",
-                        title="OMP Settings Change Confirm",
-                        prompt=scr.strip()[-600:],
-                        options=["Allow once", "Always for this session", "Deny"],
-                        source="omp_tui_screen_detector",
-                        metadata={"raw_options_count": 3, "omp_prompt": "settings"},
-                    )
-                continue
-
-            # 5) Claude Code TUI permission prompt ("Do you want to proceed?" + numbered options).
-            claude_prompt = parse_claude_approval_prompt(scr) if eng == "claude" else None
-            if claude_prompt is not None:
-                sig = f"claude_appr:{hash(scr.strip()[-400:])}"
-                if sig not in session._seen_tui_prompt_signatures:
-                    session._seen_tui_prompt_signatures.add(sig)
-                    self._register_claude_screen_approval(session, claude_prompt, scr)
-                continue
+            self.poll_tui_screen_interactions_once(session)
 
     @staticmethod
     def _middle_level(levels) -> Optional[str]:
@@ -10339,8 +11061,9 @@ class HubSessionManager:
         model: Optional[str] = None,
         thinking_level: Optional[str] = None,
         cwd: Optional[str] = None,
+        env: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """B6: the one place that turns (profile, model, thinking, cwd) into a real command line.
+        """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
         Returns exactly what will run; raises a Chinese ValueError for invalid input. Spawns nothing.
         """
@@ -10358,7 +11081,9 @@ class HubSessionManager:
         command = str(prof.get('command') or '')
         base_args = [str(a) for a in (prof.get('args') or [])]
         notes = []  # Chinese notes, e.g. substitutions
-        env: Dict[str, str] = {}
+        profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
+        caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
+        resolved_env: Dict[str, str] = dict(profile_env)
 
         options = self.engine_model_options(eng)
         explicit_model = str(model).strip() if model and str(model).strip() else None
@@ -10526,7 +11251,7 @@ class HubSessionManager:
                 args = ['-m', resolved_model] + args
             if resolved_level:
                 # Only this child process; never the hub's own environment.
-                env['KIMI_MODEL_THINKING_EFFORT'] = resolved_level
+                resolved_env['KIMI_MODEL_THINKING_EFFORT'] = resolved_level
         elif eng == 'agy':
             if resolved_model:
                 if resolved_level:
@@ -10546,7 +11271,7 @@ class HubSessionManager:
                 command = os.path.expandvars(os.path.expanduser(command))
             raw_cfg_dir = str(prof.get('config_dir') or '').strip()
             if raw_cfg_dir:
-                env['CLAUDE_CONFIG_DIR'] = os.path.abspath(
+                resolved_env['CLAUDE_CONFIG_DIR'] = os.path.abspath(
                     os.path.expandvars(os.path.expanduser(raw_cfg_dir))
                 )
             injected = []
@@ -10556,6 +11281,14 @@ class HubSessionManager:
                 injected.extend(['--effort', resolved_level])
             args = injected + args
         # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
+
+        # Caller-supplied env vars override both profile defaults and engine-computed defaults.
+        if caller_env:
+            resolved_env.update(caller_env)
+        if eng == 'claude' and resolved_env.get('CLAUDE_CONFIG_DIR'):
+            resolved_env['CLAUDE_CONFIG_DIR'] = os.path.abspath(
+                os.path.expandvars(os.path.expanduser(str(resolved_env['CLAUDE_CONFIG_DIR']).strip()))
+            )
 
         # D1 (2026-11-07): high-risk approval is on for every engine unless the profile switches it
         # off (bypass_approvals, round 2). The profile's own bypass/mode flags (old files still carry
@@ -10616,9 +11349,9 @@ class HubSessionManager:
             'engine': eng,
             'kind': kind,
             'command': command,
-            'config_dir': env.get('CLAUDE_CONFIG_DIR') if eng == 'claude' else None,
+            'config_dir': resolved_env.get('CLAUDE_CONFIG_DIR') if eng == 'claude' else None,
             'args': args,
-            'env': env,
+            'env': resolved_env,
             'cwd': work_dir,
             'model': resolved_model,
             'model_source': model_source,
@@ -10640,6 +11373,7 @@ class HubSessionManager:
         hwnd: Optional[int] = None,
         model: Optional[str] = None,
         thinking_level: Optional[str] = None,
+        env: Optional[Any] = None,
     ) -> AgentSession:
         loop = asyncio.get_running_loop()
 
@@ -10672,7 +11406,7 @@ class HubSessionManager:
             self.persist_session(sess)
             return sess
 
-        launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd)
+        launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -10819,6 +11553,14 @@ class HubSessionManager:
             asyncio.create_task(self._spawn_dsh_hub_job(sess, task))
             return sess
 
+        if engine == "claude":
+            hook_log = self._claude_hook_log_path(sess)
+            if hook_log is not None:
+                env_overrides.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
+                try:
+                    sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
+                except OSError:
+                    sess._claude_hook_offset = 0
         try:
             sess.start_pty(loop, env_overrides=env_overrides or None)
         except Exception:

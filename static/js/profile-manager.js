@@ -27,7 +27,7 @@ const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'claude', 'dsh', 'pwsh'];
 
 // Keys the editor renders itself, so the read-only "高级" box shows only what is left.
 const SHOWN_KEYS = new Set([
-  'id', 'name', 'engine', 'kind', 'command', 'config_dir', 'args', 'default_model', 'default_thinking_level',
+  'id', 'name', 'engine', 'kind', 'command', 'config_dir', 'args', 'env', 'default_model', 'default_thinking_level',
   'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'gui_url', 'dsh_tier',
   'bypass_approvals',
 ]);
@@ -44,6 +44,7 @@ let dirty = false;
 let activeTab = 'profiles';
 let filterText = '';
 let argsError = '';
+let envError = '';
 let serverError = '';
 let saveBusy = false;
 
@@ -64,6 +65,7 @@ export function initProfileManager() {
   $('#editEngine').addEventListener('change', onEngineChange);
   $('#editModelSelect').addEventListener('change', onModelSelectChange);
   $('#editArgs').addEventListener('input', updateArgsValidation);
+  if ($('#editEnv')) $('#editEnv').addEventListener('input', updateEnvValidation);
   $('#editId').addEventListener('input', () => showFieldError('editId', ''));
   $('#editName').addEventListener('input', () => {
     if (!selectedId) $('#editorTitle').textContent = $('#editName').value.trim() || '新建 Profile';
@@ -201,6 +203,7 @@ function profileDraft(id, p) {
     command: p.command || '',
     config_dir: p.config_dir || '',
     argsText: (Array.isArray(p.args) ? p.args : []).join('\n'),
+    envText: formatEnvText(p.env),
     task_mode: p.task_mode || '',
     delayText: p.startup_delay_sec ?? '',
     gui_url: p.gui_url || '',
@@ -231,6 +234,7 @@ function readDraft() {
     command: $('#editCommand').value.trim(),
     config_dir: ($('#editConfigDir')?.value || '').trim(),
     argsText: $('#editArgs').value,
+    envText: $('#editEnv') ? $('#editEnv').value : '',
     task_mode: $('#editTaskMode').value,
     delayText: $('#editDelay').value,
     gui_url: $('#editGuiUrl').value.trim(),
@@ -262,6 +266,7 @@ function writeDraft(d) {
   $('#editCommand').value = d.command;
   if ($('#editConfigDir')) $('#editConfigDir').value = d.config_dir || '';
   $('#editArgs').value = d.argsText;
+  if ($('#editEnv')) $('#editEnv').value = d.envText || '';
   ensureOption($('#editTaskMode'), d.task_mode);
   $('#editTaskMode').value = d.task_mode || '';
   $('#editDelay').value = d.delayText;
@@ -276,9 +281,11 @@ function writeDraft(d) {
   renderAdvanced(d.extra, d.isNew);
 
   argsError = '';
+  envError = '';
   serverError = '';
   refreshEditorError();
   updateArgsValidation();
+  updateEnvValidation();
   setDirty(false);
   $('#btnDeleteProfile').hidden = d.isNew;
   $('#btnDuplicateProfile').hidden = d.isNew;
@@ -481,6 +488,7 @@ function engineDefaults(engine) {
     config_dir: mostCommon((p) => p.config_dir) || '',
     task_mode: mostCommon((p) => p.task_mode) || '',
     argsText: mostCommon((p) => (Array.isArray(p.args) ? p.args.join('\n') : '')) || '',
+    envText: mostCommon((p) => formatEnvText(p.env)) || '',
     // S3: a new profile starts from the delay an existing profile of the same engine uses.
     delayText: String(mostCommon((p) => p.startup_delay_sec) ?? 2.5),
   };
@@ -493,6 +501,7 @@ function applyEngineDefaults(engine) {
   ensureOption($('#editTaskMode'), defaults.task_mode);
   $('#editTaskMode').value = defaults.task_mode;
   $('#editArgs').value = defaults.argsText;
+  if ($('#editEnv')) $('#editEnv').value = defaults.envText || '';
   $('#editDelay').value = defaults.delayText;
 }
 
@@ -501,9 +510,37 @@ function onModelSelectChange() {
   setDirty(true);
 }
 
-// -------------------------------------------------------- args validation
+// -------------------------------------------------------- args & env validation
 function parseArgsText(text) {
   return String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function formatEnvText(envObj) {
+  if (!envObj || typeof envObj !== 'object') return '';
+  return Object.entries(envObj)
+    .filter(([key]) => Boolean(key))
+    .map(([key, value]) => `${key}=${value ?? ''}`)
+    .join('\n');
+}
+
+function parseEnvText(text) {
+  const env = {};
+  const lines = String(text || '').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) {
+      return { env, error: `环境变量格式无效（缺少 '='，应为 KEY=VALUE）：${line}` };
+    }
+    const key = line.slice(0, eqIdx).trim();
+    const val = line.slice(eqIdx + 1).trim();
+    if (!key || /[\s=]/.test(key)) {
+      return { env, error: `环境变量名「${key}」不能包含空格或等号。` };
+    }
+    env[key] = val;
+  }
+  return { env, error: '' };
 }
 
 /** Returns the injected flag the user must not put in args, or "" (spec B5 / F7). */
@@ -545,6 +582,16 @@ function updateArgsValidation() {
   syncSaveButton();
 }
 
+function updateEnvValidation() {
+  const el = $('#editEnv');
+  if (!el) return;
+  const { error } = parseEnvText(el.value);
+  envError = error;
+  el.classList.toggle('is-invalid', !!envError);
+  refreshEditorError();
+  syncSaveButton();
+}
+
 // ------------------------------------------------------------ feedback/state
 function showFieldError(fieldId, message) {
   $(`#${fieldId}`).classList.toggle('is-invalid', !!message);
@@ -555,11 +602,11 @@ function showFieldError(fieldId, message) {
 }
 
 function refreshEditorError() {
-  const message = argsError || serverError;
+  const message = argsError || envError || serverError;
   const bar = $('#editorErrors');
   bar.hidden = !message;
   bar.textContent = message;
-  bar.dataset.tone = argsError ? 'validation' : 'server';
+  bar.dataset.tone = (argsError || envError) ? 'validation' : 'server';
 }
 
 function showEditorError(message) {
@@ -570,7 +617,7 @@ function showEditorError(message) {
 function syncSaveButton() {
   const btn = $('#btnSaveProfile');
   if (!btn) return;
-  btn.disabled = saveBusy || !!argsError;
+  btn.disabled = saveBusy || !!argsError || !!envError;
 }
 
 function setDirty(value) {
@@ -627,6 +674,7 @@ async function startNewProfile() {
     command: '',
     config_dir: '',
     argsText: '',
+    envText: '',
     task_mode: '',
     delayText: 2.5,
     gui_url: '',
@@ -683,6 +731,12 @@ async function saveProfile() {
     $('#editArgs').focus();
     return;
   }
+  const { env, error: parsedEnvError } = parseEnvText(d.envText);
+  if (parsedEnvError) {
+    updateEnvValidation();
+    if ($('#editEnv')) $('#editEnv').focus();
+    return;
+  }
   const isDsh = d.engine === 'dsh';
   const command = isDsh ? (d.command || 'pwsh.exe') : d.command;
   if (!command) {
@@ -704,6 +758,7 @@ async function saveProfile() {
     command,
     config_dir: d.engine === 'claude' ? (d.config_dir || null) : null,
     args,
+    env: !isDsh && Object.keys(env).length ? env : null,
     task_mode: d.task_mode || null,
     startup_delay_sec: Number.isFinite(delay) ? delay : null,
     gui_url: isDsh ? (d.gui_url || null) : null,

@@ -605,7 +605,7 @@ class AgentModelDiscovery:
 
     def _discover_dsh(self) -> Dict[str, Any]:
         dsh_cfg_path = self.home / ".config" / "dsh-crew" / "config.json"
-        thinking_levels = ["off", "low", "medium", "high", "max"]
+        thinking_levels = ["high", "max"]
         default_model = "clay/deepseek-flash"
         default_effort = "high"
         providers_list: List[Dict[str, Any]] = []

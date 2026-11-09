@@ -1,8 +1,10 @@
 import asyncio
 import hmac
 import json
+import math
 import os
 import signal
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -117,6 +119,19 @@ INJECTION_PENDING_HINT = (
 )
 
 
+def _sanitize_json_floats(value: Any) -> Any:
+    """Replaces non-finite floats (NaN, Infinity, -Infinity) with None for strict RFC 8259 JSON compliance."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_json_floats(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_floats(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_json_floats(v) for v in value]
+    return value
+
+
 def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
     """W11: spawn/resume/send report the real injection, or say honestly that it is still pending.
 
@@ -146,11 +161,14 @@ def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
     return {"injection": "none", "last_injection": None}
 
 
+HUB_VERSION = "4.1.7"
+
 # ============================================================================
 # 1. 北向 MCP Server (/mcp) —— 暴露给【主 Agent / Parent Agent】的调度、遥测与双向通信接口
 # ============================================================================
 mcp = FastMCP(
     "SubAgent-NonHeadless-Hub",
+    version=HUB_VERSION,
     instructions=(
         "统一的非无头 (Non-Headless) Sub-Agent 聚合网关，支持主从双向实时通信、全链路步骤/工具轨迹追踪与生命周期后持久化查询。\n"
         "核心能力与【严禁前台阻塞等待规范】：\n"
@@ -209,6 +227,7 @@ async def spawn_subagent(
     thinking_level: Optional[str] = None,
     cwd: Optional[str] = None,
     title: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
     wait_seconds: float = 5.0,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
@@ -217,6 +236,7 @@ async def spawn_subagent(
     - 【可读名称规范 (`title`)】：派发 Sub-Agent 时**请务必通过 `title` 参数传入一个简短可读的名字**（建议 4~16 个汉字或 2~5 个英文词，概括该 Sub-Agent 的职责或任务主题，如 `"排查构建失败"`、`"前端侧栏布局修复"`、`"API 接口联调"`），取代直接截取长 prompt 前端作为会话名称。
     - 【异步等待规范（严禁前台挂 poll）】：若本次调用返回时任务尚未完成，**请勿在前台同步执行 `background_poll_command`，也请勿前台循环调用 `wait_subagent_events`**。请使用宿主命令工具的**后台异步模式**（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后直接结束当前回合等待后台任务完成唤醒（或并行执行其他工作）。
     - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
+    - 支持通过 `env`（`Dict[str, str]`）在拉起时为该 Sub-Agent 进程注入专属环境变量（与 Profile 内置 `env` 合并，同名变量由本次 `env` 覆盖），并在会话恢复时自动保留。
     - 引擎默认以「高风险操作需审批」模式运行：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
     - 只有用户在总控台给某个 Profile 打开 `bypass_approvals`（全自动）时才不审批；返回值 `high_risk_approval` 为 `false` 即表示本次为全自动（`null` 表示该引擎没有 Hub 审批，如 dsh / pwsh），`launch_notes` 会写明。
     - 高风险操作暂停时，会话进入 `waiting_parent` 状态，并带有 `approval_request` 事件（`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
@@ -231,6 +251,7 @@ async def spawn_subagent(
         title=title,
         model=model,
         thinking_level=thinking_level,
+        env=env,
     )
 
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
@@ -269,6 +290,7 @@ async def spawn_subagent(
         "engine": session.engine,
         "effective_model": session.effective_model,
         "effective_thinking_level": session.effective_thinking_level,
+        "env": dict((session.profile_snapshot or {}).get("env") or {}),
         "kind": session.kind,
         "status": session.status,
         # Round 2: true = high-risk approval on; false = the profile's bypass_approvals is on
@@ -337,7 +359,7 @@ async def send_to_subagent(
 ) -> Dict[str, Any]:
     """
     [主 Agent -> Sub-Agent] 向运行中的非无头 Sub-Agent 发送消息、补充指令或回答提问：
-    1. 如果该 Sub-Agent 当前正阻塞在 `ask_parent` 等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
+    1. 如果该 Sub-Agent 当前正阻塞在 `hub_worker.py ask`（CLI 桥接）、`ask_parent`（`/worker-mcp` 桥接）或交互式审批/选项提示（`pending_interaction`）等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
     2. 否则，会将 `text` 写入 Sub-Agent 的交互式虚拟终端（ConPTY）及主从邮箱，实现实时中途干预（Steering）或多轮对话。
     """
     await ensure_profiles_loaded()
@@ -378,6 +400,20 @@ async def send_to_subagent(
             press_enter=press_enter,
         )
 
+    if delivery.get("injection") == "pending":
+        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 15.0), 30.0)
+        while time.time() < inj_deadline:
+            cur_inj = getattr(session, "last_injection", None)
+            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+                break
+            await asyncio.sleep(0.15)
+        cur_inj = getattr(session, "last_injection", None)
+        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+            delivery = dict(delivery)
+            delivery["injection"] = "recorded"
+            if cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
+                delivery["pty_written"] = True
+
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
     if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
         async def _progress(elapsed: float, snippet: str):
@@ -394,20 +430,6 @@ async def send_to_subagent(
             quiet_window_sec=2.5,
             progress_cb=_progress,
         )
-
-    if delivery.get("injection") == "pending":
-        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 3.5), 8.0)
-        while time.time() < inj_deadline:
-            cur_inj = getattr(session, "last_injection", None)
-            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-                break
-            await asyncio.sleep(0.15)
-        cur_inj = getattr(session, "last_injection", None)
-        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-            delivery = dict(delivery)
-            delivery["injection"] = "recorded"
-            if cur_inj.get("ok") is True:
-                delivery["pty_written"] = True
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -466,6 +488,22 @@ async def resume_subagent(
         "injection": result.get("injection") or "none",
     }
 
+    if isinstance(delivery, dict) and delivery.get("injection") == "pending":
+        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 15.0), 30.0)
+        while time.time() < inj_deadline:
+            cur_inj = getattr(session, "last_injection", None)
+            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+                break
+            await asyncio.sleep(0.15)
+    if isinstance(delivery, dict) and delivery.get("injection") in ("argv", "pending"):
+        cur_inj = getattr(session, "last_injection", None)
+        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
+            delivery = dict(delivery)
+            if delivery.get("injection") == "pending":
+                delivery["injection"] = "recorded"
+            if (cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0) and delivery.get("injection") == "recorded":
+                delivery["pty_written"] = True
+
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
     if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
         async def _progress(elapsed: float, snippet: str):
@@ -482,15 +520,6 @@ async def resume_subagent(
             quiet_window_sec=2.5,
             progress_cb=_progress,
         )
-
-    if isinstance(delivery, dict) and delivery.get("injection") in ("argv", "pending"):
-        cur_inj = getattr(session, "last_injection", None)
-        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-            delivery = dict(delivery)
-            if delivery.get("injection") == "pending":
-                delivery["injection"] = "recorded"
-            if cur_inj.get("ok") is True and delivery.get("injection") == "recorded":
-                delivery["pty_written"] = True
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -554,7 +583,7 @@ async def reply_to_subagent(
     answer: str,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 提出的问题或审批请求，立即解除 Sub-Agent 的等待阻塞。"""
+    """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 通过 `hub_worker.py ask`、`ask_parent` 或交互式提示提出的问题/审批请求，立即解除 Sub-Agent 的等待阻塞。"""
     delivery = hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
@@ -573,7 +602,7 @@ async def reply_to_subagent(
         if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
             delivery = dict(delivery)
             delivery["injection"] = "recorded"
-            if cur_inj.get("ok") is True:
+            if cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
                 delivery["pty_written"] = True
     if session and isinstance(delivery, dict):
         return {
@@ -1296,6 +1325,7 @@ async def api_launch_preview(req: Request):
             model=body.get("model"),
             thinking_level=body.get("thinking_level"),
             cwd=body.get("cwd"),
+            env=body.get("env"),
         )
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
@@ -1322,6 +1352,7 @@ async def api_create_session(req: Request):
     hwnd = body.get("hwnd")
     model = body.get("model")
     thinking_level = body.get("thinking_level")
+    env = body.get("env")
     await ensure_profiles_loaded()
     try:
         sess = await hub.create_session(
@@ -1332,6 +1363,7 @@ async def api_create_session(req: Request):
             hwnd=hwnd,
             model=model,
             thinking_level=thinking_level,
+            env=env,
         )
     except ValueError as e:
         return bad_request(str(e))
@@ -1495,10 +1527,24 @@ HUB_STARTED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
 _HUB_SHUTDOWN_TOKEN = os.environ.pop("HUB_SHUTDOWN_TOKEN", "")
 
 
+@app.get("/health")
+async def api_health():
+    return {
+        "ok": True,
+        "status": "healthy",
+        "service": "SubAgent-NonHeadless-Hub",
+        "version": HUB_VERSION,
+        "active_sessions": len(hub.sessions),
+        "hub_port": hub_port(),
+        "started_at": HUB_STARTED_AT,
+    }
+
+
 @app.get("/api/hub/info")
 async def api_hub_info():
     return {
         "service": "mcp-agent-hub",
+        "version": HUB_VERSION,
         "pid": os.getpid(),
         "port": hub_port(),
         "repo": str(BASE_DIR),

@@ -41,6 +41,7 @@ export function initSessionLauncher() {
   pills.addEventListener('keydown', onPillsKeydown);
 
   $('#cwdInput').addEventListener('input', schedulePreview);
+  if ($('#envInput')) $('#envInput').addEventListener('input', schedulePreview);
   $('#launchBtn').addEventListener('click', launchSession);
   // Ctrl+Enter starts from any field inside the launcher section.
   $('#launcherSection').addEventListener('keydown', (ev) => {
@@ -260,6 +261,7 @@ async function runPreview() {
     model: $('#modelSelect').value || null,
     thinking_level: currentLevel || null,
     cwd: $('#cwdInput').value.trim() || null,
+    env: ($('#envInput')?.value || '').trim() || null,
   };
   try {
     const data = await hubApi.launchPreview(body);
@@ -345,6 +347,7 @@ async function launchSession() {
   const p = state.profiles[profileId] || {};
   const task = $('#taskInput').value.trim();
   const cwd = $('#cwdInput').value.trim();
+  const env = ($('#envInput')?.value || '').trim();
   setBusy(btn, true);
   try {
     const data = await hubApi.createSession({
@@ -353,6 +356,7 @@ async function launchSession() {
       thinking_level: currentLevel || null,
       task: task || null,
       cwd: cwd || null,
+      env: env || null,
     });
     const session = data.session;
     if (!session) throw new Error('服务端没有返回会话信息');

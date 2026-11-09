@@ -124,6 +124,10 @@
           <input id="cwdInput" type="text" class="mono-input" list="cwdHistory" placeholder="默认：Hub 当前目录" spellcheck="false" />
           <datalist id="cwdHistory"></datalist>
         </label>
+        <label class="field">
+          <span class="field-label">环境变量 <span class="opt">可选</span></span>
+          <textarea id="envInput" rows="2" class="mono-input" spellcheck="false" placeholder="每行一个 KEY=VALUE（可覆盖 Profile 内置环境变量）"></textarea>
+        </label>
         <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="启动 Sub-Agent（Ctrl + Enter）">
           <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>启动 <kbd>Ctrl ↵</kbd>
         </button>
@@ -294,6 +298,11 @@
                     <textarea id="editArgs" rows="4" class="mono-input" spellcheck="false" placeholder="每行一个参数，空行忽略&#10;例如：--auto-approve"></textarea>
                     <span class="field-help">模型与思考等级参数由 Hub 按启动时的选择自动注入，无需在此重复。</span>
                   </div>
+                  <div class="field full">
+                    <label class="field-label" for="editEnv">环境变量 <code>env</code></label>
+                    <textarea id="editEnv" rows="3" class="mono-input" spellcheck="false" placeholder="每行一个 KEY=VALUE，空行或 # 注释行忽略&#10;例如：ANTHROPIC_BASE_URL=https://api.example.com"></textarea>
+                    <span class="field-help">该 Profile 内置的子进程环境变量；主 Agent 或启动面板传入的同名环境变量会覆盖此处的值。</span>
+                  </div>
                   <label class="field">
                     <span class="field-label">任务传入方式 <code>task_mode</code></span>
                     <select id="editTaskMode">
@@ -445,7 +454,8 @@
   agent_type="omp",
   task="分析并重构模块",
   model="kimi-code/k3.1-pro",
-  thinking_level="max"
+  thinking_level="max",
+  env={"CUSTOM_FLAG": "1"}
 )</pre>
             <button class="icon-btn sm" data-cmd="copy-target" data-target="#mcpCallSnippet" title="复制" aria-label="复制示例">
               <svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg>
