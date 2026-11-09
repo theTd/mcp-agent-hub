@@ -11,10 +11,14 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-use crate::hub_api::{count_sessions, HubApi, HubInfo, SessionCounts};
+use crate::hub_api::{count_sessions, HubApi, SessionCounts};
+#[cfg(not(feature = "portable"))]
+use crate::hub_api::HubInfo;
 use crate::hub_config::{self, HubConfig};
 use crate::hub_log;
-use crate::owned_hub::{self, OwnedHub, PortProbe, ReadyError, PORT_RELEASE_WAIT};
+use crate::owned_hub::{self, OwnedHub, ReadyError, PORT_RELEASE_WAIT};
+#[cfg(not(feature = "portable"))]
+use crate::owned_hub::PortProbe;
 use crate::tray_menu;
 use crate::windows_process;
 
@@ -172,6 +176,11 @@ impl HubShell {
     }
 
     pub fn set_splash_url(&self, url: Url) {
+        // A fresh WebView can still report about:blank during setup. Never save it as
+        // the splash destination, or progress updates will navigate away from the UI.
+        if url.scheme() != "tauri" && url.host_str() != Some("tauri.localhost") {
+            return;
+        }
         *self.splash_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
     }
 
@@ -317,7 +326,15 @@ impl HubShell {
     async fn start_locked(self: &Arc<Self>, app: &AppHandle) {
         self.cancel_start.store(false, Ordering::SeqCst);
         self.set_starting(app, "正在启动 Hub…", "");
-        let cfg = match hub_config::load() {
+        #[cfg(not(feature = "portable"))]
+        let config_result = hub_config::load();
+        #[cfg(feature = "portable")]
+        let config_result = crate::portable_runtime::prepare(
+            |message, detail| self.set_starting(app, message, detail),
+            &self.cancel_start,
+        )
+        .await;
+        let cfg = match config_result {
             Ok(cfg) => cfg,
             Err(e) => return self.fail(app, &e, false),
         };
@@ -331,6 +348,7 @@ impl HubShell {
             &format!("127.0.0.1:{} · {}", cfg.port, cfg.repo_dir.display()),
         );
         let api = HubApi::new(cfg.port);
+        #[cfg(not(feature = "portable"))]
         match owned_hub::probe_port(&api, cfg.port).await {
             PortProbe::ExternalHub(info) => return self.attach_external(app, &cfg, &info).await,
             PortProbe::Busy { pid, name } => {
@@ -353,11 +371,16 @@ impl HubShell {
         }
         match owned_hub::wait_ready(&api, &self.cancel_start, || self.owned_exit()).await {
             Ok(info) => {
+                #[cfg(feature = "portable")]
+                if !self.st().owned.as_ref().is_some_and(|owned| owned.owns_server(info.pid)) {
+                    if let Some(owned) = self.st().owned.take() { owned.terminate(); }
+                    return self.fail(app, "启动期间端口被其他 Hub 占用，请重试。便携版不会连接外部 Hub。", false);
+                }
                 self.st().mode = HubMode::Owned;
                 self.bump_generation();
                 self.log(&format!(
-                    "hub ready on port {} (hub pid {})",
-                    cfg.port, info.pid
+                    "hub ready on port {} (hub pid {}, repo {}, started {})",
+                    cfg.port, info.pid, info.repo, info.started_at
                 ));
                 let _ = self.refresh_counts().await;
                 self.open_console_quietly(app, &cfg);
@@ -385,6 +408,7 @@ impl HubShell {
         }
     }
 
+    #[cfg(not(feature = "portable"))]
     async fn attach_external(&self, app: &AppHandle, cfg: &HubConfig, info: &HubInfo) {
         self.st().mode = HubMode::External;
         self.bump_generation();

@@ -11,3 +11,4 @@ dsh_sec_test_dir/
 .stress_test_workspace/
 desktop/node_modules/
 desktop/src-tauri/target/
+desktop/dist/

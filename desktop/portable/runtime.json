@@ -1,0 +1,6 @@
+{
+  "version": "3.12.13",
+  "python_minors": [11, 12, 13, 14],
+  "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260310/cpython-3.12.13%2B20260310-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+  "sha256": "a814e8406b698ad491e1073717d644479e86abf34a3d5897b4d581381b4b8164"
+}

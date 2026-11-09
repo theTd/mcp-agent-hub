@@ -3081,10 +3081,13 @@ class HubSessionManager:
         self.base_dir = (base_dir or Path(__file__).parent).resolve()
         self.profiles_path = (profiles_path or default_profiles_path(self.base_dir)).resolve()
         self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
-        self.runtime_configs_dir = self.base_dir / ".runtime_mcp_configs"
+        data_override = (os.environ.get("HUB_DATA_DIR") or "").strip()
+        self.data_dir = Path(data_override).expanduser().resolve() if data_override else self.base_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_configs_dir = self.data_dir / ".runtime_mcp_configs"
         self.runtime_configs_dir.mkdir(exist_ok=True)
 
-        self.db = HubDatabase(self.base_dir / "hub_state.db")
+        self.db = HubDatabase(self.data_dir / "hub_state.db")
         self.summarizer_registry = TranscriptSummarizerRegistry()
         self.model_discovery = AgentModelDiscovery()
         self.profiles: Dict[str, Dict[str, Any]] = {}

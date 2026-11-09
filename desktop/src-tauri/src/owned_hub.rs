@@ -122,6 +122,9 @@ pub struct OwnedHub {
 }
 
 impl OwnedHub {
+    #[cfg(feature = "portable")]
+    pub fn owns_server(&self, pid: u32) -> bool { self.job.contains_pid(pid) }
+
     /// `python server.py` with cwd = repo, `HUB_PORT`, a per-launch `HUB_SHUTDOWN_TOKEN`, no console
     /// window, stdout+stderr appended to `<log_dir>\hub.log` (rotated first when past 10 MB).
     pub fn launch(cfg: &HubConfig, log_dir: &Path, log: LogFn) -> Result<Self, String> {
@@ -145,6 +148,19 @@ impl OwnedHub {
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
+        #[cfg(feature = "portable")]
+        {
+            let data = crate::hub_config::portable_root().join("data");
+            std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+            cmd.env("HUB_DATA_DIR", &data)
+                .env("HUB_PROFILES_PATH", &data.join("agent_profiles.json"))
+                .env("HUB_API_URL", format!("http://127.0.0.1:{}", cfg.port))
+                .env_remove("AGENT_HUB_REPO")
+                .env_remove("AGENT_HUB_PYTHON")
+                .env_remove("AGENT_HUB_PORT")
+                .env_remove("PYTHONHOME")
+                .env_remove("PYTHONPATH");
+        }
         let child = windows_process::spawn_in_job(&mut cmd, &job).map_err(|e| {
             format!(
                 "{} {}：{e}",

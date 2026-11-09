@@ -5,8 +5,12 @@ description = "MCP Agent Hub desktop shell: owns the hub process, tray, waiting-
 edition = "2021"
 publish = false
 
+[features]
+portable = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }

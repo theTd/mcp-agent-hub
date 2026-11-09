@@ -1,13 +1,18 @@
 //! Where the hub lives and how it is launched: env first, then `%APPDATA%\mcp-agent-hub-desktop\config.json`,
 //! then the defaults (the repo this app was built from, its `.venv` python, port 4444).
 
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(not(feature = "portable"), test))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 pub const DEFAULT_PORT: u16 = 4444;
+#[cfg(not(feature = "portable"))]
 pub const APP_DIR_NAME: &str = "mcp-agent-hub-desktop";
+#[cfg(feature = "portable")]
+pub const APP_DIR_NAME: &str = "mcp-agent-hub-portable";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubConfig {
@@ -49,11 +54,13 @@ pub fn parse_file_config(text: &str) -> Result<FileConfig, String> {
 }
 
 /// The repo this app was built from: `CARGO_MANIFEST_DIR\..\..` (desktop\src-tauri → repo).
+#[cfg(any(not(feature = "portable"), test))]
 pub fn built_from_repo() -> PathBuf {
     normalize(&Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."))
 }
 
 /// Lexical normalisation (drops `.` and resolves `..`), so paths read cleanly in the error view.
+#[cfg(any(not(feature = "portable"), test))]
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -98,6 +105,7 @@ fn port_from_json(value: &Value) -> Result<Option<u16>, String> {
 
 /// Resolve each setting: env var, else config.json, else the default. The python default follows the
 /// resolved repo (`<repo>\.venv\Scripts\python.exe`).
+#[cfg(any(not(feature = "portable"), test))]
 pub fn resolve(
     env: &dyn Fn(&str) -> Option<String>,
     file: &FileConfig,
@@ -123,6 +131,31 @@ pub fn resolve(
         python,
         port,
     })
+}
+
+/// Portable configuration never consults the installed edition's environment or repository.
+#[cfg(feature = "portable")]
+pub fn resolve_portable(file: &FileConfig, resources: &Path) -> Result<HubConfig, String> {
+    Ok(HubConfig {
+        repo_dir: resources.to_path_buf(),
+        python: non_empty(file.python.clone()).map(PathBuf::from).unwrap_or_default(),
+        port: file.port.as_ref().map(port_from_json).transpose()?.flatten().unwrap_or(DEFAULT_PORT),
+    })
+}
+
+#[cfg(feature = "portable")]
+pub fn select_port(file: &FileConfig) -> Result<u16, String> {
+    let explicit = file.port.as_ref().map(port_from_json).transpose()?.flatten();
+    select_available_port(explicit, DEFAULT_PORT..=4544)
+}
+
+#[cfg(feature = "portable")]
+fn select_available_port(explicit: Option<u16>, ports: std::ops::RangeInclusive<u16>) -> Result<u16, String> {
+    let available = |port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok();
+    if let Some(port) = explicit {
+        return if available(port) { Ok(port) } else { Err(format!("配置的端口 {port} 已被占用，请修改便携版 config.json 后重试")) };
+    }
+    ports.into_iter().find(|&port| available(port)).ok_or_else(|| "4444～4544 没有可用端口，请在便携版 config.json 指定其他端口".into())
 }
 
 /// Both launch inputs must exist; the message names the missing path.
@@ -159,17 +192,27 @@ pub fn log_dir() -> PathBuf {
     env_dir("LOCALAPPDATA").join(APP_DIR_NAME).join("logs")
 }
 
+#[cfg(feature = "portable")]
+pub fn portable_root() -> PathBuf {
+    env_dir("LOCALAPPDATA").join(APP_DIR_NAME).join("portable")
+}
+
 /// Load and resolve the live configuration (process env + config.json if present).
-pub fn load() -> Result<HubConfig, String> {
+pub fn load_file() -> Result<FileConfig, String> {
     let path = config_file_path();
-    let file = match std::fs::read(&path) {
+    match std::fs::read(&path) {
         Ok(bytes) => {
             let text = String::from_utf8_lossy(&bytes);
-            parse_file_config(text.trim_start_matches('\u{feff}'))?
+            parse_file_config(text.trim_start_matches('\u{feff}'))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
-        Err(e) => return Err(format!("无法读取 {}：{e}", path.display())),
-    };
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileConfig::default()),
+        Err(e) => Err(format!("无法读取 {}：{e}", path.display())),
+    }
+}
+
+#[cfg(not(feature = "portable"))]
+pub fn load() -> Result<HubConfig, String> {
+    let file = load_file()?;
     let env = |name: &str| std::env::var(name).ok();
     resolve(&env, &file, &built_from_repo())
 }
@@ -352,5 +395,26 @@ mod tests {
             cfg.console_url(Some("a b&c")),
             "http://127.0.0.1:4465/?session=a%20b%26c"
         );
+    }
+
+    #[cfg(feature = "portable")]
+    #[test]
+    fn portable_ignores_external_repository_and_has_its_own_identity() {
+        let file = parse_file_config(r#"{"repo_dir":"E:\\old-hub","port":4500}"#).unwrap();
+        let cfg = resolve_portable(&file, &repo()).unwrap();
+        assert_eq!(cfg.repo_dir, repo());
+        assert_eq!(cfg.port, 4500);
+        assert_eq!(APP_DIR_NAME, "mcp-agent-hub-portable");
+    }
+
+    #[cfg(feature = "portable")]
+    #[test]
+    fn portable_skips_busy_ports_but_rejects_busy_explicit_port() {
+        let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = busy.local_addr().unwrap().port();
+        assert!(select_available_port(Some(port), port..=port).is_err());
+        assert!(select_available_port(None, port..=port).is_err());
+        drop(busy);
+        assert_eq!(select_available_port(Some(port), port..=port).unwrap(), port);
     }
 }
