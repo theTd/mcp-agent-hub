@@ -79,6 +79,7 @@ export function eventTypeTone(type) {
 const ACTIVITY_RULES = [
   [/^Interactive session running/i, () => '交互会话运行中'],
   [/^Session exited \(exit_code=(-?\d+)\)/i, (m) => `进程已退出（退出码 ${m[1]}）`],
+  [/^Session crashed \(exit_code=(-?\d+)\)/i, (m) => `异常退出（退出码 ${m[1]}）`],
   // F2 addition: the worker's exit message carries the parent-call hint after the code.
   [/^(?:Sub-Agent\s*)?进程已退出\s*[（(]\s*exit_code=(-?\d+)\s*[)）][\s\S]*$/i, (m) => `进程已退出（退出码 ${m[1]}）`],
   [/^Task completed/i, () => '任务已完成'],

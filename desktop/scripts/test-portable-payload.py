@@ -78,6 +78,7 @@ def main():
     check(not (runtime / "downloads").exists(), "cached EXE startup makes zero Python downloads")
     check(not (source / "hub_worker.py").exists() and not (source / "worker_bridge_mcp.py").exists(), "retired worker bridge is absent")
     check((source / "native_session_launch.py").is_file(), "native launch configuration helper is packaged")
+    check((source / "agent_guidance.py").is_file(), "English agent guidance is packaged")
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

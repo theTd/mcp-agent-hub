@@ -30,6 +30,7 @@ REAL_PTY_PROCESS = PtyProcess
 
 from transcript_tail import TranscriptTail, read_complete_lines
 from native_session_launch import strip_legacy_worker_bridge_args
+from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 
@@ -3327,7 +3328,11 @@ class HubSessionManager:
     def get_mcp_enabled_profiles(self) -> Dict[str, Dict[str, Any]]:
         """Returns a compact, enabled-only view of profiles for MCP callers (no disabled models or internal launch details)."""
         result: Dict[str, Dict[str, Any]] = {}
+        builtins = self._builtin_profiles()
         for pid, p in self.get_enabled_profiles().items():
+            description = p.get("description") or ""
+            if pid in builtins and description == builtins[pid].get("description"):
+                description = PROFILE_DESCRIPTIONS[pid]
             prof_item: Dict[str, Any] = {
                 "id": p.get("id") or pid,
                 "name": p.get("name") or pid,
@@ -3338,7 +3343,7 @@ class HubSessionManager:
                 "available_models": list(p.get("available_models") or []),
                 "available_thinking_levels": list(p.get("available_thinking_levels") or []),
                 "when_to_use": p.get("when_to_use") or "",
-                "description": p.get("description") or "",
+                "description": description,
                 "env": dict(p.get("env") or {}),
                 BYPASS_APPROVALS_KEY: bool(p.get(BYPASS_APPROVALS_KEY, False)),
             }
@@ -3348,41 +3353,27 @@ class HubSessionManager:
     def build_routing_guide_markdown(self) -> str:
         """B12: the guide parent agents read. Only enabled profiles and their engines' enabled models appear."""
         active_engines = self._active_engine_ids()
-        lines: List[str] = ["# Sub-Agent 调用与路由指南"]
+        lines: List[str] = ["# Subagent routing guide"]
         instructions = (self.global_routing_instructions or "").strip()
         if instructions:
             lines.append(instructions)
         lines.append("")
-        lines.append("## 异步等待规范与命名规范")
-        lines.append(
-            "- **必填简短可读名称 (`title`)**：调用 `spawn_subagent` 派发 Sub-Agent 时，**请务必为其起一个简短可读的 `title`**（建议 4～16 个字或 2～5 个词，例如 `\"修复终端断连\"`、`\"前端侧边栏改造\"`、`\"实机光影巡检\"`），概括该 Sub-Agent 的核心职责，取代截取长 Prompt 前端作为名称。"
-        )
-        lines.append(
-            "- **环境变量注入 (`env`)**：调用 `spawn_subagent(..., env={\"KEY\": \"VALUE\"})` 可为该会话注入专属环境变量（与 Profile 内置 `env` 合并，同名变量由本次 `env` 覆盖），并在会话恢复（`resume_subagent`）时自动保留。"
-        )
-        lines.append(
-            "- 启动 (`spawn_subagent`)、发消息 (`send_to_subagent`) 或恢复 (`resume_subagent`) 后，若任务尚未结束，返回值会提供 `background_poll_command`。"
-        )
-        lines.append(
-            "- **严禁在前台同步执行 `background_poll_command`**，也**严禁在主回合里循环调用 `wait_subagent_events` 死等**。"
-        )
-        lines.append(
-            "- 正确做法：使用宿主 Shell 工具的**后台异步模式**（如 `run_in_background=true` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后立即结束当前回合等待后台命令退出唤醒（或继续并行处理其他工作）。"
-        )
+        lines.append("## Dispatch and waiting")
+        lines.extend(f"- {rule}" for rule in ROUTING_RULES)
         lines.append("")
-        lines.append("## Profile（agent_type）")
+        lines.append("## Profiles (agent_type)")
         for pid, p in self.profiles.items():
             if not p.get("enabled", True):
                 continue
             name = p.get("name") or pid
-            def_mod = p.get("default_model") or "无"
-            def_thk = p.get("default_thinking_level") or "无"
-            lines.append(f"- `{pid}` — {name}｜默认：{def_mod} · {def_thk}")
+            def_mod = p.get("default_model") or "none"
+            def_thk = p.get("default_thinking_level") or "none"
+            lines.append(f"- `{pid}` — {name} | defaults: {def_mod} / {def_thk}")
             when_lines = [ln.strip() for ln in (p.get("when_to_use") or "").splitlines() if ln.strip()]
             if when_lines:
-                lines.append("  何时用：" + "\n  ".join(when_lines))
+                lines.append("  When to use: " + "\n  ".join(when_lines))
         lines.append("")
-        lines.append("## 可用模型与思考等级（model / thinking_level）")
+        lines.append("## Available models and thinking levels (model / thinking_level)")
         for eng, info in self.engines_catalog.items():
             if eng not in active_engines:
                 continue
@@ -3391,15 +3382,15 @@ class HubSessionManager:
                 continue
             header = f"### {eng}"
             if eng == "agy":
-                header += '（思考等级会拼成模型名后缀：传 model="gemini-4-argon", thinking_level="high" 或直接传 model="gemini-4-argon-high" 均可）'
+                header += ' (thinking level is a model-name suffix; pass model="gemini-4-argon", thinking_level="high" or model="gemini-4-argon-high")'
             lines.append(header)
             for m in models:
-                levels = ", ".join(m.get("thinking_levels") or []) or "无"
+                levels = ", ".join(m.get("thinking_levels") or []) or "none"
                 note = (m.get("note") or "").strip()
                 model_line = f"- `{(m.get('id') or '')}`"
                 if note:
                     model_line += f" — {note}"
-                model_line += f"｜思考等级：{levels}"
+                model_line += f" | thinking levels: {levels}"
                 lines.append(model_line)
         return "\n".join(lines)
 
@@ -5471,15 +5462,18 @@ class HubSessionManager:
         else:
             self.pending_questions[req_id]["interaction"] = interaction
 
-        opts_lines = "\n".join(f"  [{i + 1}] {opt}" for i, opt in enumerate(options)) if options else "  (自由文本回复)"
+        opts_lines = "\n".join(f"  [{i + 1}] {opt}" for i, opt in enumerate(options)) if options else "  (free-text reply)"
         ev_type = "approval_request" if kind == "approval_request" else "question"
         formatted_content = (
-            f"【{'⚠️ 高风险操作审批请求 (Approval Request)' if kind == 'approval_request' else '❓ Sub-Agent 交互提问 / 选项征询 (Interactive Question)'}】\n"
-            f"- 来源引擎: `{interaction['engine']}` (`{source}`) | request_id=`{req_id}`\n"
-            f"- 标题: {title}\n"
-            f"- 详情: {prompt}\n"
-            f"- 可选操作/选项:\n{opts_lines}\n"
-            f"👉 主 Agent 请调用 `respond_to_subagent_approval_or_choice(session_id='{session.session_id}', decision='approve'|'approve_session'|'deny', option_index=1..N, custom_input='...')` 代批或代选。"
+            f"{'Approval request' if kind == 'approval_request' else 'Interactive question'}\n"
+            f"- Engine: `{interaction['engine']}` (`{source}`) | request_id=`{req_id}`\n"
+            f"- Title: {title}\n"
+            f"- Details: {prompt}\n"
+            f"- Options:\n{opts_lines}\n"
+            f"Use respond_to_subagent_approval_or_choice(session_id='{session.session_id}', "
+            f"request_id='{req_id}') with decision='approve' / 'approve_session' / 'deny' for approvals, "
+            "option_index=1..N for choices, or custom_input for free text. "
+            "Free text alone denies an approval; approve_session may persist an engine allow rule."
         )
         await self.record_worker_event(
             session.session_id,
@@ -9518,17 +9512,17 @@ class HubSessionManager:
         lines = [ln for ln in text.splitlines() if ln.strip()][-15:]
         tail = "\n".join(lines)
         if not tail:
-            return "（无输出）"
+            return "(no output)"
         return tail[-1500:]
 
     def _exit_event_content(self, session_id: str, exit_code: int, sess: Optional[AgentSession]) -> str:
         resumable = bool(sess.resumable) if sess is not None else False
-        hint = f"可调用 get_subagent_final_response('{session_id}') 获取持久化的最终输出与执行轨迹"
+        hint = f"Call get_subagent_final_response('{session_id}') for the persisted answer and trace."
         if resumable:
-            hint += f"；可调用 resume_subagent('{session_id}') 恢复该会话"
+            hint += f" Call resume_subagent('{session_id}') to resume this session."
         if sess is not None and sess.end_reason == "crashed":
-            return f"异常退出（退出码 {exit_code}）。最后输出：\n{self._crash_tail(sess)}\n{hint}。"
-        return f"进程已退出（退出码 {exit_code}）。{hint}。"
+            return f"Session crashed (exit_code={exit_code}). Last output:\n{self._crash_tail(sess)}\n{hint}"
+        return f"Session exited (exit_code={exit_code}). {hint}"
 
     async def _on_session_exit(self, session: Any, exit_code: int):
         """One exited process → at most one lifecycle event for its session id (A7).
@@ -9996,11 +9990,11 @@ class HubSessionManager:
             lines.append(f"Destination: {parsed['destination']}")
         if session_key == "p":
             lines.append(
-                "（approve_session = 发送 p：永久放行，codex 会把这个命令前缀的放行规则写入 "
-                "~/.codex/rules/default.rules，以后所有 codex 会话都不再询问）"
+                "approve_session sends p: permanently allow this command prefix in "
+                "~/.codex/rules/default.rules for all Codex sessions."
             )
         elif not session_key:
-            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
+            lines.append("No session approval option is offered; approve_session approves once.")
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -10098,11 +10092,11 @@ class HubSessionManager:
         has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
         if persists_opt is not None:
             lines.append(
-                f"（approve_session = 发送 {persists_opt.get('key', '2')}：不再询问该命令，"
-                "claude 会把该放行规则写入项目 .claude/settings.local.json）"
+                f"approve_session sends {persists_opt.get('key', '2')}: persist this command's "
+                "allow rule in the project's .claude/settings.local.json."
             )
         elif not has_session_opt:
-            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
+            lines.append("No session approval option is offered; approve_session approves once.")
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -10197,11 +10191,11 @@ class HubSessionManager:
         has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
         if persists_opt is not None:
             lines.append(
-                f"（approve_session = 发送 {persists_opt.get('key', '2')}：不再询问该命令，"
-                "claude 会把该放行规则写入项目 .claude/settings.local.json）"
+                f"approve_session sends {persists_opt.get('key', '2')}: persist this command's "
+                "allow rule in the project's .claude/settings.local.json."
             )
         elif not has_session_opt:
-            lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
+            lines.append("No session approval option is offered; approve_session approves once.")
         req_id = (
             str(hook_ev.get("tool_use_id") or "").strip()
             or f"claude-perm-{int(float(hook_ev.get('timestamp') or time.time()) * 1000)}"

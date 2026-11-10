@@ -28,6 +28,7 @@ from session_manager import (
 )
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
+from agent_guidance import BACKGROUND_POLL_HINT, SERVER_INSTRUCTIONS
 
 BASE_DIR = Path(__file__).parent.resolve()
 PROFILES_PATH = default_profiles_path(BASE_DIR)
@@ -117,8 +118,8 @@ def _session_can_receive(session) -> bool:
 
 
 INJECTION_PENDING_HINT = (
-    "文本将在 TUI 就绪后（或前一条输入完成后）输入并确认提交，调用尚未等到结果；"
-    "最终结果可用 get_subagent_status_and_trace 查看 last_injection。"
+    "Text will be submitted once the TUI is ready and any earlier input has finished. "
+    "Submission is still pending; inspect last_injection with get_subagent_status_and_trace."
 )
 
 
@@ -172,26 +173,17 @@ HUB_VERSION = "4.1.7"
 mcp = FastMCP(
     "SubAgent-NonHeadless-Hub",
     version=HUB_VERSION,
-    instructions=(
-        "统一的非无头 (Non-Headless) Sub-Agent 聚合网关，支持主从双向实时通信、全链路步骤/工具轨迹追踪与生命周期后持久化查询。\n"
-        "核心能力与【严禁前台阻塞等待规范】：\n"
-        "1. `spawn_subagent(agent_type, task, model, thinking_level, cwd, title, wait_seconds)`：在统一总控台中以非无头模式启动 Sub-Agent（可动态指定 `model` 与 `thinking_level`；**请务必传入简短可读的 `title`**，如 `\"编译错误排查\"`、`\"Codex 会话修复\"`，4~16 个汉字或 2~5 个英文词，严禁直接把长 prompt 当作名字），返回 `session_id` 与后台监听命令 `background_poll_command`；\n"
-        "2. 【等待方式——严禁前台挂起 poll】：启动或发消息后，**绝对不要在前台同步执行 `background_poll_command`**，也**不要在主回合里循环调用 `wait_subagent_events` 死等**！正确做法：将返回的 `background_poll_command` 交给宿主 Shell 工具以**后台异步模式**运行（例如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`），然后立即结束当前回合等待系统自动唤醒（或继续并行处理其他工作）；\n"
-        "3. `get_subagent_status_and_trace(session_id)`：随时非阻塞查询 Sub-Agent 当前执行到第几步 (`step_count`)、最近调用了哪些工具 (`recent_tool_calls`)、产生了哪些中间消息 (`intermediate_messages`)；\n"
-        "4. `get_subagent_final_response(session_id)`：无论 Sub-Agent 仍在运行还是已经退出/销毁，均可从 SQLite 持久化库中获取其 `final_response`；\n"
-        "5. `send_to_subagent` / `reply_to_subagent` / `respond_to_subagent_approval_or_choice` / `resume_subagent`：主从双向发消息、回答提问、高风险操作代批与归档会话恢复。"
-    ),
+    instructions=SERVER_INSTRUCTIONS,
 )
 
 
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
     """
-    列出网关中所有已启用的 Sub-Agent 引擎与 Profile 配置（包含 omp、kimi、agy、codex、claude、dsh 等）。
-    返回内容包含：
-    1. `routing_guide_markdown`：Sub-Agent 调用与路由指南，汇总已启用的 Profile、可用模型与思考等级；
-    2. `profiles`：每个已启用 Profile 的默认配置、`when_to_use`、可用模型列表 (`available_models`) 与思考等级 (`available_thinking_levels`)；
-    3. `engines_catalog`：各引擎已启用的模型与思考等级详情（已禁用的模型与 Profile 已自动过滤，不占用上下文）。
+    List enabled profiles, engines, models and thinking levels.
+    Read routing_guide_markdown and each profile's when_to_use before choosing an agent.
+    Profiles include defaults; engines_catalog excludes disabled profiles and models.
+    Set refresh_discovery=true to refresh the installed engine catalog.
     """
     await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
     base_url = hub_api_base_url()
@@ -207,10 +199,9 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
 @mcp.tool()
 async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Dict[str, Any]:
     """
-    [自动探测模型与思考等级] 实时扫描宿主机上安装的所有 Sub-Agent 引擎（omp / kimi / agy / codex / claude / dsh），
-    返回每个引擎当前已启用的模型列表 (`available_models`)、可用思考等级 (`available_thinking_levels`)，
-    以及 `routing_guide_markdown`。已禁用的模型会自动过滤。
-    主 Agent 可将 `available_models` 中的任意 `model` 和 `thinking_level` 直接传入 `spawn_subagent(agent_type, task, model=..., thinking_level=...)`。
+    Discover enabled models and thinking levels for installed engines.
+    Pass a listed model and thinking_level to spawn_subagent; follow routing_guide_markdown.
+    Set refresh=true to refresh discovery rather than use cached results.
     """
     await ensure_profiles_loaded(refresh_discovery=refresh)
     return {
@@ -233,15 +224,14 @@ async def spawn_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    以非无头（Non-Headless 真实交互式 TUI / GUI）模式在统一总控台中拉起一个 Sub-Agent，并返回 `session_id`、`transcript_summary` 与后台监听命令 `background_poll_command`。
-    - 【可读名称规范 (`title`)】：派发 Sub-Agent 时**请务必通过 `title` 参数传入一个简短可读的名字**（建议 4~16 个汉字或 2~5 个英文词，概括该 Sub-Agent 的职责或任务主题，如 `"排查构建失败"`、`"前端侧栏布局修复"`、`"API 接口联调"`），取代直接截取长 prompt 前端作为会话名称。
-    - 【异步等待规范（严禁前台挂 poll）】：若本次调用返回时任务尚未完成，**请勿在前台同步执行 `background_poll_command`，也请勿前台循环调用 `wait_subagent_events`**。请使用宿主命令工具的**后台异步模式**（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`）启动 `background_poll_command`，随后直接结束当前回合等待后台任务完成唤醒（或并行执行其他工作）。
-    - 支持通过 `model` 和 `thinking_level` 动态指定任意已启用模型与思考等级（如 `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `auto`）。
-    - 支持通过 `env`（`Dict[str, str]`）在拉起时为该 Sub-Agent 进程注入专属环境变量（与 Profile 内置 `env` 合并，同名变量由本次 `env` 覆盖），并在会话恢复时自动保留。
-    - 引擎默认以「高风险操作需审批」模式运行：常规读写与命令自动执行；高风险操作（递归/强制删除、强推与 `git reset --hard` 等破坏性 git、发布包、格式化磁盘/关机等，具体范围以各引擎自身的判定为准）会暂停。
-    - 只有用户在总控台给某个 Profile 打开 `bypass_approvals`（全自动）时才不审批；返回值 `high_risk_approval` 为 `false` 即表示本次为全自动（`null` 表示该引擎没有 Hub 审批，如 dsh / pwsh），`launch_notes` 会写明。
-    - 高风险操作暂停时，会话进入 `waiting_parent` 状态，并带有 `approval_request` 事件（`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
-    - 请调用 `respond_to_subagent_approval_or_choice(session_id, decision=...)` 代批或代选，未答复前 Sub-Agent 会一直等待。
+    Start an interactive subagent and return session_id, transcript_summary and background_poll_command.
+    Provide a short, readable title (for example, "Fix build failure"). Choose model and
+    thinking_level from list_agent_profiles. env overrides profile variables and survives resume.
+    Run the returned polling command in the host shell's background mode; see server instructions.
+    High-risk actions pause for approval unless the user enabled the profile's bypass_approvals.
+    high_risk_approval is true when enforced, false when bypassed, or null for engines without
+    Hub approval. Questions and approvals set waiting_parent and pending_interaction; answer
+    with reply_to_subagent or respond_to_subagent_approval_or_choice.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -262,7 +252,7 @@ async def spawn_subagent(
                 await ctx.report_progress(
                     progress=min(elapsed, wait_seconds),
                     total=wait_seconds,
-                    message=f"Sub-Agent [{session.session_id}] 正在启动执行 (step={session.step_count}, {int(elapsed)}s)...",
+                    message=f"Subagent [{session.session_id}] is starting (step={session.step_count}, {int(elapsed)}s)...",
                 )
 
         settle_info = await hub.wait_for_output_settle(
@@ -308,11 +298,7 @@ async def spawn_subagent(
         "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
-        "background_poll_hint": (
-            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
-            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
-            "若并行派发了多个 Sub-Agent，可将多个 session_id 以英文逗号拼接传给同一个 hub_poll.py（如 `--session id1,id2,id3`），切勿自行编写轮询脚本。"
-        ),
+        "background_poll_hint": BACKGROUND_POLL_HINT,
         "worker_events": events,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
@@ -326,12 +312,9 @@ async def get_subagent_status_and_trace(
     recent_messages_limit: int = 10,
 ) -> Dict[str, Any]:
     """
-    [核心可观测性工具] 查询指定 Sub-Agent 的实时或历史工作情况：
-    - 当前执行到了第几步 (`step_count`) 与当前活动描述 (`current_activity`)
-    - 最近执行了哪些工具及其入参/结果摘要 (`recent_tool_calls`)
-    - 产生了哪些中间思考或进度消息 (`intermediate_messages`)
-    - 是否有正在等待主 Agent 回答的问题 (`pending_question_id`)
-    - 最终响应 (`final_response`，即使 Sub-Agent 已经退出或被关闭，仍可从 SQLite 持久化存储中查到)
+    Read live or persisted progress: step_count, current_activity, recent_tool_calls,
+    intermediate_messages, pending_question_id and final_response. Results remain readable
+    after exit. Intermediate text is progress, not proof of turn completion.
     """
     return await hub.get_subagent_status_and_trace(
         session_id=session_id,
@@ -343,9 +326,9 @@ async def get_subagent_status_and_trace(
 @mcp.tool()
 async def get_subagent_final_response(session_id: str) -> Dict[str, Any]:
     """
-    [生命周期后持久化查询工具] 获取指定 Sub-Agent 的最终响应 (`final_response`) 与任务总结。
-    即使该 Sub-Agent 进程已经自然退出 (`exited`) 或已被调用 `terminate_subagent` 销毁，
-    本工具依然能从网关的 SQLite 数据库中完整检索出它的 `final_response`、修改文件列表和终端历史尾部。
+    Retrieve the stored final_response, summary and terminal history after a turn or process ends.
+    Check from_previous_turn: a resumed or continuing session retains its previous answer
+    until the new turn produces one. An intermediate response does not confirm completion.
     """
     return await hub.get_subagent_final_response(session_id=session_id)
 
@@ -359,9 +342,10 @@ async def send_to_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    [主 Agent -> Sub-Agent] 向运行中的非无头 Sub-Agent 发送消息、补充指令或回答提问：
-    1. 如果该 Sub-Agent 当前正等待原生提问或审批/选项提示（`pending_interaction`）等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
-    2. 否则，会将 `text` 写入 Sub-Agent 的交互式虚拟终端（ConPTY）及主从邮箱，实现实时中途干预（Steering）或多轮对话。
+    Send instructions or a follow-up message to a subagent, resuming an ended resumable session.
+    If pending_interaction exists, text answers that native question or approval prompt.
+    Otherwise it is delivered through the engine's terminal or native message API.
+    Check last_injection for submission status and use background_poll_command for further events.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -422,7 +406,7 @@ async def send_to_subagent(
                 await ctx.report_progress(
                     progress=min(elapsed, wait_seconds),
                     total=wait_seconds,
-                    message=f"等待 Sub-Agent [{session_id}] 处理消息 (step={session.step_count}, {int(elapsed)}s)...",
+                    message=f"Subagent [{session_id}] is processing the message (step={session.step_count}, {int(elapsed)}s)...",
                 )
 
         settle_info = await hub.wait_for_output_settle(
@@ -454,10 +438,7 @@ async def send_to_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": (
-            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
-            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
-        ),
+        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -471,11 +452,10 @@ async def resume_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    [会话恢复工具] 恢复一个已经结束或已归档的 Sub-Agent 会话，沿用同一个 `session_id`（主 Agent 的引用继续有效）：
-    - 按引擎的恢复配方重新启动 CLI 并接上原来的对话（omp / kimi / agy / codex / claude / dsh），工作目录、模型与思考等级沿用归档记录；
-    - 传入 `text` 时，恢复后按该引擎的初始任务方式把消息交给它；不传则只恢复会话；
-    - 会话仍在运行时不重复启动，直接返回当前状态；
-    - 不可恢复时会抛出中文原因（例如 `PowerShell 会话结束后无法找回上下文`）。
+    Resume an ended or archived native conversation with the same session_id, working directory,
+    model and thinking level. Optional text starts a new turn; omit it to restore only.
+    A live session returns its current state without starting another process.
+    A non-resumable session raises an error with the reason.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -512,7 +492,7 @@ async def resume_subagent(
                 await ctx.report_progress(
                     progress=min(elapsed, wait_seconds),
                     total=wait_seconds,
-                    message=f"正在等待 Sub-Agent [{session_id}] 恢复并处理消息 (step={session.step_count}, {int(elapsed)}s)...",
+                    message=f"Subagent [{session_id}] is resuming and processing the message (step={session.step_count}, {int(elapsed)}s)...",
                 )
 
         settle_info = await hub.wait_for_output_settle(
@@ -542,10 +522,7 @@ async def resume_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": (
-            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
-            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
-        ),
+        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -554,9 +531,9 @@ async def resume_subagent(
 @mcp.tool()
 async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
     """
-    [归档列表工具] 列出已结束并归档的 Sub-Agent 会话（最新在前），可按会话 ID、任务、工作目录或 Profile 过滤。
-    每条记录返回：`session_id`、Profile、模型 · 思考等级、工作目录、任务首行、结束原因、结束时间，
-    以及是否可恢复 (`resumable`) 与不可恢复的原因 (`resume_block_reason`)；用 `resume_subagent` 恢复。
+    List archived sessions, newest first; filter by session ID, task, working directory or profile.
+    Entries include model, thinking level, end reason/time, resumable and resume_block_reason.
+    Restore a resumable entry with resume_subagent.
     """
     payload = await hub.list_archive(limit=limit, offset=0, query=query or "")
     sessions = [
@@ -584,7 +561,7 @@ async def reply_to_subagent(
     answer: str,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 的原生交互提示提出的问题/审批请求，立即解除 Sub-Agent 的等待阻塞。"""
+    """Answer a pending native question or approval prompt; pass request_id to target that interaction."""
     delivery = await hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
@@ -627,19 +604,17 @@ async def respond_to_subagent_approval_or_choice(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    [主 Agent 代批高风险操作 & 代选交互选项工具]
-    引擎默认以「高风险操作需审批」模式运行（Profile 打开 `bypass_approvals` 时为全自动，不会出现审批请求）：Sub-Agent 要执行高风险操作时，会话进入 `waiting_parent` 状态并发出 `approval_request` 事件
-    （`pending_interaction.kind == "approval_request"`）；Sub-Agent 主动提问时同样进入 `waiting_parent`（`kind == "question"`）。
-    主 Agent 调用本工具按各 CLI 引擎（dsh / kimi / omp / codex / claude / agy）的原生按键或接口完成代批或代选，答复前 Sub-Agent 会一直等待：
-    - `decision`：审批决定，`"approve"`（只允许这一次）、`"approve_session"`（本会话内同类操作不再询问）、`"deny"`（拒绝）；
-      审批请求必须给出明确决定，不传任何参数不会默认放行。
-    - `option_index`：1-based 选项序号，直接选择 `pending_interaction.options` 中的第 N 项（agy、omp 会写入全局设置的「永久允许/永久拒绝」选项和 agy「本对话内一律拒绝」选项不会出现在列表里；codex 的 p 选项会出现，见下）；
-    - `custom_input`：与 `decision="deny"` 同传时作为拒绝理由反馈给 Sub-Agent；审批请求只传 `custom_input` 时视为「拒绝并反馈这段文字」；
-      回答问题时作为 Other 自由输入。
-    - 引擎差异：codex 命令审批的 `approve_session` 发送 p＝**永久放行**：codex 会把该命令前缀的放行规则写入用户的
-      `~/.codex/rules/default.rules`，之后所有 codex 会话都不再询问（codex 改文件审批的 `approve_session` 发送 a，只对这些文件、本会话有效）；
-      由规则触发的 omp 审批没有「本会话允许」，`approve_session` 会按允许一次处理；kimi 的「本会话允许」对危险命令不生效。
-      返回值的 `notes` 会说明实际效果。
+    Answer a pending approval or choice using the engine's native keys or API.
+    decision is approve (once), approve_session (scope depends on engine), or deny.
+    Approvals require an explicit decision; empty arguments never approve.
+    option_index selects a 1-based entry in pending_interaction.options. custom_input answers
+    a question, or supplies denial feedback; custom_input alone denies an approval request.
+    AGY/OMP permanent global rules and AGY conversation-wide denial options are filtered out.
+    Codex command approve_session sends p and permanently saves the command prefix in
+    ~/.codex/rules/default.rules for ALL Codex sessions; edit approval sends a for these files
+    in this session. Claude may persist an allow rule in .claude/settings.local.json when offered.
+    Rule-triggered OMP prompts fall back to approve-once; Kimi session approval does not cover
+    dangerous commands. Inspect the returned notes for the actual scope.
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -661,7 +636,7 @@ async def respond_to_subagent_approval_or_choice(
                 await ctx.report_progress(
                     progress=min(elapsed, wait_seconds),
                     total=wait_seconds,
-                    message=f"已向 Sub-Agent [{session_id}] 发送代批/代选指令 ({action_result.get('chosen_label')})，等待继续执行 ({int(elapsed)}s)...",
+                    message=f"Sent interaction response to subagent [{session_id}] ({action_result.get('chosen_label')}); waiting for progress ({int(elapsed)}s)...",
                 )
 
         settle_info = await hub.wait_for_output_settle(
@@ -686,10 +661,7 @@ async def respond_to_subagent_approval_or_choice(
         "worker_events": events,
         "next_seq": next_seq,
         "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": (
-            "严禁在前台同步执行此命令或循环调用 wait_subagent_events！"
-            "请用 Shell 工具的后台异步模式（如 run_in_background=True 或 WaitMsBeforeAsync=500）启动 background_poll_command，然后立即结束当前回合等待唤醒。"
-        ),
+        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -703,10 +675,9 @@ async def wait_subagent_events(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    [同步兜底工具 —— 默认请勿使用] 同步阻塞当前 MCP 工具调用，等待指定 Sub-Agent（或 'all'）发来事件。
-    ⚠️ 重要提示：此工具会在前台同步卡住主 Agent 的当前回合！
-    - 只要宿主支持后台命令（如 `run_in_background=True` 或 `WaitMsBeforeAsync=500`），**请始终在后台异步运行 `spawn_subagent` / `send_to_subagent` 返回的 `background_poll_command`** 并结束当前回合等待唤醒，**严禁在前台调用本工具或在前台跑 `hub_poll.py` 轮询**。
-    - 仅在纯 MCP 客户端完全没有 Shell 工具或不支持后台任务时，才将本工具作为兜底使用。
+    Wait synchronously for events from a session or 'all' after after_seq.
+    Use only when the host lacks a shell or background task support. Otherwise run the returned
+    background_poll_command in background mode and yield for its completion notification.
     """
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     elapsed = 0.0
@@ -728,7 +699,7 @@ async def wait_subagent_events(
             await ctx.report_progress(
                 progress=min(elapsed, timeout_seconds),
                 total=timeout_seconds,
-                message=f"正在监听 Sub-Agent [{session_id}] 的消息与完成事件 ({int(elapsed)}s)...",
+                message=f"Waiting for subagent [{session_id}] messages or completion ({int(elapsed)}s)...",
             )
 
     return await hub.poll_worker_events(session_id=session_id, after_seq=after_seq, timeout_sec=0.1)
@@ -737,9 +708,8 @@ async def wait_subagent_events(
 @mcp.tool()
 async def summarize_subagent_transcript(session_id: str) -> Dict[str, Any]:
     """
-    [CLI 专属 Transcript 总结器] 针对不同 CLI 应用程序（omp / kimi / codex / claude / agy / dsh）解析其原生结构化会话日志，
-    过滤掉所有 TUI 边框、动画 Spinner、状态栏等视觉噪音，仅向主 Agent 返回最核心的思考摘要 (`key_thoughts`)、
-    工具调用链 (`recent_actions`)、最新结论 (`latest_conclusion`) 与高信噪比 Markdown 简报 (`digest_markdown`)。
+    Summarize native records as key_thoughts, recent_actions, latest_conclusion and digest_markdown.
+    Terminal borders, spinners and status bars are filtered. A summary alone does not prove completion.
     """
     return await hub.summarize_transcript(session_id=session_id)
 
@@ -751,9 +721,8 @@ async def read_subagent_screen(
     include_raw_tui: bool = False,
 ) -> Dict[str, Any]:
     """
-    读取指定非无头 Sub-Agent 的状态摘要与去噪后的关键输出行。
-    默认 (`include_raw_tui=False`) 自动使用 CLI Transcript 总结器与 TUI 噪音过滤器剔除边框和状态栏，避免干扰主 Agent 注意力；
-    仅当显式传入 `include_raw_tui=True` 时才返回原始虚拟终端屏幕字符。
+    Read status, a transcript summary and sanitized terminal output.
+    Set include_raw_tui=true only when raw terminal characters are needed for diagnosis.
     """
     transcript_summary = await hub.summarize_transcript(session_id=session_id)
     session = hub.sessions.get(session_id)
@@ -783,7 +752,7 @@ async def read_subagent_screen(
 
     persisted = await hub.db.get_session_record(session_id)
     if not persisted:
-        raise ValueError(f"找不到会话 {session_id}")
+        raise ValueError(f"Session '{session_id}' not found.")
     # Archive spec §5: an archived session's screen is the last_screen the final record kept.
     last_screen = persisted.get("last_screen") or ""
     if last_screen:
@@ -818,7 +787,7 @@ async def read_subagent_screen(
 
 @mcp.tool()
 async def list_active_sessions(include_historical: bool = True, limit: int = 25) -> Dict[str, Any]:
-    """列出当前总控台中所有正在运行的 Sub-Agent 会话，以及 SQLite 中持久化的历史已结束会话。"""
+    """List live console sessions and persisted historical sessions."""
     active = [s.to_dict() for s in hub.sessions.values()]
     result: Dict[str, Any] = {
         "global_seq": hub.global_seq,
@@ -835,9 +804,8 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
 @mcp.tool()
 async def terminate_subagent(session_id: str) -> Dict[str, Any]:
     """
-    关闭指定的 Sub-Agent 会话进程。
-    关闭前会将最终响应、终端滚动历史和工具调用轨迹交给后台持久化队列，
-    关闭后主 Agent 依然可以随时调用 `get_subagent_final_response(session_id)` 或 `get_subagent_status_and_trace(session_id)` 查询其结果！
+    Stop a subagent process and queue its answer, terminal history and tool trace for persistence.
+    Results remain readable with get_subagent_final_response or get_subagent_status_and_trace.
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -871,13 +839,13 @@ async def attach_desktop_gui_window(
     window_title_keyword: str,
     tuck_offscreen: bool = True,
 ) -> Dict[str, Any]:
-    """查找宿主机桌面上标题包含指定关键词的原生 GUI 窗口，纳入统一 Web 总控台投屏管控，并可移至屏幕外隐藏。"""
+    """Attach a desktop window matching the title keyword to the console; optionally tuck it offscreen."""
     windows = Win32WindowHelper.list_top_windows()
     matched = [w for w in windows if window_title_keyword.lower() in w["title"].lower()]
     if not matched:
         return {
             "attached": False,
-            "message": f"未找到标题包含 '{window_title_keyword}' 的桌面窗口",
+            "message": f"No desktop window title contains '{window_title_keyword}'",
             "available_windows": windows[:15],
         }
     target = matched[0]
