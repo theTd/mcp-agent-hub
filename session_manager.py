@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,6 +27,10 @@ from winpty import PtyProcess
 # R6: the real class is kept apart from the module-level name so a test can replace
 # session_manager.PtyProcess with a fake without making the shutdown tree-kill touch a fake PID.
 REAL_PTY_PROCESS = PtyProcess
+
+from transcript_tail import TranscriptTail
+from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
+from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 
 from dsh_endpoint import dsh_base_url, dsh_url
 from model_discovery import AgentModelDiscovery
@@ -82,490 +85,6 @@ class BITMAPINFOHEADER(ctypes.Structure):
     ]
 
 
-class HubDatabase:
-    """SQLite persistence layer ensuring Sub-Agent trace, intermediate messages, and final_response survive process exit & hub restarts."""
-
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self._lock = threading.Lock()
-        self._init_db()
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self):
-        with self._lock, self._conn() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    profile_id TEXT,
-                    profile_name TEXT,
-                    kind TEXT,
-                    title TEXT,
-                    cwd TEXT,
-                    status TEXT,
-                    created_at REAL,
-                    updated_at REAL,
-                    ended_at REAL,
-                    exit_code INTEGER,
-                    step_count INTEGER DEFAULT 0,
-                    current_activity TEXT DEFAULT '',
-                    last_task TEXT DEFAULT '',
-                    engine TEXT DEFAULT '',
-                    effective_model TEXT,
-                    effective_thinking_level TEXT,
-                    final_response TEXT,
-                    final_response_source TEXT,
-                    files_changed_json TEXT DEFAULT '[]',
-                    scrollback_text TEXT DEFAULT '',
-                    transcript_path TEXT DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS tool_calls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT,
-                    step_num INTEGER,
-                    timestamp REAL,
-                    tool_name TEXT,
-                    input_summary TEXT,
-                    output_summary TEXT,
-                    status TEXT,
-                    source TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_tools_session ON tool_calls(session_id, id);
-
-                CREATE TABLE IF NOT EXISTS intermediate_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT,
-                    step_num INTEGER,
-                    timestamp REAL,
-                    content TEXT,
-                    source TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_msgs_session ON intermediate_messages(session_id, id);
-
-                CREATE TABLE IF NOT EXISTS worker_events (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT,
-                    timestamp REAL,
-                    type TEXT,
-                    category TEXT,
-                    content TEXT,
-                    status TEXT,
-                    files_changed_json TEXT,
-                    request_id TEXT
-                );
-                """
-            )
-            # B9: persisted history must say which engine/model really ran, and which process status ended.
-            # Archive spec §3: an ended session keeps everything needed to view and revive it. Old rows
-            # get NULLs; every ALTER that already ran fails harmlessly, so a second start is a no-op.
-            for ddl in (
-                "ALTER TABLE sessions ADD COLUMN transcript_path TEXT DEFAULT ''",
-                "ALTER TABLE sessions ADD COLUMN engine TEXT DEFAULT ''",
-                "ALTER TABLE sessions ADD COLUMN effective_model TEXT",
-                "ALTER TABLE sessions ADD COLUMN effective_thinking_level TEXT",
-                "ALTER TABLE sessions ADD COLUMN end_reason TEXT",
-                "ALTER TABLE sessions ADD COLUMN archived_at REAL",
-                "ALTER TABLE sessions ADD COLUMN spawned_at REAL",
-                "ALTER TABLE sessions ADD COLUMN profile_snapshot TEXT",
-                "ALTER TABLE sessions ADD COLUMN conversation_ref TEXT",
-                "ALTER TABLE sessions ADD COLUMN scrollback BLOB",
-                "ALTER TABLE sessions ADD COLUMN last_screen TEXT DEFAULT ''",
-                "ALTER TABLE sessions ADD COLUMN parent_messages TEXT",
-                "ALTER TABLE sessions ADD COLUMN resume_count INTEGER DEFAULT 0",
-                "ALTER TABLE sessions ADD COLUMN last_resumed_at REAL",
-                "ALTER TABLE sessions ADD COLUMN resumable INTEGER",
-                "ALTER TABLE sessions ADD COLUMN resume_block_reason TEXT",
-            ):
-                try:
-                    conn.execute(ddl)
-                except Exception:
-                    pass
-
-    def get_max_seq(self) -> int:
-        with self._lock, self._conn() as conn:
-            row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM worker_events").fetchone()
-            return int(row["m"]) if row else 0
-
-    def upsert_session(
-        self,
-        s_dict: Dict[str, Any],
-        scrollback_text: str = "",
-        archive: Optional[Dict[str, Any]] = None,
-    ):
-        """Inserts or refreshes one session row; `archive` carries the archive-spec columns (§3).
-
-        Every archive column is COALESCEd, so a plain telemetry persist never erases what the final
-        record already wrote. `resumable` is written whenever it is not None (0 must beat a stale 1),
-        and its block reason is replaced in the same step so it can be cleared again.
-        """
-        arc = archive or {}
-        values: Dict[str, Any] = {
-            "session_id": s_dict["session_id"],
-            "profile_id": s_dict["profile_id"],
-            "profile_name": s_dict["profile_name"],
-            "kind": s_dict["kind"],
-            "title": s_dict["title"],
-            "cwd": s_dict["cwd"],
-            "status": s_dict["status"],
-            "created_at": s_dict["created_at"],
-            "updated_at": time.time(),
-            "ended_at": s_dict.get("ended_at"),
-            "exit_code": s_dict.get("exit_code"),
-            "step_count": s_dict.get("step_count", 0),
-            "current_activity": s_dict.get("current_activity", ""),
-            "last_task": s_dict.get("last_task", ""),
-            "engine": s_dict.get("engine") or "",
-            "effective_model": s_dict.get("effective_model"),
-            "effective_thinking_level": s_dict.get("effective_thinking_level"),
-            "final_response": s_dict.get("final_response"),
-            "final_response_source": s_dict.get("final_response_source"),
-            "files_changed_json": json.dumps(s_dict.get("files_changed", []), ensure_ascii=False),
-            "scrollback_text": scrollback_text,
-            "transcript_path": s_dict.get("transcript_path") or "",
-            "end_reason": arc.get("end_reason"),
-            "archived_at": arc.get("archived_at"),
-            "spawned_at": arc.get("spawned_at"),
-            "profile_snapshot": arc.get("profile_snapshot") or "",
-            "conversation_ref": arc.get("conversation_ref") or "",
-            "scrollback": arc.get("scrollback"),
-            "last_screen": arc.get("last_screen") or "",
-            "parent_messages": arc.get("parent_messages") or "",
-            "resume_count": int(arc.get("resume_count") or 0),
-            "last_resumed_at": arc.get("last_resumed_at"),
-            "resumable": arc.get("resumable"),
-            "resume_block_reason": arc.get("resume_block_reason"),
-        }
-        columns = list(values.keys())
-        placeholders = ", ".join(f":{c}" for c in columns)
-        updates = []
-        for col in columns:
-            if col == "session_id":
-                continue
-            # A12: a plain telemetry persist (which knows none of these) must never erase what the
-            # final record already wrote. D2 removed the one clear that used to exist: a resume now
-            # keeps the previous answer too, and the new turn overwrites it through set_final_response.
-            if col in ("ended_at", "exit_code", "archived_at", "spawned_at",
-                       "profile_snapshot", "conversation_ref", "parent_messages",
-                       "last_resumed_at", "end_reason", "final_response", "final_response_source"):
-                updates.append(f"{col}=COALESCE(NULLIF(excluded.{col}, ''), sessions.{col})")
-            elif col == "scrollback_text":
-                updates.append(
-                    "scrollback_text=CASE WHEN length(excluded.scrollback_text) > 0 "
-                    "THEN excluded.scrollback_text ELSE sessions.scrollback_text END"
-                )
-            elif col == "scrollback":
-                updates.append(
-                    "scrollback=CASE WHEN excluded.scrollback IS NOT NULL "
-                    "AND length(excluded.scrollback) > 0 THEN excluded.scrollback ELSE sessions.scrollback END"
-                )
-            elif col == "last_screen":
-                updates.append(
-                    "last_screen=CASE WHEN length(excluded.last_screen) > 0 "
-                    "THEN excluded.last_screen ELSE sessions.last_screen END"
-                )
-            elif col == "transcript_path":
-                updates.append(
-                    "transcript_path=CASE WHEN length(excluded.transcript_path) > 0 "
-                    "THEN excluded.transcript_path ELSE sessions.transcript_path END"
-                )
-            elif col == "engine":
-                updates.append("engine=COALESCE(NULLIF(excluded.engine, ''), sessions.engine)")
-            elif col == "resume_block_reason":
-                updates.append(
-                    "resume_block_reason=CASE WHEN excluded.resumable IS NOT NULL "
-                    "THEN excluded.resume_block_reason "
-                    "ELSE COALESCE(excluded.resume_block_reason, sessions.resume_block_reason) END"
-                )
-            elif col == "resumable":
-                updates.append("resumable=COALESCE(excluded.resumable, sessions.resumable)")
-            else:
-                updates.append(f"{col}=excluded.{col}")
-        with self._lock, self._conn() as conn:
-            conn.execute(
-                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({placeholders}) "
-                f"ON CONFLICT(session_id) DO UPDATE SET {', '.join(updates)}",
-                values,
-            )
-
-    def add_tool_call(
-        self,
-        session_id: str,
-        step_num: int,
-        tool_name: str,
-        input_summary: str,
-        output_summary: str = "",
-        status: str = "running",
-        source: str = "hook",
-    ):
-        with self._lock, self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO tool_calls (session_id, step_num, timestamp, tool_name, input_summary, output_summary, status, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (session_id, step_num, round(time.time(), 3), tool_name, input_summary[:1000], output_summary[:1000], status, source),
-            )
-
-    def complete_latest_tool_call(self, session_id: str, tool_name: Optional[str], output_summary: str):
-        with self._lock, self._conn() as conn:
-            if tool_name:
-                row = conn.execute(
-                    "SELECT id FROM tool_calls WHERE session_id=? AND tool_name=? ORDER BY id DESC LIMIT 1",
-                    (session_id, tool_name),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT id FROM tool_calls WHERE session_id=? ORDER BY id DESC LIMIT 1",
-                    (session_id,),
-                ).fetchone()
-            if row:
-                conn.execute(
-                    "UPDATE tool_calls SET status='completed', output_summary=? WHERE id=?",
-                    (output_summary[:1000], row["id"]),
-                )
-
-    def add_intermediate_message(self, session_id: str, step_num: int, content: str, source: str = "agent"):
-        content = (content or "").strip()
-        if not content:
-            return
-        with self._lock, self._conn() as conn:
-            last = conn.execute(
-                "SELECT content FROM intermediate_messages WHERE session_id=? ORDER BY id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-            if last and last["content"] == content:
-                return
-            conn.execute(
-                """
-                INSERT INTO intermediate_messages (session_id, step_num, timestamp, content, source)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (session_id, step_num, round(time.time(), 3), content[:4000], source),
-            )
-
-    def insert_worker_event(self, rec: Dict[str, Any]) -> int:
-        with self._lock, self._conn() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO worker_events (session_id, timestamp, type, category, content, status, files_changed_json, request_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    rec["session_id"],
-                    rec["timestamp"],
-                    rec["type"],
-                    rec["category"],
-                    rec["content"],
-                    rec["status"],
-                    json.dumps(rec.get("files_changed", []), ensure_ascii=False),
-                    rec.get("request_id"),
-                ),
-            )
-            return int(cur.lastrowid)
-
-    @staticmethod
-    def _decode_json_column(raw: Any, default: Any) -> Any:
-        if raw is None or raw == "":
-            return default
-        try:
-            return json.loads(raw)
-        except Exception:
-            return default
-
-    def get_session_record(self, session_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock, self._conn() as conn:
-            row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["files_changed"] = self._decode_json_column(d.pop("files_changed_json", None), [])
-            # Archive spec §3: the JSON columns come back parsed; the compressed scrollback stays out
-            # of the record (the scrollback endpoint reads it through get_scrollback_blob).
-            d["profile_snapshot"] = self._decode_json_column(d.pop("profile_snapshot", None), None)
-            d["conversation_ref"] = self._decode_json_column(d.pop("conversation_ref", None), None)
-            d["parent_messages"] = self._decode_json_column(d.pop("parent_messages", None), [])
-            d.pop("scrollback", None)
-            d["archived"] = bool(d.get("archived_at"))
-            return d
-
-    def get_recent_tool_calls(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        with self._lock, self._conn() as conn:
-            rows = conn.execute(
-                "SELECT step_num, timestamp, tool_name, input_summary, output_summary, status, source FROM tool_calls WHERE session_id=? ORDER BY id DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-            return [dict(r) for r in reversed(rows)]
-
-    def get_recent_intermediate_messages(self, session_id: str, limit: int = 15) -> List[Dict[str, Any]]:
-        with self._lock, self._conn() as conn:
-            rows = conn.execute(
-                "SELECT step_num, timestamp, content, source FROM intermediate_messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-            return [dict(r) for r in reversed(rows)]
-
-    def list_persisted_sessions(self, limit: int = 30, include_archived: bool = True) -> List[Dict[str, Any]]:
-        """Session summary rows; `include_archived=False` is "live + ended-in-memory" (spec §6)."""
-        where = "" if include_archived else "WHERE archived_at IS NULL"
-        with self._lock, self._conn() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT session_id, profile_id, profile_name, kind, title, cwd, status,
-                       created_at, updated_at, ended_at, exit_code, step_count,
-                       current_activity, last_task, engine, effective_model, effective_thinking_level,
-                       CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
-                       final_response_source
-                FROM sessions
-                {where}
-                ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    # ---- Archive & resume storage (spec archive-spec.md §3, §6) ----------------------------
-
-    ARCHIVE_SUMMARY_COLUMNS = """
-        session_id, profile_id, profile_name, kind, title, cwd, status, engine,
-        created_at, updated_at, ended_at, exit_code, step_count, last_task,
-        effective_model, effective_thinking_level, end_reason, archived_at,
-        resume_count, last_resumed_at, resumable, resume_block_reason,
-        profile_snapshot, conversation_ref,
-        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END
-            AS has_final_response
-    """
-
-    def list_archived(self, limit: int = 50, offset: int = 0, query: str = "") -> List[Dict[str, Any]]:
-        """Archive rows, newest first; `query` matches session id, task, cwd and profile (§6)."""
-        limit = max(1, min(int(limit or 50), 200))
-        offset = max(0, int(offset or 0))
-        clauses = ["archived_at IS NOT NULL"]
-        params: List[Any] = []
-        q = (query or "").strip()
-        if q:
-            like = f"%{q}%"
-            clauses.append(
-                "(session_id LIKE ? OR last_task LIKE ? OR cwd LIKE ? "
-                "OR profile_id LIKE ? OR profile_name LIKE ?)"
-            )
-            params.extend([like, like, like, like, like])
-        sql = (
-            f"SELECT {self.ARCHIVE_SUMMARY_COLUMNS} FROM sessions WHERE {' AND '.join(clauses)} "
-            "ORDER BY COALESCE(ended_at, archived_at, updated_at) DESC, archived_at DESC LIMIT ? OFFSET ?"
-        )
-        params.extend([limit, offset])
-        with self._lock, self._conn() as conn:
-            rows = conn.execute(sql, params).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                d["resumable"] = bool(d.get("resumable"))
-                d["archived"] = True
-                d["end_reason_label"] = END_REASON_LABELS.get(str(d.get("end_reason") or ""), "")
-                # W1: the list row must carry the same inputs the single-record path has, or
-                # compute_resumable sees no snapshot / a JSON string and condemns every record.
-                d["profile_snapshot"] = self._decode_json_column(d.get("profile_snapshot"), None)
-                d["conversation_ref"] = self._decode_json_column(d.get("conversation_ref"), {})
-                out.append(d)
-            return out
-
-    def count_archived(self, query: str = "") -> int:
-        clauses = ["archived_at IS NOT NULL"]
-        params: List[Any] = []
-        q = (query or "").strip()
-        if q:
-            like = f"%{q}%"
-            clauses.append(
-                "(session_id LIKE ? OR last_task LIKE ? OR cwd LIKE ? "
-                "OR profile_id LIKE ? OR profile_name LIKE ?)"
-            )
-            params.extend([like, like, like, like, like])
-        with self._lock, self._conn() as conn:
-            row = conn.execute(
-                f"SELECT COUNT(*) AS n FROM sessions WHERE {' AND '.join(clauses)}", params
-            ).fetchone()
-            return int(row["n"]) if row else 0
-
-    def get_scrollback_blob(self, session_id: str) -> Optional[bytes]:
-        with self._lock, self._conn() as conn:
-            row = conn.execute(
-                "SELECT scrollback FROM sessions WHERE session_id=?", (session_id,)
-            ).fetchone()
-            if not row or row["scrollback"] is None:
-                return None
-            raw = row["scrollback"]
-            return bytes(raw) if not isinstance(raw, bytes) else raw
-
-    def delete_session_record(self, session_id: str) -> bool:
-        """Deletes the hub's row only; the CLI's own conversation files are never touched."""
-        with self._lock, self._conn() as conn:
-            cur = conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
-            return cur.rowcount > 0
-
-    def update_archive_fields(self, session_id: str, **fields: Any) -> None:
-        """Writes a few session columns directly (startup normalisation, resume blocks)."""
-        # The startup normalisation also rewrites the live status it found in the row, and the
-        # resume-block updates rewrite nothing else; both sets must be allowed here.
-        allowed = set(ARCHIVE_COLUMNS) | {"status", "ended_at", "current_activity"}
-        sets = []
-        params: List[Any] = []
-        for key, value in fields.items():
-            if key not in allowed:
-                continue
-            sets.append(f"{key}=?")
-            params.append(value)
-        if not sets:
-            return
-        params.append(session_id)
-        with self._lock, self._conn() as conn:
-            conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
-
-    def update_archive_fields_bulk(self, updates: List[tuple]) -> None:
-        """R8: writes many rows' archive fields in ONE transaction (one commit per archive page)."""
-        if not updates:
-            return
-        allowed = set(ARCHIVE_COLUMNS) | {"status", "ended_at", "current_activity"}
-        with self._lock, self._conn() as conn:
-            for session_id, fields in updates:
-                sets: List[str] = []
-                params: List[Any] = []
-                for key, value in (fields or {}).items():
-                    if key not in allowed:
-                        continue
-                    sets.append(f"{key}=?")
-                    params.append(value)
-                if not sets:
-                    continue
-                params.append(session_id)
-                conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE session_id=?", params)
-
-    def reset_session_after_resume(self, session_id: str) -> None:
-        """A revived session is live again: it leaves the archive and its end state (§5.3).
-
-        D2: the stored final answer is deliberately left in place. The previous turn's reply stays
-        readable until the revived turn writes its own; begin_new_turn marks it in memory as
-        "from_previous_turn" and the next final-response source overwrites it.
-        """
-        with self._lock, self._conn() as conn:
-            conn.execute(
-                """
-                UPDATE sessions
-                SET archived_at=NULL, end_reason=NULL, ended_at=NULL, exit_code=NULL,
-                    resumable=NULL, resume_block_reason=NULL, status='starting'
-                WHERE session_id=?
-                """,
-                (session_id,),
-            )
-
-    def list_session_ids(self) -> List[str]:
-        with self._lock, self._conn() as conn:
-            return [str(r["session_id"]) for r in conn.execute("SELECT session_id FROM sessions").fetchall()]
 
 
 # Priority levels for final_response sources so explicit MCP or native transcript never gets overwritten by raw screen text
@@ -702,12 +221,6 @@ TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
 # Live statuses keep their meaning; an ended session carries one of these end reasons.
 LIVE_STATUSES = ("starting", "running", "waiting_parent", "completed")
 END_REASONS = ("exited", "crashed", "terminated", "interrupted")
-END_REASON_LABELS = {
-    "exited": "已退出",
-    "crashed": "异常退出",
-    "terminated": "已终止",
-    "interrupted": "已中断",
-}
 # K5: the `terminated` event says who ended the session. The console pane and an MCP caller are two
 # different actors and must not share one sentence.
 TERMINATED_MESSAGES = {
@@ -727,7 +240,7 @@ RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
 # way a record leaves the hub is the manual delete (console 删除记录 / DELETE /api/archive/{id}).
 # R5/R6: a graceful stop must not hang on a CLI that ignores the first signal or a DSH host that
 # takes its time; each session is bounded and so is the whole loop.
-SHUTDOWN_MAX_SEC = 15.0
+SHUTDOWN_MAX_SEC = 8.0
 SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC = 2.0
 AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
 CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
@@ -985,11 +498,6 @@ HISTORY_TRUNCATED_PREFIX = "\x1b[90m[较早的输出已截断]\x1b[0m\r\n"
 # R7: an agy resume whose archived transcript is still locked by another watcher gets this long
 # to become claimable, then the watcher stops instead of spinning for the session's lifetime.
 AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
-ARCHIVE_COLUMNS = (
-    "end_reason", "archived_at", "spawned_at", "profile_snapshot", "conversation_ref",
-    "scrollback", "last_screen", "parent_messages", "resume_count", "last_resumed_at",
-    "resumable", "resume_block_reason",
-)
 
 
 def resume_banner(resume_count: int) -> str:
@@ -2502,12 +2010,16 @@ class AgentSession:
             except Exception:
                 break
 
-        self.ended_at = time.time()
         try:
-            self.exit_code = self.pty.exitstatus if self.pty else 0
+            exit_code = self.pty.exitstatus if self.pty else 0
         except Exception:
-            self.exit_code = 0
+            exit_code = 0
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._finish_read, exit_code)
 
+    def _finish_read(self, exit_code):
+        self.ended_at = time.time()
+        self.exit_code = exit_code
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
         try:
             scrollback = self.get_full_scrollback_text(max_lines=80)
@@ -2529,7 +2041,7 @@ class AgentSession:
         if self.on_exit_cb and self._loop and not self.terminated_by_user:
             # V-5: a user termination already has its one lifecycle event; do not queue a second one.
             # A7: carry this object, so the manager can tell it apart from a later resume's object.
-            self._loop.call_soon_threadsafe(self.on_exit_cb, self, self.exit_code or 0)
+            self.on_exit_cb(self, self.exit_code or 0)
 
     def _on_pty_output(self, data: str):
         detected_tools = []
@@ -2548,7 +2060,7 @@ class AgentSession:
                 pass
 
             # Heuristic detection of TUI tool lines only for generic terminals without native transcript watchers
-            if (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy"):
+            if (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy", "dsh"):
                 try:
                     for line in self.screen.display:
                         clean = line.strip()
@@ -2724,21 +2236,27 @@ class AgentSession:
     def get_full_scrollback_text(self, max_lines: int = 300) -> str:
         """Returns combined scrollback history + active screen lines from pyte.HistoryScreen."""
         with self._lock:
-            hist_lines: List[str] = []
-            try:
-                for row in self.screen.history.top:
-                    chars = "".join( row[col].data if col in row else " " for col in range(self.cols) ).rstrip()
-                    hist_lines.append(chars)
-            except Exception:
-                pass
             try:
                 curr_lines = [line.rstrip() for line in self.screen.display]
             except Exception:
                 curr_lines = []
-            all_lines = hist_lines + curr_lines
+            # Render only the requested tail. Rebuilding all 10,000 history rows for
+            # every accepted tool record used to starve HTTP and terminal heartbeats.
+            all_lines = curr_lines
             while all_lines and not all_lines[-1]:
                 all_lines.pop()
-            if max_lines and len(all_lines) > max_lines:
+            newest_history = []
+            try:
+                for row in reversed(self.screen.history.top):
+                    if max_lines and len(newest_history) + len(all_lines) >= max_lines:
+                        break
+                    text = "".join(row[col].data if col in row else " " for col in range(self.cols)).rstrip()
+                    if text or all_lines or newest_history:
+                        newest_history.append(text)
+            except Exception:
+                pass
+            all_lines = list(reversed(newest_history)) + all_lines
+            if max_lines:
                 all_lines = all_lines[-max_lines:]
             return "\n".join(all_lines)
 
@@ -3077,14 +2595,20 @@ class Win32WindowHelper:
 class HubSessionManager:
     """Central manager for Sub-Agent profiles, ConPTY sessions, 4-Layer Telemetry, and SQLite Post-Lifecycle Persistence."""
 
-    def __init__(self, profiles_path: Optional[Path] = None, base_dir: Optional[Path] = None):
+    def __init__(self, profiles_path: Optional[Path] = None, base_dir: Optional[Path] = None,
+                 data_dir: Optional[Path] = None):
         self.base_dir = (base_dir or Path(__file__).parent).resolve()
+        self.data_dir = (data_dir or self.base_dir).resolve()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self.profiles_path = (profiles_path or default_profiles_path(self.base_dir)).resolve()
         self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
-        self.runtime_configs_dir = self.base_dir / ".runtime_mcp_configs"
+        self.runtime_configs_dir = self.data_dir / ".runtime_mcp_configs"
         self.runtime_configs_dir.mkdir(exist_ok=True)
 
-        self.db = HubDatabase(self.base_dir / "hub_state.db")
+        self.db = HubPersistence(self.data_dir / "hub_state.db")
+        self._loop = None
+        self._background_tasks = set()
+        self._shutdown_task = None
         self.summarizer_registry = TranscriptSummarizerRegistry()
         self.model_discovery = AgentModelDiscovery()
         self.profiles: Dict[str, Dict[str, Any]] = {}
@@ -3100,7 +2624,7 @@ class HubSessionManager:
         self._transcript_lock = threading.RLock()
         # Q3: marker-less conversations are assigned in launch order per engine, so "pick candidate
         # + claim" has to be one step per engine, not one step per watcher.
-        self._engine_transcript_locks: Dict[str, threading.RLock] = {}
+        self._engine_transcript_locks: Dict[str, asyncio.Lock] = {}
         # Q2: a marker scan of the first TRANSCRIPT_MARKER_SCAN_BYTES, cached until the file grows.
         self._marker_scan_cache: Dict[str, tuple] = {}
         # Q5: profile mutations rebuild the in-memory state from the discovery already in hand. This
@@ -3114,7 +2638,7 @@ class HubSessionManager:
         self._resume_locks: Dict[str, asyncio.Lock] = {}
 
         # Bidirectional Mailbox & Sequenced Event Bus
-        self.global_seq: int = self.db.get_max_seq()
+        self.global_seq: int = 0
         self.worker_events: List[Dict[str, Any]] = []
         self.parent_messages: Dict[str, List[Dict[str, Any]]] = {}
         # A11: worker→parent messages kept per session, outside the global 2000-event ring, so the
@@ -3133,14 +2657,44 @@ class HubSessionManager:
         # rows get their final record. D1: nothing is pruned here or anywhere else — records are kept
         # forever. Profiles are loaded first, because "still resumable" depends on the profile still
         # existing and being enabled.
-        try:
-            self._normalize_archive_on_startup()
-        except Exception:
-            pass
-        # Spec §3: while a session is live its scrollback is written at most once every 60 s, only
-        # when it changed — a timer, not a side effect of some other persist that may never come.
-        threading.Thread(target=self._scrollback_flush_loop, name="hub-scrollback-flush", daemon=True).start()
         threading.Thread(target=self._initial_discovery, name="hub-initial-discovery", daemon=True).start()
+
+    async def start(self):
+        """Open storage off the loop before accepting requests or starting watchers."""
+        if self._loop is not None:
+            return
+        self._loop = asyncio.get_running_loop()
+        try:
+            await self.db.start()
+            self.global_seq = await self.db.get_max_seq()
+            await self._normalize_archive_on_startup()
+            await self.db.flush()
+        except BaseException:
+            await self.db.close(timeout=0.5)
+            raise
+        self._schedule(self._scrollback_flush_loop())
+
+    def _schedule(self, coroutine):
+        """Track callback/watch tasks so shutdown cannot race their final snapshots."""
+        if self._shutting_down:
+            coroutine.close()
+            return None
+        task = asyncio.create_task(self.db.run_internal(coroutine))
+        self._background_tasks.add(task)
+        def finished(done):
+            coroutine.close()  # Also release a coroutine cancelled before run_internal started.
+            self._background_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                error = done.exception()
+                logger.error("Hub background task failed", exc_info=(type(error), error, error.__traceback__))
+        task.add_done_callback(finished)
+        return task
+
+    def _exit_callback(self, session, exit_code):
+        self._schedule(self._on_session_exit(session, exit_code))
+
+    def _tool_callback(self, session_id, tool_name, tool_arg):
+        self._schedule(self._on_tui_tool_detected(session_id, tool_name, tool_arg))
 
     def _initial_discovery(self) -> None:
         try:
@@ -3259,12 +2813,12 @@ class HubSessionManager:
         self._marker_scan_cache[key] = (size, frozenset(ids))
         return ids
 
-    def _engine_transcript_lock(self, engine: str) -> threading.RLock:
+    def _engine_transcript_lock(self, engine: str) -> asyncio.Lock:
         eng = (engine or "").strip().lower()
         with self._transcript_lock:
             lock = self._engine_transcript_locks.get(eng)
             if lock is None:
-                lock = threading.RLock()
+                lock = asyncio.Lock()
                 self._engine_transcript_locks[eng] = lock
             return lock
 
@@ -3327,7 +2881,7 @@ class HubSessionManager:
             return {}
         return {}
 
-    def _claim_transcript(self, session: AgentSession, path: Path) -> bool:
+    async def _claim_transcript(self, session: AgentSession, path: Path) -> bool:
         """Claims one transcript file for this session; False when another live session owns it."""
         key = self._transcript_key(path)
         with self._transcript_lock:
@@ -3340,7 +2894,7 @@ class HubSessionManager:
         if ref:
             # Spec §3: filled as soon as the watcher claims a conversation.
             session.conversation_ref = ref
-        self.persist_session(session)
+        await self.persist_session(session)
         return True
 
     def _release_transcripts(self, session_id: str) -> None:
@@ -3349,7 +2903,7 @@ class HubSessionManager:
                 if owner == session_id:
                     del self._claimed_transcripts[key]
 
-    def _claim_conversation(self, session: AgentSession, candidates: List[Path], levels_up: int = 0) -> Optional[Path]:
+    async def _claim_conversation(self, session: AgentSession, candidates: List[Path], levels_up: int = 0) -> Optional[Path]:
         """Q2/Q3: marker first, then FIFO in launch order, all under one lock per engine.
 
         A transcript that names a hub session id belongs to that session, and no other session may
@@ -3373,18 +2927,17 @@ class HubSessionManager:
                 unmarked.append(path)
 
         if marked_for_me:
-            with self._transcript_lock:
-                for path in sorted(
-                    marked_for_me,
-                    key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p)),
-                ):
-                    if self._transcript_claimed_by_other(path, session):
-                        continue
-                    if self._claim_transcript(session, path):
-                        return path
+            for path in sorted(
+                marked_for_me,
+                key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p)),
+            ):
+                if self._transcript_claimed_by_other(path, session):
+                    continue
+                if await self._claim_transcript(session, path):
+                    return path
 
         engine = (session.engine or "").strip().lower()
-        with self._engine_transcript_lock(engine):
+        async with self._engine_transcript_lock(engine):
             live = [
                 s for s in list(self.sessions.values())
                 if (s.engine or "").strip().lower() == engine and s.is_process_alive()
@@ -3404,7 +2957,7 @@ class HubSessionManager:
             for path in ordered:
                 if self._transcript_claimed_by_other(path, session):
                     continue
-                if self._claim_transcript(session, path):
+                if await self._claim_transcript(session, path):
                     return path
         return None
 
@@ -4342,13 +3895,14 @@ class HubSessionManager:
         for ev in list(self._event_waiters):
             ev.set()
 
-    def persist_session(
+    @logical_write
+    async def persist_session(
         self, session: AgentSession, force_scrollback: bool = False, final: bool = False
     ):
         """Writes the row. `final` marks the exit/archive write, the only one that rebuilds the
         mailbox thread (A11) instead of leaving the stored one alone."""
         scrollback = session.get_full_scrollback_text(max_lines=250)
-        self.db.upsert_session(
+        await self.db.upsert_session(
             session.to_dict(),
             scrollback_text=scrollback,
             archive=self._archive_payload(session, force_scrollback=force_scrollback, final=final),
@@ -4426,12 +3980,21 @@ class HubSessionManager:
                 return None
             if session.raw_history_rev == session._scrollback_rev_written:
                 return None
+            if session.raw_history_rev == getattr(session, "_scrollback_pending_rev", -1):
+                return None
         # W9: cut at a line break and keep the newest resume banner (a raw byte slice can split an
         # escape sequence or drop the banner the pane is supposed to show above the new output).
-        text = trim_history_text("".join(session.raw_history), RESUME_SCROLLBACK_MAX_BYTES)
+        with session._lock:
+            text = trim_history_text("".join(session.raw_history), RESUME_SCROLLBACK_MAX_BYTES)
+            revision = session.raw_history_rev
         raw = text.encode("utf-8", "replace")
-        session._scrollback_written_at = now
-        session._scrollback_rev_written = session.raw_history_rev
+        self.db.on_accept(lambda: setattr(session, "_scrollback_pending_rev", revision))
+        def committed():
+            session._scrollback_written_at = time.time()
+            session._scrollback_rev_written = revision
+            if getattr(session, "_scrollback_pending_rev", -1) == revision:
+                session._scrollback_pending_rev = -1
+        self.db.on_commit(committed)
         return zlib.compress(raw, 6)
 
     def _archive_payload(
@@ -4504,17 +4067,28 @@ class HubSessionManager:
         session.resume_block_reason = None if ok else reason
         return session
 
-    def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
+    @logical_write
+    async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
         """The final record, written when a session leaves the live list or at hub shutdown/start."""
         session.archived_at = time.time()
         self._finalize_session(session, end_reason=end_reason)
         # V5: an archived record must never report a live status; its end state is the truth.
         if session.end_reason:
             session.status = session.end_reason
-        self.persist_session(session, force_scrollback=True, final=True)
+        await self.persist_session(session, force_scrollback=True, final=True)
         return session
 
-    def compute_resumable(self, record: Dict[str, Any]) -> tuple:
+    def _resume_check_context(self):
+        """Value snapshot for filesystem probes; worker threads never inspect live sessions."""
+        with self._transcript_lock:
+            claimed = dict(self._claimed_transcripts)
+        return {
+            "profiles": {key: {"enabled": value.get("enabled", True)} for key, value in self.profiles.items()},
+            "claimed": claimed,
+            "live_ids": {sid for sid, sess in self.sessions.items() if sess.is_process_alive()},
+        }
+
+    def compute_resumable(self, record: Dict[str, Any], *, context=None) -> tuple:
         """(can_resume, Chinese reason) for one hub record — the §4 pre-checks, re-checked on demand."""
         sticky = self._sticky_resume_block(record)
         if sticky:
@@ -4532,7 +4106,7 @@ class HubSessionManager:
         if not cwd or not os.path.isdir(cwd):
             return False, f"工作目录已不存在：{cwd}"
         profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
-        prof = self.profiles.get(profile_id)
+        prof = (self.profiles if context is None else context["profiles"]).get(profile_id)
         if not prof or not prof.get("enabled", True):
             return False, f"Profile「{profile_id}」不存在或已停用"
         if not isinstance(ref, dict) or not ref:
@@ -4541,11 +4115,16 @@ class HubSessionManager:
             path = str(ref.get("session_file") or "")
             if not path or not os.path.isfile(path):
                 return False, f"omp 会话文件已不存在：{path}"
-            with self._transcript_lock:
-                owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            if context is None:
+                with self._transcript_lock:
+                    owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            else:
+                owner = context["claimed"].get(self._transcript_key(Path(path)))
             if owner and owner != session_id:
-                live = self.sessions.get(owner)
-                if live is not None and live.is_process_alive():
+                alive = owner in context["live_ids"] if context is not None else (
+                    owner in self.sessions and self.sessions[owner].is_process_alive()
+                )
+                if alive:
                     return False, "该 omp 会话正被另一个运行中的会话使用"
         elif engine == "kimi":
             sid = str(ref.get("session_id") or "")
@@ -4586,11 +4165,16 @@ class HubSessionManager:
                 return False, "未记录到 claude 会话 ID，无法恢复"
             if not path or not os.path.isfile(path):
                 return False, f"claude 会话文件已不存在：{path}"
-            with self._transcript_lock:
-                owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            if context is None:
+                with self._transcript_lock:
+                    owner = self._claimed_transcripts.get(self._transcript_key(Path(path)))
+            else:
+                owner = context["claimed"].get(self._transcript_key(Path(path)))
             if owner and owner != session_id:
-                live = self.sessions.get(owner)
-                if live is not None and live.is_process_alive():
+                alive = owner in context["live_ids"] if context is not None else (
+                    owner in self.sessions and self.sessions[owner].is_process_alive()
+                )
+                if alive:
                     return False, "该 claude 会话正被另一个运行中的会话使用"
         elif engine == "dsh":
             if not ref.get("dsh_job_id"):
@@ -4712,19 +4296,19 @@ class HubSessionManager:
         except OSError:
             return 0
 
-    def _load_scrollback_text(self, session_id: str) -> str:
-        blob = self.db.get_scrollback_blob(session_id)
+    async def _load_scrollback_text(self, session_id: str) -> str:
+        blob = await self.db.get_scrollback_blob(session_id)
         if blob:
             try:
                 return zlib.decompress(blob).decode("utf-8", "replace")
             except Exception:
                 pass
         # A row written before this feature has only the plain text tail; better than an empty pane.
-        rec = self.db.get_session_record(session_id) or {}
+        rec = await self.db.get_session_record(session_id) or {}
         return str(rec.get("scrollback_text") or "")
 
-    def _load_record_for_resume(self, session_id: str) -> Optional[Dict[str, Any]]:
-        rec = self.db.get_session_record(session_id)
+    async def _load_record_for_resume(self, session_id: str) -> Optional[Dict[str, Any]]:
+        rec = await self.db.get_session_record(session_id)
         sess = self.sessions.get(session_id)
         if sess is None:
             return rec
@@ -4736,12 +4320,12 @@ class HubSessionManager:
                 rec[key] = live_rec[key]
         return rec
 
-    def _mark_resumable(self, session_id: str, ok: bool, reason: str = "") -> None:
+    async def _mark_resumable(self, session_id: str, ok: bool, reason: str = "") -> None:
         sess = self.sessions.get(session_id)
         if sess is not None:
             sess.resumable = ok
             sess.resume_block_reason = None if ok else reason
-        self.db.update_archive_fields(
+        await self.db.update_archive_fields(
             session_id,
             resumable=1 if ok else 0,
             resume_block_reason=None if ok else reason,
@@ -4754,7 +4338,7 @@ class HubSessionManager:
             self._resume_locks[session_id] = lock
         return lock
 
-    def _make_resumed_session(
+    async def _make_resumed_session(
         self,
         session_id: str,
         record: Dict[str, Any],
@@ -4781,8 +4365,8 @@ class HubSessionManager:
             gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
-            on_exit_cb=self._on_session_exit,
-            on_tui_tool_cb=self._on_tui_tool_detected,
+            on_exit_cb=self._exit_callback,
+            on_tui_tool_cb=self._tool_callback,
         )
         sess.engine = engine
         sess.effective_model = snapshot.get("model") or record.get("effective_model")
@@ -4820,7 +4404,7 @@ class HubSessionManager:
         sess.final_response = record.get("final_response") or None
         sess.final_response_source = record.get("final_response_source") or None
         # Spec §5.3: the pane starts with the archived output, then the resume separator.
-        archived = self._load_scrollback_text(session_id)
+        archived = await self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
         sess.raw_history = [seed]
         sess.raw_history_bytes = len(seed.encode("utf-8", "replace"))
@@ -4886,6 +4470,8 @@ class HubSessionManager:
                 return await self._resume_locked(sid, text)
             except ValueError:
                 raise
+            except PersistenceUnavailable:
+                raise
             except Exception as e:
                 # A9: a spawn OSError / a DB error / a non-JSON DSH reply is a resume failure with
                 # a Chinese 400 detail, never a 500.
@@ -4898,7 +4484,7 @@ class HubSessionManager:
             # delivered — through the ordinary parent→child path, not the resume injection.
             delivery = None
             if text and str(text).strip():
-                delivery = self.deliver_parent_message(sid, str(text), also_write_pty=True)
+                delivery = await self.deliver_parent_message(sid, str(text), also_write_pty=True)
             return {
                 "session": existing,
                 "resumed": False,
@@ -4907,7 +4493,7 @@ class HubSessionManager:
                 "delivery": delivery,
                 "injection": (delivery or {}).get("injection") or "none",
             }
-        record = self._load_record_for_resume(sid)
+        record = await self._load_record_for_resume(sid)
         if record is None:
             raise ValueError(f"找不到会话 {sid}")
         engine = str(record.get("engine") or "").strip().lower()
@@ -4917,7 +4503,7 @@ class HubSessionManager:
             if not await self._dsh_job_exists(job_id):
                 ok, reason = False, DSH_UNKNOWN_JOB_MESSAGE
         if not ok:
-            self._mark_resumable(sid, False, reason)
+            await self._mark_resumable(sid, False, reason)
             raise ValueError(reason)
         if engine == "dsh":
             return await self._resume_dsh_session(sid, record, text)
@@ -4962,7 +4548,7 @@ class HubSessionManager:
         if engine == "agy":
             # D10: (re)write the bridge config the built args point at (--add-dir).
             self._write_agy_bridge_config(session_id)
-        sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
+        sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
         if message and injection == "argv":
             sess.last_injection = {
                 "at": round(time.time(), 3),
@@ -5019,27 +4605,27 @@ class HubSessionManager:
             raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
         if old is not None:
             self._release_transcripts(session_id)
-        self.db.reset_session_after_resume(session_id)
+        await self.db.reset_session_after_resume(session_id)
         # D2: the same shared helper the live follow-up uses marks the archived answer as the
         # previous turn's; it stays readable until the resumed turn writes its own.
         self.begin_new_turn(sess)
-        self.persist_session(sess)
+        await self.persist_session(sess)
 
         if engine == "codex":
-            asyncio.create_task(self._watch_codex_rollout(sess))
+            self._schedule(self._watch_codex_rollout(sess))
         elif engine == "omp":
             session_dir = Path(str(ref.get("session_dir") or self.runtime_configs_dir / f"omp_sess_{session_id}"))
-            asyncio.create_task(self._watch_omp_session(sess, session_dir))
+            self._schedule(self._watch_omp_session(sess, session_dir))
         elif engine == "kimi":
-            asyncio.create_task(self._watch_kimi_session(sess))
+            self._schedule(self._watch_kimi_session(sess))
         elif engine == "agy":
-            asyncio.create_task(self._watch_agy_transcript(sess))
+            self._schedule(self._watch_agy_transcript(sess))
         elif engine == "claude":
-            asyncio.create_task(self._watch_claude_session(sess))
+            self._schedule(self._watch_claude_session(sess))
 
         if sess.kind == "tui":
-            asyncio.create_task(self._watch_tui_interactive_prompts(sess))
-            asyncio.create_task(
+            self._schedule(self._watch_tui_interactive_prompts(sess))
+            self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
                     task_to_inject=prompt_for_tui,
@@ -5048,7 +4634,7 @@ class HubSessionManager:
                 )
             )
 
-        self.record_worker_event(
+        await self.record_worker_event(
             session_id,
             {
                 "type": "resumed",
@@ -5085,6 +4671,8 @@ class HubSessionManager:
                 if resp.status_code == 404:
                     return False
                 data = resp.json()
+        except PersistenceUnavailable:
+            raise
         except Exception:
             return False
         if not resp.is_success or not isinstance(data, dict):
@@ -5114,6 +4702,8 @@ class HubSessionManager:
                     headers={"x-dsh-crew-job-token": token},
                     json={"message": clean},
                 )
+        except PersistenceUnavailable:
+            raise
         except Exception:
             return None
 
@@ -5144,6 +4734,8 @@ class HubSessionManager:
                         dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/continue"),
                         json={"text": clean, "messaging_token": token},
                     )
+            except PersistenceUnavailable:
+                raise
             except Exception as e:
                 raise ValueError(f"DSH 恢复失败：{e}") from e
             try:
@@ -5180,6 +4772,8 @@ class HubSessionManager:
                     resp = await client.get(
                         dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0}
                     )
+            except PersistenceUnavailable:
+                raise
             except Exception as e:
                 raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=e)) from e
             if not resp.is_success:
@@ -5199,22 +4793,22 @@ class HubSessionManager:
                     DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=f"任务状态为 {jstatus or '未知'}")
                 )
 
-        sess = self._make_resumed_session(session_id, record, snapshot, ref, built)
+        sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
         old = self.sessions.get(session_id)
         # A1: a dsh pane's open socket survives the object replacement too, and typed input has to
         # reach the virtual terminal — which needs the loop and the parent-delivery callback.
         sess._loop = loop
         if sess.on_virtual_line_cb is None:
-            sess.on_virtual_line_cb = lambda sid, line: self.deliver_parent_message(
+            sess.on_virtual_line_cb = lambda sid, line: self._schedule(self.deliver_parent_message(
                 sid, line, also_write_pty=False
-            )
+            ))
         if old is not None and old is not sess:
             sess.adopt_ws_frontends(old)
             sess.push_ws_frame(resume_banner(sess.resume_count))
         self.sessions[session_id] = sess
         if old is not None:
             self._release_transcripts(session_id)
-        self.db.reset_session_after_resume(session_id)
+        await self.db.reset_session_after_resume(session_id)
         # D2: same shared helper as every other new turn (resume keeps the archived answer).
         self.begin_new_turn(sess)
         if clean:
@@ -5251,8 +4845,8 @@ class HubSessionManager:
             sess.current_activity = f"Re-attached ended DSH job {job_id} ({jstatus})"
             if old_token:
                 sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
-        self.persist_session(sess)
-        self.record_worker_event(
+        await self.persist_session(sess)
+        await self.record_worker_event(
             session_id,
             {
                 "type": "resumed",
@@ -5262,11 +4856,11 @@ class HubSessionManager:
             },
         )
         if clean:
-            loop.create_task(self._watch_dsh_hub_job(
+            self._schedule(self._watch_dsh_hub_job(
                 sess, new_job, sess.dsh_token or token
             ))
         elif jstatus in ("running", "needs_input"):
-            loop.create_task(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token))
+            self._schedule(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token))
         injection = "dsh_continue" if clean else "dsh_attach"
         delivery = {
             "delivered": bool(clean),
@@ -5286,37 +4880,39 @@ class HubSessionManager:
             "injection": injection,
         }
 
-    def list_archive(self, limit: int = 50, offset: int = 0, query: str = "") -> Dict[str, Any]:
+    async def list_archive(self, limit: int = 50, offset: int = 0, query: str = "") -> Dict[str, Any]:
         """The console's and the parent agent's archive view (spec §6).
 
         W1/R8: the page is refreshed from the same complete rows the single-record path uses, and
         all changed rows are written in one transaction instead of one commit per row.
         """
-        rows = self.db.list_archived(limit=limit, offset=offset, query=query)
-        changed: List[tuple] = []
-        for rec in rows:
-            if not self._recheck_resumable(rec):
-                continue
-            changed.append((
-                str(rec.get("session_id") or ""),
-                {
-                    "resumable": 1 if rec.get("resumable") else 0,
-                    "resume_block_reason": rec.get("resume_block_reason") or None,
-                },
-            ))
+        rows = await self.db.list_archived(limit=limit, offset=offset, query=query)
+        context = self._resume_check_context()
+        def recheck():
+            changed = []
+            for rec in rows:
+                if self._recheck_resumable(rec, context=context):
+                    changed.append((str(rec.get("session_id") or ""), {
+                        "resumable": 1 if rec.get("resumable") else 0,
+                        "resume_block_reason": rec.get("resume_block_reason") or None,
+                    }))
+            return changed
+        changed = await asyncio.to_thread(recheck)
         try:
-            self.db.update_archive_fields_bulk(changed)
+            await self.db.update_archive_fields_bulk(changed)
+        except PersistenceUnavailable:
+            raise
         except Exception:
             # A failed refresh write must not take the archive page down; the next read retries.
             pass
         return {
             "sessions": [self._archive_summary(rec) for rec in rows],
-            "total": self.db.count_archived(query),
+            "total": await self.db.count_archived(query),
             "limit": max(1, min(int(limit or 50), 200)),
             "offset": max(0, int(offset or 0)),
         }
 
-    def _recheck_resumable(self, rec: Dict[str, Any]) -> bool:
+    def _recheck_resumable(self, rec: Dict[str, Any], *, context=None) -> bool:
         """A5/W1: re-checks the cheap filesystem facts and updates the record in place.
 
         Returns True when the stored verdict must be written. A record that never selected the
@@ -5329,23 +4925,25 @@ class HubSessionManager:
         end_reason = str(rec.get("end_reason") or "")
         if not rec.get("archived_at") and not end_reason:
             return False
-        ok, reason = self.compute_resumable(rec)
+        ok, reason = self.compute_resumable(rec, context=context)
         stored_ok = bool(rec.get("resumable"))
         stored_reason = str(rec.get("resume_block_reason") or "")
         rec["resumable"] = ok
         rec["resume_block_reason"] = None if ok else reason
         return stored_ok != ok or stored_reason != ("" if ok else reason)
 
-    def _refresh_resumable(self, rec: Dict[str, Any]) -> Dict[str, Any]:
+    async def _refresh_resumable(self, rec: Dict[str, Any]) -> Dict[str, Any]:
         """A5: the single-record archive endpoint re-checks and persists a change."""
         session_id = str(rec.get("session_id") or "")
         if self._recheck_resumable(rec):
             try:
-                self.db.update_archive_fields(
+                await self.db.update_archive_fields(
                     session_id,
                     resumable=1 if rec.get("resumable") else 0,
                     resume_block_reason=rec.get("resume_block_reason") or None,
                 )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
         return rec
@@ -5398,42 +4996,42 @@ class HubSessionManager:
             "has_final_response": bool(rec.get("has_final_response") or rec.get("final_response")),
         }
 
-    def get_archive_record(self, session_id: str) -> Optional[Dict[str, Any]]:
-        rec = self.db.get_session_record(session_id)
+    async def get_archive_record(self, session_id: str) -> Optional[Dict[str, Any]]:
+        rec = await self.db.get_session_record(session_id)
         if not rec:
             return None
-        return self._archive_summary(self._refresh_resumable(rec))
+        return self._archive_summary(await self._refresh_resumable(rec))
 
-    def get_archive_scrollback(self, session_id: str) -> Optional[str]:
-        rec = self.db.get_session_record(session_id)
+    async def get_archive_scrollback(self, session_id: str) -> Optional[str]:
+        rec = await self.db.get_session_record(session_id)
         if not rec:
             return None
-        return self._load_scrollback_text(session_id)
+        return await self._load_scrollback_text(session_id)
 
-    def delete_archive_record(self, session_id: str) -> bool:
+    async def delete_archive_record(self, session_id: str) -> bool:
         """Deletes the hub's archived row only; the engine's own conversation files stay (§6)."""
-        rec = self.db.get_session_record(session_id)
+        rec = await self.db.get_session_record(session_id)
         if not rec:
             raise ValueError(f"找不到会话 {session_id}")
         if session_id in self.sessions:
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
         if not rec.get("archived_at"):
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
-        deleted = self.db.delete_session_record(session_id)
+        deleted = await self.db.delete_session_record(session_id)
         if deleted:
             # D10: the hub-private agy bridge dir goes with the record (the engine's own
             # conversation files stay).
             self._remove_agy_bridge_dir(session_id)
         return deleted
 
-    def _scrollback_flush_loop(self) -> None:
+    async def _scrollback_flush_loop(self) -> None:
         """Write each live session's scrollback once it is 60 s old (spec §1.6/§3).
 
         The tick is short and the 60 s throttle lives in _scrollback_blob, so the first write lands
         a few seconds after the session's first minute instead of drifting one further minute.
         """
-        while True:
-            time.sleep(5.0)
+        while not self._shutting_down:
+            await asyncio.sleep(5.0)
             try:
                 now = time.time()
                 for sess in list(self.sessions.values()):
@@ -5441,19 +5039,19 @@ class HubSessionManager:
                         continue
                     if now - sess._scrollback_written_at < RESUME_SCROLLBACK_INTERVAL_SEC:
                         continue
-                    self.persist_session(sess)
-            except Exception:
-                pass
+                    await self.persist_session(sess)
+            except PersistenceUnavailable:
+                logger.warning("Scrollback persistence delayed; will retry")
 
-    def _normalize_archive_on_startup(self) -> None:
+    async def _normalize_archive_on_startup(self) -> None:
         """Spec §1.5/§5: a stopped hub's live rows become interrupted + archived at the next start."""
         now = time.time()
         status_to_reason = {
             "exited": "exited", "crashed": "crashed", "terminated": "terminated",
             "completed": "exited", "interrupted": "interrupted",
         }
-        for sid in self.db.list_session_ids():
-            rec = self.db.get_session_record(sid)
+        for sid in await self.db.list_session_ids():
+            rec = await self.db.get_session_record(sid)
             if not rec:
                 continue
             if rec.get("archived_at") and rec.get("resumable") is not None:
@@ -5477,9 +5075,9 @@ class HubSessionManager:
             ok, reason = self.compute_resumable(merged)
             fields["resumable"] = 1 if ok else 0
             fields["resume_block_reason"] = None if ok else reason
-            self.db.update_archive_fields(sid, **fields)
+            await self.db.update_archive_fields(sid, **fields)
 
-    def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
+    async def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
         """B9: removes a session from the live list without rewriting the status an ended process already earned.
 
         A session whose process was alive is terminated and emits a `terminated` worker event; one
@@ -5497,7 +5095,7 @@ class HubSessionManager:
         terminated = sess.terminate()
         if terminated:
             sess.end_reason = "terminated"
-        self._archive_session(sess)
+        await self._archive_session(sess)
         del self.sessions[session_id]
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
         # of leaving the server side open and silent for the rest of the hub's life.
@@ -5506,7 +5104,7 @@ class HubSessionManager:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
         if terminated or (was_alive and sess.status == "terminated"):
-            self.record_worker_event(
+            await self.record_worker_event(
                 session_id,
                 {
                     "type": "terminated",
@@ -5560,53 +5158,69 @@ class HubSessionManager:
         except Exception:
             pass
 
-    def archive_all_sessions_on_shutdown(self) -> int:
-        """A6/R5/R6/W7: a graceful hub stop archives every in-memory session, flushing scrollback + screen.
+    async def archive_all_sessions_on_shutdown(self) -> int:
+        """Share one shutdown operation between the HTTP stop and lifespan exit."""
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+        return await asyncio.shield(self._shutdown_task)
 
-        A live one becomes interrupted (spec §1.5) and is resumable afterwards; an already-ended one
-        keeps its own reason. R6 terminates a live PTY's process tree, R5 cancels a live DSH job, and
-        W7 closes the browser sockets. Each session is best effort and the whole loop is bounded.
-        """
+    async def _shutdown(self) -> int:
         self._shutting_down = True
+        self.db.stop_accepting()
+        deadline = time.monotonic() + SHUTDOWN_MAX_SEC
+        tasks = list(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=0.3)
+            except asyncio.TimeoutError:
+                logger.error("Timed out cancelling hub producers")
+        sessions = list(self.sessions.values())
+        reasons = {}
+        stops = []
+        for sess in sessions:
+            if sess.is_process_alive():
+                reasons[sess.session_id] = "interrupted"
+                sess.status = "interrupted"
+                sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
+                if sess.dsh_job_id:
+                    stops.append(asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=2.0))
+                elif sess.pty is not None:
+                    stops.append(asyncio.to_thread(self._terminate_pty_tree, sess, budget=2.0))
+            else:
+                reasons[sess.session_id] = sess.end_reason or sess.classify_end_reason(sess.exit_code)
+        if stops:
+            try:
+                await asyncio.wait_for(asyncio.gather(*stops, return_exceptions=True), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.error("Timed out stopping session processes")
         archived = 0
-        deadline = time.time() + SHUTDOWN_MAX_SEC
-        for session_id, sess in list(self.sessions.items()):
+        try:
+            async with asyncio.timeout(max(0.001, deadline - time.monotonic() - 0.25)):
+                for sess in sessions:
+                    await self.db.run_internal(self._archive_session(sess, end_reason=reasons[sess.session_id]))
+                    sess.close_ws_frontends()
+                    archived += 1
+        except (asyncio.TimeoutError, PersistenceUnavailable):
+            logger.exception("Shutdown archived only %d/%d sessions", archived, len(sessions))
+        finally:
+            self.sessions.clear()
+            with self._transcript_lock:
+                self._claimed_transcripts.clear()
+            self._notify_waiters()
+            for entry in self.pending_questions.values():
+                event = entry.get("event")
+                if isinstance(event, asyncio.Event):
+                    event.set()
             try:
-                if sess.is_process_alive():
-                    end_reason = "interrupted"
-                    sess.status = "interrupted"
-                    sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
-                    remaining = min(2.0, deadline - time.time())
-                    if remaining > 0:
-                        if sess.dsh_job_id:
-                            self._cancel_dsh_job(str(sess.dsh_job_id), timeout=remaining)
-                        elif sess.pty is not None:
-                            self._terminate_pty_tree(sess, budget=remaining)
-                else:
-                    end_reason = sess.end_reason or sess.classify_end_reason(sess.exit_code)
-                self._archive_session(sess, end_reason=end_reason)
-                sess.close_ws_frontends()
-                archived += 1
-            except Exception:
-                continue
-        self.sessions.clear()
-        with self._transcript_lock:
-            self._claimed_transcripts.clear()
-        for waiter in list(self._event_waiters):
-            try:
-                waiter.set()
-            except Exception:
-                pass
-        for q_entry in list(self.pending_questions.values()):
-            ev = q_entry.get("event")
-            if isinstance(ev, asyncio.Event):
-                try:
-                    ev.set()
-                except Exception:
-                    pass
+                await self.db.close(timeout=max(0.001, deadline - time.monotonic()))
+            except PersistenceUnavailable:
+                logger.exception("Shutdown could not flush every accepted write")
         return archived
 
-    def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    @logical_write
+    async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Processes telemetry from Claude Hooks, Codex JSONL Tailer, Worker MCP `report_step`, or TUI Heuristic Parser."""
         sess = self.sessions.get(session_id)
         if sess and data.get("transcript_path"):
@@ -5647,7 +5261,7 @@ class HubSessionManager:
                 elif tool_name:
                     sess.current_activity = f"Step {step_num}: Executing tool [{tool_name}] {input_str[:80]}"
             if tool_name:
-                self.db.add_tool_call(
+                await self.db.add_tool_call(
                     session_id=session_id,
                     step_num=step_num,
                     tool_name=tool_name,
@@ -5657,13 +5271,13 @@ class HubSessionManager:
                 )
 
         elif hook_event == "PostToolUse":
-            self.db.complete_latest_tool_call(session_id, tool_name, resp_str)
+            await self.db.complete_latest_tool_call(session_id, tool_name, resp_str)
             if sess and tool_name:
                 sess.current_activity = f"Step {sess.step_count}: Completed tool [{tool_name}]"
 
         for msg in intermediate_list:
             if msg and str(msg).strip():
-                self.db.add_intermediate_message(session_id, step_num, str(msg).strip(), source=source)
+                await self.db.add_intermediate_message(session_id, step_num, str(msg).strip(), source=source)
 
         if final_text and str(final_text).strip():
             f_source = "native_transcript"
@@ -5676,7 +5290,7 @@ class HubSessionManager:
                     sess.current_activity = f"Step {sess.step_count}: Turn completed (final response captured)"
 
         if hook_event in ("Stop", "SubagentStop", "TurnComplete") and final_text:
-            self.record_worker_event(
+            await self.record_worker_event(
                 session_id,
                 {
                     "type": "turn_completed",
@@ -5687,12 +5301,12 @@ class HubSessionManager:
             )
 
         if sess:
-            self.persist_session(sess)
+            await self.persist_session(sess)
 
         return {"ok": True, "session_id": session_id, "step_count": step_num}
 
-    def _on_tui_tool_detected(self, session_id: str, tool_name: str, tool_arg: str):
-        self.record_telemetry(
+    async def _on_tui_tool_detected(self, session_id: str, tool_name: str, tool_arg: str):
+        await self.record_telemetry(
             session_id,
             {
                 "source": "tui_screen_parser",
@@ -5702,7 +5316,8 @@ class HubSessionManager:
             },
         )
 
-    def record_worker_event(self, session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    @logical_write
+    async def record_worker_event(self, session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Records an event emitted by a Sub-Agent (message, question, completed, turn_completed, exited) and wakes Parent pollers."""
         sess = self.sessions.get(session_id)
         ev_type = payload.get("type", "message")
@@ -5717,7 +5332,7 @@ class HubSessionManager:
             if ev_type == "completed":
                 if sess.step_count == 0:
                     sess.step_count = 1
-                    self.db.add_tool_call(
+                    await self.db.add_tool_call(
                         session_id=session_id,
                         step_num=1,
                         tool_name="report_complete",
@@ -5726,7 +5341,7 @@ class HubSessionManager:
                         source="worker_bridge",
                     )
                 if content:
-                    self.db.add_intermediate_message(session_id, sess.step_count, content, source="report_complete_mcp")
+                    await self.db.add_intermediate_message(session_id, sess.step_count, content, source="report_complete_mcp")
                 sess.status = "completed"
                 sess.set_final_response(content, "report_complete_mcp")
                 sess.files_changed = payload.get("files_changed") or sess.files_changed
@@ -5736,7 +5351,7 @@ class HubSessionManager:
                 prefix = "Waiting for parent approval" if ev_type == "approval_request" else "Waiting for parent answer"
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
-                self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
+                await self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
             if ev_type == "turn_completed":
                 if sess.step_count == 0:
                     sess.step_count = 1
@@ -5767,23 +5382,21 @@ class HubSessionManager:
             "request_id": payload.get("request_id"),
             "interaction": payload.get("interaction"),
         }
-        seq = self.db.insert_worker_event(record)
-        self.global_seq = max(self.global_seq, seq)
+        seq = await self.db.insert_worker_event(record)
         record["seq"] = seq
-
-        self.worker_events.append(record)
-        if len(self.worker_events) > 2000:
-            self.worker_events = self.worker_events[-2000:]
-        # A11: the archive thread's worker side must outlive the ring.
-        self._remember_worker_message(session_id, record)
-
         if sess:
-            self.persist_session(sess)
-
-        self._notify_waiters()
+            await self.persist_session(sess)
+        def publish():
+            self.global_seq = max(self.global_seq, seq)
+            self.worker_events.append(record)
+            if len(self.worker_events) > 2000:
+                self.worker_events = self.worker_events[-2000:]
+            self._remember_worker_message(session_id, record)
+            self._notify_waiters()
+        self.db.on_accept(publish)
         return record
 
-    def summarize_transcript(self, session_id: str) -> Dict[str, Any]:
+    async def summarize_transcript(self, session_id: str) -> Dict[str, Any]:
         """
         Produces a structured, CLI-specific transcript summary (for omp, kimi, codex, agy, dsh, claude)
         so the Parent Agent never needs to read noisy raw TUI screen dumps.
@@ -5795,7 +5408,7 @@ class HubSessionManager:
             t_path = sess.transcript_path
             raw_fallback = sess.get_clean_screen_text(max_lines=30)
         else:
-            persisted = self.db.get_session_record(session_id)
+            persisted = await self.db.get_session_record(session_id)
             if not persisted:
                 raise ValueError(f"Session '{session_id}' not found in live memory or SQLite history.")
             raw_fallback = persisted.pop("scrollback_text", "")
@@ -5803,10 +5416,10 @@ class HubSessionManager:
             tp_str = meta.get("transcript_path") or ""
             t_path = Path(tp_str) if tp_str else None
 
-        tools = self.db.get_recent_tool_calls(session_id, limit=20)
-        inter_msgs = self.db.get_recent_intermediate_messages(session_id, limit=15)
+        tools = await self.db.get_recent_tool_calls(session_id, limit=20)
+        inter_msgs = await self.db.get_recent_intermediate_messages(session_id, limit=15)
 
-        summary = self.summarizer_registry.summarize_session(
+        summary = await asyncio.to_thread(self.summarizer_registry.summarize_session,
             profile_id=meta.get("profile_id", "generic"),
             transcript_path=t_path,
             session_meta=meta,
@@ -5830,11 +5443,11 @@ class HubSessionManager:
                 sess.set_final_response(summary["latest_conclusion"], "transcript_summarizer")
                 changed = True
             if changed:
-                self.persist_session(sess)
+                await self.persist_session(sess)
 
         return summary
 
-    def get_subagent_status_and_trace(
+    async def get_subagent_status_and_trace(
         self,
         session_id: str,
         recent_tools_limit: int = 15,
@@ -5844,19 +5457,19 @@ class HubSessionManager:
         sess = self.sessions.get(session_id)
         if sess:
             if sess.kind == "tui" and sess.status in LIVE_STATUSES:
-                self.poll_tui_screen_interactions_once(sess)
-            self.persist_session(sess)
+                await self.poll_tui_screen_interactions_once(sess)
+            await self.persist_session(sess)
             meta = sess.to_dict()
         else:
-            persisted = self.db.get_session_record(session_id)
+            persisted = await self.db.get_session_record(session_id)
             if not persisted:
                 raise ValueError(f"Session '{session_id}' not found in live memory or SQLite history.")
             persisted.pop("scrollback_text", "")
             meta = persisted
 
-        tools = self.db.get_recent_tool_calls(session_id, limit=recent_tools_limit)
-        inter_msgs = self.db.get_recent_intermediate_messages(session_id, limit=recent_messages_limit)
-        transcript_summary = self.summarize_transcript(session_id)
+        tools = await self.db.get_recent_tool_calls(session_id, limit=recent_tools_limit)
+        inter_msgs = await self.db.get_recent_intermediate_messages(session_id, limit=recent_messages_limit)
+        transcript_summary = await self.summarize_transcript(session_id)
 
         final_resp = meta.get("final_response")
         final_src = meta.get("final_response_source")
@@ -5912,20 +5525,20 @@ class HubSessionManager:
             rec.get("engine") or snap.get("engine"), snap.get(BYPASS_APPROVALS_KEY) is True
         )
 
-    def get_subagent_final_response(self, session_id: str) -> Dict[str, Any]:
+    async def get_subagent_final_response(self, session_id: str) -> Dict[str, Any]:
         """Retrieves the Sub-Agent's clean final response and transcript summary both during and after its lifecycle."""
-        transcript_summary = self.summarize_transcript(session_id)
+        transcript_summary = await self.summarize_transcript(session_id)
         sess = self.sessions.get(session_id)
         if sess:
             if not sess.final_response and transcript_summary.get("latest_conclusion"):
                 sess.set_final_response(transcript_summary["latest_conclusion"], "transcript_summarizer")
-            self.persist_session(sess)
+            await self.persist_session(sess)
 
-        rec = self.db.get_session_record(session_id)
+        rec = await self.db.get_session_record(session_id)
         if not rec:
             raise ValueError(f"Session '{session_id}' not found in live memory or SQLite history.")
 
-        inter_msgs = self.db.get_recent_intermediate_messages(session_id, limit=5)
+        inter_msgs = await self.db.get_recent_intermediate_messages(session_id, limit=5)
         latest_inter = inter_msgs[-1]["content"] if inter_msgs else None
 
         final_resp = rec.get("final_response")
@@ -5956,7 +5569,8 @@ class HubSessionManager:
             "transcript_summary": transcript_summary,
         }
 
-    async def ask_parent_and_wait(self, session_id: str, question: str, timeout_seconds: float = 300.0) -> Dict[str, Any]:
+    @logical_write
+    async def _register_parent_question(self, session_id: str, question: str):
         req_id = f"ask-{uuid.uuid4().hex[:8]}"
         wait_ev = asyncio.Event()
         q_entry = {
@@ -5974,7 +5588,7 @@ class HubSessionManager:
         if sess:
             sess.pending_question_id = req_id
 
-        event_rec = self.record_worker_event(
+        event_rec = await self.record_worker_event(
             session_id,
             {
                 "type": "question",
@@ -5983,7 +5597,10 @@ class HubSessionManager:
                 "request_id": req_id,
             },
         )
+        return req_id, wait_ev, q_entry, event_rec, sess
 
+    async def ask_parent_and_wait(self, session_id: str, question: str, timeout_seconds: float = 300.0) -> Dict[str, Any]:
+        req_id, wait_ev, q_entry, event_rec, sess = await self._register_parent_question(session_id, question)
         try:
             await asyncio.wait_for(wait_ev.wait(), timeout=timeout_seconds)
             return {
@@ -6005,7 +5622,8 @@ class HubSessionManager:
                 if sess.status == "waiting_parent":
                     sess.status = "running"
 
-    def register_pending_interaction(
+    @logical_write
+    async def register_pending_interaction(
         self,
         session: AgentSession,
         kind: str,
@@ -6028,7 +5646,7 @@ class HubSessionManager:
         if request_id and not from_screen:
             # D7: one prompt = one pending interaction. A machine record (kimi wire, agy transcript)
             # of a prompt the screen detector registered first adopts that registration.
-            adopted = self._adopt_screen_interaction(
+            adopted = await self._adopt_screen_interaction(
                 session, kind, req_id, title, prompt, source, dict(metadata or {})
             )
             if adopted is not None:
@@ -6079,7 +5697,7 @@ class HubSessionManager:
             f"- 可选操作/选项:\n{opts_lines}\n"
             f"👉 主 Agent 请调用 `respond_to_subagent_approval_or_choice(session_id='{session.session_id}', decision='approve'|'approve_session'|'deny', option_index=1..N, custom_input='...')` 代批或代选。"
         )
-        self.record_worker_event(
+        await self.record_worker_event(
             session.session_id,
             {
                 "type": ev_type,
@@ -6102,7 +5720,7 @@ class HubSessionManager:
             ids.add(str(interaction["request_id"]))
         return ids
 
-    def _adopt_screen_interaction(
+    async def _adopt_screen_interaction(
         self,
         session: AgentSession,
         kind: str,
@@ -6145,7 +5763,7 @@ class HubSessionManager:
                 entry["interaction"] = cand
                 self.pending_questions[request_id] = entry
             session._unadopted_screen_interaction = None
-            self.persist_session(session)
+            await self.persist_session(session)
             return cand
         if pending is None and (time.time() - float(cand.get("created_at") or 0)) <= SCREEN_ADOPT_WINDOW_SEC:
             # Answered before its machine record was read: the same prompt, already handled.
@@ -6153,7 +5771,8 @@ class HubSessionManager:
             return dict(cand, request_id=request_id, aliases=[cand.get("request_id")], already_resolved=True)
         return None
 
-    def clear_pending_interaction(self, session: AgentSession, request_id: Optional[str] = None):
+    @logical_write
+    async def clear_pending_interaction(self, session: AgentSession, request_id: Optional[str] = None):
         """Clears an active pending interaction when resolved via Parent response or native Transcript event."""
         if not session.pending_interaction:
             return
@@ -6166,13 +5785,13 @@ class HubSessionManager:
         for qid in ids:
             if qid in self.pending_questions:
                 self.pending_questions[qid]["answered"] = True
-                self.pending_questions[qid]["event"].set()
+                self.db.on_accept(self.pending_questions[qid]["event"].set)
         # D7: the answered prompt may still be drawn for a moment; the screen detector waits.
         session._prompt_quiet_until = time.time() + TUI_PROMPT_REDETECT_QUIET_SEC
         session._seen_tui_prompt_signatures.clear()
         if session.status == "waiting_parent":
             session.status = "running"
-        self.persist_session(session)
+        await self.persist_session(session)
 
     @staticmethod
     def _resolve_approval_choice(
@@ -6411,7 +6030,7 @@ class HubSessionManager:
             trace += f" + feedback as next message {feedback!r}"
         return trace, note, downgraded
 
-    def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
+    async def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
         """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
 
         A new interaction pending by then would take the text as its own answer (a deny), so the
@@ -6421,15 +6040,16 @@ class HubSessionManager:
             return
         if sess.pending_interaction is not None:
             logger.warning("[%s] deny feedback not typed: a new interaction is pending", session_id)
-            self.db.add_intermediate_message(
+            await self.db.add_intermediate_message(
                 session_id, sess.step_count,
                 f"[Parent deny feedback NOT delivered: a new interaction was pending] {text}",
                 source="parent_approval_proxy",
             )
             return
-        self.deliver_parent_message(session_id, text, also_write_pty=True)
+        await self.deliver_parent_message(session_id, text, also_write_pty=True)
 
-    def respond_to_interaction(
+    @logical_write
+    async def respond_to_interaction(
         self,
         session_id: str,
         decision: Optional[str] = None,
@@ -6558,7 +6178,7 @@ class HubSessionManager:
                     sess.dsh_token = new_token
                     sess.status = "running"
                     if loop:
-                        loop.create_task(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
+                        self._schedule(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
                     delivered = True
                 action_trace = f"DSH /continue job={dsh_job_id}->{cjob.get('id')} text={reply_str!r}"
                 sess.emit_virtual_ansi(
@@ -6777,7 +6397,7 @@ class HubSessionManager:
             if q_entry and not q_entry.get("answered"):
                 q_entry["answered"] = True
                 q_entry["answer"] = chosen_label
-                q_entry["event"].set()
+                self.db.on_accept(q_entry["event"].set)
             sess.write_input(chosen_label)
             if loop:
                 loop.call_later(0.25, sess.write_input, "\r")
@@ -6787,15 +6407,15 @@ class HubSessionManager:
             delivered = True
 
         # Mark pending question/interaction as resolved
-        self.clear_pending_interaction(sess, target_qid)
+        await self.clear_pending_interaction(sess, target_qid)
         sess.current_activity = f"Parent responded ({chosen_label[:50]})"
-        self.db.add_intermediate_message(
+        await self.db.add_intermediate_message(
             session_id,
             sess.step_count,
             f"[Parent Delegated Response -> {chosen_label}] ({action_trace})",
             source="parent_approval_proxy",
         )
-        self._record_tui_injection(
+        await self._record_tui_injection(
             sess,
             {
                 "at": round(time.time(), 3),
@@ -6806,17 +6426,17 @@ class HubSessionManager:
                 "label": "成功" if delivered else "失败",
             },
         )
-        self.persist_session(sess)
+        await self.persist_session(sess)
 
         if eng in ("agy", "claude") and approval_action == "deny_feedback" and (custom_input or "").strip():
             # D7: agy and claude end the turn on a deny; the feedback goes in as the next message once
             # the composer is back (after the interaction above is cleared, never into the prompt).
             feedback_text = (custom_input or "").strip()
             if loop is not None:
-                loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, self._deliver_deny_feedback, session_id, feedback_text)
+                loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, lambda: self._schedule(self._deliver_deny_feedback(session_id, feedback_text)))
             else:
-                time.sleep(AGY_DENY_FEEDBACK_DELAY_SEC)
-                self._deliver_deny_feedback(session_id, feedback_text)
+                await asyncio.sleep(AGY_DENY_FEEDBACK_DELAY_SEC)
+                await self._deliver_deny_feedback(session_id, feedback_text)
 
         return {
             "ok": True,
@@ -6891,7 +6511,7 @@ class HubSessionManager:
         engine = str(getattr(session, "engine", "") or "").strip().lower()
         return engine in TUI_LIVE_SUBMIT_CHECKED and self._tui_composer_located(session)
 
-    def _deliver_live_text_to_tui(
+    async def _deliver_live_text_to_tui(
         self, sess: AgentSession, text: str, turn_before: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """K6 (fix 9c): a live message with Enter to a TUI session; {pty_written, injection, queued}.
@@ -6932,7 +6552,7 @@ class HubSessionManager:
         # replaces that entry in recent_injections instead of adding a second one.
         submit_id = f"inj-{uuid.uuid4().hex[:8]}"
         sess.last_injection = self._live_submitting_record(submit_id)
-        loop.create_task(
+        self._schedule(
             self._submit_queued_live_text(sess, text, submit_key, claim, turn_before, submit_id)
         )
         return {"pty_written": False, "injection": "pending", "queued": True}
@@ -7048,6 +6668,8 @@ class HubSessionManager:
         except asyncio.CancelledError:
             claim.release()
             raise
+        except PersistenceUnavailable:
+            raise
         except Exception as e:
             logger.exception("[%s] live message submit failed", getattr(sess, "session_id", "?"))
             result = {"ok": False, "reason": "submit_error", "detail": str(e)[:200], "attempts": 0,
@@ -7059,7 +6681,7 @@ class HubSessionManager:
                 result["submit_id"] = submit_id
             if result.get("ok") is False and turn_before is not None:
                 self._restore_turn_after_failed_message(sess, turn_before)
-            self._record_tui_injection(sess, result)
+            await self._record_tui_injection(sess, result)
         finally:
             claim.release()
 
@@ -7076,7 +6698,8 @@ class HubSessionManager:
         sess.completion_reported = bool(turn_before["completion_reported"])
         sess.final_response_from_previous_turn = bool(turn_before["from_previous_turn"])
 
-    def deliver_parent_message(
+    @logical_write
+    async def deliver_parent_message(
         self,
         session_id: str,
         text: str,
@@ -7123,7 +6746,7 @@ class HubSessionManager:
                 "n",
             ):
                 dec = t_clean.lower().replace(" ", "_")
-            res = self.respond_to_interaction(
+            res = await self.respond_to_interaction(
                 session_id=session_id,
                 decision=dec,
                 option_index=opt_idx,
@@ -7148,7 +6771,7 @@ class HubSessionManager:
             if not q_entry["answered"]:
                 q_entry["answered"] = True
                 q_entry["answer"] = text
-                q_entry["event"].set()
+                self.db.on_accept(q_entry["event"].set)
                 resolved_question_id = target_qid
                 if q_entry.get("dsh_message_id") and q_entry.get("dsh_job_id"):
                     try:
@@ -7228,12 +6851,12 @@ class HubSessionManager:
                             sess.emit_virtual_ansi(
                                 f"\r\n\x1b[1;36m↻ [Continuing DSH Session {sess.dsh_session_id} -> {cjob['id']}]: {clean_txt}\x1b[0m\r\n"
                             )
-                            loop.create_task(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
+                            self._schedule(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
                             pty_written = True
                         else:
                             dsh_error = f"DSH 无法继续该任务（HTTP {r.status_code}）"
                     elif not sess.dsh_job_id:
-                        loop.create_task(self._spawn_dsh_hub_job(sess, clean_txt))
+                        self._schedule(self._spawn_dsh_hub_job(sess, clean_txt))
                         pty_written = True
                     else:
                         # A8: a DSH session in any other status cannot take the text; say so.
@@ -7249,7 +6872,7 @@ class HubSessionManager:
                   and sess.is_process_alive()):
                 # K6 (fix 9c): a live message with Enter goes through the same checked submit as
                 # the startup text when the composer can be located, one writer at a time.
-                live = self._deliver_live_text_to_tui(sess, text.rstrip("\r\n"), turn_before)
+                live = await self._deliver_live_text_to_tui(sess, text.rstrip("\r\n"), turn_before)
                 pty_written = live["pty_written"]
                 live_injection = live["injection"]
                 live_queued = live["queued"]
@@ -7280,7 +6903,7 @@ class HubSessionManager:
         if dsh_error is not None:
             # A8: a message DSH could not take is reported with its reason, never as a canned true.
             if sess:
-                self.persist_session(sess)
+                await self.persist_session(sess, final=True)
             return {
                 "delivered": False,
                 "reason": dsh_error,
@@ -7300,7 +6923,7 @@ class HubSessionManager:
             self.begin_new_turn(sess, status="running")
 
         if sess:
-            self.persist_session(sess)
+            await self.persist_session(sess, final=True)
 
         return {
             "delivered": True,
@@ -7327,7 +6950,7 @@ class HubSessionManager:
             results.append(ev)
         return results
 
-    def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
+    async def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
         """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
         target_ids = None
         if session_id and session_id != "all":
@@ -7337,7 +6960,7 @@ class HubSessionManager:
             if target_ids and sid not in target_ids:
                 continue
             if sess is not None and sess.kind == "tui" and sess.pending_interaction is None and sess.status in LIVE_STATUSES:
-                self.poll_tui_screen_interactions_once(sess)
+                await self.poll_tui_screen_interactions_once(sess)
             if sess is not None and sess.status == "waiting_parent" and sess.pending_interaction:
                 item = dict(sess.pending_interaction)
                 item.setdefault("session_id", sid)
@@ -7352,7 +6975,7 @@ class HubSessionManager:
         wake_on_pending: bool = False,
     ) -> Dict[str, Any]:
         immediate = self.get_worker_events(session_id=session_id, after_seq=after_seq)
-        pending_now = self.get_pending_interactions(session_id=session_id)
+        pending_now = await self.get_pending_interactions(session_id=session_id)
         if immediate:
             next_seq = immediate[-1]["seq"]
             return {
@@ -7392,7 +7015,7 @@ class HubSessionManager:
                     break
                 waiter.clear()
                 found = self.get_worker_events(session_id=session_id, after_seq=after_seq)
-                pending_after = self.get_pending_interactions(session_id=session_id)
+                pending_after = await self.get_pending_interactions(session_id=session_id)
                 if found:
                     next_seq = found[-1]["seq"]
                     return {
@@ -7424,7 +7047,7 @@ class HubSessionManager:
             "after_seq": after_seq,
             "next_seq": max(after_seq, self.global_seq),
             "events": [],
-            "pending_interactions": self.get_pending_interactions(session_id=session_id),
+            "pending_interactions": await self.get_pending_interactions(session_id=session_id),
             "next_poll_command": self.build_poll_command(session_id, after_seq),
         }
 
@@ -7478,7 +7101,7 @@ class HubSessionManager:
             if ref_path and os.path.isfile(ref_path):
                 target_file = Path(ref_path)
                 offset = int(session.attach_offset or 0)
-                self._claim_transcript(session, target_file)
+                await self._claim_transcript(session, target_file)
         else:
             while self._transcript_watch_alive(session):
                 await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
@@ -7505,7 +7128,7 @@ class HubSessionManager:
                         candidates.append(candidate)
                     except OSError:
                         continue
-                target_file = self._claim_conversation(session, candidates, levels_up=0)
+                target_file = await self._claim_conversation(session, candidates, levels_up=0)
                 if target_file:
                     break
 
@@ -7517,12 +7140,12 @@ class HubSessionManager:
             if session.resume_attach:
                 # A resumed codex may start a new rollout for the same session id; accept it when it
                 # appears and tail it from the beginning (everything in it is new).
-                switched = self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
+                switched = await self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
                 if switched is not None:
                     target_file = switched
                     offset = 0
             elif session.session_id not in self._transcript_marker_ids(target_file):
-                upgraded = self._codex_upgrade_to_marked_rollout(session, codex_root, target_file, scan_start)
+                upgraded = await self._codex_upgrade_to_marked_rollout(session, codex_root, target_file, scan_start)
                 if upgraded is not None:
                     target_file = upgraded
                     offset = 0
@@ -7548,7 +7171,7 @@ class HubSessionManager:
                             turn_has_step = True
                             tname = payload.get("name") or payload.get("tool_name") or ptype
                             targs = payload.get("arguments") or payload.get("input") or ""
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "codex_jsonl",
@@ -7571,7 +7194,7 @@ class HubSessionManager:
                                     str(o.get("label") or o.get("value") or o) if isinstance(o, dict) else str(o)
                                     for o in raw_opts
                                 ]
-                                self.register_pending_interaction(
+                                await self.register_pending_interaction(
                                     session=session,
                                     kind="question",
                                     title=q_title,
@@ -7583,7 +7206,7 @@ class HubSessionManager:
                                 )
                         elif ptype in ("custom_tool_call_output", "function_call_output"):
                             out_val = payload.get("output") or ""
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "codex_jsonl",
@@ -7597,7 +7220,7 @@ class HubSessionManager:
                                 and session.pending_interaction
                                 and session.pending_interaction.get("kind") == "approval_request"
                             ):
-                                self.clear_pending_interaction(session)
+                                await self.clear_pending_interaction(session)
                         elif ptype == "message" and payload.get("role") == "user":
                             parts = payload.get("content") or []
                             user_txts = [
@@ -7610,7 +7233,7 @@ class HubSessionManager:
                             if user_txts:
                                 session.note_transcript_user_message(" ".join(user_txts).strip())
                                 if session.pending_interaction:
-                                    self.clear_pending_interaction(session)
+                                    await self.clear_pending_interaction(session)
                                 turn_has_step = False
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
@@ -7625,7 +7248,7 @@ class HubSessionManager:
                                 msg_txt = "\n".join(texts).strip()
                                 if not turn_has_step:
                                     turn_has_step = True
-                                    self.record_telemetry(
+                                    await self.record_telemetry(
                                         session.session_id,
                                         {
                                             "source": "codex_jsonl",
@@ -7634,7 +7257,7 @@ class HubSessionManager:
                                             "tool_input": msg_txt[:200],
                                         },
                                     )
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "codex_jsonl",
@@ -7650,7 +7273,7 @@ class HubSessionManager:
                         # D7: codex 0.165 no longer writes these to the rollout (the screen detector
                         # catches its prompts); kept for older builds, with the current labels.
                         is_edit = ptype == "apply_patch_approval_request"
-                        self.register_pending_interaction(
+                        await self.register_pending_interaction(
                             session=session,
                             kind="approval_request",
                             title=f"Codex {ptype}",
@@ -7679,7 +7302,7 @@ class HubSessionManager:
                         if last_msg:
                             if not turn_has_step:
                                 turn_has_step = True
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "codex_jsonl",
@@ -7689,7 +7312,7 @@ class HubSessionManager:
                                     },
                                 )
                             session.set_final_response(str(last_msg), "codex_task_complete")
-                            self.record_worker_event(
+                            await self.record_worker_event(
                                 session.session_id,
                                 {
                                     "type": "turn_completed",
@@ -7701,15 +7324,15 @@ class HubSessionManager:
                     elif otype == "event_msg" and ptype == "turn_aborted":
                         abort_reason = str(payload.get("reason") or "interrupted")
                         if session.pending_interaction:
-                            self.clear_pending_interaction(session)
-                        self.db.complete_latest_tool_call(
+                            await self.clear_pending_interaction(session)
+                        await self.db.complete_latest_tool_call(
                             session.session_id, None, f"Turn aborted ({abort_reason})"
                         )
                         if session.status == "running":
                             session.status = "waiting_parent"
                         session.current_activity = f"Turn aborted ({abort_reason}) — idle at prompt"
-                        self.persist_session(session)
-                        self.record_worker_event(
+                        await self.persist_session(session)
+                        await self.record_worker_event(
                             session.session_id,
                             {
                                 "type": "turn_aborted",
@@ -7718,6 +7341,8 @@ class HubSessionManager:
                                 "content": f"Codex turn aborted ({abort_reason})",
                             },
                         )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
             await asyncio.sleep(1.0)
@@ -7726,7 +7351,7 @@ class HubSessionManager:
             # Research: an archived codex session refuses to resume; surface its own instruction.
             screen = session.get_clean_screen_text(max_lines=40).lower()
             if "is archived" in screen or "unarchive" in screen:
-                self._mark_codex_archived(session)
+                await self._mark_codex_archived(session)
 
     @staticmethod
     def _codex_date_dirs(root: Path, anchor: float, now: float) -> List[Path]:
@@ -7750,7 +7375,7 @@ class HubSessionManager:
             day = day + datetime.timedelta(days=1)
         return days
 
-    def _codex_resume_new_rollout(
+    async def _codex_resume_new_rollout(
         self, session: AgentSession, root: Path, current: Path, scan_start: float
     ) -> Optional[Path]:
         ref = session.conversation_ref or {}
@@ -7776,13 +7401,13 @@ class HubSessionManager:
             return None
         candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
         chosen = candidates[-1]
-        if not self._claim_transcript(session, chosen):
+        if not await self._claim_transcript(session, chosen):
             return None
         session.conversation_ref = {"session_id": sid, "rollout_path": str(chosen)}
-        self.persist_session(session)
+        await self.persist_session(session)
         return chosen
 
-    def _codex_upgrade_to_marked_rollout(
+    async def _codex_upgrade_to_marked_rollout(
         self, session: AgentSession, root: Path, current: Path, scan_start: float
     ) -> Optional[Path]:
         """If an unmarked rollout was claimed before Codex flushed the prompt containing our session_id,
@@ -7806,19 +7431,19 @@ class HubSessionManager:
                         old_key = self._transcript_key(current)
                         if self._claimed_transcripts.get(old_key) == session.session_id:
                             self._claimed_transcripts.pop(old_key, None)
-                        if self._claim_transcript(session, candidate):
-                            return candidate
+                    if await self._claim_transcript(session, candidate):
+                        return candidate
                 except OSError:
                     continue
         return None
 
-    def _mark_codex_archived(self, session: AgentSession) -> None:
+    async def _mark_codex_archived(self, session: AgentSession) -> None:
         reason = CODEX_ARCHIVED_MESSAGE.format(sid=(session.conversation_ref or {}).get("session_id") or "")
         session.resumable = False
         session.resume_block_reason = reason
-        self.db.update_archive_fields(session.session_id, resumable=0, resume_block_reason=reason)
+        await self.db.update_archive_fields(session.session_id, resumable=0, resume_block_reason=reason)
         session.emit_virtual_ansi(f"\r\n\x1b[1;31m✖ {reason}\x1b[0m\r\n")
-        self.record_worker_event(
+        await self.record_worker_event(
             session.session_id,
             {"type": "error", "category": "lifecycle", "status": "failed", "content": reason},
         )
@@ -7834,7 +7459,7 @@ class HubSessionManager:
             if ref_path and os.path.isfile(ref_path):
                 target_file = Path(ref_path)
                 offset = int(session.attach_offset or 0)
-                self._claim_transcript(session, target_file)
+                await self._claim_transcript(session, target_file)
         else:
             while self._transcript_watch_alive(session):
                 await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
@@ -7846,7 +7471,7 @@ class HubSessionManager:
                 for candidate in files:
                     if not self._conversation_created_after(candidate, session):
                         continue
-                    if self._claim_transcript(session, candidate):
+                    if await self._claim_transcript(session, candidate):
                         target_file = candidate
                         break
                 if target_file:
@@ -7893,7 +7518,7 @@ class HubSessionManager:
                             "args": targs,
                             "call_id": str(data.get("toolCallId") or ""),
                         }
-                        self.record_telemetry(
+                        await self.record_telemetry(
                             session.session_id,
                             {
                                 "source": "omp_jsonl",
@@ -7913,7 +7538,7 @@ class HubSessionManager:
                                 for o in raw_opts
                             ]
                             display_opts = list(opt_labels) + ["Other (type your own)"]
-                            self.register_pending_interaction(
+                            await self.register_pending_interaction(
                                 session=session,
                                 kind="question",
                                 title=q_header,
@@ -7943,15 +7568,15 @@ class HubSessionManager:
                                 session.note_transcript_user_message(" ".join(user_txts).strip())
                             session._inflight_transcript_tool = None
                             if session.pending_interaction:
-                                self.clear_pending_interaction(session)
+                                await self.clear_pending_interaction(session)
                             turn_has_step = False
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
                         elif role == "toolResult":
                             session._inflight_transcript_tool = None
                             if session.pending_interaction:
-                                self.clear_pending_interaction(session)
-                            self.record_telemetry(
+                                await self.clear_pending_interaction(session)
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "omp_jsonl",
@@ -7987,7 +7612,7 @@ class HubSessionManager:
                                             for o in raw_opts
                                         ]
                                         display_opts = list(opt_labels) + ["Other (type your own)"]
-                                        self.register_pending_interaction(
+                                        await self.register_pending_interaction(
                                             session=session,
                                             kind="question",
                                             title=q_header,
@@ -8005,7 +7630,7 @@ class HubSessionManager:
                             final_txt = "\n".join(texts).strip() if (texts and not has_tool_use) else None
                             if final_txt and not turn_has_step:
                                 turn_has_step = True
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "omp_jsonl",
@@ -8014,7 +7639,7 @@ class HubSessionManager:
                                         "tool_input": final_txt[:200],
                                     },
                                 )
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "omp_jsonl",
@@ -8023,6 +7648,8 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
             await asyncio.sleep(0.8)
@@ -8042,7 +7669,7 @@ class HubSessionManager:
                 ids.add(str(obj["id"]))
         return ids
 
-    def _drain_kimi_wire_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+    async def _drain_kimi_wire_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Synchronously drains Kimi's wire.jsonl for interaction.request / interaction.resolved."""
         tpath = getattr(session, "transcript_path", None)
         if not tpath:
@@ -8081,7 +7708,7 @@ class HubSessionManager:
                     if ikind == "approval":
                         disp = req_obj.get("display") or {}
                         cmd_str = disp.get("command") or req_obj.get("description") or req_obj.get("action") or "action"
-                        self.register_pending_interaction(
+                        await self.register_pending_interaction(
                             session=session,
                             kind="approval_request",
                             title=f"Kimi Approval: {req_obj.get('toolName') or 'Shell'} ({req_obj.get('action') or 'run'})",
@@ -8109,7 +7736,7 @@ class HubSessionManager:
                             for o in raw_opts
                         ]
                         display_opts = list(opt_labels) + ["Other (custom text input)"]
-                        self.register_pending_interaction(
+                        await self.register_pending_interaction(
                             session=session,
                             kind="question",
                             title=q_header,
@@ -8123,7 +7750,9 @@ class HubSessionManager:
                             },
                         )
                 elif obj.get("type") == "interaction.resolved":
-                    self.clear_pending_interaction(session, str(obj.get("id") or ""))
+                    await self.clear_pending_interaction(session, str(obj.get("id") or ""))
+        except PersistenceUnavailable:
+            raise
         except Exception:
             pass
         return session.pending_interaction
@@ -8151,7 +7780,7 @@ class HubSessionManager:
             if ref_path and os.path.isfile(ref_path):
                 target_file = Path(ref_path)
                 offset = int(session.attach_offset or 0)
-                self._claim_transcript(session, target_file)
+                await self._claim_transcript(session, target_file)
 
         while target_file is None and self._transcript_watch_alive(session):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
@@ -8165,7 +7794,7 @@ class HubSessionManager:
                 # it still must not be a transcript another hub session is already tailing (V2).
                 kimi_sid = m.group(1)
                 exact = list(kimi_root.rglob(f"{kimi_sid}/agents/main/wire.jsonl"))
-                if exact and exact[0].exists() and self._claim_transcript(session, exact[0]):
+                if exact and exact[0].exists() and await self._claim_transcript(session, exact[0]):
                     target_file = exact[0]
                     break
 
@@ -8179,7 +7808,7 @@ class HubSessionManager:
                     candidates.append(p)
                 except OSError:
                     pass
-            target_file = self._claim_conversation(session, candidates, levels_up=2)
+            target_file = await self._claim_conversation(session, candidates, levels_up=2)
             if target_file:
                 break
 
@@ -8187,13 +7816,13 @@ class HubSessionManager:
             return
         session.transcript_path = target_file
         session._kimi_wire_interaction_offset = offset
-        self.persist_session(session)
+        await self.persist_session(session)
 
         latest_assistant_text: Optional[str] = None
         turn_has_step = False
         while self._transcript_watch_alive(session):
             try:
-                self._drain_kimi_wire_interactions_once(session)
+                await self._drain_kimi_wire_interactions_once(session)
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
                     lines = f.readlines()
@@ -8226,7 +7855,7 @@ class HubSessionManager:
                         if latest_assistant_text:
                             if not turn_has_step:
                                 turn_has_step = True
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "kimi_wire_jsonl",
@@ -8236,7 +7865,7 @@ class HubSessionManager:
                                     },
                                 )
                             session.set_final_response(latest_assistant_text, "native_transcript")
-                            self.record_worker_event(
+                            await self.record_worker_event(
                                 session.session_id,
                                 {
                                     "type": "turn_completed",
@@ -8253,7 +7882,7 @@ class HubSessionManager:
                         if ev_type == "content.part":
                             part = ev.get("part") or {}
                             if part.get("type") == "think" and part.get("think"):
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "kimi_wire_jsonl",
@@ -8264,7 +7893,7 @@ class HubSessionManager:
                             elif part.get("type") == "text" and part.get("text"):
                                 txt = str(part["text"]).strip()
                                 latest_assistant_text = txt
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "kimi_wire_jsonl",
@@ -8275,7 +7904,7 @@ class HubSessionManager:
                                 )
                         elif ev_type == "tool.call":
                             turn_has_step = True
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "kimi_wire_jsonl",
@@ -8285,7 +7914,7 @@ class HubSessionManager:
                                 },
                             )
                         elif ev_type == "tool.result":
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "kimi_wire_jsonl",
@@ -8320,7 +7949,7 @@ class HubSessionManager:
                         if texts:
                             latest_assistant_text = "\n".join(texts)
                         if inter:
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "kimi_wire_jsonl",
@@ -8334,7 +7963,7 @@ class HubSessionManager:
                             fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
                             tname = fn.get("name") or tc.get("name") or "kimi_tool"
                             targs = fn.get("arguments") or tc.get("arguments") or ""
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "kimi_wire_jsonl",
@@ -8344,7 +7973,7 @@ class HubSessionManager:
                                 },
                             )
                     elif role == "tool":
-                        self.record_telemetry(
+                        await self.record_telemetry(
                             session.session_id,
                             {
                                 "source": "kimi_wire_jsonl",
@@ -8352,6 +7981,8 @@ class HubSessionManager:
                                 "tool_response": content,
                             },
                         )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
             await asyncio.sleep(0.8)
@@ -8379,7 +8010,7 @@ class HubSessionManager:
             if ref_path and os.path.isfile(ref_path):
                 target_file = Path(ref_path)
                 offset = int(session.attach_offset or 0)
-                self._claim_transcript(session, target_file)
+                await self._claim_transcript(session, target_file)
 
         if target_file is None and session.resume_attach and ref_path:
             # A3/V3: the archived brain dir is the reference. Some brain dirs hold no
@@ -8400,7 +8031,7 @@ class HubSessionManager:
                     return
                 if os.path.isfile(ref_path):
                     candidate = Path(ref_path)
-                    if self._claim_transcript(session, candidate):
+                    if await self._claim_transcript(session, candidate):
                         target_file = candidate
                         offset = resume_attach_offset
                         break
@@ -8409,7 +8040,7 @@ class HubSessionManager:
                 if time.time() <= verify_deadline:
                     stray = self._agy_new_conversation_dir(session, brain_root)
                     if stray is not None:
-                        self._mark_agy_resume_failed(session)
+                        await self._mark_agy_resume_failed(session)
                         return
                 await asyncio.sleep(0.5)
             if target_file is None:
@@ -8429,7 +8060,7 @@ class HubSessionManager:
                     candidates.append(p)
                 except OSError:
                     continue
-            target_file = self._claim_conversation(session, candidates, levels_up=2)
+            target_file = await self._claim_conversation(session, candidates, levels_up=2)
             if target_file:
                 break
 
@@ -8451,7 +8082,7 @@ class HubSessionManager:
                 if not resume_confirmed and time.time() <= verify_deadline:
                     stray = self._agy_new_conversation_dir(session, brain_root)
                     if stray is not None:
-                        self._mark_agy_resume_failed(session)
+                        await self._mark_agy_resume_failed(session)
                         return
             try:
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
@@ -8472,7 +8103,7 @@ class HubSessionManager:
                             session.note_transcript_user_message(user_txt)
                         session._inflight_transcript_tool = None
                         if session.pending_interaction is not None:
-                            self.clear_pending_interaction(session)
+                            await self.clear_pending_interaction(session)
                         turn_has_step = False
                         if session.status == "completed":
                             self.begin_new_turn(session, status="running")
@@ -8480,9 +8111,9 @@ class HubSessionManager:
                     if obj.get("type") == "GENERIC":
                         session._inflight_transcript_tool = None
                         if session.pending_interaction is not None:
-                            self.clear_pending_interaction(session)
+                            await self.clear_pending_interaction(session)
                         gen_content = str(obj.get("content") or "").strip()
-                        self.record_telemetry(
+                        await self.record_telemetry(
                             session.session_id,
                             {
                                 "source": "agy_transcript",
@@ -8506,7 +8137,7 @@ class HubSessionManager:
                             tcalls = []
                         inter = [x for x in (thinking, content) if x]
                         if inter:
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "agy_transcript",
@@ -8542,7 +8173,7 @@ class HubSessionManager:
                                     "args": parsed_tc_args or targs,
                                     "call_id": str(tc.get("id") or obj.get("step_index") or ""),
                                 }
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "agy_transcript",
@@ -8562,7 +8193,7 @@ class HubSessionManager:
                                     q0 = qs[0] if qs and isinstance(qs[0], dict) else parsed_args
                                     q_prompt = str(q0.get("question") or "AGY Sub-Agent is asking a question")
                                     raw_opts = [str(o) for o in (q0.get("options") or [])]
-                                    self.register_pending_interaction(
+                                    await self.register_pending_interaction(
                                         session=session,
                                         kind="question",
                                         title="AGY ask_question",
@@ -8584,7 +8215,7 @@ class HubSessionManager:
                             if final_text:
                                 if not turn_has_step:
                                     turn_has_step = True
-                                    self.record_telemetry(
+                                    await self.record_telemetry(
                                         session.session_id,
                                         {
                                             "source": "agy_transcript",
@@ -8594,7 +8225,7 @@ class HubSessionManager:
                                         },
                                     )
                                 session.set_final_response(final_text, "native_transcript")
-                                self.record_worker_event(
+                                await self.record_worker_event(
                                     session.session_id,
                                     {
                                         "type": "turn_completed",
@@ -8603,6 +8234,8 @@ class HubSessionManager:
                                         "content": final_text,
                                     },
                                 )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
             await asyncio.sleep(0.8)
@@ -8683,14 +8316,14 @@ class HubSessionManager:
                 continue
         return None
 
-    def _mark_agy_resume_failed(self, session: AgentSession) -> None:
+    async def _mark_agy_resume_failed(self, session: AgentSession) -> None:
         session.resumable = False
         session.resume_block_reason = AGY_RESUME_FAILURE_MESSAGE
-        self.db.update_archive_fields(
+        await self.db.update_archive_fields(
             session.session_id, resumable=0, resume_block_reason=AGY_RESUME_FAILURE_MESSAGE
         )
         session.emit_virtual_ansi(f"\r\n\x1b[1;31m✖ {AGY_RESUME_FAILURE_MESSAGE}\x1b[0m\r\n")
-        self.record_worker_event(
+        await self.record_worker_event(
             session.session_id,
             {
                 "type": "error",
@@ -8733,7 +8366,7 @@ class HubSessionManager:
             if ref_path and os.path.isfile(ref_path):
                 target_file = Path(ref_path)
                 offset = int(session.attach_offset or 0)
-                self._claim_transcript(session, target_file)
+                await self._claim_transcript(session, target_file)
 
         while target_file is None and self._transcript_watch_alive(session):
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
@@ -8748,7 +8381,7 @@ class HubSessionManager:
                     exact = list(claude_root.rglob(f"{expected_uuid}.jsonl"))
                 except OSError:
                     exact = []
-                if exact and exact[0].is_file() and self._claim_transcript(session, exact[0]):
+                if exact and exact[0].is_file() and await self._claim_transcript(session, exact[0]):
                     target_file = exact[0]
                     break
 
@@ -8763,7 +8396,7 @@ class HubSessionManager:
                         continue
             except OSError:
                 pass
-            target_file = self._claim_conversation(session, candidates, levels_up=0)
+            target_file = await self._claim_conversation(session, candidates, levels_up=0)
             if target_file:
                 break
 
@@ -8781,7 +8414,7 @@ class HubSessionManager:
 
         while self._transcript_watch_alive(session):
             try:
-                self._drain_claude_hook_events(session)
+                await self._drain_claude_hook_events(session)
                 with open(target_file, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(offset)
                     lines = f.readlines()
@@ -8801,13 +8434,13 @@ class HubSessionManager:
                         if isinstance(content, str) and content.strip():
                             session._inflight_transcript_tool = None
                             if session.pending_interaction is not None:
-                                self.clear_pending_interaction(session)
+                                await self.clear_pending_interaction(session)
                             turn_last_text = None
                             turn_completed_emitted = False
                             turn_has_step = False
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
-                                self.persist_session(session)
+                                await self.persist_session(session)
                             session.note_transcript_user_message(content.strip())
                         elif isinstance(content, list):
                             user_texts = [
@@ -8818,27 +8451,27 @@ class HubSessionManager:
                             if user_texts:
                                 session._inflight_transcript_tool = None
                                 if session.pending_interaction is not None:
-                                    self.clear_pending_interaction(session)
+                                    await self.clear_pending_interaction(session)
                                 turn_last_text = None
                                 turn_completed_emitted = False
                                 turn_has_step = False
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
-                                    self.persist_session(session)
+                                    await self.persist_session(session)
                                 session.note_transcript_user_message(" ".join(user_texts))
                             for b in content:
                                 if not isinstance(b, dict) or b.get("type") != "tool_result":
                                     continue
                                 session._inflight_transcript_tool = None
                                 if session.pending_interaction is not None:
-                                    self.clear_pending_interaction(session)
+                                    await self.clear_pending_interaction(session)
                                 res_content = b.get("content")
                                 if isinstance(res_content, list):
                                     res_content = "\n".join(
                                         str(x.get("text") or x) if isinstance(x, dict) else str(x)
                                         for x in res_content
                                     )
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "claude_jsonl",
@@ -8852,7 +8485,7 @@ class HubSessionManager:
                             q_txt = str(obj["content"]).strip()
                             if q_txt:
                                 session.note_transcript_user_message(q_txt)
-                                self.db.add_intermediate_message(
+                                await self.db.add_intermediate_message(
                                     session.session_id,
                                     max(1, session.step_count),
                                     f"[Steer queued mid-turn] {q_txt[:240]}",
@@ -8861,12 +8494,12 @@ class HubSessionManager:
                                 session.current_activity = (
                                     f"Step {max(1, session.step_count)}: Steer message queued ({q_txt[:70]})"
                                 )
-                                self.persist_session(session)
+                                await self.persist_session(session)
                         elif op == "dequeue":
                             turn_last_text = None
                             turn_completed_emitted = False
                             turn_has_step = False
-                            self.db.add_intermediate_message(
+                            await self.db.add_intermediate_message(
                                 session.session_id,
                                 max(1, session.step_count),
                                 "[Steer dequeued] Processing queued parent instruction",
@@ -8875,12 +8508,12 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Processing queued steer message"
                             )
-                            self.persist_session(session)
+                            await self.persist_session(session)
                     elif otype == "ai-title" and obj.get("aiTitle"):
                         ai_title = str(obj["aiTitle"]).strip()
                         if ai_title and ai_title not in seen_topics:
                             seen_topics.add(ai_title)
-                            self.db.add_intermediate_message(
+                            await self.db.add_intermediate_message(
                                 session.session_id,
                                 max(1, session.step_count),
                                 f"[Topic] {ai_title}",
@@ -8898,7 +8531,7 @@ class HubSessionManager:
                         turn_has_step = True
                         turn_completed_emitted = False
                         step_desc = f"LLM inference ({req_model}{':' + req_effort if req_effort else ''})"
-                        self.record_telemetry(
+                        await self.record_telemetry(
                             session.session_id,
                             {
                                 "source": "claude_jsonl",
@@ -8967,7 +8600,7 @@ class HubSessionManager:
                                     "args": tinput,
                                     "call_id": str(part.get("id") or ""),
                                 }
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "claude_jsonl",
@@ -8986,7 +8619,7 @@ class HubSessionManager:
                                         str(o.get("label") or o) if isinstance(o, dict) else str(o)
                                         for o in raw_opts
                                     ]
-                                    self.register_pending_interaction(
+                                    await self.register_pending_interaction(
                                         session=session,
                                         kind="question",
                                         title=q_header,
@@ -9002,7 +8635,7 @@ class HubSessionManager:
                         if not turn_has_step and (thoughts or texts):
                             turn_has_step = True
                             req_model = str(msg.get("model") or session.effective_model or "claude")
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "claude_jsonl",
@@ -9028,7 +8661,7 @@ class HubSessionManager:
                             turn_completed_emitted = True
                         final_txt = "\n".join(texts).strip() if is_end_turn else None
                         if inter or final_txt:
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "claude_jsonl",
@@ -9042,7 +8675,7 @@ class HubSessionManager:
                         if not turn_completed_emitted and session.pending_interaction is None:
                             turn_completed_emitted = True
                             fallback_final = turn_last_text or session.final_response or "Turn completed"
-                            self.record_telemetry(
+                            await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "claude_jsonl",
@@ -9055,7 +8688,7 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Turn completed in {float(dur_ms) / 1000.0:.1f}s (final response captured)"
                             )
-                            self.persist_session(session)
+                            await self.persist_session(session)
 
                 now_ts = time.time()
                 if (
@@ -9084,6 +8717,8 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Streaming response — {latest_line[:70]}"
                             )
+            except PersistenceUnavailable:
+                raise
             except Exception:
                 pass
             await asyncio.sleep(0.8)
@@ -9873,7 +9508,7 @@ class HubSessionManager:
         except Exception:
             return False
 
-    def _record_tui_injection(self, session: AgentSession, result: Dict[str, Any]) -> None:
+    async def _record_tui_injection(self, session: AgentSession, result: Dict[str, Any]) -> None:
         """W3/K6: last_injection, the pane's red/grey line and the persisted row for one typed text.
 
         K6 (fix 9c): a live message (mode "parent_message") is recorded here too, under its own name;
@@ -9891,7 +9526,9 @@ class HubSessionManager:
                 f"\r\n\x1b[90m… {what}未确认（unconfirmed）\x1b[0m\r\n"
             )
         try:
-            self.persist_session(session)
+            await self.persist_session(session)
+        except PersistenceUnavailable:
+            raise
         except Exception:
             pass
 
@@ -10048,7 +9685,7 @@ class HubSessionManager:
                     last_text = None
                     stable_since = time.time()
                     continue
-                self._record_tui_injection(session, result)
+                await self._record_tui_injection(session, result)
                 # W4: the text is typed; the readiness wait it could have been lost in is over.
                 return
 
@@ -10070,9 +9707,9 @@ class HubSessionManager:
                             "label": "失败", "at": round(time.time(), 3), "ready": ready,
                             "detail": "not_ready_again_before_deadline",
                         })
-                        self._record_tui_injection(session, result)
+                        await self._record_tui_injection(session, result)
                         return
-                    self._record_tui_injection(session, {
+                    await self._record_tui_injection(session, {
                         "ok": None, "reason": "unconfirmed", "attempts": 0,
                         "mode": "startup_task", "at": round(time.time(), 3),
                         "label": "未确认", "ready": ready, "trust_dismissed": trust_dismissed,
@@ -10097,7 +9734,7 @@ class HubSessionManager:
             return f"异常退出（退出码 {exit_code}）。最后输出：\n{self._crash_tail(sess)}\n{hint}。"
         return f"进程已退出（退出码 {exit_code}）。{hint}。"
 
-    def _on_session_exit(self, session: Any, exit_code: int):
+    async def _on_session_exit(self, session: Any, exit_code: int):
         """One exited process → at most one lifecycle event for its session id (A7).
 
         The callback carries the session object: after a resume replaced it, the old object's exit
@@ -10109,7 +9746,7 @@ class HubSessionManager:
         sess = self.sessions.get(session_id)
         if obj is not None and sess is not obj:
             if sess is None:
-                rec = self.db.get_session_record(session_id)
+                rec = await self.db.get_session_record(session_id)
                 if rec and rec.get("archived_at"):
                     # close_session already wrote the final record and emitted its one event.
                     self._release_transcripts(session_id)
@@ -10123,7 +9760,7 @@ class HubSessionManager:
             self._user_terminated.discard(session_id)
             return
         if sess is None:
-            rec = self.db.get_session_record(session_id)
+            rec = await self.db.get_session_record(session_id)
             if rec and rec.get("archived_at"):
                 # close_session already wrote the final record and emitted its one event.
                 self._release_transcripts(session_id)
@@ -10138,10 +9775,10 @@ class HubSessionManager:
             if sess.end_reason:
                 sess.status = sess.end_reason
             # The final record writes the scrollback and the mailbox thread once, here (spec §3, A11).
-            self.persist_session(sess, force_scrollback=True, final=True)
+            await self.persist_session(sess, force_scrollback=True, final=True)
             end_reason = sess.end_reason or "exited"
         ev_type = "crashed" if end_reason == "crashed" else "exited"
-        self.record_worker_event(
+        await self.record_worker_event(
             session_id,
             {
                 "type": ev_type,
@@ -10184,7 +9821,7 @@ class HubSessionManager:
             session.emit_virtual_ansi(
                 "\x1b[90m✦ Ready. Type a task below or call send_to_subagent to dispatch into DSH Web Host.\x1b[0m\r\n> "
             )
-            self.persist_session(session)
+            await self.persist_session(session)
             return
 
         token = str(uuid.uuid4())
@@ -10209,7 +9846,7 @@ class HubSessionManager:
                         return
                     session.emit_virtual_ansi(f"\x1b[1;31m✖ DSH Spawn Error: {err_msg}\x1b[0m\r\n")
                     session.status = "exited"
-                    self.persist_session(session)
+                    await self.persist_session(session)
                     return
                 job = data["job"]
                 job_id = job["id"]
@@ -10243,17 +9880,19 @@ class HubSessionManager:
                     f"\x1b[90m(DSH Web Session: {dsh_sid})\x1b[0m\r\n"
                     f"\x1b[90m❯ {task.strip()}\x1b[0m\r\n"
                 )
-                self.persist_session(session)
+                await self.persist_session(session)
                 await self._watch_dsh_hub_job(session, job_id, token)
+        except PersistenceUnavailable:
+            raise
         except Exception as e:
             if session.terminated_by_user:
                 # Q4: a spawn that fails after the user terminated must not resurrect the session.
                 return
             session.emit_virtual_ansi(f"\x1b[1;31m✖ Failed to reach DSH Host on {dsh_host}: {e}\x1b[0m\r\n")
             session.status = "exited"
-            self.persist_session(session)
+            await self.persist_session(session)
 
-    async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str):
+    async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str, *, log_path: Optional[Path] = None):
         """
         Tails ~/.config/dsh-crew/logs/<job_id>.log for real-time steps/tools/thoughts AND
         polls /_dsh/dsh-crew/jobs/<job_id>/messages for bidirectional worker->parent messages & questions!
@@ -10261,75 +9900,73 @@ class HubSessionManager:
         if session.terminated_by_user:
             # Q4: never attach, persist or emit for a session the user already terminated.
             return
-        log_file = Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
+        log_file = log_path or Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
         session.transcript_path = log_file
-        self.persist_session(session)
-        log_offset = 0
+        await self.persist_session(session)
+        tail = TranscriptTail(log_file)
         msg_cursor = 0
 
-        def drain_log_lines():
-            nonlocal log_offset
-            if not log_file.exists():
-                return
-            try:
-                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(log_offset)
-                    lines = f.readlines()
-                    log_offset = f.tell()
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except Exception:
-                        continue
-                    kind = ev.get("kind")
-                    summary = ev.get("summary", "")
-                    if kind == "step":
-                        s_num = int(ev.get("step") or (session.step_count + 1))
-                        t_num = ev.get("turn", 1)
-                        session.step_count = max(session.step_count, s_num)
-                        session.current_activity = f"Step {s_num} (Turn {t_num})"
-                        session.emit_virtual_ansi(f"\r\n\x1b[1;36m▶ [Step {s_num} · Turn {t_num}]\x1b[0m\r\n")
-                        self.persist_session(session)
-                    elif kind == "tool_call":
-                        tname = ev.get("tool") or summary or "dsh_tool"
-                        self.record_telemetry(
-                            session.session_id,
-                            {
-                                "source": "dsh_job_log",
-                                "hook_event": "PreToolUse",
-                                "tool_name": tname,
-                                "tool_input": summary,
-                            },
-                        )
-                        session.emit_virtual_ansi(f"\x1b[33m  ⚙ Tool Call: {tname}\x1b[0m\r\n")
-                    elif kind == "tool_result":
-                        self.record_telemetry(
-                            session.session_id,
-                            {
-                                "source": "dsh_job_log",
-                                "hook_event": "PostToolUse",
-                                "tool_response": summary,
-                            },
-                        )
-                        session.emit_virtual_ansi(f"\x1b[32m  ✓ {summary}\x1b[0m\r\n")
-                    elif kind == "text" and summary:
-                        self.record_telemetry(
-                            session.session_id,
-                            {
-                                "source": "dsh_job_log",
-                                "hook_event": "AssistantMessage",
-                                "intermediate_messages": [summary],
-                                "final_assistant_text": summary,
-                            },
-                        )
-                        session.emit_virtual_ansi(f"\x1b[37m  💬 {summary}\x1b[0m\r\n")
-                    elif kind == "error" and summary:
-                        session.emit_virtual_ansi(f"\x1b[1;31m  ✖ {summary}\x1b[0m\r\n")
-            except Exception:
-                pass
+        async def drain_log_lines():
+            lines = await tail.read_batch()
+            for next_offset, line in lines:
+                if session.terminated_by_user or self._shutting_down:
+                    return False
+                try:
+                    ev = json.loads(line)
+                except (ValueError, TypeError):
+                    logger.warning("Skipping malformed DSH log line for %s", session.session_id)
+                    tail.acknowledge(next_offset)
+                    continue
+                kind = ev.get("kind")
+                summary = ev.get("summary", "")
+                if kind == "step":
+                    s_num = int(ev.get("step") or (session.step_count + 1))
+                    t_num = ev.get("turn", 1)
+                    session.step_count = max(session.step_count, s_num)
+                    session.current_activity = f"Step {s_num} (Turn {t_num})"
+                    session.emit_virtual_ansi(f"\r\n\x1b[1;36m▶ [Step {s_num} · Turn {t_num}]\x1b[0m\r\n")
+                    await self.persist_session(session)
+                elif kind == "tool_call":
+                    tname = ev.get("tool") or summary or "dsh_tool"
+                    await self.record_telemetry(
+                        session.session_id,
+                        {
+                            "source": "dsh_job_log",
+                            "hook_event": "PreToolUse",
+                            "tool_name": tname,
+                            "tool_input": summary,
+                        },
+                    )
+                    session.emit_virtual_ansi(f"\x1b[33m  ⚙ Tool Call: {tname}\x1b[0m\r\n")
+                elif kind == "tool_result":
+                    await self.record_telemetry(
+                        session.session_id,
+                        {
+                            "source": "dsh_job_log",
+                            "hook_event": "PostToolUse",
+                            "tool_response": summary,
+                        },
+                    )
+                    session.emit_virtual_ansi(f"\x1b[32m  ✓ {summary}\x1b[0m\r\n")
+                elif kind == "text" and summary:
+                    await self.record_telemetry(
+                        session.session_id,
+                        {
+                            "source": "dsh_job_log",
+                            "hook_event": "AssistantMessage",
+                            "intermediate_messages": [summary],
+                            "final_assistant_text": summary,
+                        },
+                    )
+                    session.emit_virtual_ansi(f"\x1b[37m  💬 {summary}\x1b[0m\r\n")
+                elif kind == "error" and summary:
+                    session.emit_virtual_ansi(f"\x1b[1;31m  ✖ {summary}\x1b[0m\r\n")
+                tail.acknowledge(next_offset)
+                # A single pyte/history snapshot can be costly. Let socket I/O run
+                # between records as well as between the bounded file-read batches.
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0)
+            return len(lines) == tail.batch_lines
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             while (
@@ -10337,7 +9974,8 @@ class HubSessionManager:
                 and not session.terminated_by_user
                 and session.status in ("starting", "running", "waiting_parent")
             ):
-                drain_log_lines()
+                if await drain_log_lines():
+                    continue
 
                 # Poll DSH WorkerMailbox for worker->parent messages or blocking questions
                 try:
@@ -10354,8 +9992,6 @@ class HubSessionManager:
                         m_res = m_resp.json().get("result") or {}
                         for m in m_res.get("messages") or []:
                             seq = int(m.get("sequence", 0))
-                            if seq > msg_cursor:
-                                msg_cursor = seq
                             mkind = m.get("kind")
                             mtext = m.get("text", "")
                             mid = m.get("message_id") or f"dsh-msg-{seq}"
@@ -10381,7 +10017,7 @@ class HubSessionManager:
                                         f"\r\n\x1b[1;35m{'🛡️' if is_sec_approval else '❓'} [DSH Worker {'Approval Request' if is_sec_approval else 'Asking Parent'} (request_id={mid})]:\x1b[0m\r\n"
                                         f"\x1b[35m   {mtext}\x1b[0m\r\n"
                                     )
-                                    self.register_pending_interaction(
+                                    await self.register_pending_interaction(
                                         session=session,
                                         kind=int_kind,
                                         title=int_title,
@@ -10400,14 +10036,14 @@ class HubSessionManager:
                                         f"\r\n\x1b[1;34m📨 [DSH Worker Message to Parent]: {mtext}\x1b[0m\r\n"
                                     )
                                     if mtext.lstrip().startswith("[approval granted without asking"):
-                                        self.db.add_intermediate_message(
+                                        await self.db.add_intermediate_message(
                                             session.session_id,
                                             session.step_count,
                                             mtext.strip(),
                                             source="dsh_auto_approval_notice",
                                         )
                                     else:
-                                        self.record_worker_event(
+                                        await self.record_worker_event(
                                             session.session_id,
                                             {
                                                 "type": "message_to_parent",
@@ -10416,6 +10052,9 @@ class HubSessionManager:
                                                 "content": mtext,
                                             },
                                         )
+                            msg_cursor = max(msg_cursor, seq)
+                except PersistenceUnavailable:
+                    raise
                 except Exception:
                     pass
 
@@ -10444,7 +10083,7 @@ class HubSessionManager:
                                     for o in raw_opts
                                 ]
                                 is_sec = q_header == "Security mode" or "Allow this call?" in q_prompt
-                                self.register_pending_interaction(
+                                await self.register_pending_interaction(
                                     session=session,
                                     kind="approval_request" if is_sec else "question",
                                     title=q_header,
@@ -10463,11 +10102,12 @@ class HubSessionManager:
                                 # Q4: the job ended, but the user's termination is the final word on
                                 # this session's status, persistence and events.
                                 return
-                            drain_log_lines()
+                            while await drain_log_lines():
+                                pass  # Each batch yields; preserve every trailing telemetry record.
                             full_res = (jview.get("result") or jview.get("error") or "").strip()
                             if full_res:
                                 session.set_final_response(full_res, "dsh_hub_completion")
-                                self.record_telemetry(
+                                await self.record_telemetry(
                                     session.session_id,
                                     {
                                         "source": "dsh_hub_api",
@@ -10505,7 +10145,7 @@ class HubSessionManager:
                                 f"\x1b[1;32m╰{'─' * (done_w - 1)}╯\x1b[0m\r\n"
                                 f"\x1b[90m(Session {session.dsh_session_id} stays warm in DSH Host — send input to continue)\x1b[0m\r\n> "
                             )
-                            self.persist_session(session)
+                            await self.persist_session(session)
                             # V6: one feed entry per dsh turn. The record_telemetry(TurnComplete)
                             # above already emitted turn_completed with this result; the extra
                             # "completed" event duplicated it. "completed" is the worker's
@@ -10513,7 +10153,7 @@ class HubSessionManager:
                             # warm and can be continued, so it would also misstate the session.
                             # Only a result-less turn needs its own event.
                             if not full_res:
-                                self.record_worker_event(
+                                await self.record_worker_event(
                                     session.session_id,
                                     {
                                         "type": "turn_completed",
@@ -10523,6 +10163,8 @@ class HubSessionManager:
                                     },
                                 )
                             break
+                except PersistenceUnavailable:
+                    raise
                 except Exception:
                     pass
 
@@ -10608,7 +10250,7 @@ class HubSessionManager:
         shutil.rmtree(target, ignore_errors=True)
         return not target.exists()
 
-    def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+    async def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7 + round 2 (owner): every option on the screen is offered, each with the action its
         shortcut key means. approve_session sends the key the screen shows for the "don't ask again"
         option: `p` on a command prompt (codex writes a permanent allow rule for that command prefix
@@ -10636,7 +10278,7 @@ class HubSessionManager:
             )
         elif not session_key:
             lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
-        return self.register_pending_interaction(
+        return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
             title="Codex TUI Approval Modal" if kind == "command" else "Codex TUI Edit Approval",
@@ -10651,7 +10293,7 @@ class HubSessionManager:
             },
         )
 
-    def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+    async def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7: agy's options are offered by label; the one that persists to settings.json never is."""
         opts = [dict(o) for o in parsed.get("options") or []]
         # Round 3: the conversation-wide deny rule (`No, and always deny … in this conversation`) is
@@ -10671,7 +10313,7 @@ class HubSessionManager:
             lines.append(f"{what}: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
-        return self.register_pending_interaction(
+        return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
             title="AGY TUI Permission Prompt",
@@ -10686,7 +10328,7 @@ class HubSessionManager:
             },
         )
 
-    def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
+    async def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
         """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered."""
         offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
         inflight = getattr(session, "_inflight_transcript_tool", None) or {}
@@ -10696,7 +10338,7 @@ class HubSessionManager:
         lines = [f"Allow tool: {parsed.get('tool') or inflight.get('tool_name') or '?'}"] + list(parsed.get("details") or [])
         if best_cmd and best_cmd not in "\n".join(lines):
             lines.append(f"Command: {best_cmd}")
-        return self.register_pending_interaction(
+        return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
             title=f"OMP Tool Approval ({parsed.get('tool') or inflight.get('tool_name') or 'tool'})",
@@ -10713,7 +10355,7 @@ class HubSessionManager:
             },
         )
 
-    def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
+    async def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """Claude Code permission prompt fallback: options are offered by label."""
         opts = [dict(o) for o in parsed.get("options") or []]
         offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
@@ -10738,7 +10380,7 @@ class HubSessionManager:
             )
         elif not has_session_opt:
             lines.append("（这个提示没有「不再询问」选项：approve_session 按允许一次处理）")
-        return self.register_pending_interaction(
+        return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
             title="Claude Code Permission Prompt",
@@ -10768,7 +10410,7 @@ class HubSessionManager:
             return self.runtime_configs_dir / f"claude_hooks_{claude_uuid}.jsonl"
         return None
 
-    def _register_claude_hook_approval(self, session: AgentSession, hook_ev: Dict[str, Any]):
+    async def _register_claude_hook_approval(self, session: AgentSession, hook_ev: Dict[str, Any]):
         """Registers a Claude Code permission prompt directly from the native PermissionRequest hook."""
         tname = str(hook_ev.get("tool_name") or "Tool").strip()
         tinput = hook_ev.get("tool_input") if isinstance(hook_ev.get("tool_input"), dict) else {}
@@ -10841,7 +10483,7 @@ class HubSessionManager:
             str(hook_ev.get("tool_use_id") or "").strip()
             or f"claude-perm-{int(float(hook_ev.get('timestamp') or time.time()) * 1000)}"
         )
-        return self.register_pending_interaction(
+        return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
             title=f"Claude Code Permission Prompt ({tname})",
@@ -10858,7 +10500,7 @@ class HubSessionManager:
             },
         )
 
-    def _drain_claude_hook_events(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+    async def _drain_claude_hook_events(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Reads any newly appended PermissionRequest records from claude_hooks_<uuid>.jsonl."""
         log_path = self._claude_hook_log_path(session)
         if log_path is None or not log_path.is_file():
@@ -10882,18 +10524,20 @@ class HubSessionManager:
                 if ev.get("hook_event_name") == "PermissionRequest":
                     if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
                         session._prompt_quiet_until = 0.0
-                    self._register_claude_hook_approval(session, ev)
+                    await self._register_claude_hook_approval(session, ev)
+        except PersistenceUnavailable:
+            raise
         except Exception:
             pass
         return session.pending_interaction
 
-    def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
+    async def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Synchronously checks a live TUI session's hooks/transcript/screen once for approval or multi-choice prompts."""
         eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
         if eng == "claude":
-            self._drain_claude_hook_events(session)
+            await self._drain_claude_hook_events(session)
         elif eng == "kimi":
-            self._drain_kimi_wire_interactions_once(session)
+            await self._drain_kimi_wire_interactions_once(session)
         if session.pending_interaction is not None:
             return session.pending_interaction
         # D7: an answered prompt can stay on screen for a moment; it is not a new one.
@@ -10910,7 +10554,7 @@ class HubSessionManager:
             sig = f"codex_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self._register_codex_screen_approval(session, codex_prompt, scr)
+                return await self._register_codex_screen_approval(session, codex_prompt, scr)
             return None
 
         # 2) AGY TUI permission prompt ("Run this command?" + numbered options, mapped by label)
@@ -10919,7 +10563,7 @@ class HubSessionManager:
             sig = f"agy_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self._register_agy_screen_approval(session, agy_prompt, scr)
+                return await self._register_agy_screen_approval(session, agy_prompt, scr)
             return None
 
         # 2b) AGY TUI `ask_question` multi-choice selector ("Question 1/" or "Navigate · enter Select").
@@ -10951,7 +10595,7 @@ class HubSessionManager:
                         opts.append(opt_lbl)
                 if not opts:
                     opts = ["Option 1", "Option 2", "Write-in..."]
-                return self.register_pending_interaction(
+                return await self.register_pending_interaction(
                     session=session,
                     kind="question",
                     title="AGY TUI ask_question",
@@ -10969,7 +10613,7 @@ class HubSessionManager:
             sig = f"kimi_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self.register_pending_interaction(
+                return await self.register_pending_interaction(
                     session=session,
                     kind="approval_request",
                     title="Kimi TUI Approval Panel",
@@ -10991,7 +10635,7 @@ class HubSessionManager:
             sig = f"omp_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self._register_omp_screen_approval(session, omp_prompt)
+                return await self._register_omp_screen_approval(session, omp_prompt)
             return None
 
         # 4b) OMP settings-change confirm ("Allow once" + "Always for this session" + "Deny").
@@ -10999,7 +10643,7 @@ class HubSessionManager:
             sig = f"omp_settings:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self.register_pending_interaction(
+                return await self.register_pending_interaction(
                     session=session,
                     kind="approval_request",
                     title="OMP Settings Change Confirm",
@@ -11023,7 +10667,7 @@ class HubSessionManager:
             sig = f"claude_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
-                return self._register_claude_screen_approval(session, claude_prompt, scr)
+                return await self._register_claude_screen_approval(session, claude_prompt, scr)
             return None
 
         # N1: when no interactive prompt is on screen anymore, clear seen signatures so a later
@@ -11042,7 +10686,7 @@ class HubSessionManager:
         # of the session, so a follow-up turn's risky command sat at agy's prompt unseen.
         while session.status in LIVE_STATUSES:
             await asyncio.sleep(0.9)
-            self.poll_tui_screen_interactions_once(session)
+            await self.poll_tui_screen_interactions_once(session)
 
     @staticmethod
     def _middle_level(levels) -> Optional[str]:
@@ -11389,8 +11033,8 @@ class HubSessionManager:
                 command="",
                 args=[],
                 hwnd=int(hwnd),
-                on_exit_cb=self._on_session_exit,
-                on_tui_tool_cb=self._on_tui_tool_detected,
+                on_exit_cb=self._exit_callback,
+                on_tui_tool_cb=self._tool_callback,
             )
             sess.status = "running"
             sess.engine = "desktop_gui"
@@ -11403,7 +11047,7 @@ class HubSessionManager:
                 "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
             }
             self.sessions[session_id] = sess
-            self.persist_session(sess)
+            await self.persist_session(sess)
             return sess
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env)
@@ -11488,8 +11132,8 @@ class HubSessionManager:
             gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
-            on_exit_cb=self._on_session_exit,
-            on_tui_tool_cb=self._on_tui_tool_detected,
+            on_exit_cb=self._exit_callback,
+            on_tui_tool_cb=self._tool_callback,
         )
         sess.effective_model = effective_model
         sess.effective_thinking_level = effective_thinking
@@ -11546,11 +11190,11 @@ class HubSessionManager:
             sess.dsh_spec = dict(launch.get("dsh_spec") or {})
             sess.start_virtual(
                 loop,
-                on_virtual_line_cb=lambda sid, line: self.deliver_parent_message(sid, line, also_write_pty=False),
+                on_virtual_line_cb=lambda sid, line: self._schedule(self.deliver_parent_message(sid, line, also_write_pty=False)),
             )
             self.sessions[session_id] = sess
-            self.persist_session(sess)
-            asyncio.create_task(self._spawn_dsh_hub_job(sess, task))
+            await self.persist_session(sess)
+            self._schedule(self._spawn_dsh_hub_job(sess, task))
             return sess
 
         if engine == "claude":
@@ -11568,21 +11212,21 @@ class HubSessionManager:
                 self._remove_agy_bridge_dir(session_id)
             raise
         self.sessions[session_id] = sess
-        self.persist_session(sess)
+        await self.persist_session(sess)
 
         if engine == "codex":
-            asyncio.create_task(self._watch_codex_rollout(sess))
+            self._schedule(self._watch_codex_rollout(sess))
         elif omp_sess_dir is not None:
-            asyncio.create_task(self._watch_omp_session(sess, omp_sess_dir))
+            self._schedule(self._watch_omp_session(sess, omp_sess_dir))
         elif engine == "kimi":
-            asyncio.create_task(self._watch_kimi_session(sess))
+            self._schedule(self._watch_kimi_session(sess))
         elif engine == "agy":
-            asyncio.create_task(self._watch_agy_transcript(sess))
+            self._schedule(self._watch_agy_transcript(sess))
         elif engine == "claude":
-            asyncio.create_task(self._watch_claude_session(sess))
+            self._schedule(self._watch_claude_session(sess))
 
         if kind == "tui":
-            asyncio.create_task(self._watch_tui_interactive_prompts(sess))
+            self._schedule(self._watch_tui_interactive_prompts(sess))
             prompt_to_send: Optional[str] = None
             if task and task_mode == "pty_input":
                 prompt_to_send = task
@@ -11596,7 +11240,7 @@ class HubSessionManager:
                     else:
                         # The caller wrote its own bridge instructions; only add the session marker.
                         prompt_to_send = f"{task}\n\n[Sub-Agent Bridge Info: session_id={sess.session_id}]"
-            asyncio.create_task(
+            self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
                     task_to_inject=prompt_to_send,
@@ -11631,6 +11275,8 @@ class HubSessionManager:
                     res = progress_cb(elapsed, session.get_clean_screen_text(max_lines=15))
                     if asyncio.iscoroutine(res):
                         await res
+                except PersistenceUnavailable:
+                    raise
                 except Exception:
                     pass
 
@@ -11639,19 +11285,21 @@ class HubSessionManager:
             # before the Enter has even been pressed.
             submitting = self._tui_writer_queue(session).busy("parent_message")
             if not submitting and session.status in ("completed", "waiting_parent", "exited", "terminated"):
-                self.persist_session(session)
+                await self.persist_session(session)
                 return {"settled": True, "reason": f"status_{session.status}", "elapsed_sec": round(elapsed, 1)}
 
             if (has_seen_new_output and not submitting
                     and (now - session.last_output_at) >= quiet_window_sec and elapsed >= 3.0):
                 try:
-                    self.summarize_transcript(session.session_id)
+                    await self.summarize_transcript(session.session_id)
+                except PersistenceUnavailable:
+                    raise
                 except Exception:
                     pass
-                self.persist_session(session)
+                await self.persist_session(session)
                 return {"settled": True, "reason": "output_settled", "elapsed_sec": round(elapsed, 1)}
 
-        self.persist_session(session)
+        await self.persist_session(session)
         return {
             "settled": False,
             "reason": "timeout_still_running_in_console",

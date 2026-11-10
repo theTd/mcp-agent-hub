@@ -2,6 +2,16 @@
 
 Design decisions confirmed by the owner. Change a line here before changing the behaviour it records.
 
+## Background persistence (2026-11-10, Hub lock contention fix)
+
+| id | decision |
+|---|---|
+| buffered-durability | Ordinary telemetry and mailbox success means accepted by the bounded background queue. Forced process termination can lose accepted, uncommitted data. Normal shutdown drains accepted writes; `persisted_in_sqlite` is true only after commit confirmation. |
+| sqlite-writer | Keep the existing schema and one Hub per database. Require WAL and `synchronous=FULL`; a dedicated thread owns the only writer, with ordered batches of at most 128 logical units / 25 ms. Lock waits are 100 ms with background retry. |
+| bounded-admission | Limit pending writes to 4096 units / 32 MiB. External admission and consistency barriers wait at most 2 seconds before returning temporary unavailability. Internal watchers wait for capacity without advancing their input cursor. |
+| graceful-budget | Stop producers once, stop child processes concurrently (at most 2 seconds), capture final archives and scrollback, then drain within a shared 8 second budget. Log pending counts on failure/timeout. |
+| committed-lists | Live session lists read memory and committed history without flushing. Archive details, restore, deletion and full history await a commit barrier. `/health` reports queue age/count, committed event sequence and storage errors without accessing SQLite. |
+
 ## Web console (2026-11-05, console UI redesign)
 
 | id | decision | default kept |

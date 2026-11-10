@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import logging
 import math
 import os
 import signal
@@ -26,13 +27,15 @@ from session_manager import (
     strip_osc_terminal_replies,
 )
 from transcript_summarizer import sanitize_tui_screen_text
+from hub_persistence import PersistenceUnavailable
 
 BASE_DIR = Path(__file__).parent.resolve()
 PROFILES_PATH = default_profiles_path(BASE_DIR)
 STATIC_DIR = BASE_DIR / "static"
 STATIC_INDEX = STATIC_DIR / "index.html"
 
-hub = HubSessionManager(PROFILES_PATH, base_dir=BASE_DIR)
+DATA_DIR = Path(os.environ.get("HUB_DATA_DIR") or BASE_DIR).resolve()
+hub = HubSessionManager(PROFILES_PATH, base_dir=BASE_DIR, data_dir=DATA_DIR)
 
 
 # B11: discovery shells out to five CLIs and talks to the DSH host over HTTP, so it never runs on
@@ -273,7 +276,7 @@ async def spawn_subagent(
 
     events = hub.get_worker_events(session_id=session.session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = hub.summarize_transcript(session.session_id)
+    transcript_summary = await hub.summarize_transcript(session.session_id)
     # W11: the initial task travels through the TUI only for task_mode=pty_input, and only if the
     # wait did not see it typed yet.
     injection_pending = (
@@ -332,7 +335,7 @@ async def get_subagent_status_and_trace(
     - 是否有正在等待主 Agent 回答的问题 (`pending_question_id`)
     - 最终响应 (`final_response`，即使 Sub-Agent 已经退出或被关闭，仍可从 SQLite 持久化存储中查到)
     """
-    return hub.get_subagent_status_and_trace(
+    return await hub.get_subagent_status_and_trace(
         session_id=session_id,
         recent_tools_limit=recent_tools_limit,
         recent_messages_limit=recent_messages_limit,
@@ -346,7 +349,7 @@ async def get_subagent_final_response(session_id: str) -> Dict[str, Any]:
     即使该 Sub-Agent 进程已经自然退出 (`exited`) 或已被调用 `terminate_subagent` 销毁，
     本工具依然能从网关的 SQLite 数据库中完整检索出它的 `final_response`、修改文件列表和终端历史尾部。
     """
-    return hub.get_subagent_final_response(session_id=session_id)
+    return await hub.get_subagent_final_response(session_id=session_id)
 
 
 @mcp.tool()
@@ -393,7 +396,7 @@ async def send_to_subagent(
         if not session.last_task:
             session.last_task = text
         session.current_activity = f"Steering message from parent: {text[:80]}"
-        delivery = hub.deliver_parent_message(
+        delivery = await hub.deliver_parent_message(
             session_id=session_id,
             text=text,
             also_write_pty=True,
@@ -433,7 +436,7 @@ async def send_to_subagent(
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = hub.summarize_transcript(session_id)
+    transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
         "session_id": session.session_id,
@@ -523,7 +526,7 @@ async def resume_subagent(
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = hub.summarize_transcript(session_id)
+    transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
         "session_id": session.session_id,
@@ -557,7 +560,7 @@ async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -
     每条记录返回：`session_id`、Profile、模型 · 思考等级、工作目录、任务首行、结束原因、结束时间，
     以及是否可恢复 (`resumable`) 与不可恢复的原因 (`resume_block_reason`)；用 `resume_subagent` 恢复。
     """
-    payload = hub.list_archive(limit=limit, offset=0, query=query or "")
+    payload = await hub.list_archive(limit=limit, offset=0, query=query or "")
     sessions = [
         {
             "session_id": rec.get("session_id"),
@@ -584,7 +587,7 @@ async def reply_to_subagent(
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 通过 `hub_worker.py ask`、`ask_parent` 或交互式提示提出的问题/审批请求，立即解除 Sub-Agent 的等待阻塞。"""
-    delivery = hub.deliver_parent_message(
+    delivery = await hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
         request_id=request_id,
@@ -645,7 +648,7 @@ async def respond_to_subagent_approval_or_choice(
         raise ValueError(f"Session '{session_id}' not found in active sessions.")
 
     start_seq = hub.global_seq
-    action_result = hub.respond_to_interaction(
+    action_result = await hub.respond_to_interaction(
         session_id=session_id,
         decision=decision,
         option_index=option_index,
@@ -672,7 +675,7 @@ async def respond_to_subagent_approval_or_choice(
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = hub.summarize_transcript(session_id)
+    transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
         "session_id": session_id,
@@ -740,7 +743,7 @@ async def summarize_subagent_transcript(session_id: str) -> Dict[str, Any]:
     过滤掉所有 TUI 边框、动画 Spinner、状态栏等视觉噪音，仅向主 Agent 返回最核心的思考摘要 (`key_thoughts`)、
     工具调用链 (`recent_actions`)、最新结论 (`latest_conclusion`) 与高信噪比 Markdown 简报 (`digest_markdown`)。
     """
-    return hub.summarize_transcript(session_id=session_id)
+    return await hub.summarize_transcript(session_id=session_id)
 
 
 @mcp.tool()
@@ -754,7 +757,7 @@ async def read_subagent_screen(
     默认 (`include_raw_tui=False`) 自动使用 CLI Transcript 总结器与 TUI 噪音过滤器剔除边框和状态栏，避免干扰主 Agent 注意力；
     仅当显式传入 `include_raw_tui=True` 时才返回原始虚拟终端屏幕字符。
     """
-    transcript_summary = hub.summarize_transcript(session_id=session_id)
+    transcript_summary = await hub.summarize_transcript(session_id=session_id)
     session = hub.sessions.get(session_id)
     if session:
         raw_txt = session.get_clean_screen_text(max_lines=max_lines)
@@ -780,7 +783,7 @@ async def read_subagent_screen(
             res["raw_screen_text"] = raw_txt
         return res
 
-    persisted = hub.db.get_session_record(session_id)
+    persisted = await hub.db.get_session_record(session_id)
     if not persisted:
         raise ValueError(f"找不到会话 {session_id}")
     # Archive spec §5: an archived session's screen is the last_screen the final record kept.
@@ -827,7 +830,7 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
     if include_historical:
         # Spec §6: list_active_sessions stays "live + ended-in-memory"; archived records are listed
         # by list_archived_sessions.
-        result["persisted_sessions"] = hub.db.list_persisted_sessions(limit=limit, include_archived=False)
+        result["persisted_sessions"] = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
     return result
 
 
@@ -835,12 +838,12 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
 async def terminate_subagent(session_id: str) -> Dict[str, Any]:
     """
     关闭指定的 Sub-Agent 会话进程。
-    关闭前会自动将其最终响应 (`final_response`)、终端滚动历史和工具调用轨迹永久保存到 SQLite，
+    关闭前会将最终响应、终端滚动历史和工具调用轨迹交给后台持久化队列，
     关闭后主 Agent 依然可以随时调用 `get_subagent_final_response(session_id)` 或 `get_subagent_status_and_trace(session_id)` 查询其结果！
     """
     session = hub.sessions.get(session_id)
     if not session:
-        persisted = hub.db.get_session_record(session_id)
+        persisted = await hub.db.get_session_record(session_id)
         if persisted:
             return {
                 "terminated": True,
@@ -851,14 +854,14 @@ async def terminate_subagent(session_id: str) -> Dict[str, Any]:
         raise ValueError(f"Session '{session_id}' not found.")
 
     # K5: the parent agent ended it, so the lifecycle event says 主 Agent, not 用户.
-    result = hub.close_session(session_id, source="mcp")
-    final_info = hub.get_subagent_final_response(session_id)
+    result = await hub.close_session(session_id, source="mcp")
+    final_info = await hub.get_subagent_final_response(session_id)
     return {
         "terminated": True,
         "session_id": session_id,
         "was_alive": result.get("was_alive"),
         "status": result.get("status"),
-        "persisted_in_sqlite": True,
+        "persisted_in_sqlite": hub.db.status()["pending_writes"] == 0,
         "final_response": final_info.get("final_response"),
         "final_response_source": final_info.get("final_response_source"),
         "step_count": final_info.get("step_count"),
@@ -921,7 +924,7 @@ async def report_step(
     intermediate_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """[Sub-Agent 专用] 上报当前执行步骤、调用的工具或产出的中间结论。"""
-    return hub.record_telemetry(
+    return await hub.record_telemetry(
         session_id,
         {
             "source": "worker_mcp",
@@ -941,7 +944,7 @@ async def message_parent(
     category: str = "progress",
 ) -> Dict[str, Any]:
     """[Sub-Agent 专用] 主动向主 Agent 发送一条非阻塞消息（立即唤醒主 Agent 的后台监听进程）。"""
-    rec = hub.record_worker_event(
+    rec = await hub.record_worker_event(
         session_id,
         {"type": "message", "category": category, "content": message},
     )
@@ -965,8 +968,8 @@ async def report_complete(
     status: str = "success",
     files_changed: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 向主 Agent 正式宣告当前任务已完成并交付最终总结（永久持久化到 SQLite 并立即唤醒主 Agent）。"""
-    rec = hub.record_worker_event(
+    """[Sub-Agent 专用] 宣告任务完成并交付最终总结（后台持久化入队后唤醒主 Agent）。"""
+    rec = await hub.record_worker_event(
         session_id,
         {
             "type": "completed",
@@ -997,16 +1000,14 @@ mcp_worker_app = worker_http_mcp.http_app(path="/worker-mcp", transport="streama
 @asynccontextmanager
 async def combined_lifespan(app_instance: FastAPI):
     async with AsyncExitStack() as stack:
+        await hub.start()
+        stack.push_async_callback(hub.archive_all_sessions_on_shutdown)
         await stack.enter_async_context(mcp_parent_app.lifespan(app_instance))
         await stack.enter_async_context(mcp_worker_app.lifespan(app_instance))
-        yield
-        # A6: a graceful hub stop archives every in-memory session — live ones become interrupted
-        # (spec §1.5) and stay resumable, ended ones keep their own reason. The manager archives
-        # each session in its own try/except, and a failure here never blocks the shutdown.
         try:
-            hub.archive_all_sessions_on_shutdown()
-        except Exception:
-            pass
+            yield
+        finally:
+            await hub.archive_all_sessions_on_shutdown()
 
 
 app = FastAPI(
@@ -1015,19 +1016,31 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(PersistenceUnavailable)
+async def persistence_unavailable_handler(request: Request, exc: PersistenceUnavailable):
+    return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Retry-After": "1"})
+
+
+@app.middleware("http")
+async def reject_work_during_shutdown(request: Request, call_next):
+    if hub._shutting_down and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
+        return JSONResponse({"detail": "Hub 正在关闭"}, status_code=503)
+    return await call_next(request)
+
+
 # ============================================================================
 # 3. 遥测与双向消息邮箱 HTTP API
 # ============================================================================
 @app.post("/api/telemetry/{session_id}")
 async def api_record_telemetry(session_id: str, req: Request):
     body = await req.json()
-    return hub.record_telemetry(session_id, body)
+    return await hub.record_telemetry(session_id, body)
 
 
 @app.get("/api/sessions/{session_id}/trace")
 async def api_get_session_trace(session_id: str):
     try:
-        return hub.get_subagent_status_and_trace(session_id)
+        return await hub.get_subagent_status_and_trace(session_id)
     except ValueError as e:
         return not_found(f"找不到会话 {session_id}")
 
@@ -1035,14 +1048,14 @@ async def api_get_session_trace(session_id: str):
 @app.get("/api/sessions/{session_id}/final")
 async def api_get_session_final(session_id: str):
     try:
-        return hub.get_subagent_final_response(session_id)
+        return await hub.get_subagent_final_response(session_id)
     except ValueError as e:
         return not_found(f"找不到会话 {session_id}")
 
 
 @app.get("/api/history/sessions")
 async def api_list_historical_sessions(limit: int = Query(30)):
-    return {"sessions": hub.db.list_persisted_sessions(limit=limit)}
+    return {"sessions": await hub.db.list_persisted_sessions(limit=limit)}
 
 
 @app.get("/api/mailbox/poll")
@@ -1076,7 +1089,7 @@ async def api_mailbox_events(
 @app.post("/api/mailbox/{session_id}/worker-event")
 async def api_worker_emit_event(session_id: str, req: Request):
     body = await req.json()
-    rec = hub.record_worker_event(session_id, body)
+    rec = await hub.record_worker_event(session_id, body)
     return {"ok": True, "event": rec}
 
 
@@ -1103,7 +1116,7 @@ async def api_parent_reply(session_id: str, req: Request):
     text = body.get("text", "")
     request_id = body.get("request_id")
     also_write_pty = bool(body.get("also_write_pty", True))
-    return hub.deliver_parent_message(
+    return await hub.deliver_parent_message(
         session_id=session_id,
         text=text,
         request_id=request_id,
@@ -1115,7 +1128,7 @@ async def api_parent_reply(session_id: str, req: Request):
 async def api_parent_respond_interaction(session_id: str, req: Request):
     body = await req.json()
     try:
-        return hub.respond_to_interaction(
+        return await hub.respond_to_interaction(
             session_id=session_id,
             decision=body.get("decision"),
             option_index=body.get("option_index"),
@@ -1225,8 +1238,8 @@ async def api_list_sessions():
     return {
         "global_seq": hub.global_seq,
         "sessions": [s.to_dict() for s in hub.sessions.values()],
-        "persisted_sessions": hub.db.list_persisted_sessions(limit=50),
-        "archive_total": hub.db.count_archived(),
+        "persisted_sessions": await hub.db.list_persisted_sessions(limit=50, consistent=False),
+        "archive_total": await hub.db.count_archived(consistent=False),
         "recent_events": hub.worker_events[-30:],
         "default_cwd": hub.hub_default_cwd(),
         "hub_port": hub_port(),
@@ -1238,7 +1251,7 @@ async def api_get_session(session_id: str):
     sess = hub.sessions.get(session_id)
     if sess is not None:
         return sess.to_dict()
-    rec = hub.get_archive_record(session_id)
+    rec = await hub.get_archive_record(session_id)
     if rec:
         return rec
     return not_found(f"找不到会话 {session_id}")
@@ -1248,12 +1261,12 @@ async def api_get_session(session_id: str):
 @app.get("/api/archive")
 async def api_list_archive(limit: int = Query(50), offset: int = Query(0), q: str = Query("")):
     # R8: a page refreshes up to 200 records with filesystem probes; that must not run on the loop.
-    return await asyncio.to_thread(hub.list_archive, limit, offset, q)
+    return await hub.list_archive(limit, offset, q)
 
 
 @app.get("/api/archive/{session_id}")
 async def api_get_archive(session_id: str):
-    rec = hub.get_archive_record(session_id)
+    rec = await hub.get_archive_record(session_id)
     if not rec:
         return not_found(f"找不到会话 {session_id}")
     return rec
@@ -1261,15 +1274,15 @@ async def api_get_archive(session_id: str):
 
 @app.get("/api/archive/{session_id}/scrollback")
 async def api_get_archive_scrollback(session_id: str):
-    if hub.db.get_session_record(session_id) is None:
+    if await hub.db.get_session_record(session_id) is None:
         return not_found(f"找不到会话 {session_id}")
-    return PlainTextResponse(hub.get_archive_scrollback(session_id) or "")
+    return PlainTextResponse(await hub.get_archive_scrollback(session_id) or "")
 
 
 @app.delete("/api/archive/{session_id}")
 async def api_delete_archive(session_id: str):
     try:
-        hub.delete_archive_record(session_id)
+        await hub.delete_archive_record(session_id)
     except ValueError as e:
         message = str(e)
         if message.startswith("找不到会话"):
@@ -1337,7 +1350,7 @@ async def api_launch_preview(req: Request):
 @app.get("/api/sessions/{session_id}/transcript-summary")
 async def api_session_transcript_summary(session_id: str):
     try:
-        return hub.summarize_transcript(session_id)
+        return await hub.summarize_transcript(session_id)
     except ValueError as e:
         return not_found(f"找不到会话 {session_id}")
 
@@ -1377,7 +1390,7 @@ async def api_send_input(session_id: str, req: Request):
         return not_found(f"找不到会话 {session_id}")
     body = await req.json()
     text = body.get("text", "")
-    hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True, press_enter=False)
+    await hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True, press_enter=False)
     return {"ok": True}
 
 
@@ -1388,7 +1401,7 @@ async def api_delete_session(session_id: str):
     K5: this is the console’s own removal (the pane’s 终止 button), so the lifecycle event says the
     user did it; only the MCP terminate_subagent tool passes source="mcp".
     """
-    result = hub.close_session(session_id, source="console")
+    result = await hub.close_session(session_id, source="console")
     if not result.get("found"):
         return not_found(f"找不到会话 {session_id}")
     return {
@@ -1537,6 +1550,7 @@ async def api_health():
         "active_sessions": len(hub.sessions),
         "hub_port": hub_port(),
         "started_at": HUB_STARTED_AT,
+        "persistence": hub.db.status(),
     }
 
 
@@ -1553,14 +1567,14 @@ async def api_hub_info():
     }
 
 
-def _stop_hub_like_ctrl_c() -> None:
+async def _stop_hub_like_ctrl_c() -> None:
     # Persist/archive every live session and unblock long-pollers before uvicorn begins tearing
     # down HTTP/MCP streams, so even if an open stream hits timeout_graceful_shutdown no session
     # record is ever lost.
     try:
-        hub.archive_all_sessions_on_shutdown()
+        await hub.archive_all_sessions_on_shutdown()
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Hub shutdown failed before SIGINT")
     signal.raise_signal(signal.SIGINT)
 
 

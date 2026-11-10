@@ -9,8 +9,10 @@ Run: <venv python> test_hub_desktop_api.py
 """
 
 import io
+import json
 import os
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +20,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from contextlib import closing
 
 import httpx
 
@@ -27,8 +30,14 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 HUB_DIR = Path(__file__).parent.resolve()
 # K3: the interpreter this suite runs on, not a guessed <repo>/.venv (a worktree has none).
 PYTHON_EXE = sys.executable
-PORT_NO_TOKEN = int(os.environ.get("HUB_TEST_PORT_A", "4468"))
-PORT_TOKEN = int(os.environ.get("HUB_TEST_PORT_B", "4469"))
+def unused_port():
+    with closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+PORT_NO_TOKEN = int(os.environ.get("HUB_TEST_PORT_A") or unused_port())
+PORT_TOKEN = int(os.environ.get("HUB_TEST_PORT_B") or unused_port())
 
 results = []
 
@@ -41,18 +50,28 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 def start_hub(port: int, token: str, log_path: Path) -> subprocess.Popen:
     env = dict(os.environ)
     env["HUB_PORT"] = str(port)
+    data_dir = log_path.parent / log_path.stem
+    data_dir.mkdir(parents=True, exist_ok=True)
+    profiles = data_dir / "profiles.json"
+    profiles.write_text(json.dumps({"profiles": {}}), encoding="utf-8")
+    env["HUB_DATA_DIR"] = str(data_dir)
+    env["HUB_PROFILES_PATH"] = str(profiles)
     env.pop("HUB_SHUTDOWN_TOKEN", None)
     if token:
         env["HUB_SHUTDOWN_TOKEN"] = token
-    log = open(log_path, "wb")
-    return subprocess.Popen(
-        [PYTHON_EXE, str(HUB_DIR / "server.py")],
-        cwd=str(HUB_DIR),
-        env=env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    # Exercise the real entry point and signal path without CLI/model discovery.
+    entry = (
+        "import runpy, session_manager; "
+        "session_manager.HubSessionManager._initial_discovery = "
+        "lambda manager: manager._discovery_ready.set(); "
+        "runpy.run_path('server.py', run_name='__main__')"
     )
+    with open(log_path, "wb") as log:
+        return subprocess.Popen(
+            [PYTHON_EXE, "-c", entry], cwd=str(HUB_DIR), env=env,
+            stdout=log, stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
 
 def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> dict:
@@ -151,7 +170,7 @@ def scenario_token(log_dir: Path) -> None:
         log_text = log_path.read_bytes().decode("utf-8", errors="replace")
         check("lifespan shutdown ran", "Application shutdown complete" in log_text)
         check("token never logged", token not in log_text)
-        with sqlite3.connect(str(HUB_DIR / "hub_state.db")) as conn:
+        with closing(sqlite3.connect(log_path.parent / log_path.stem / "hub_state.db")) as conn:
             row = conn.execute(
                 "SELECT status, end_reason, archived_at IS NOT NULL FROM sessions WHERE session_id = ?",
                 (session_id,),
@@ -166,10 +185,11 @@ def scenario_token(log_dir: Path) -> None:
 
 
 def main() -> int:
-    log_dir = Path(os.environ.get("HUB_TEST_LOG_DIR") or (Path(tempfile.gettempdir()) / "hub-desktop-api-test"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    scenario_no_token(log_dir)
-    scenario_token(log_dir)
+    with tempfile.TemporaryDirectory(prefix="hub-desktop-isolated-") as directory:
+        log_dir = Path(os.environ.get("HUB_TEST_LOG_DIR") or directory)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        scenario_no_token(log_dir)
+        scenario_token(log_dir)
     passed = sum(1 for _, ok in results if ok)
     print(f"\n{passed}/{len(results)} checks passed")
     return 0 if passed == len(results) else 1
