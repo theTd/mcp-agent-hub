@@ -77,7 +77,7 @@ pub fn waiting_toast_for(event: &Value) -> Option<WaitingToast> {
             event.get("seq").and_then(Value::as_u64).unwrap_or(0)
         ),
     };
-    // A structured interaction carries the raw prompt; a worker ask_parent only has `content`.
+    // Native structured interactions carry the raw prompt; historical events may only have content.
     let prompt = event
         .get("interaction")
         .and_then(|i| str_field(i, "prompt"))

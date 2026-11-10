@@ -282,59 +282,20 @@ fn live_external_hub_is_attached_then_taken_over() {
     }
 }
 
-/// M10 headless: a worker ask on a real hub reaches the notifier's filter as exactly one
-/// 「子 Agent 在提问」 toast for that session (this test shows no toast), de-duplicated.
+/// Native transcript events use the existing parent-facing waiting event contract.
 #[test]
-#[ignore = "starts a real hub on AGENT_HUB_PORT (default 4465)"]
-fn live_worker_ask_reaches_the_toast_filter_once() {
-    let _g = LIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(cfg) = live_config() else { return };
-    let logs = tempfile::tempdir().unwrap();
-    let log = |l: &str| println!("  [shell] {l}");
-    block_on(async {
-        let (hub, _info) = launch_ready(&cfg, logs.path(), &log).await;
-        let api = HubApi::new(cfg.port);
-        let start_seq = api.global_seq().await.unwrap();
-        let sid = create_pwsh_session(cfg.port, logs.path()).await;
-        let port = cfg.port;
-        let ask_sid = sid.clone();
-        let ask = tauri::async_runtime::spawn(async move {
-            post_json(
-                port,
-                &format!("/api/mailbox/{ask_sid}/worker-ask"),
-                json!({"question": "Headless check: which branch?\nsecond line", "timeout_seconds": 3}),
-                Duration::from_secs(15),
-            )
-            .await
-        });
-        let mut dedup = ToastDeduper::new(100);
-        let mut seq = start_seq;
-        let mut seen_events = Vec::new();
-        let mut toasts = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while toasts.is_empty() && Instant::now() < deadline {
-            let reply = api.poll(seq, 5).await.unwrap();
-            seq = reply.next_seq;
-            toasts.extend(toasts_for_events(&reply.events, &mut dedup));
-            seen_events.extend(reply.events);
-        }
-        let categories: Vec<&str> = seen_events
-            .iter()
-            .filter_map(|e| e["category"].as_str())
-            .collect();
-        println!("events after seq {start_seq}: {categories:?}");
-        println!("toasts: {toasts:?}");
-        assert_eq!(toasts.len(), 1, "exactly one toast");
-        assert_eq!(toasts[0].session_id, sid);
-        assert_eq!(toasts[0].kind, WaitKind::Question);
-        assert_eq!(toasts[0].prompt_line, "Headless check: which branch?");
-        assert!(
-            toasts_for_events(&seen_events, &mut dedup).is_empty(),
-            "the same events never toast twice"
-        );
-        let _ = ask.await;
-        let report = hub.stop_gracefully(&log).await;
-        assert!(report.graceful);
-        println!("OK: one toast for {sid}, de-duplicated; hub stopped");
+fn native_question_reaches_the_toast_filter_once() {
+    let event = json!({
+        "seq": 1, "session_id": "native-test", "type": "question",
+        "category": "question_waiting_reply", "request_id": "native-call-1",
+        "interaction": {"source": "codex_jsonl_request_user_input",
+            "kind": "question", "prompt": "Which branch?\nsecond line"}
     });
+    let mut dedup = ToastDeduper::new(100);
+    let toasts = toasts_for_events(&[event.clone(), event.clone()], &mut dedup);
+    assert_eq!(toasts.len(), 1);
+    assert_eq!(toasts[0].session_id, "native-test");
+    assert_eq!(toasts[0].kind, WaitKind::Question);
+    assert_eq!(toasts[0].prompt_line, "Which branch?");
+    assert!(toasts_for_events(&[event], &mut dedup).is_empty());
 }

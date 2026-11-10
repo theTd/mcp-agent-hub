@@ -93,16 +93,6 @@ def evaluate_command(command: str) -> dict:
     if not cmd:
         return {}
 
-    # Always allow hub_worker.py bridge commands
-    if "hub_worker.py" in cmd:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "permissionDecisionReason": "Hub worker bridge command",
-            }
-        }
-
     # 1. High-risk destructive commands -> always ask
     for pat in HIGH_RISK_PATTERNS:
         if pat.search(cmd):
@@ -179,17 +169,6 @@ def main() -> int:
     tool_input = payload.get("tool_input") or {}
 
     if event_name == "PermissionRequest":
-        cmd = str(tool_input.get("command") or "") if isinstance(tool_input, dict) else ""
-        if tool_name in ("Bash", "PowerShell") and "hub_worker.py" in cmd:
-            out = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": {"behavior": "allow"},
-                }
-            }
-            sys.stdout.write(json.dumps(out))
-            sys.stdout.flush()
-            return 0
         _record_permission_request(payload)
         return 0
 

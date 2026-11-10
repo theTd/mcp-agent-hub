@@ -279,14 +279,27 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if frame == '{"type": "replay_end"}':
                 return websocket
 
+    async def test_worker_interfaces_are_removed(self):
+        for path, method in [
+            ("/worker-mcp", "post"),
+            ("/api/telemetry/test-tui", "post"),
+            ("/api/mailbox/test-tui/worker-event", "post"),
+            ("/api/mailbox/test-tui/worker-ask", "post"),
+            ("/api/mailbox/test-tui/parent-messages", "get"),
+        ]:
+            response = await getattr(self.client, method)(path)
+            self.assertEqual(response.status_code, 404, path)
+        profiles = await self.module.list_agent_profiles()
+        self.assertNotIn("worker_mcp_http_url", profiles)
+        self.assertNotIn("worker_cli_script", profiles)
+
     async def test_http_and_terminal_during_five_second_write_lock(self):
         lock = sqlite3.connect(self.directory / "hub_state.db", timeout=0.1)
         lock.execute("BEGIN IMMEDIATE")
         websocket = await self.connect_terminal()
         try:
             start = time.monotonic()
-            response = await self.client.post("/api/telemetry/test-tui", json={"hook_event": "PreToolUse", "tool_name": "test_tool", "tool_input": "locked"})
-            self.assertEqual(response.status_code, 200, response.text)
+            await self.module.hub.record_telemetry("test-tui", {"source": "codex_jsonl", "hook_event": "PreToolUse", "tool_name": "test_tool", "tool_input": "locked"})
             self.assertLess(time.monotonic() - start, 0.5, "telemetry acknowledges admission, not commit")
             worst = 0
             probes = 0
@@ -389,7 +402,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             store.max_units = 1
             await store.add_tool_call("test-tui", 1, "capacity-filler", "")
             before = time.monotonic()
-            response = await self.client.post("/api/mailbox/test-tui/worker-event", json={"type": "completed", "content": "must not publish"})
+            response = await self.client.post("/api/mailbox/test-tui/reply", json={"text": "must not publish", "also_write_pty": False})
             elapsed = time.monotonic() - before
             self.assertEqual(response.status_code, 503, response.text)
             self.assertGreaterEqual(elapsed, 1.9)
@@ -402,10 +415,10 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             lock.rollback()
             lock.close()
         await store.flush()
-        response = await self.client.post("/api/mailbox/test-tui/worker-event", json={"type": "message", "content": "recovered"})
+        response = await self.client.post("/api/mailbox/test-tui/reply", json={"text": "recovered", "also_write_pty": False})
         self.assertEqual(response.status_code, 200)
         await store.flush()
-        self.assertEqual([row["content"] for row in self.module.hub.worker_events], ["recovered"])
+        self.assertEqual([row["content"] for row in self.module.hub.parent_messages["test-tui"]], ["recovered"])
 
     async def test_dsh_backpressure_keeps_unaccepted_offset(self):
         import session_manager
@@ -470,7 +483,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         hub = self.module.hub
         await hub.record_telemetry("test-tui", {"hook_event": "PreToolUse", "tool_name": "paired", "tool_input": "input"})
         await hub.record_telemetry("test-tui", {"hook_event": "PostToolUse", "tool_name": "paired", "tool_response": "output"})
-        await hub.record_worker_event("test-tui", {"type": "completed", "content": "authoritative final"})
+        await hub.record_telemetry("test-tui", {"source": "codex_jsonl", "hook_event": "TurnComplete", "final_assistant_text": "authoritative final"})
         await hub.record_worker_event("test-tui", {"type": "turn_completed", "content": "lower priority"})
         await hub._archive_session(self.session, end_reason="exited")
         await hub.persist_session(self.session)  # Empty archive fields must not erase the final row.
@@ -491,7 +504,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed["status"], "starting")
 
     async def test_shutdown_is_idempotent_and_archives_final_state(self):
-        self.session.set_final_response("durable final", "report_complete_mcp")
+        self.session.set_final_response("durable final", "native_transcript")
         await self.module.hub.record_worker_event("test-tui", {"type": "turn_completed", "content": "durable final"})
         counts = await asyncio.gather(self.module.hub.archive_all_sessions_on_shutdown(), self.module.hub.archive_all_sessions_on_shutdown())
         self.assertEqual(counts, [1, 1])
@@ -522,10 +535,8 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_parent_mailbox_admission_and_durable_reply(self):
         hub = self.module.hub
-        ask = asyncio.create_task(hub.ask_parent_and_wait("test-tui", "question", timeout_seconds=5))
-        while not hub.worker_events:
-            await asyncio.sleep(0.005)
-        request_id = hub.worker_events[-1]["request_id"]
+        await hub.register_pending_interaction(self.session, "question", "Native question", "question", [], "codex_jsonl_request_user_input", request_id="native-q")
+        request_id = self.session.pending_question_id
         await hub.db.flush()
         hub.db.max_units = 1
         hub.db.admission_timeout = 0.05
@@ -535,20 +546,17 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await hub.db.add_tool_call("test-tui", 1, "filler", "")
             with self.assertRaises(PersistenceUnavailable):
                 await hub.deliver_parent_message("test-tui", "rejected answer", request_id=request_id)
-            self.assertFalse(ask.done())
+            self.assertIsNotNone(self.session.pending_interaction)
             self.assertFalse(hub.pending_questions[request_id]["answered"])
             self.assertEqual(hub.parent_messages.get("test-tui", []), [])
             lock.rollback()
             await hub.db.flush()
             await hub.deliver_parent_message("test-tui", "accepted answer", request_id=request_id)
-            self.assertEqual((await ask)["answer"], "accepted answer")
+            self.assertIsNone(self.session.pending_interaction)
             record = await hub.db.get_session_record("test-tui")
             self.assertEqual([m["content"] for m in record["parent_messages"] if m["direction"] == "parent"], ["accepted answer"])
         finally:
             lock.close()
-            if not ask.done():
-                ask.cancel()
-                await asyncio.gather(ask, return_exceptions=True)
 
 
 if __name__ == "__main__":

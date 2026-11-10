@@ -1,6 +1,5 @@
 """Exercise the delivered EXE and extracted backend without stopping an installed desktop."""
 import argparse
-import asyncio
 import json
 import os
 from pathlib import Path
@@ -12,8 +11,6 @@ import tempfile
 import time
 
 import httpx
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
 from winpty import PtyProcess
 
 
@@ -21,15 +18,6 @@ def check(condition, message):
     if not condition:
         raise AssertionError(message)
     print("PASS:", message, flush=True)
-
-
-async def bridge_tools(python, source, env):
-    parameters = StdioServerParameters(command=str(python), args=[str(source / "worker_bridge_mcp.py")], env=env)
-    async with stdio_client(parameters) as (reader, writer):
-        async with ClientSession(reader, writer, read_timeout_seconds=30) as session:
-            await session.initialize()
-            tools = await session.list_tools()
-            check({"report_step", "message_parent", "ask_parent", "report_complete"}.issubset({t.name for t in tools.tools}), "extracted worker bridge completes MCP initialization")
 
 
 def main():
@@ -88,6 +76,8 @@ def main():
     check(Path(launch["repo_dir"]).resolve() == source.resolve(), "repository overrides cannot redirect the portable payload")
     check(not any(p.suffix in (".exe", ".db") or p.name == "agent_profiles.json" for p in source.rglob("*")), "embedded payload has no Python, installers, database or personal profiles")
     check(not (runtime / "downloads").exists(), "cached EXE startup makes zero Python downloads")
+    check(not (source / "hub_worker.py").exists() and not (source / "worker_bridge_mcp.py").exists(), "retired worker bridge is absent")
+    check((source / "native_session_launch.py").is_file(), "native launch configuration helper is packaged")
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -132,9 +122,7 @@ def main():
                 check("portable-pty-ok" in output, "prepared Python can spawn and read a ConPTY session")
             finally:
                 pty.close(force=True)
-            subprocess.run([str(python), str(source / "hub_worker.py"), "--help"], env=api_env, cwd=root, check=True, capture_output=True, timeout=15)
             subprocess.run([str(python), str(source / "hub_poll.py"), "--help"], env=api_env, cwd=root, check=True, capture_output=True, timeout=15)
-            asyncio.run(bridge_tools(python, source, api_env))
             hook = subprocess.run([str(python), str(source / "engine_policies/claude_pre_tool_hook.py")], input=json.dumps({"hook_event_name": "PermissionRequest", "session_id": "portable-smoke", "tool_name": "Bash", "tool_input": {"command": "echo test"}}), text=True, env=api_env, cwd=root, capture_output=True, timeout=15)
             check(hook.returncode == 0 and (data / ".runtime_mcp_configs/claude_hooks_portable-smoke.jsonl").is_file(), "extracted Claude hook writes to the same data directory")
         finally:

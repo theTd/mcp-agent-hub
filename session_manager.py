@@ -28,7 +28,8 @@ from winpty import PtyProcess
 # session_manager.PtyProcess with a fake without making the shutdown tree-kill touch a fake PID.
 REAL_PTY_PROCESS = PtyProcess
 
-from transcript_tail import TranscriptTail
+from transcript_tail import TranscriptTail, read_complete_lines
+from native_session_launch import strip_legacy_worker_bridge_args
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 
@@ -87,47 +88,20 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 
 
-# Priority levels for final_response sources so explicit MCP or native transcript never gets overwritten by raw screen text
+# Native answers outrank derived summaries and screen snapshots.
 FINAL_SOURCE_PRIORITY = {
     None: 0,
     "terminal_turn_snapshot": 1,
     "transcript_summarizer": 2,
-    # K4: the content of a turn_completed worker event is the engine's own end-of-turn answer. It has
-    # to beat a screen snapshot and the summariser, and it has to lose to the sources that are
-    # strictly better evidence for the same turn: the engine's own transcript, a codex/dsh completion
-    # and the worker's report_complete. So it sits between them, and a transcript that already named
-    # the answer keeps its own source label instead of being relabelled by the event.
+    # Keep the source label of a stronger native record when multiple observers see the same turn.
     "turn_completed": 3,
     "native_transcript": 4,
     "codex_task_complete": 5,
     "dsh_hub_completion": 5,
-    "report_complete_mcp": 6,
+    "report_complete_mcp": 6,  # Historical saved results only; no reporting interface remains.
 }
 
-# F1: the completion hint tells an engine to run `complete "<用一句话写出你的结果>"`. A literal copy of
-# that placeholder (or of the old "SUMMARY") is not a result: the round-4 kimi run archived
-# final_response="SUMMARY". One constant is used by the hint and by the completion handler, so the
-# two cannot drift apart again.
-COMPLETION_SUMMARY_PLACEHOLDER = "<用一句话写出你的结果>"
-PLACEHOLDER_SUMMARY_TEXTS = frozenset({
-    "summary",
-    "your final summary",
-    "your one-sentence result",
-    "用一句话写出你的结果",
-})
-PLACEHOLDER_SUMMARY_RE = re.compile(r"^<[^<>]{0,80}>$")
-SUMMARY_QUOTE_CHARS = "\"'“”‘’「」"
-
-
-def is_placeholder_summary(text: Optional[str]) -> bool:
-    """F1: True when a completion summary is only the hint's placeholder, never a result."""
-    s = str(text or "").strip()
-    if not s:
-        return True
-    s = s.strip(SUMMARY_QUOTE_CHARS).strip()
-    if s.lower() in PLACEHOLDER_SUMMARY_TEXTS:
-        return True
-    return bool(PLACEHOLDER_SUMMARY_RE.match(s))
+NATIVE_TRANSCRIPT_DRAIN_SEC = 3.0
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
@@ -278,8 +252,7 @@ TUI_INPUT_BOX_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*[│┃|]\s*$")
 TUI_INPUT_BOX_OPEN_RE = re.compile(r"^\s*[│┃|]\s*>\s?(.*?)\s*$")
 TUI_INPUT_GLYPH_RE = re.compile(r"^\s*(?:[│┃|]\s*)?(?:[>❯›»])\s?(.*)$")
 # K2 (fix 9): how each engine draws its composer. "box" is a framed box whose first content row is
-# "│ > …" and whose height grows with the text (kimi's box is 12 rows tall for a task carrying the
-# worker-bridge hint at 120 columns); every other engine draws a bare prompt glyph row ("glyph").
+# "│ > …" and whose height grows with the text; every other engine draws a bare prompt glyph row.
 # K6 (fix 9c): the table is also the list of engines whose composer the hub KNOWS from real
 # captures. A live message is typed through the checked submit only for an engine listed here AND in
 # TUI_LIVE_SUBMIT_CHECKED; any other TUI (pwsh, a generic CLI, where a "> " output row is not a
@@ -911,10 +884,6 @@ def _approval_flag_tokens(engine: str, args: List[str]):
                 width = 2
             elif a.startswith("--permission-mode="):
                 width, label = 1, "--permission-mode"
-            elif a.startswith(("--allowedTools=", "--allowed-tools=")) and "hub_worker.py" in a:
-                width, label = 1, "--allowedTools="
-            elif a in ("--allowedTools", "--allowed-tools") and "hub_worker.py" in nxt(i):
-                width = 2
             elif a.startswith("--settings=") and _is_claude_approval_settings_path(a.split("=", 1)[1]):
                 width, label = 1, "--settings="
             elif a == "--settings" and _is_claude_approval_settings_path(nxt(i)):
@@ -970,9 +939,6 @@ def _agy_profile_settings(args: List[str]) -> Dict[str, Any]:
     return merged
 
 
-CLAUDE_WORKER_ALLOWED_TOOLS = "Bash(*hub_worker.py*),PowerShell(*hub_worker.py*)"
-
-
 def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -> List[str]:
     """The flags the hub injects so `engine` runs with high-risk approval on (D2-D5)."""
     eng = (engine or "").strip().lower()
@@ -987,7 +953,6 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
             "--permission-mode",
             "acceptEdits",
             f"--settings={claude_approval_settings_path()}",
-            f"--allowedTools={CLAUDE_WORKER_ALLOWED_TOOLS}",
         ]
     if eng == "agy":
         settings = _agy_profile_settings(list(profile_args or []))
@@ -1047,91 +1012,6 @@ def apply_approval_flags(engine: str, args: List[str], bypass: bool = False) -> 
     kept = [a for i, a in enumerate(raw) if i not in drop]
     inject = bypass_launch_flags(engine, raw) if bypass else approval_launch_flags(engine, raw)
     return inject + kept
-
-
-# ── Round 3 (DECISIONS.md D10): agy reports through a per-session MCP bridge ─────────────────────
-# In auto mode agy's shell runs in a sandbox without loopback network, so `python hub_worker.py …`
-# can never reach the hub. agy's own MCP client runs outside that sandbox: the hub writes a
-# per-session `.agents/mcp_config.json` (read by agy from every workspace dir, `--add-dir` included)
-# that starts worker_bridge_mcp.py for this session, and allows its tools for this session only.
-# The server name must differ from the user's global agy MCP servers (agent-hub, playwright, ...).
-AGY_BRIDGE_SERVER_NAME = "hub-bridge"
-AGY_BRIDGE_ALLOW_RULE = f"mcp({AGY_BRIDGE_SERVER_NAME}/*)"
-AGY_BRIDGE_DIR_PREFIX = "agy_sess_"
-
-
-def agy_bridge_session_dir(runtime_dir: Path, session_id: str) -> Path:
-    """`<runtime_configs_dir>\\agy_sess_<sid>`: the hub-private dir agy gets as an extra workspace."""
-    return Path(runtime_dir) / f"{AGY_BRIDGE_DIR_PREFIX}{session_id}"
-
-
-def agy_bridge_mcp_config(session_id: str, python_exe: str, bridge_script: str, hub_url: str) -> Dict[str, Any]:
-    """The `.agents/mcp_config.json` content that runs the worker bridge for one session."""
-    return {
-        "mcpServers": {
-            AGY_BRIDGE_SERVER_NAME: {
-                "command": str(python_exe),
-                "args": [str(bridge_script)],
-                "env": {"HUB_API_URL": str(hub_url), "HUB_SESSION_ID": str(session_id)},
-            }
-        }
-    }
-
-
-def agy_bridge_launch_args(args: List[str], cwd: str, sess_dir: str, bypass: bool = False) -> List[str]:
-    """D10: the session-only part of an agy launch, merged into the args apply_approval_flags made.
-
-    The hub's `--settings` gains `trustedWorkspaces` [cwd, sessdir] (session only: no trust dialog,
-    nothing saved) and, unless the profile bypasses approvals, the allow rule for the bridge's tools;
-    `--add-dir <sessdir>` makes agy read the bridge config. Idempotent: running it twice (or on a
-    resume of args that already carry it) adds nothing twice.
-    """
-    out = [str(a) for a in args]
-    cwd_s = str(cwd or "")
-    dir_native = str(sess_dir)
-    dir_fwd = dir_native.replace("\\", "/")
-    idx: Optional[int] = None
-    inline = False
-    for i, a in enumerate(out):
-        if a == "--settings" and i + 1 < len(out):
-            idx = i
-            break
-        if a.startswith("--settings="):
-            idx, inline = i, True
-            break
-    raw_value = (out[idx].split("=", 1)[1] if inline else out[idx + 1]) if idx is not None else ""
-    settings = (_agy_settings_object(raw_value) if idx is not None else None) or {}
-    trusted = [str(t) for t in (settings.get("trustedWorkspaces") or []) if str(t)]
-    known = {os.path.normcase(os.path.normpath(t)) for t in trusted}
-    for path in (cwd_s, dir_native):
-        if path and os.path.normcase(os.path.normpath(path)) not in known:
-            trusted.append(path)
-            known.add(os.path.normcase(os.path.normpath(path)))
-    settings["trustedWorkspaces"] = trusted
-    if not bypass:
-        perms = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
-        perms = dict(perms)
-        allow = [str(r) for r in (perms.get("allow") or [])]
-        if AGY_BRIDGE_ALLOW_RULE not in allow:
-            allow.append(AGY_BRIDGE_ALLOW_RULE)
-        perms["allow"] = allow
-        settings["permissions"] = perms
-    value = json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
-    if idx is None:
-        at = out.index("--dangerously-skip-permissions") + 1 if "--dangerously-skip-permissions" in out else 0
-        out[at:at] = ["--settings", value]
-    elif inline:
-        out[idx] = f"--settings={value}"
-    else:
-        out[idx + 1] = value
-    has_dir = any(
-        out[i] == "--add-dir" and i + 1 < len(out)
-        and os.path.normcase(os.path.normpath(out[i + 1])) == os.path.normcase(os.path.normpath(dir_native))
-        for i in range(len(out))
-    )
-    if not has_dir:
-        out.extend(["--add-dir", dir_fwd])
-    return out
 
 
 # ── D7: reading the engines' approval prompts and answering them ──────────────────────────────
@@ -1677,7 +1557,7 @@ def unwrap_windows_cmd_shim(
 
     When winpty spawns a .cmd/.bat file, Windows wraps it in `cmd.exe /c ...`, whose `%*` batch
     expansion truncates multiline arguments at the first `\\n` (losing everything after line 1 of a
-    multiline task and the Hub's `[Sub-Agent Bridge Info]` footer). Launching `node.exe` directly
+    multiline task and its passive Hub session marker). Launching `node.exe` directly
     bypasses `cmd.exe /c` so `CreateProcessW` preserves newlines verbatim. For non-npm .cmd/.bat
     scripts that cannot be unwrapped, newlines in arguments are collapsed to spaces so `cmd.exe`
     never drops trailing lines.
@@ -1969,8 +1849,6 @@ class AgentSession:
         env["COLORTERM"] = "truecolor"
         if env_overrides:
             env.update(env_overrides)
-        env["HUB_SESSION_ID"] = self.session_id
-        env["HUB_API_URL"] = hub_api_base_url()
 
         if PtyProcess is REAL_PTY_PROCESS:
             cmd_list = unwrap_windows_cmd_shim(self.command, list(self.args), env=env)
@@ -2024,7 +1902,7 @@ class AgentSession:
         try:
             scrollback = self.get_full_scrollback_text(max_lines=80)
             clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-            if clean_lines:
+            if clean_lines and not self.final_response_from_previous_turn:
                 self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
         except Exception:
             pass
@@ -2298,7 +2176,7 @@ class AgentSession:
         try:
             scrollback = self.get_full_scrollback_text(max_lines=80)
             clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-            if clean_lines:
+            if clean_lines and not self.final_response_from_previous_turn:
                 self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
         except Exception:
             pass
@@ -2795,7 +2673,7 @@ class HubSessionManager:
     def _transcript_marker_ids(self, path: Path) -> Set[str]:
         """Q2: hub session ids named in the transcript's first chunk (the task carries session_id=<id>).
 
-        Only the head of the file is read, because the bridge hint travels with the initial task; the
+        Only the head of the file is read, because the session marker travels with the initial task; the
         answer is cached until the file grows, so a steady-state scan costs one stat.
         """
         try:
@@ -3214,7 +3092,7 @@ class HubSessionManager:
                 "startup_delay_sec": 1.0,
                 "submit_key": "\r",
                 "enabled": True,
-                "description": "交互式 PowerShell 7 终端（已注入 HUB_SESSION_ID 与 hub_worker.py 桥接）。",
+                "description": "交互式 PowerShell 7 终端。",
             },
         }
 
@@ -4194,7 +4072,7 @@ class HubSessionManager:
         ref = record.get("conversation_ref") or {}
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
         command = str(snapshot.get("command") or "")
-        base_args = [str(a) for a in (snapshot.get("args") or [])]
+        base_args = strip_legacy_worker_bridge_args([str(a) for a in (snapshot.get("args") or [])], self.runtime_configs_dir)
         profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
         prof_cur = self.profiles.get(profile_id) or {}
         env = normalize_env_map(prof_cur.get("env"))
@@ -4218,20 +4096,10 @@ class HubSessionManager:
         elif bypass:
             built["notes"].append(BYPASS_NO_EFFECT_NOTE.format(engine=engine))
         if engine == "omp":
-            # V4: the spawn carried --append-system-prompt=<worker-bridge hint>. A resume that drops
-            # it leaves the same session without the hint it was started with.
-            hint_args: List[str] = []
-            if str(snapshot.get("task_mode") or "") == "omp_positional" and not any(
-                str(a).startswith("--append-system-prompt") for a in base_args
-            ):
-                hint_args = [
-                    f"--append-system-prompt="
-                    f"{self._build_worker_bridge_system_hint(str(record.get('session_id') or ''))}"
-                ]
             built["args"] = [
                 f"--session-dir={ref.get('session_dir')}",
                 f"--resume={ref.get('session_file')}",
-            ] + hint_args + base_args
+            ] + base_args
             built["message_mode"] = "positional"
         elif engine == "kimi":
             # Research: --agent / --agent-file / --environment are rejected together with -S.
@@ -4239,13 +4107,7 @@ class HubSessionManager:
             built["args"] = ["-S", str(ref.get("session_id"))] + cleaned
             built["message_mode"] = "pty_input"
         elif engine == "agy":
-            # D10: the same per-session MCP bridge as the spawn (the caller rewrites its config file
-            # before the launch, recreating the dir if it went missing).
-            sid = str(record.get("session_id") or "")
-            built["args"] = agy_bridge_launch_args(
-                [f"--conversation={ref.get('conversation_id')}"] + base_args,
-                cwd, str(self._agy_bridge_dir(sid)), bypass=bypass,
-            )
+            built["args"] = [f"--conversation={ref.get('conversation_id')}"] + base_args
             built["message_mode"] = "agy_interactive_flag"
         elif engine == "codex":
             built["args"] = ["resume", str(ref.get("session_id")), "-C", cwd] + base_args
@@ -4259,16 +4121,7 @@ class HubSessionManager:
                 built["env"]["CLAUDE_CONFIG_DIR"] = os.path.abspath(
                     os.path.expandvars(os.path.expanduser(cfg_dir))
                 )
-            hint_args: List[str] = []
-            if str(snapshot.get("task_mode") or "") == "claude_positional" and not any(
-                str(a) == "--append-system-prompt" or str(a).startswith("--append-system-prompt=")
-                for a in base_args
-            ):
-                hint_args = [
-                    "--append-system-prompt",
-                    self._build_worker_bridge_system_hint(str(record.get("session_id") or ""), "claude"),
-                ]
-            built["args"] = ["--resume", str(ref.get("session_id"))] + hint_args + base_args
+            built["args"] = ["--resume", str(ref.get("session_id"))] + base_args
             built["message_mode"] = "positional"
         elif engine == "dsh":
             built["args"] = []
@@ -4377,6 +4230,9 @@ class HubSessionManager:
         sess.step_count = int(record.get("step_count") or 0)
         sess.created_at = float(record.get("created_at") or time.time())
         sess.profile_snapshot = dict(snapshot)
+        sess.profile_snapshot["args"] = strip_legacy_worker_bridge_args(
+            list(snapshot.get("args") or []), self.runtime_configs_dir
+        )
         # Round 2: the resume ran with the profile's current switch; record that, not the old one.
         sess.profile_snapshot[BYPASS_APPROVALS_KEY] = bool(built.get("bypass_approvals"))
         sess.launch_notes = list(built.get("notes") or [])
@@ -4511,16 +4367,13 @@ class HubSessionManager:
             return await self._resume_dsh_session(sid, record, text)
         return await self._resume_process_session(sid, record, text)
 
+    @staticmethod
+    def _task_with_session_marker(session_id: str, task: str) -> str:
+        return f"{task}\n\n[Hub Session: session_id={session_id}]"
+
     def _resume_task_text(self, session_id: str, text: str, engine: str) -> str:
         clean = str(text).replace("\r", " ").strip()
-        if engine == "kimi":
-            # Spec §4: the kimi task is typed into the TUI with the session-id marker.
-            return f"{clean}\n\n[Sub-Agent Bridge Info: session_id={session_id}]"
-        if engine == "agy":
-            # D10: the bridge hint again, so a conversation started with the old shell-command hint
-            # (which cannot reach the hub from agy's sandbox) learns the MCP tools.
-            return f"{clean}\n{self._build_agy_bridge_hint(session_id)}"
-        return clean
+        return self._task_with_session_marker(session_id, clean)
 
     async def _resume_process_session(
         self, session_id: str, record: Dict[str, Any], text: Optional[str]
@@ -4547,9 +4400,6 @@ class HubSessionManager:
                 prompt_for_tui = self._resume_task_text(session_id, message, engine)
                 injection = "pending"
 
-        if engine == "agy":
-            # D10: (re)write the bridge config the built args point at (--add-dir).
-            self._write_agy_bridge_config(session_id)
         sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
         if message and injection == "argv":
             sess.last_injection = {
@@ -5020,10 +4870,6 @@ class HubSessionManager:
         if not rec.get("archived_at"):
             raise ValueError("会话仍在列表中，请先移除再删除归档记录")
         deleted = await self.db.delete_session_record(session_id)
-        if deleted:
-            # D10: the hub-private agy bridge dir goes with the record (the engine's own
-            # conversation files stay).
-            self._remove_agy_bridge_dir(session_id)
         return deleted
 
     async def _scrollback_flush_loop(self) -> None:
@@ -5223,7 +5069,7 @@ class HubSessionManager:
 
     @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, Worker MCP `report_step`, or TUI Heuristic Parser."""
+        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser."""
         sess = self.sessions.get(session_id)
         if sess and data.get("transcript_path"):
             sess.transcript_path = Path(str(data["transcript_path"]))
@@ -5281,7 +5127,22 @@ class HubSessionManager:
             if msg and str(msg).strip():
                 await self.db.add_intermediate_message(session_id, step_num, str(msg).strip(), source=source)
 
-        if final_text and str(final_text).strip():
+        if tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected", "PostToolUse"):
+            await self.record_worker_event(session_id, {
+                "type": "tool_result" if hook_event == "PostToolUse" else "tool_call",
+                "category": "progress",
+                "status": "running",
+                "content": f"{tool_name}: {resp_str if hook_event == 'PostToolUse' else input_str}",
+            })
+        elif hook_event == "AssistantMessage" and intermediate_list:
+            await self.record_worker_event(session_id, {
+                "type": "progress",
+                "category": "progress",
+                "status": "running",
+                "content": "\n".join(str(msg).strip() for msg in intermediate_list if msg and str(msg).strip()),
+            })
+
+        if hook_event in ("Stop", "SubagentStop", "TurnComplete") and final_text and str(final_text).strip():
             f_source = "native_transcript"
             if sess:
                 if sess.step_count == 0:
@@ -5291,14 +5152,14 @@ class HubSessionManager:
                 if hook_event in ("Stop", "SubagentStop", "TurnComplete"):
                     sess.current_activity = f"Step {sess.step_count}: Turn completed (final response captured)"
 
-        if hook_event in ("Stop", "SubagentStop", "TurnComplete") and final_text:
+        if hook_event in ("Stop", "SubagentStop", "TurnComplete"):
             await self.record_worker_event(
                 session_id,
                 {
                     "type": "turn_completed",
                     "category": "turn_completed",
                     "status": "turn_idle",
-                    "content": str(final_text).strip(),
+                    "content": str(final_text or "").strip(),
                 },
             )
 
@@ -5320,48 +5181,28 @@ class HubSessionManager:
 
     @logical_write
     async def record_worker_event(self, session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Records an event emitted by a Sub-Agent (message, question, completed, turn_completed, exited) and wakes Parent pollers."""
+        """Persist an observed native/lifecycle event and wake parent listeners."""
         sess = self.sessions.get(session_id)
         ev_type = payload.get("type", "message")
         content = (payload.get("content") or "").strip()
-        if ev_type == "completed" and is_placeholder_summary(content):
-            # F1: the hint's own placeholder (or the old literal "SUMMARY") is not a result. The
-            # completion itself still counts -- status and event below -- but an empty summary must
-            # never become final_response, an intermediate message, or a stored event body.
-            content = ""
-
         if sess:
-            if ev_type == "completed":
-                if sess.step_count == 0:
-                    sess.step_count = 1
-                    await self.db.add_tool_call(
-                        session_id=session_id,
-                        step_num=1,
-                        tool_name="report_complete",
-                        input_summary=content[:200],
-                        status="completed",
-                        source="worker_bridge",
-                    )
+            if ev_type == "turn_completed" and getattr(sess, "_turn_completion_emitted", False):
                 if content:
-                    await self.db.add_intermediate_message(session_id, sess.step_count, content, source="report_complete_mcp")
-                sess.status = "completed"
-                sess.set_final_response(content, "report_complete_mcp")
-                sess.files_changed = payload.get("files_changed") or sess.files_changed
-                sess.current_activity = f"Task completed ({payload.get('status', 'success')})"
-            elif ev_type in ("question", "approval_request"):
+                    sess.set_final_response(content, "turn_completed")
+                await self.persist_session(sess)
+                return {"session_id": session_id, "type": ev_type, "duplicate": True}
+            if ev_type in ("question", "approval_request"):
                 sess.status = "waiting_parent"
                 prefix = "Waiting for parent approval" if ev_type == "approval_request" else "Waiting for parent answer"
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
-                await self.db.add_intermediate_message(session_id, sess.step_count, content, source="message_parent_mcp")
+                await self.db.add_intermediate_message(session_id, sess.step_count, content, source="native_message")
             if ev_type == "turn_completed":
                 if sess.step_count == 0:
                     sess.step_count = 1
                 if content:
-                    # K4: every engine's turn_completed carries the end-of-turn answer (agy "OK", kimi
-                    # "PELICAN-7", codex/omp task_complete, dsh's result). It is this turn's final
-                    # response unless a better source already wrote one: set_final_response keeps the
-                    # higher-priority source, so report_complete / codex_task_complete are never lost.
+                    # Preserve the engine's native answer source when completion is also observed
+                    # through a hook or another watcher.
                     sess.set_final_response(content, "turn_completed")
                 if sess.status in ("starting", "running") and sess.pending_interaction is None:
                     sess.status = "completed"
@@ -5369,9 +5210,10 @@ class HubSessionManager:
                         ("Task completed", "Turn completed", f"Step {sess.step_count}: Turn completed")
                     ):
                         sess.current_activity = f"Step {sess.step_count}: Turn completed (final response captured)"
-            if ev_type in ("completed", "turn_completed"):
-                # Spec §1.4: the agent reported completion, so a later exit is a clean one.
+            if ev_type == "turn_completed":
+                # A native turn end makes a later process exit a clean one.
                 sess.completion_reported = True
+                sess._turn_completion_emitted = True
 
         record = {
             "session_id": session_id,
@@ -5430,18 +5272,14 @@ class HubSessionManager:
             raw_screen_fallback=raw_fallback,
         )
 
-        # Upgrade session's final_response if transcript summarizer found a clean conclusion.
-        # D2: never while the stored answer is still the previous turn's. The summariser reads
-        # whatever transcript exists, which right after a follow-up or a resume is still the ended
-        # turn's; letting it "overwrite" would both lose the kept answer and clear from_previous_turn
-        # before the new turn produced anything. The new turn's own sources (turn_completed, the
-        # native transcript, report_complete) still replace the kept answer through set_final_response.
+        # Only inactive sessions can acquire a derived conclusion. During a new turn the native
+        # end record must replace the kept answer; a summary may still describe the previous turn.
         if sess:
             changed = False
             if int(summary.get("step_count") or 0) > sess.step_count:
                 sess.step_count = int(summary["step_count"])
                 changed = True
-            if summary.get("latest_conclusion") and not sess.final_response_from_previous_turn:
+            if summary.get("latest_conclusion") and sess.status not in ("starting", "running", "waiting_parent") and not sess.final_response_from_previous_turn:
                 sess.set_final_response(summary["latest_conclusion"], "transcript_summarizer")
                 changed = True
             if changed:
@@ -5475,7 +5313,7 @@ class HubSessionManager:
 
         final_resp = meta.get("final_response")
         final_src = meta.get("final_response_source")
-        if (not final_resp or final_src == "terminal_turn_snapshot") and transcript_summary.get("latest_conclusion"):
+        if (not final_resp or final_src == "terminal_turn_snapshot") and (sess is None or sess.status not in ("starting", "running", "waiting_parent")) and transcript_summary.get("latest_conclusion"):
             final_resp = transcript_summary["latest_conclusion"]
             final_src = "transcript_summarizer"
 
@@ -5532,7 +5370,7 @@ class HubSessionManager:
         transcript_summary = await self.summarize_transcript(session_id)
         sess = self.sessions.get(session_id)
         if sess:
-            if not sess.final_response and transcript_summary.get("latest_conclusion"):
+            if not sess.final_response and sess.status not in ("starting", "running", "waiting_parent") and transcript_summary.get("latest_conclusion"):
                 sess.set_final_response(transcript_summary["latest_conclusion"], "transcript_summarizer")
             await self.persist_session(sess)
 
@@ -5540,17 +5378,11 @@ class HubSessionManager:
         if not rec:
             raise ValueError(f"Session '{session_id}' not found in live memory or SQLite history.")
 
-        inter_msgs = await self.db.get_recent_intermediate_messages(session_id, limit=5)
-        latest_inter = inter_msgs[-1]["content"] if inter_msgs else None
-
         final_resp = rec.get("final_response")
         final_src = rec.get("final_response_source")
-        if (not final_resp or final_src == "terminal_turn_snapshot") and transcript_summary.get("latest_conclusion"):
+        if (not final_resp or final_src == "terminal_turn_snapshot") and (sess is None or sess.status not in ("starting", "running", "waiting_parent")) and transcript_summary.get("latest_conclusion"):
             final_resp = transcript_summary["latest_conclusion"]
             final_src = "transcript_summarizer"
-        elif not final_resp:
-            final_resp = latest_inter or transcript_summary.get("digest_markdown", "")
-            final_src = "intermediate_message" if latest_inter else "transcript_summary"
 
         return {
             "session_id": session_id,
@@ -5572,59 +5404,6 @@ class HubSessionManager:
         }
 
     @logical_write
-    async def _register_parent_question(self, session_id: str, question: str):
-        req_id = f"ask-{uuid.uuid4().hex[:8]}"
-        wait_ev = asyncio.Event()
-        q_entry = {
-            "request_id": req_id,
-            "session_id": session_id,
-            "question": question,
-            "asked_at": time.time(),
-            "answered": False,
-            "answer": None,
-            "event": wait_ev,
-        }
-        self.pending_questions[req_id] = q_entry
-
-        sess = self.sessions.get(session_id)
-        if sess:
-            sess.pending_question_id = req_id
-
-        event_rec = await self.record_worker_event(
-            session_id,
-            {
-                "type": "question",
-                "category": "question_waiting_reply",
-                "content": question,
-                "request_id": req_id,
-            },
-        )
-        return req_id, wait_ev, q_entry, event_rec, sess
-
-    async def ask_parent_and_wait(self, session_id: str, question: str, timeout_seconds: float = 300.0) -> Dict[str, Any]:
-        req_id, wait_ev, q_entry, event_rec, sess = await self._register_parent_question(session_id, question)
-        try:
-            await asyncio.wait_for(wait_ev.wait(), timeout=timeout_seconds)
-            return {
-                "answered": True,
-                "request_id": req_id,
-                "seq": event_rec["seq"],
-                "answer": q_entry["answer"],
-            }
-        except asyncio.TimeoutError:
-            return {
-                "answered": False,
-                "request_id": req_id,
-                "seq": event_rec["seq"],
-                "error": f"等待主 Agent 回复超时 ({timeout_seconds}s)。可调用 poll_parent_instructions 查看后续回复。",
-            }
-        finally:
-            if sess and sess.pending_question_id == req_id:
-                sess.pending_question_id = None
-                if sess.status == "waiting_parent":
-                    sess.status = "running"
-
-    @logical_write
     async def register_pending_interaction(
         self,
         session: AgentSession,
@@ -5642,6 +5421,9 @@ class HubSessionManager:
         transitions the session to `waiting_parent`, and emits a sequenced event to wake the Parent Agent.
         """
         req_id = request_id or f"int-{uuid.uuid4().hex[:8]}"
+        resolved = getattr(session, "_resolved_interactions", {})
+        if req_id in resolved:
+            return resolved[req_id]
         if session.pending_interaction and req_id in self._interaction_ids(session.pending_interaction):
             return session.pending_interaction
         from_screen = str(source or "").endswith("_screen_detector")
@@ -5770,7 +5552,13 @@ class HubSessionManager:
         if pending is None and (time.time() - float(cand.get("created_at") or 0)) <= SCREEN_ADOPT_WINDOW_SEC:
             # Answered before its machine record was read: the same prompt, already handled.
             session._unadopted_screen_interaction = None
-            return dict(cand, request_id=request_id, aliases=[cand.get("request_id")], already_resolved=True)
+            resolved = dict(cand, request_id=request_id, aliases=[cand.get("request_id")], already_resolved=True)
+            remembered = getattr(session, "_resolved_interactions", {})
+            remembered[request_id] = resolved
+            while len(remembered) > 128:
+                remembered.pop(next(iter(remembered)))
+            session._resolved_interactions = remembered
+            return resolved
         return None
 
     @logical_write
@@ -5781,6 +5569,12 @@ class HubSessionManager:
         ids = self._interaction_ids(session.pending_interaction)
         if request_id and request_id not in ids:
             return
+        resolved = getattr(session, "_resolved_interactions", {})
+        for qid in ids:
+            resolved[qid] = session.pending_interaction
+        while len(resolved) > 128:
+            resolved.pop(next(iter(resolved)))
+        session._resolved_interactions = resolved
         session.pending_interaction = None
         if session.pending_question_id in ids:
             session.pending_question_id = None
@@ -6394,7 +6188,7 @@ class HubSessionManager:
                     action_trace = f"Claude AskUserQuestion option key {key_num!r} ({chosen_label}) + '\\r'"
                 delivered = True
 
-        # ── Generic / Fallback TUI or Worker MCP `ask_parent` ─────────────────────────────────
+        # ── Generic / Fallback TUI ─────────────────────────────────
         else:
             if q_entry and not q_entry.get("answered"):
                 q_entry["answered"] = True
@@ -6409,6 +6203,14 @@ class HubSessionManager:
             delivered = True
 
         # Mark pending question/interaction as resolved
+        self.parent_messages.setdefault(session_id, []).append({
+            "id": f"pmsg-{uuid.uuid4().hex[:8]}",
+            "session_id": session_id,
+            "timestamp": round(time.time(), 3),
+            "content": custom_input.strip() if custom_input and custom_input.strip() else chosen_label,
+            "resolved_question_id": target_qid,
+            "read_by_worker": bool(delivered),
+        })
         await self.clear_pending_interaction(sess, target_qid)
         sess.current_activity = f"Parent responded ({chosen_label[:50]})"
         await self.db.add_intermediate_message(
@@ -6428,7 +6230,7 @@ class HubSessionManager:
                 "label": "成功" if delivered else "失败",
             },
         )
-        await self.persist_session(sess)
+        await self.persist_session(sess, final=True)
 
         if eng in ("agy", "claude") and approval_action == "deny_feedback" and (custom_input or "").strip():
             # D7: agy and claude end the turn on a deny; the feedback goes in as the next message once
@@ -6470,6 +6272,7 @@ class HubSessionManager:
         priority table still governs the rest of that turn. completion_reported restarts with the
         turn, so a later exit is judged on this turn's evidence.
         """
+        session._turn_completion_emitted = False
         session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
         session._seen_tui_prompt_signatures.clear()
@@ -6698,6 +6501,7 @@ class HubSessionManager:
             return
         sess.status = turn_before["status"]
         sess.completion_reported = bool(turn_before["completion_reported"])
+        sess._turn_completion_emitted = bool(turn_before["turn_completion_emitted"])
         sess.final_response_from_previous_turn = bool(turn_before["from_previous_turn"])
 
     @logical_write
@@ -6721,6 +6525,7 @@ class HubSessionManager:
             {
                 "status": sess.status,
                 "completion_reported": sess.completion_reported,
+                "turn_completion_emitted": getattr(sess, "_turn_completion_emitted", False),
                 "from_previous_turn": sess.final_response_from_previous_turn,
             }
             if starts_new_turn else None
@@ -7054,9 +6859,7 @@ class HubSessionManager:
         }
 
     def build_poll_command(self, session_id: str, after_seq: int = 0, timeout: int = 1800) -> str:
-        # K3: the interpreter the hub itself runs on, exactly as the bridge hint already does. A
-        # worktree (or any checkout without a local .venv) has no <repo>/.venv, and the parent was
-        # handed a path that did not exist.
+        # Use the running Hub's interpreter; a worktree need not contain a local .venv.
         # Use forward slashes and only quote paths when they contain spaces, so the command runs
         # directly as a command in both bash and PowerShell without needing a PowerShell-only `&`.
         python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
@@ -7069,19 +6872,19 @@ class HubSessionManager:
         )
 
     def _transcript_watch_alive(self, session: AgentSession) -> bool:
-        """F2: a transcript watcher follows the process, not the status label.
-
-        `completed` is a live status (archive-spec §2): the process is still running, and kimi
-        writes its real reply and `agent.turn.ended` to the transcript only after it reported
-        completion. The watcher therefore stops when the process ends, when the session leaves the
-        live list, or at its own deadline -- never merely because the report said `completed`.
-        """
+        """Follow all turns and briefly drain delayed native records after process exit."""
         if self.sessions.get(session.session_id) is not session:
             return False
         try:
-            return bool(session.is_process_alive())
+            if session.is_process_alive():
+                return True
         except Exception:
             return False
+        if session.terminated_by_user:
+            return False
+        if session.ended_at is None:
+            session.ended_at = time.time()
+        return time.time() < session.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC
 
     async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails the Codex rollout jsonl files for a spawned Codex session.
@@ -7152,10 +6955,7 @@ class HubSessionManager:
                     target_file = upgraded
                     offset = 0
             try:
-                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    lines = f.readlines()
-                    offset = f.tell()
+                lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -7204,7 +7004,7 @@ class HubSessionManager:
                                     options=opt_labels,
                                     source="codex_jsonl_request_user_input",
                                     request_id=payload.get("call_id") or f"codex-q-{uuid.uuid4().hex[:6]}",
-                                    metadata={"raw_options_count": len(opt_labels)},
+                                    metadata={"raw_options_count": len(opt_labels), "tool_name": tname},
                                 )
                         elif ptype in ("custom_tool_call_output", "function_call_output"):
                             out_val = payload.get("output") or ""
@@ -7218,9 +7018,17 @@ class HubSessionManager:
                                 },
                             )
                             if (
-                                ptype == "custom_tool_call_output"
-                                and session.pending_interaction
-                                and session.pending_interaction.get("kind") == "approval_request"
+                                session.pending_interaction
+                                and (
+                                    (
+                                        payload.get("call_id") in self._interaction_ids(session.pending_interaction)
+                                        and (session.pending_interaction.get("metadata") or {}).get("tool_name") == "request_user_input"
+                                    )
+                                    or (
+                                        ptype == "custom_tool_call_output"
+                                        and session.pending_interaction.get("kind") == "approval_request"
+                                    )
+                                )
                             ):
                                 await self.clear_pending_interaction(session)
                         elif ptype == "message" and payload.get("role") == "user":
@@ -7314,15 +7122,15 @@ class HubSessionManager:
                                     },
                                 )
                             session.set_final_response(str(last_msg), "codex_task_complete")
-                            await self.record_worker_event(
-                                session.session_id,
-                                {
-                                    "type": "turn_completed",
-                                    "category": "turn_completed",
-                                    "status": "turn_idle",
-                                    "content": str(last_msg),
-                                },
-                            )
+                        await self.record_worker_event(
+                            session.session_id,
+                            {
+                                "type": "turn_completed",
+                                "category": "turn_completed",
+                                "status": "turn_idle",
+                                "content": str(last_msg or ""),
+                            },
+                        )
                     elif otype == "event_msg" and ptype == "turn_aborted":
                         abort_reason = str(payload.get("reason") or "interrupted")
                         if session.pending_interaction:
@@ -7484,10 +7292,7 @@ class HubSessionManager:
         turn_has_step = False
         while self._transcript_watch_alive(session):
             try:
-                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    lines = f.readlines()
-                    offset = f.tell()
+                lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -7629,7 +7434,8 @@ class HubSessionManager:
                                             },
                                         )
                             inter = thoughts + texts
-                            final_txt = "\n".join(texts).strip() if (texts and not has_tool_use) else None
+                            is_end_turn = not has_tool_use and msg.get("stopReason") in ("stop", "end_turn", "stop_sequence")
+                            final_txt = "\n".join(texts).strip() if is_end_turn else None
                             if final_txt and not turn_has_step:
                                 turn_has_step = True
                                 await self.record_telemetry(
@@ -7645,7 +7451,7 @@ class HubSessionManager:
                                 session.session_id,
                                 {
                                     "source": "omp_jsonl",
-                                    "hook_event": "TurnComplete" if final_txt else "AssistantMessage",
+                                    "hook_event": "TurnComplete" if is_end_turn else "AssistantMessage",
                                     "intermediate_messages": inter,
                                     "final_assistant_text": final_txt,
                                 },
@@ -7681,10 +7487,7 @@ class HubSessionManager:
             return session.pending_interaction
         offset = int(getattr(session, "_kimi_wire_interaction_offset", 0) or 0)
         try:
-            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(offset)
-                lines = f.readlines()
-                session._kimi_wire_interaction_offset = f.tell()
+            lines, session._kimi_wire_interaction_offset = read_complete_lines(target_file, offset)
             if not lines:
                 return session.pending_interaction
             resolved_in_batch = self._kimi_resolved_interaction_ids(lines)
@@ -7825,10 +7628,7 @@ class HubSessionManager:
         while self._transcript_watch_alive(session):
             try:
                 await self._drain_kimi_wire_interactions_once(session)
-                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    lines = f.readlines()
-                    offset = f.tell()
+                lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -7849,6 +7649,7 @@ class HubSessionManager:
                             str(p.get("text") or "") for p in parts if isinstance(p, dict)
                         ))
                         turn_has_step = False
+                        latest_assistant_text = None
                         if session.status == "completed":
                             self.begin_new_turn(session, status="running")
                         continue
@@ -7867,15 +7668,15 @@ class HubSessionManager:
                                     },
                                 )
                             session.set_final_response(latest_assistant_text, "native_transcript")
-                            await self.record_worker_event(
-                                session.session_id,
-                                {
-                                    "type": "turn_completed",
-                                    "category": "turn_completed",
-                                    "status": "turn_idle",
-                                    "content": latest_assistant_text,
-                                },
-                            )
+                        await self.record_worker_event(
+                            session.session_id,
+                            {
+                                "type": "turn_completed",
+                                "category": "turn_completed",
+                                "status": "turn_idle",
+                                "content": latest_assistant_text or "",
+                            },
+                        )
                         continue
 
                     if obj.get("type") == "context.append_loop_event":
@@ -8087,10 +7888,7 @@ class HubSessionManager:
                         await self._mark_agy_resume_failed(session)
                         return
             try:
-                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    lines = f.readlines()
-                    offset = f.tell()
+                lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -8213,7 +8011,7 @@ class HubSessionManager:
                             # turn; the next transcript row is a new USER_INPUT (or the file ends).
                             # On a resume the watcher attaches at the old file size, so every event
                             # here belongs to a new turn and only one is emitted per turn.
-                            final_text = content or thinking
+                            final_text = content or ""
                             if final_text:
                                 if not turn_has_step:
                                     turn_has_step = True
@@ -8227,15 +8025,15 @@ class HubSessionManager:
                                         },
                                     )
                                 session.set_final_response(final_text, "native_transcript")
-                                await self.record_worker_event(
-                                    session.session_id,
-                                    {
-                                        "type": "turn_completed",
-                                        "category": "turn_completed",
-                                        "status": "turn_idle",
-                                        "content": final_text,
-                                    },
-                                )
+                            await self.record_worker_event(
+                                session.session_id,
+                                {
+                                    "type": "turn_completed",
+                                    "category": "turn_completed",
+                                    "status": "turn_idle",
+                                    "content": final_text,
+                                },
+                            )
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -8417,10 +8215,7 @@ class HubSessionManager:
         while self._transcript_watch_alive(session):
             try:
                 await self._drain_claude_hook_events(session)
-                with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    lines = f.readlines()
-                    offset = f.tell()
+                lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
                     line = line.strip()
                     if not line:
@@ -8655,14 +8450,13 @@ class HubSessionManager:
                             )
                         inter = thoughts + texts
                         is_end_turn = (
-                            bool(texts)
-                            and not has_tool_use
+                            not has_tool_use
                             and stop_reason in ("end_turn", "stop_sequence")
                         )
                         if is_end_turn:
                             turn_completed_emitted = True
                         final_txt = "\n".join(texts).strip() if is_end_turn else None
-                        if inter or final_txt:
+                        if inter or is_end_turn:
                             await self.record_telemetry(
                                 session.session_id,
                                 {
@@ -8676,7 +8470,7 @@ class HubSessionManager:
                         dur_ms = obj.get("durationMs")
                         if not turn_completed_emitted and session.pending_interaction is None:
                             turn_completed_emitted = True
-                            fallback_final = turn_last_text or session.final_response or "Turn completed"
+                            fallback_final = turn_last_text or ""
                             await self.record_telemetry(
                                 session.session_id,
                                 {
@@ -8731,7 +8525,7 @@ class HubSessionManager:
 
         The real captures show three different composers:
           kimi   a framed box: "│ > …" on its first row, the wrapped rest of the text on the rows
-                 below it, then "╰───╯" (12 rows tall for a task carrying the worker-bridge hint)
+                 below it, then "╰───╯" (height varies with the task text)
           omp    a bare ❯ row under a rule, with status lines below it
           codex  a bare › row (placeholder "Ask Codex to do anything") above its status line
         Looking only at the last non-empty line (the old code) always found a status line instead.
@@ -9755,6 +9549,17 @@ class HubSessionManager:
                     self._user_terminated.discard(session_id)
             # Either a resume already owns this id or the session is gone: this exit is history.
             return
+        if sess is not None and sess.engine in ("codex", "claude", "omp", "kimi", "agy") and not sess.terminated_by_user:
+            # Engines can flush the last JSONL row just after the PTY closes. Let the existing
+            # watcher drain it before classifying/persisting the exit and releasing ownership.
+            if sess.ended_at is None:
+                sess.ended_at = time.time()
+            remaining = sess.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC + 0.1 - time.time()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if self.sessions.get(session_id) is not sess:
+                return
+            sess.end_reason = sess.classify_end_reason(exit_code)
         if session_id in self._user_terminated or (sess and sess.terminated_by_user):
             # V-5: the user termination already emitted its one lifecycle event.
             # Q12: the process is gone; let go of its transcript and of the one-event marker.
@@ -10148,12 +9953,8 @@ class HubSessionManager:
                                 f"\x1b[90m(Session {session.dsh_session_id} stays warm in DSH Host — send input to continue)\x1b[0m\r\n> "
                             )
                             await self.persist_session(session)
-                            # V6: one feed entry per dsh turn. The record_telemetry(TurnComplete)
-                            # above already emitted turn_completed with this result; the extra
-                            # "completed" event duplicated it. "completed" is the worker's
-                            # report_complete signal for a process that is done — a dsh job stays
-                            # warm and can be continued, so it would also misstate the session.
-                            # Only a result-less turn needs its own event.
+                            # TurnComplete above emitted the native result. An empty result still
+                            # ends the turn without creating an answer from a status sentence.
                             if not full_res:
                                 await self.record_worker_event(
                                     session.session_id,
@@ -10161,7 +9962,7 @@ class HubSessionManager:
                                         "type": "turn_completed",
                                         "category": "turn_completed",
                                         "status": "turn_idle",
-                                        "content": f"DSH 任务 {jstatus} 结束",
+                                        "content": "",
                                     },
                                 )
                             break
@@ -10171,86 +9972,6 @@ class HubSessionManager:
                     pass
 
                 await asyncio.sleep(0.4)
-
-    def _build_worker_bridge_system_hint(self, session_id: str, engine: Optional[str] = None) -> str:
-        eng = (engine or "").strip().lower()
-        if eng == "agy":
-            return self._build_agy_bridge_hint(session_id)
-        # W10: the hub may run on an interpreter that has no <repo>/.venv (this worktree does not);
-        # the hint must name the interpreter the hub itself runs on, or every bridge command fails.
-        # In Codex's Windows restricted-token sandbox, %APPDATA%\uv\python and .venv uv trampolines
-        # are blocked with "permission denied (os error 5)", whereas `python` in PATH runs stdlib-only
-        # hub_worker.py directly on the first attempt without triggering an approval modal.
-        if eng == "codex":
-            python_exe = "python"
-        else:
-            python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
-        worker_cli = str((self.base_dir / "hub_worker.py").resolve()).replace("\\", "/")
-        return (
-            f"\n[Sub-Agent Bridge Info: session_id={session_id}]\n"
-            f"You are running inside MCP Agent Hub. To communicate with the Parent Agent at any time, you can run:\n"
-            f'- Report step: `{python_exe} "{worker_cli}" step "step description" --tool "tool_name"`\n'
-            f'- Send message to parent: `{python_exe} "{worker_cli}" message "your progress message"`\n'
-            f'- Ask parent & wait for answer: `{python_exe} "{worker_cli}" ask "your question"`\n'
-            f'- Report task complete: `{python_exe} "{worker_cli}" complete "{COMPLETION_SUMMARY_PLACEHOLDER}"`'
-            f' (replace the placeholder with your own one-sentence result)\n'
-        )
-
-    @staticmethod
-    def _build_agy_bridge_hint(session_id: str) -> str:
-        """D10: agy's shell sandbox has no loopback network, so agy reports through the MCP tools of
-        its per-session `hub-bridge` server (allowed for this session, no prompt). The session is
-        preset in the server's environment. Arguments as in worker_bridge_mcp.py."""
-        srv = AGY_BRIDGE_SERVER_NAME
-        return (
-            f"\n[Sub-Agent Bridge Info: session_id={session_id}]\n"
-            f"You are running inside MCP Agent Hub. To communicate with the Parent Agent, call the MCP tools of"
-            f" server `{srv}` (do not run shell commands for this; your session is preset, do not pass session_id):\n"
-            f"- Report step: `{srv}/report_step` (step_title, optional tool_name, tool_input_summary,"
-            f" intermediate_message)\n"
-            f"- Send message to parent: `{srv}/message_parent` (message, optional category=\"progress\")\n"
-            f"- Ask parent & wait for answer: `{srv}/ask_parent` (question, optional timeout_seconds=300)\n"
-            f"- Report task complete: `{srv}/report_complete` (summary = your own one-sentence result,"
-            f" optional status=\"success\", files_changed)\n"
-        )
-
-    def _agy_bridge_dir(self, session_id: str) -> Path:
-        return agy_bridge_session_dir(self.runtime_configs_dir, session_id)
-
-    def _write_agy_bridge_config(self, session_id: str) -> Path:
-        """D10: (re)writes `<runtime>\\agy_sess_<sid>\\.agents\\mcp_config.json` and returns the dir.
-        Called on spawn and on every resume, so a dir that went missing is simply recreated."""
-        sess_dir = self._agy_bridge_dir(session_id)
-        agents_dir = sess_dir / ".agents"
-        agents_dir.mkdir(parents=True, exist_ok=True)
-        config = agy_bridge_mcp_config(
-            session_id,
-            str(Path(sys.executable).resolve()),
-            str((Path(__file__).resolve().parent / "worker_bridge_mcp.py")),
-            hub_api_base_url(),
-        )
-        (agents_dir / "mcp_config.json").write_text(
-            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return sess_dir
-
-    def _remove_agy_bridge_dir(self, session_id: str) -> bool:
-        """D10: drops the hub-private bridge dir of one session (only that literal dir under the
-        runtime configs dir); a missing dir is fine."""
-        sid = str(session_id or "").strip()
-        if not sid or "/" in sid or "\\" in sid or sid in (".", ".."):
-            return False
-        target = self._agy_bridge_dir(sid)
-        try:
-            root = Path(self.runtime_configs_dir).resolve()
-            if target.resolve().parent != root or not target.name.startswith(AGY_BRIDGE_DIR_PREFIX):
-                return False
-        except OSError:
-            return False
-        if not target.exists():
-            return False
-        shutil.rmtree(target, ignore_errors=True)
-        return not target.exists()
 
     async def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7 + round 2 (owner): every option on the screen is offered, each with the action its
@@ -10509,10 +10230,7 @@ class HubSessionManager:
             return session.pending_interaction
         offset = int(getattr(session, "_claude_hook_offset", 0) or 0)
         try:
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(offset)
-                lines = f.readlines()
-                session._claude_hook_offset = f.tell()
+            lines, session._claude_hook_offset = read_complete_lines(log_path, offset)
             for raw in lines:
                 raw = raw.strip()
                 if not raw:
@@ -10725,7 +10443,7 @@ class HubSessionManager:
         name = str(prof.get('name') or pid)
         kind = str(prof.get('kind') or 'tui')
         command = str(prof.get('command') or '')
-        base_args = [str(a) for a in (prof.get('args') or [])]
+        base_args = strip_legacy_worker_bridge_args([str(a) for a in (prof.get('args') or [])], self.runtime_configs_dir)
         notes = []  # Chinese notes, e.g. substitutions
         profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
         caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
@@ -11084,42 +10802,30 @@ class HubSessionManager:
             startup_delay = 0.0
         submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
-        agy_bridge_dir: Optional[Path] = None
         claude_session_uuid: Optional[str] = None
-
-        if engine == "agy":
-            # D10: the per-session MCP bridge (config file + --add-dir + session-only settings).
-            # Like omp's --session-dir it is not part of the snapshot: a resume rebuilds it.
-            agy_bridge_dir = self._write_agy_bridge_config(session_id)
-            args = agy_bridge_launch_args(
-                args, work_dir, str(agy_bridge_dir), bypass=bool(launch.get("bypass_approvals"))
-            )
 
         if task_mode == "omp_positional":
             omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
             omp_sess_dir.mkdir(exist_ok=True)
             args.extend([
                 f"--session-dir={omp_sess_dir}",
-                f"--append-system-prompt={self._build_worker_bridge_system_hint(session_id)}",
             ])
             if task:
-                args.append(task)
+                args.append(self._task_with_session_marker(session_id, task))
         elif task_mode == "claude_positional":
             claude_session_uuid = str(uuid.uuid4())
             args.extend([
                 "--session-id",
                 claude_session_uuid,
-                "--append-system-prompt",
-                self._build_worker_bridge_system_hint(session_id, engine),
             ])
             if task:
-                args.append(task)
+                args.append(self._task_with_session_marker(session_id, task))
         elif task_mode == "agy_interactive_flag":
             if task:
-                args.extend(["-i", task + "\n" + self._build_worker_bridge_system_hint(session_id, engine)])
+                args.extend(["-i", self._task_with_session_marker(session_id, task)])
         elif task_mode == "codex_positional":
             if task:
-                args.append(task + "\n" + self._build_worker_bridge_system_hint(session_id, engine))
+                args.append(self._task_with_session_marker(session_id, task))
 
         prof_name = str(prof.get("name", profile_id))
         sess = AgentSession(
@@ -11207,12 +10913,7 @@ class HubSessionManager:
                     sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
                 except OSError:
                     sess._claude_hook_offset = 0
-        try:
-            sess.start_pty(loop, env_overrides=env_overrides or None)
-        except Exception:
-            if agy_bridge_dir is not None:
-                self._remove_agy_bridge_dir(session_id)
-            raise
+        sess.start_pty(loop, env_overrides=env_overrides or None)
         self.sessions[session_id] = sess
         await self.persist_session(sess)
 
@@ -11231,17 +10932,7 @@ class HubSessionManager:
             self._schedule(self._watch_tui_interactive_prompts(sess))
             prompt_to_send: Optional[str] = None
             if task and task_mode == "pty_input":
-                prompt_to_send = task
-                if profile_id.startswith("kimi"):
-                    if "hub_worker.py" not in task:
-                        # Kimi has no system-prompt flag, so the full worker-bridge hint (session
-                        # marker plus step / message / ask / complete) travels with the typed task,
-                        # as it does in the task text for codex and agy. Newlines become spaces
-                        # when typed. The marker inside it keeps transcript ownership unambiguous (Q2).
-                        prompt_to_send = task + "\n" + self._build_worker_bridge_system_hint(sess.session_id)
-                    else:
-                        # The caller wrote its own bridge instructions; only add the session marker.
-                        prompt_to_send = f"{task}\n\n[Sub-Agent Bridge Info: session_id={sess.session_id}]"
+                prompt_to_send = self._task_with_session_marker(sess.session_id, task)
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,

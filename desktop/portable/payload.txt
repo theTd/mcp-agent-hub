@@ -3,12 +3,11 @@ session_manager.py
 hub_database.py
 hub_persistence.py
 transcript_tail.py
+native_session_launch.py
 model_discovery.py
 dsh_endpoint.py
 transcript_summarizer.py
-hub_worker.py
 hub_poll.py
-worker_bridge_mcp.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/omp-approval.yml
