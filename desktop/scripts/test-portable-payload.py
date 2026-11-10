@@ -79,6 +79,13 @@ def main():
     check(not (source / "hub_worker.py").exists() and not (source / "worker_bridge_mcp.py").exists(), "retired worker bridge is absent")
     check((source / "native_session_launch.py").is_file(), "native launch configuration helper is packaged")
     check((source / "agent_guidance.py").is_file(), "English agent guidance is packaged")
+    check((source / "parent_waiting.py").is_file(), "bounded parent waiting contract is packaged")
+    check((source / "dsh_workspace_permissions.py").is_file()
+          and "_require_dsh_workspace" in (source / "session_manager.py").read_text(encoding="utf-8"),
+          "DSH workspace permission preparation and dispatch gates are packaged")
+    check("async def _submit_codex_text" in (source / "session_manager.py").read_text(encoding="utf-8")
+          and "clear_input: bool = False" in (source / "server.py").read_text(encoding="utf-8"),
+          "native-confirmed Codex submission and explicit draft recovery are packaged")
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -110,6 +117,37 @@ def main():
                 check(client.get(base + "/static/vendor/" + asset).status_code == 200, f"offline terminal resource {asset} is served")
             check((data / "hub_state.db").is_file() and not (source / "hub_state.db").exists(), "database is stored separately from extracted code")
             check(client.get(base + "/api/sessions").json()["sessions"] == [], "isolated test Hub has no personal live sessions")
+            empty = client.post(base + "/api/mailbox/payload-empty-check/reply", json={"text": ""}).json()
+            check(empty.get("delivered") is False and empty.get("reason") == "empty_text"
+                  and empty.get("pty_written") is False, "delivered EXE rejects empty sends without phantom delivery")
+            profile = {"id": "approval-payload-check", "name": "Approval payload check", "engine": "codex",
+                       "command": str(python), "args": [], "kind": "tui", "task_mode": "codex_positional",
+                       "enabled": True, "bypass_approvals": True}
+            check(client.post(base + "/api/profiles", json=profile, timeout=30).status_code == 200,
+                  "extracted Hub accepts an isolated test profile")
+            preview = client.post(base + "/api/launch-preview", json={"profile_id": profile["id"],
+                                  "cwd": str(root), "bypass_approvals": False}, timeout=30).json()
+            check(preview.get("high_risk_approval") is True and preview.get("approval_source") == "session"
+                  and preview.get("bypass_approvals_override") is False,
+                  "delivered EXE supports per-session approval overriding a bypassed profile")
+            check(client.delete(base + "/api/profiles/" + profile["id"]).status_code == 200,
+                  "isolated test profile is removed")
+
+            dsh_profile = dict(profile, id="dsh-permission-payload-check", name="DSH payload check",
+                               engine="dsh", task_mode="dsh_hub_api", bypass_approvals=False)
+            check(client.post(base + "/api/profiles", json=dsh_profile, timeout=30).status_code == 200,
+                  "extracted Hub accepts an isolated DSH profile")
+            before_diagnostics = list((data / "diagnostics").glob("dsh-acl-*.json"))
+            dsh_preview = client.post(base + "/api/launch-preview", json={"profile_id": dsh_profile["id"],
+                                      "cwd": str(root)}, timeout=30).json()
+            preparation = dsh_preview.get("sandbox_preparation") or {}
+            check(preparation.get("mode") == "check" and preparation.get("scope") == "workspace_root_only"
+                  and preparation.get("status") in ("ready", "would_repair", "blocked", "skipped"),
+                  "delivered EXE exposes DSH workspace preparation in launch preview")
+            check(list((data / "diagnostics").glob("dsh-acl-*.json")) == before_diagnostics,
+                  "DSH launch preview creates no permission repair records")
+            check(client.delete(base + "/api/profiles/" + dsh_profile["id"]).status_code == 200,
+                  "isolated DSH test profile is removed")
 
             pty = PtyProcess.spawn([str(python), "-I", "-c", "print('portable-pty-ok')"], cwd=str(root), env=api_env)
             try:

@@ -8,6 +8,7 @@ transcript_tail.py
 native_session_launch.py
 model_discovery.py
 dsh_endpoint.py
+dsh_workspace_permissions.py
 transcript_summarizer.py
 hub_poll.py
 engine_policies/claude_pre_tool_hook.py

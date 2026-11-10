@@ -25,6 +25,7 @@ from session_manager import (
     hub_api_base_url,
     hub_port,
     strip_osc_terminal_replies,
+    resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
@@ -136,7 +137,7 @@ def _sanitize_json_floats(value: Any) -> Any:
     return value
 
 
-def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
+def _injection_report(session, pending: bool = False, submit_id: Optional[str] = None) -> Dict[str, Any]:
     """W11: spawn/resume/send report the real injection, or say honestly that it is still pending.
 
     The call waits up to wait_seconds; a TUI that needs longer to become ready has not typed the
@@ -148,6 +149,10 @@ def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
     """
     injection = getattr(session, "last_injection", None)
     recent = list(getattr(session, "recent_injections", None) or [])
+    if submit_id is not None:
+        injection = next((item for item in reversed(recent) if item.get("submit_id") == submit_id), None)
+        if not submit_id:
+            return {"injection": "none", "last_injection": None}
     history = {"recent_injections": recent} if recent else {}
     if isinstance(injection, dict) and injection.get("pending"):
         # K6 (fix 9c): a live message is still being typed and proved in the background; the
@@ -235,6 +240,7 @@ async def spawn_subagent(
     cwd: Optional[str] = None,
     title: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
+    bypass_approvals: Optional[bool] = None,
     wait_seconds: float = 5.0,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
@@ -245,7 +251,8 @@ async def spawn_subagent(
     After launch follow next_action: reply, wait, collect_results or inspect. While
     unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments
     after processing each result. Background CLI waiting requires host completion notifications.
-    High-risk actions pause for approval unless the user enabled the profile's bypass_approvals.
+    bypass_approvals=null inherits the profile, false enforces approvals, true bypasses them
+    for this session and its resumes without changing the profile.
     high_risk_approval is true when enforced, false when bypassed, or null for engines without
     Hub approval. Questions and approvals set waiting_parent and pending_interaction; answer
     with reply_to_subagent or respond_to_subagent_approval_or_choice.
@@ -255,6 +262,7 @@ async def spawn_subagent(
     session = await hub.create_session(
         profile_id=agent_type,
         launch_source="agent",
+        bypass_approvals=bypass_approvals,
         task=task,
         cwd=cwd,
         title=title,
@@ -306,6 +314,8 @@ async def spawn_subagent(
         # Round 2: true = high-risk approval on; false = the profile's bypass_approvals is on
         # (full-auto); null = the engine has no hub approval (dsh, pwsh).
         "high_risk_approval": session.high_risk_approval,
+        **resolve_session_approval_fields(session.profile_snapshot),
+        "sandbox_preparation": session.sandbox_preparation,
         # The launch's notes (ignored profile flags, substitutions, "bypass_approvals is on ...").
         "launch_notes": list(getattr(session, "launch_notes", None) or []),
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
@@ -360,19 +370,27 @@ async def send_to_subagent(
     press_enter: bool = True,
     wait_seconds: float = 10.0,
     ctx: Optional[Context] = None,
+    clear_input: bool = False,
 ) -> Dict[str, Any]:
     """
     Send instructions or a follow-up message to a subagent, resuming an ended resumable session.
     If pending_interaction exists, text answers that native question or approval prompt.
     Otherwise it is delivered through the engine's terminal or native message API.
-    Check last_injection for submission status, then follow next_action. Successful delivery
+    To discard a failed Codex draft, send empty text with clear_input=true while idle. Never
+    resend after an unconfirmed submit without checking native state. Check the matching
+    submit_id in last_injection/recent_injections, then follow next_action. Successful delivery
     does not mean completion; keep waiting with next_wait_arguments while work remains.
     """
     await ensure_profiles_loaded()
+    if not text.strip() and not clear_input:
+        return {"session_id": session_id, "delivery": {"delivered": False, "reason": "empty_text",
+                "pty_written": False, "injection": "none"}, "injection": "none", "last_injection": None}
     start_seq = hub.global_seq
     session = hub.sessions.get(session_id)
     resumed = False
     if session is None or not _session_can_receive(session):
+        if clear_input:
+            raise ValueError("clear_input requires a live Codex TUI session")
         # Archive spec §5: an ended or archived session is revived automatically, then the message
         # is delivered the way an initial task would be. A non-resumable record raises its Chinese
         # reason instead of a silent `pty_written:false`.
@@ -404,20 +422,23 @@ async def send_to_subagent(
             text=text,
             also_write_pty=True,
             press_enter=press_enter,
+            clear_input=clear_input,
         )
 
     if delivery.get("injection") == "pending":
         inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 15.0), 30.0)
         while time.time() < inj_deadline:
-            cur_inj = getattr(session, "last_injection", None)
+            cur_inj = _injection_report(session, submit_id=delivery.get("submit_id"))["last_injection"]
             if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
                 break
             await asyncio.sleep(0.15)
-        cur_inj = getattr(session, "last_injection", None)
+        cur_inj = _injection_report(session, submit_id=delivery.get("submit_id"))["last_injection"]
         if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
             delivery = dict(delivery)
             delivery["injection"] = "recorded"
-            if cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
+            delivery["delivered"] = cur_inj.get("ok")
+            delivery["reason"] = cur_inj.get("reason")
+            if cur_inj.get("pty_written") or cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
                 delivery["pty_written"] = True
 
     settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
@@ -441,21 +462,29 @@ async def send_to_subagent(
     next_seq = events[-1]["seq"] if events else start_seq
     transcript_summary = await hub.summarize_transcript(session_id)
 
+    continuation = await _parent_continuation(session_id, next_seq, events)
+    if delivery.get("delivered") is not True and delivery.get("injection") != "pending" and not delivery.get("input_cleared"):
+        # A completed previous turn is not the outcome of a message that never submitted.
+        continuation["next_action"] = "inspect"
+
     return {
-        **await _parent_continuation(session_id, next_seq, events),
+        **continuation,
         "session_id": session.session_id,
         "status": session.status,
         "resumed": resumed,
         "resume_count": session.resume_count,
-        # Round 2: a resume follows the profile's current bypass_approvals switch.
+        # Explicit session overrides survive resume; inherited sessions follow the current profile.
         "high_risk_approval": session.high_risk_approval,
+        **resolve_session_approval_fields(session.profile_snapshot),
         **({"launch_notes": list(session.launch_notes)} if resumed and session.launch_notes else {}),
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
         "delivery": delivery,
+        "sandbox_preparation": session.sandbox_preparation,
         **_injection_report(
             session,
             bool(delivery.get("injection") == "pending" and session.last_injection is None),
+            submit_id=delivery.get("submit_id", "") if not resumed else delivery.get("submit_id"),
         ),
         "worker_events": events,
         "next_seq": next_seq,
@@ -536,6 +565,7 @@ async def resume_subagent(
         "resume_count": session.resume_count,
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
         "current_activity": session.current_activity,
+        "sandbox_preparation": session.sandbox_preparation,
         "delivery": delivery,
         **_injection_report(
             session,
@@ -640,6 +670,8 @@ async def respond_to_subagent_approval_or_choice(
     Rule-triggered OMP prompts fall back to approve-once; Kimi session approval does not cover
     dangerous commands. Inspect the returned notes for the actual scope.
     After responding, follow next_action and keep waiting with next_wait_arguments while work remains.
+    delivered means input was sent. response_state=confirmed means native acknowledgement;
+    unconfirmed retains the pending request: keep waiting and never resend automatically.
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -1002,6 +1034,8 @@ async def api_parent_reply(session_id: str, req: Request):
         text=text,
         request_id=request_id,
         also_write_pty=also_write_pty,
+        press_enter=bool(body.get("press_enter", True)),
+        clear_input=bool(body.get("clear_input", False)),
     )
 
 
@@ -1220,7 +1254,10 @@ async def api_launch_preview(req: Request):
             thinking_level=body.get("thinking_level"),
             cwd=body.get("cwd"),
             env=body.get("env"),
+            bypass_approvals=body.get("bypass_approvals"),
         )
+        if preview.get("engine") == "dsh":
+            preview["sandbox_preparation"] = await hub._prepare_dsh_workspace(preview["cwd"], repair=False)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
     payload = {"ok": True}
@@ -1258,6 +1295,7 @@ async def api_create_session(req: Request):
             model=model,
             thinking_level=thinking_level,
             env=env,
+            bypass_approvals=body.get("bypass_approvals"),
         )
     except ValueError as e:
         return bad_request(str(e))
@@ -1271,8 +1309,13 @@ async def api_send_input(session_id: str, req: Request):
         return not_found(f"找不到会话 {session_id}")
     body = await req.json()
     text = body.get("text", "")
-    await hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True, press_enter=False)
-    return {"ok": True}
+    try:
+        delivery = await hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True,
+            press_enter=bool(body.get("press_enter", False)), clear_input=bool(body.get("clear_input", False)))
+    except ValueError as e:
+        return bad_request(str(e))
+    return {"ok": delivery.get("delivered") is True or delivery.get("input_cleared") is True,
+            "delivery": delivery}
 
 
 @app.delete("/api/sessions/{session_id}")

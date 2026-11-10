@@ -37,6 +37,7 @@ from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 
 from dsh_endpoint import dsh_base_url, dsh_url
+from dsh_workspace_permissions import prepare_dsh_workspace
 from model_discovery import AgentModelDiscovery
 from transcript_summarizer import (
     ENGINE_BUSY_LINE_RES,
@@ -434,32 +435,32 @@ TUI_DEFAULT_SUBMIT_PROOF = {
 TUI_SUBMIT_PROOF_RULES = {
     "kimi": {
         "cleared_composer": False,
-        "transcript": "user_message",
-        "history_glyph": "❯",
+        "transcript": "exact_user_message",
+        "history_glyph": "",
         "reject_phrases": ("LLM not set",),
     },
     "claude": {
-        "cleared_composer": True,
-        "transcript": "growth",
-        "history_glyph": "❯",
+        "cleared_composer": False,
+        "transcript": "exact_user_message",
+        "history_glyph": "",
         "reject_phrases": (),
     },
     "omp": {
-        "cleared_composer": True,
-        "transcript": "growth",
-        "history_glyph": "❯",
+        "cleared_composer": False,
+        "transcript": "exact_user_message",
+        "history_glyph": "",
         "reject_phrases": (),
     },
     "agy": {
-        "cleared_composer": True,
-        "transcript": "growth",
-        "history_glyph": ">",
+        "cleared_composer": False,
+        "transcript": "exact_user_message",
+        "history_glyph": "",
         "reject_phrases": (),
     },
     "codex": {
-        "cleared_composer": True,
-        "transcript": "growth",
-        "history_glyph": "›",
+        "cleared_composer": False,
+        "transcript": "exact_user_message",
+        "history_glyph": "",
         "reject_phrases": (),
     },
 }
@@ -969,13 +970,25 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
 # approval flags. Only the engines below have approval flags; dsh and pwsh ignore the key.
 APPROVAL_ENGINES = ("omp", "kimi", "codex", "claude", "agy")
 BYPASS_APPROVALS_KEY = "bypass_approvals"
-BYPASS_ON_NOTE = "bypass_approvals is on for this profile：该 Profile 已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
+BYPASS_ON_NOTE = "bypass_approvals is on：本次会话已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
 BYPASS_NO_EFFECT_NOTE = "bypass_approvals 对 {engine} 引擎不适用（该引擎没有 Hub 注入的审批参数），已忽略"
 
 
 def profile_bypasses_approvals(profile: Optional[Dict[str, Any]]) -> bool:
     """True only for a stored boolean true; a missing key (or anything else) means approval stays on."""
     return isinstance(profile, dict) and profile.get(BYPASS_APPROVALS_KEY) is True
+
+
+def resolve_session_approval(engine: str, profile: Dict[str, Any], override: Optional[bool]) -> Dict[str, Any]:
+    """Resolve a session-only override without changing the stored profile."""
+    if override is not None and type(override) is not bool:
+        raise ValueError("bypass_approvals 只能是 true、false 或 null")
+    applicable = engine in APPROVAL_ENGINES
+    return {
+        "bypass_approvals_override": override,
+        "bypass_approvals": (profile_bypasses_approvals(profile) if override is None else override) if applicable else False,
+        "approval_source": ("profile" if override is None else "session") if applicable else "not_applicable",
+    }
 
 
 def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bool]:
@@ -985,6 +998,22 @@ def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bo
     if eng not in APPROVAL_ENGINES:
         return None
     return not bypass
+
+
+def resolve_session_approval_fields(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Public launch policy fields; old snapshots keep inheriting the profile on resume."""
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot) if snapshot else {}
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    snapshot = snapshot or {}
+    return {"bypass_approvals": snapshot.get("bypass_approvals") is True,
+            "bypass_approvals_override": snapshot.get("bypass_approvals_override"),
+            "approval_source": snapshot.get("approval_source") or (
+                "profile" if snapshot.get("engine") in APPROVAL_ENGINES else "not_applicable")}
 
 
 def bypass_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -> List[str]:
@@ -1278,6 +1307,23 @@ def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     screen (`p` on command prompts, `a` on edit prompts), or "" when the screen shows none.
     """
     text = str(screen or "")
+    # MCP approvals use the native selector rather than the command/edit y/n shortcuts.
+    mcp_header = re.search(r'Allow the\s+(.+?)\s+MCP server to run tool\s+"([^"]+)"\?', text, re.DOTALL)
+    if mcp_header:
+        body = text[mcp_header.end():]
+        opts = _numbered_options(body.splitlines())
+        for option in opts:
+            label = option["label"].strip().lower()
+            option["action"] = "deny" if label.startswith("cancel") else (
+                "approve_once" if label.startswith("allow") else "unknown"
+            )
+        # Require a complete modal, not an echoed task or a partially drawn title.
+        if {o["action"] for o in opts} >= {"approve_once", "deny"} and "enter to submit" in body.lower():
+            arguments = re.split(r"(?m)^\s*[›>]?\s*\d+\.\s", body, maxsplit=1)[0].strip()
+            return {"prompt_kind": "mcp", "header": " ".join(mcp_header.group(0).split()),
+                    "server": " ".join(mcp_header.group(1).split()), "tool": mcp_header.group(2),
+                    "arguments": arguments, "options": opts, "session_key": ""}
+        return None
     if "Would you like to run the following command?" in text:
         kind, marker = "command", "Would you like to run the following command?"
     elif "Would you like to make the following edits?" in text:
@@ -1757,6 +1803,8 @@ class AgentSession:
         self.last_injection = None
         # K6 (fix 9c): the startup text and the live messages type into the TUI one at a time.
         self.tui_writer = TuiWriterQueue()
+        # A failed/unchecked draft must be explicitly cleared before another message is typed.
+        self._tui_draft_pending: Optional[Dict[str, Any]] = None
         self._scrollback_written_at: float = 0.0
         self._scrollback_rev_written: int = -1
         self._seen_tui_tool_lines: Set[str] = set()
@@ -1799,6 +1847,7 @@ class AgentSession:
         self.dsh_session_id: Optional[str] = None
         self.dsh_token: Optional[str] = None
         self.dsh_spec: Dict[str, Any] = {}
+        self.sandbox_preparation: Optional[Dict[str, Any]] = None
         self._virtual_line_buf: str = ""
         self.on_virtual_line_cb: Optional[Callable[[str, str], Any]] = None
 
@@ -2311,11 +2360,13 @@ class AgentSession:
             "rows": self.rows,
             "dsh_job_id": self.dsh_job_id,
             "dsh_session_id": self.dsh_session_id,
+            "sandbox_preparation": self.sandbox_preparation,
             "effective_model": self.effective_model,
             "effective_thinking_level": self.effective_thinking_level,
             # Round 2: true = high-risk approval on, false = the profile's bypass_approvals was on
             # for this launch, null = the engine has no hub approval (dsh, pwsh).
             "high_risk_approval": self.high_risk_approval,
+            **resolve_session_approval_fields(self.profile_snapshot),
             "transcript_path": str(self.transcript_path) if self.transcript_path else "",
             "end_reason": self.end_reason,
             "archived_at": self.archived_at,
@@ -4084,10 +4135,10 @@ class HubSessionManager:
         # D9 (2026-11-07): the snapshot goes through the same strip+inject as a fresh launch, so a
         # session archived before approval-by-default (with --auto-approve, --auto, ...) resumes in
         # the safe mode too. omp's in-memory "approve for this session" is gone after a resume anyway.
-        # Round 2: the profile's CURRENT bypass_approvals decides, not the value at the first launch,
-        # so switching it off makes resumed sessions safe again (and on makes them full-auto).
-        bypass = profile_bypasses_approvals(prof_cur)
-        built["bypass_approvals"] = bypass
+        # Explicit session overrides survive; legacy/inherited sessions follow the current profile.
+        policy = resolve_session_approval(engine, prof_cur, snapshot.get("bypass_approvals_override"))
+        built.update(policy)
+        bypass = policy["bypass_approvals"]
         built["notes"] = []
         if engine in APPROVAL_ENGINES:
             base_args = apply_approval_flags(engine, base_args, bypass=bypass)
@@ -4235,6 +4286,7 @@ class HubSessionManager:
         )
         # Round 2: the resume ran with the profile's current switch; record that, not the old one.
         sess.profile_snapshot[BYPASS_APPROVALS_KEY] = bool(built.get("bypass_approvals"))
+        sess.profile_snapshot.update(resolve_session_approval_fields(built))
         sess.launch_notes = list(built.get("notes") or [])
         sess.conversation_ref = dict(ref)
         known_tp = (
@@ -4269,6 +4321,7 @@ class HubSessionManager:
         sess.raw_history_rev = 1
         if engine == "dsh":
             sess.dsh_spec = dict(snapshot.get("dsh_spec") or {})
+            sess.sandbox_preparation = snapshot.get("sandbox_preparation")
             sess.dsh_job_id = ref.get("dsh_job_id")
             sess.dsh_session_id = ref.get("dsh_session_id")
         self._restore_parent_mailbox(session_id, record)
@@ -4578,6 +4631,13 @@ class HubSessionManager:
         jstatus: Optional[str] = None
         dsh_send_mode = "attach"
 
+        preparation = await self._prepare_dsh_workspace(
+            str(built.get("cwd") or snapshot.get("cwd") or record.get("cwd") or ""),
+            repair=bool(clean),
+        )
+        if clean and not preparation["allowed"]:
+            raise ValueError(preparation["reason"])
+
         # Talk to DSH first: a failed continue/re-attach must not replace the archived record.
         if clean:
             try:
@@ -4646,6 +4706,8 @@ class HubSessionManager:
                 )
 
         sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
+        sess.sandbox_preparation = preparation
+        sess.profile_snapshot["sandbox_preparation"] = preparation
         old = self.sessions.get(session_id)
         # A1: a dsh pane's open socket survives the object replacement too, and typed input has to
         # reach the virtual terminal — which needs the loop and the parent-delivery callback.
@@ -5349,6 +5411,12 @@ class HubSessionManager:
             "high_risk_approval": (
                 sess.high_risk_approval if sess else self._record_high_risk_approval(meta)
             ),
+            **resolve_session_approval_fields(sess.profile_snapshot if sess else meta.get("profile_snapshot")),
+            "sandbox_preparation": (
+                sess.sandbox_preparation if sess else
+                (meta.get("profile_snapshot") or {}).get("sandbox_preparation")
+                if isinstance(meta.get("profile_snapshot"), dict) else None
+            ),
             "transcript_summary": transcript_summary,
         }
 
@@ -5573,6 +5641,9 @@ class HubSessionManager:
         ids = self._interaction_ids(session.pending_interaction)
         if request_id and request_id not in ids:
             return
+        metadata = session.pending_interaction.get("metadata") or {}
+        if metadata.get("response_state") in ("sent", "unconfirmed"):
+            metadata["response_state"] = "confirmed"
         resolved = getattr(session, "_resolved_interactions", {})
         for qid in ids:
             resolved[qid] = session.pending_interaction
@@ -5867,7 +5938,14 @@ class HubSessionManager:
             raise ValueError(f"Active session '{session_id}' not found.")
 
         eng = (sess.engine or self._infer_engine(sess.profile_id, {})).lower()
+        await self.poll_tui_screen_interactions_once(sess)
         inter = sess.pending_interaction or {}
+        if not inter:
+            raise ValueError("没有待处理的审批或选择请求；未发送按键")
+        if request_id and request_id not in self._interaction_ids(inter):
+            raise ValueError("request_id 已过期或不匹配当前请求；未发送按键")
+        if (inter.get("metadata") or {}).get("response_state") in ("sent", "unconfirmed"):
+            raise ValueError("该请求已发送回应，正在等待原生确认；不会重复发送按键")
         target_qid = request_id or inter.get("request_id") or sess.pending_question_id
         q_entry = self.pending_questions.get(target_qid) if target_qid else None
         if not inter and q_entry and q_entry.get("interaction"):
@@ -5932,6 +6010,7 @@ class HubSessionManager:
 
         action_trace = ""
         delivered = False
+        response_state = "sent"
 
         try:
             loop = asyncio.get_running_loop()
@@ -5966,6 +6045,7 @@ class HubSessionManager:
                     f"\r\n\x1b[1;32m↩ [Parent Approved/Replied to DSH ({dsh_msg_id})]: {reply_str}\x1b[0m\r\n"
                 )
             elif dsh_job_id:
+                await self._require_dsh_workspace(sess)
                 new_token = str(uuid.uuid4())
                 r = httpx.post(
                     dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/continue"),
@@ -6084,7 +6164,36 @@ class HubSessionManager:
         elif eng == "codex":
             if kind == "approval_request":
                 feedback = _one_line(custom_input)
-                if approval_action in ("deny", "deny_feedback"):
+                if meta.get("codex_prompt") == "mcp":
+                    parsed = parse_codex_approval_prompt(sess.get_clean_screen_text(max_lines=max(38, sess.rows)))
+                    if not parsed or self._codex_mcp_identity(parsed) != tuple(meta.get("prompt_identity") or ()):
+                        raise ValueError("Codex MCP 审批弹窗已变化或关闭；未发送按键")
+                    wanted = "deny" if approval_action in ("deny", "deny_feedback") else "approve_once"
+                    choices = list(meta.get("option_actions") or [])
+                    if wanted not in choices:
+                        raise ValueError("当前 Codex MCP 弹窗没有对应选项；未发送按键")
+                    idx = choices.index(wanted)
+                    chosen_idx_1based, chosen_label = idx + 1, options[idx]
+                    if approval_action == "approve_session":
+                        notes.append("当前 MCP 弹窗没有会话放行选项，本次仅批准一次")
+                    approval_action = wanted
+                    meta["response_state"] = "sent"
+                    inter["metadata"] = meta
+                    sess.write_input("\x1b[A" * len(options) + "\x1b[B" * idx + "\r")
+                    action_trace = f"Codex MCP selector option {idx + 1} + Enter"
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        await self._refresh_codex_mcp_response(sess)
+                        if sess.pending_interaction is not inter:
+                            break
+                        await asyncio.sleep(0.05)
+                    response_state = "confirmed" if meta.get("response_state") == "confirmed" else "unconfirmed"
+                    meta["response_state"] = response_state
+                    if response_state == "unconfirmed":
+                        notes.append("输入已送达，但原生审批尚未确认；保留待处理请求，不自动重发")
+                    if feedback:
+                        notes.append("MCP Cancel 不支持拒绝反馈输入；未向终端追加反馈")
+                elif approval_action in ("deny", "deny_feedback"):
                     steps = [(0.0, "n")]
                     if approval_action == "deny_feedback":
                         steps.append((0.25, feedback + "\r"))
@@ -6215,8 +6324,10 @@ class HubSessionManager:
             "resolved_question_id": target_qid,
             "read_by_worker": bool(delivered),
         })
-        await self.clear_pending_interaction(sess, target_qid)
-        sess.current_activity = f"Parent responded ({chosen_label[:50]})"
+        if response_state != "unconfirmed":
+            await self.clear_pending_interaction(sess, target_qid)
+        sess.current_activity = ("Awaiting native approval confirmation" if response_state == "unconfirmed"
+                                 else f"Parent responded ({chosen_label[:50]})")
         await self.db.add_intermediate_message(
             session_id,
             sess.step_count,
@@ -6231,7 +6342,7 @@ class HubSessionManager:
                 "reason": f"interaction_{kind}",
                 "attempts": 1,
                 "mode": "interaction_response",
-                "label": "成功" if delivered else "失败",
+                "label": "未确认" if response_state == "unconfirmed" else ("成功" if delivered else "失败"),
             },
         )
         await self.persist_session(sess, final=True)
@@ -6249,6 +6360,7 @@ class HubSessionManager:
         return {
             "ok": True,
             "delivered": delivered,
+            "response_state": response_state,
             "session_id": session_id,
             "engine": eng,
             "resolved_request_id": target_qid,
@@ -6364,7 +6476,8 @@ class HubSessionManager:
         self._schedule(
             self._submit_queued_live_text(sess, text, submit_key, claim, turn_before, submit_id)
         )
-        return {"pty_written": False, "injection": "pending", "queued": True}
+        return {"pty_written": False, "injection": "pending", "queued": True,
+                "submit_id": submit_id}
 
     @staticmethod
     def _live_submitting_record(submit_id: str = "") -> Dict[str, Any]:
@@ -6415,9 +6528,15 @@ class HubSessionManager:
             # meanwhile; this message is the one being submitted now.
             submit_id = submit_id or f"inj-{uuid.uuid4().hex[:8]}"
             sess.last_injection = self._live_submitting_record(submit_id)
+            size_before = 0
+            if sess.transcript_path:
+                try:
+                    size_before = Path(sess.transcript_path).stat().st_size
+                except OSError:
+                    pass
             if not sess.is_process_alive():
                 result = {"ok": False, "reason": "process_gone", "attempts": 0, "label": "失败"}
-            elif self._live_submit_checked(sess):
+            elif sess.engine == "codex" or self._live_submit_checked(sess):
                 result = await self._submit_text_to_tui(sess, text, submit_key)
                 retypes = 0
                 while result.pop("retype", False) and sess.is_process_alive():
@@ -6439,13 +6558,8 @@ class HubSessionManager:
                 probe = clean[:30].strip()
                 tail = clean[-30:].strip()
                 eng = str(getattr(sess, "engine", "") or "").strip().lower()
-                size_before = 0
-                if sess.transcript_path:
-                    try:
-                        size_before = Path(sess.transcript_path).stat().st_size
-                    except OSError:
-                        size_before = 0
                 marks = self._tui_submit_marks(sess, sess.get_clean_screen_text(max_lines=40), eng, probe)
+                marks["expected_text"] = clean
                 await asyncio.sleep(TUI_UNCHECKED_ENTER_DELAY_SEC)
                 sess.write_input(submit_key or "\r")
                 if eng in TUI_LIVE_SUBMIT_CHECKED and clean:
@@ -6488,7 +6602,9 @@ class HubSessionManager:
             result["at"] = round(time.time(), 3)
             if submit_id:
                 result["submit_id"] = submit_id
-            if result.get("ok") is False and turn_before is not None:
+            if result.get("ok") is not True and result.get("recovery_required") and turn_before is not None:
+                self._restore_turn_after_failed_message(sess, turn_before)
+            elif result.get("ok") is False and turn_before is not None:
                 self._restore_turn_after_failed_message(sess, turn_before)
             await self._record_tui_injection(sess, result)
         finally:
@@ -6516,8 +6632,21 @@ class HubSessionManager:
         request_id: Optional[str] = None,
         also_write_pty: bool = True,
         press_enter: bool = True,
+        clear_input: bool = False,
     ) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
+        if clear_input:
+            if str(text).strip():
+                raise ValueError("clear_input must be sent alone with empty text")
+            return await self._clear_tui_draft(sess)
+        if not str(text).strip():
+            return {"delivered": False, "reason": "empty_text", "session_id": session_id,
+                    "pty_written": False, "injection": "none"}
+        if sess and sess.engine == "codex" and getattr(sess, "_tui_draft_pending", None):
+            if not self._reconcile_codex_submit(sess):
+                return {"delivered": False, "reason": "input_recovery_required", "session_id": session_id,
+                        "pty_written": False, "injection": "none",
+                        "recovery_hint": "Inspect the draft, then send empty text with clear_input=true; do not resend blindly."}
         # T1: this message may start a new turn on a session that already reported completion. The
         # status is captured before the delivery branches change it, and the reset itself runs at
         # the end, only when the text really reached the session — a failed delivery must not leave
@@ -6618,6 +6747,7 @@ class HubSessionManager:
         # K6 (fix 9c): a live message handed to the background submit (typed and proved there).
         live_queued = False
         live_injection: Optional[str] = None
+        live_submit_id: Optional[str] = None
         dsh_error: Optional[str] = None
         if sess and sess.dsh_spec and not resolved_question_id and not dsh_replied:
             clean_txt = text.strip()
@@ -6639,6 +6769,7 @@ class HubSessionManager:
                             sess.emit_virtual_ansi(f"\r\n\x1b[1;36m➤ [Parent Steer Injected into DSH]: {clean_txt}\x1b[0m\r\n")
                             pty_written = True
                     elif sess.dsh_job_id and sess.status in ("completed", "exited"):
+                        await self._require_dsh_workspace(sess)
                         new_token = str(uuid.uuid4())
                         r = httpx.post(
                             dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/continue"),
@@ -6687,19 +6818,37 @@ class HubSessionManager:
                 pty_written = live["pty_written"]
                 live_injection = live["injection"]
                 live_queued = live["queued"]
+                live_submit_id = live.get("submit_id")
             else:
                 clean_txt = text.rstrip("\r\n") if press_enter else text
-                pty_written = sess.write_input(clean_txt)
+                if sess.engine == "codex":
+                    claim = self._tui_writer_queue(sess).claim("draft_input")
+                    try:
+                        await claim.wait_turn()
+                        if getattr(sess, "_tui_draft_pending", None) or sess.pending_interaction:
+                            raise ValueError("Input is pending; inspect or clear the draft before writing")
+                        line = self._tui_input_line(sess.get_clean_screen_text(max_lines=40), "codex")
+                        if not self._codex_composer_empty(sess, line):
+                            raise ValueError("Cannot write into a nonempty or unavailable composer")
+                        pty_written = sess.write_input(clean_txt)
+                        if pty_written:
+                            sess._tui_draft_pending = {"reason": "unsubmitted_draft"}
+                    finally:
+                        claim.release()
+                else:
+                    pty_written = sess.write_input(clean_txt)
                 if pty_written and clean_txt:
+                    live_submit_id = f"inj-{uuid.uuid4().hex[:8]}"
                     # W11: a live steering write is the last injection too, so the tool result no
                     # longer shows last_injection:null after a send_to_subagent. K6 (fix 9c): a
                     # text sent with Enter was never checked here, so it does not claim ok:true.
                     sess.last_injection = (
-                        self._unchecked_live_result() if press_enter else {
+                        dict(self._unchecked_live_result(), submit_id=live_submit_id) if press_enter else {
+                            "submit_id": live_submit_id,
                             "at": round(time.time(), 3),
                             "ok": True,
                             "reason": "live_write",
-                            "attempts": 1,
+                            "attempts": 0,
                             "mode": "parent_message",
                             "label": "已写入",
                         }
@@ -6725,7 +6874,7 @@ class HubSessionManager:
                 "mailbox_message_id": msg_rec["id"],
             }
 
-        if sess and starts_new_turn and (pty_written or live_queued) and not resolved_question_id:
+        if sess and starts_new_turn and press_enter and (pty_written or live_queued) and not resolved_question_id:
             # T1: send_to_subagent's live write, the console's send and a parent reply all land
             # here. The completed turn's answer is cleared and the status goes back to running, so
             # the wait in send_to_subagent sees a turn in progress instead of status_completed.
@@ -6737,7 +6886,7 @@ class HubSessionManager:
             await self.persist_session(sess, final=True)
 
         return {
-            "delivered": True,
+            "delivered": None if live_queued else True,
             "session_id": session_id,
             "resolved_question_id": resolved_question_id,
             "pty_written": pty_written,
@@ -6745,6 +6894,7 @@ class HubSessionManager:
             # last_injection (pty_written stays false until then, as for a pending startup text).
             "injection": live_injection or ("live_write" if pty_written else "none"),
             "mailbox_message_id": msg_rec["id"],
+            **({"submit_id": live_submit_id} if live_submit_id else {}),
         }
 
     def get_worker_events(self, session_id: str = "all", after_seq: int = 0) -> List[Dict[str, Any]]:
@@ -6766,7 +6916,7 @@ class HubSessionManager:
         for sid, sess in list(self.sessions.items()):
             if target_ids and sid not in target_ids:
                 continue
-            if sess is not None and sess.kind == "tui" and sess.pending_interaction is None and sess.status in LIVE_STATUSES:
+            if sess is not None and sess.kind == "tui" and sess.status in LIVE_STATUSES:
                 await self.poll_tui_screen_interactions_once(sess)
             if sess is not None and sess.status == "waiting_parent" and sess.pending_interaction:
                 item = dict(sess.pending_interaction)
@@ -6987,6 +7137,7 @@ class HubSessionManager:
                     if otype == "response_item":
                         if ptype in ("custom_tool_call", "function_call"):
                             turn_has_step = True
+                            session._codex_last_tool_call_id = payload.get("call_id")
                             tname = payload.get("name") or payload.get("tool_name") or ptype
                             targs = payload.get("arguments") or payload.get("input") or ""
                             await self.record_telemetry(
@@ -7043,6 +7194,10 @@ class HubSessionManager:
                                     or (
                                         ptype == "custom_tool_call_output"
                                         and session.pending_interaction.get("kind") == "approval_request"
+                                        and (
+                                            (session.pending_interaction.get("metadata") or {}).get("codex_prompt") != "mcp"
+                                            or payload.get("call_id") == (session.pending_interaction.get("metadata") or {}).get("native_call_id")
+                                        )
                                     )
                                 )
                             ):
@@ -8861,6 +9016,11 @@ class HubSessionManager:
                 or abs(sum(counts) - typed_len) <= max(TUI_PASTE_PLACEHOLDER_SLACK_CHARS, 16)
             )
         counts = [int(n) for n in pattern.findall(line) if str(n).isdigit()]
+        if eng == "codex" and counts:
+            # ConPTY may split a paste: the composer contains a literal prefix plus a placeholder.
+            # Counting the placeholder alone never reaches the expected total in that case.
+            literal_len = len(pattern.sub("", line).strip())
+            return abs(sum(counts) + literal_len - typed_len) <= TUI_PASTE_PLACEHOLDER_SLACK_CHARS
         return bool(counts) and abs(sum(counts) - typed_len) <= TUI_PASTE_PLACEHOLDER_SLACK_CHARS
 
     @classmethod
@@ -8921,6 +9081,7 @@ class HubSessionManager:
         size_before: int,
         probe: str,
         tail: str,
+        expected_text: Optional[str] = None,
     ) -> bool:
         """Directly scans bytes appended to session.transcript_path since size_before for a matching user message."""
         tpath = getattr(session, "transcript_path", None)
@@ -8930,9 +9091,9 @@ class HubSessionManager:
             p = Path(tpath)
             if not p.is_file() or p.stat().st_size <= max(0, int(size_before)):
                 return False
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
+            with open(p, "rb") as f:
                 f.seek(max(0, int(size_before)))
-                lines = f.readlines()
+                lines = f.read().decode("utf-8", errors="replace").splitlines()
         except OSError:
             return False
 
@@ -8995,7 +9156,7 @@ class HubSessionManager:
                         and "<environment_context>" not in str(b.get("text"))
                     ]
                     if txts:
-                        candidates.append(" ".join(txts).strip())
+                        candidates.extend(txts)
             # 5) Kimi: type == "turn.prompt" and origin.kind == "user"
             elif otype == "turn.prompt" and (obj.get("origin") or {}).get("kind") == "user":
                 parts = obj.get("input") or []
@@ -9004,11 +9165,136 @@ class HubSessionManager:
                     candidates.append(" ".join(txts).strip())
 
             for txt in candidates:
-                if txt and self._composer_holds(txt, probe, tail):
+                matches = (txt.replace("\r\n", "\n").strip() == expected_text.replace("\r\n", "\n").strip()
+                           if expected_text is not None else self._composer_holds(txt, probe, tail))
+                if txt and matches:
                     if hasattr(session, "note_transcript_user_message"):
                         session.note_transcript_user_message(txt)
                     return True
         return False
+
+    def _reconcile_codex_submit(self, session: AgentSession) -> bool:
+        draft = getattr(session, "_tui_draft_pending", None) or {}
+        if draft.get("expected_text") and draft.get("attempts") == 1 and self._probe_transcript_for_user_submit(
+            session, draft["size_before"], "", "", expected_text=draft["expected_text"]
+        ):
+            session._tui_draft_pending = None
+            return True
+        return False
+
+    def _capture_submit_diagnostic(self, session: AgentSession, reason: str) -> Optional[str]:
+        """Keep bounded ANSI evidence locally; never return private screen contents in the tool reply."""
+        try:
+            target = self.data_dir / "diagnostics" / f"submit-{uuid.uuid4().hex}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with session._lock:
+                evidence = {"session_id": session.session_id, "reason": reason, "at": time.time(),
+                            "cols": session.cols, "rows": session.rows,
+                            "screen_cols": session.screen.columns, "screen_rows": session.screen.lines,
+                            "raw_ansi_tail": "".join(session.raw_history)[-65536:]}
+            target.write_text(json.dumps(evidence, ensure_ascii=False), encoding="utf-8")
+            return str(target)
+        except OSError:
+            logger.warning("Could not save submit diagnostic for %s", session.session_id)
+            return None
+
+    @staticmethod
+    def _codex_composer_empty(session: AgentSession, line: Optional[str]) -> bool:
+        if line is None:
+            return False
+        if not line.strip():
+            return True
+        # The native placeholder is painted after a cursor at column 3. A typed copy of
+        # the same words has its cursor after the text, so must still count as a draft.
+        return line.strip() == "Ask Codex to do anything" and session.screen.cursor.x == 2
+
+    async def _clear_tui_draft(self, session: Optional[AgentSession]) -> Dict[str, Any]:
+        if session is None or session.engine != "codex" or not session.is_process_alive():
+            raise ValueError("clear_input requires a live Codex TUI session")
+        claim = self._tui_writer_queue(session).claim("clear_input")
+        try:
+            await claim.wait_turn()
+            await self.poll_tui_screen_interactions_once(session)
+            if session.pending_interaction or session.status not in ("completed", "idle"):
+                raise ValueError("Cannot clear input during an approval or active turn")
+            screen = session.get_clean_screen_text(max_lines=40)
+            line = self._tui_input_line(screen, "codex")
+            if line is None or self._tui_blocking_dialog(screen, session):
+                raise ValueError("Cannot locate a safe Codex composer to clear")
+            if self._codex_composer_empty(session, line):
+                if getattr(session, "_tui_draft_pending", None):
+                    raise ValueError("Draft state is uncertain; inspect the terminal before clearing")
+                return {"delivered": False, "reason": "input_already_empty", "pty_written": False,
+                        "injection": "none", "session_id": session.session_id}
+            # Only a visible nonempty idle draft receives Ctrl+C. Never send it to an empty box.
+            if not session.write_input("\x03"):
+                raise ValueError("Failed to write clear-input key")
+            blank_since = None
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                await asyncio.sleep(.1)
+                line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), "codex")
+                if self._codex_composer_empty(session, line) and session.is_process_alive():
+                    blank_since = blank_since or time.monotonic()
+                    if time.monotonic() - blank_since >= .5:
+                        session._tui_draft_pending = None
+                        return {"delivered": False, "reason": "input_cleared", "pty_written": True,
+                                "injection": "none", "session_id": session.session_id,
+                                "input_cleared": True}
+                else:
+                    blank_since = None
+            session._tui_draft_pending = {"reason": "clear_unconfirmed"}
+            return {"delivered": False, "reason": "clear_unconfirmed", "pty_written": True,
+                    "injection": "none", "session_id": session.session_id,
+                    "input_cleared": False}
+        finally:
+            claim.release()
+
+    async def _submit_codex_text(self, session: AgentSession, text: str, submit_key: str) -> Dict[str, Any]:
+        """One paste, at most one Enter, and exact native user-message proof. Never retry Enter."""
+        if getattr(session, "_tui_draft_pending", None) and not self._reconcile_codex_submit(session):
+            return {"ok": False, "reason": "input_recovery_required", "attempts": 0, "label": "失败"}
+        clean = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not clean:
+            return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
+        screen = session.get_clean_screen_text(max_lines=40)
+        line = self._tui_input_line(screen, "codex")
+        if session.pending_interaction or self._tui_blocking_dialog(screen, session) or line is None:
+            return {"ok": False, "reason": "composer_unavailable", "attempts": 0, "label": "失败"}
+        if not self._codex_composer_empty(session, line):
+            session._tui_draft_pending = {"reason": "existing_draft"}
+            return {"ok": False, "reason": "input_recovery_required", "attempts": 0, "label": "失败"}
+        try:
+            if not session.transcript_path:
+                raise FileNotFoundError("Native transcript is not attached")
+            size = Path(session.transcript_path).stat().st_size
+        except OSError:
+            return {"ok": False, "reason": "native_transcript_unavailable", "attempts": 0, "label": "失败"}
+        draft = {"expected_text": clean, "size_before": size, "attempts": 0}
+        session._tui_draft_pending = draft
+        if not session.write_input(f"\x1b[200~{clean}\x1b[201~"):
+            session._tui_draft_pending = None
+            return {"ok": False, "reason": "write_failed", "attempts": 0, "label": "失败"}
+        screen, echoed, settled, waited = await self._await_typed_text_settled(
+            session, "codex", clean[:30], clean[-30:], typed_len=len(clean), expected_text=clean)
+        extra = {"echo_settled": settled, "echo_wait_sec": round(waited, 2), "echoed": echoed,
+                 "pty_written": True, "extra_press": False}
+        reason = "typed_text_not_settled"
+        if settled and not self._tui_blocking_dialog(screen, session) and not session.pending_interaction:
+            if session.write_input(submit_key):
+                draft["attempts"] = 1
+                deadline = time.monotonic() + TUI_SUBMIT_EVIDENCE_SEC
+                while time.monotonic() < deadline:
+                    if self._reconcile_codex_submit(session):
+                        return {"ok": True, "reason": "transcript_user_message", "attempts": 1,
+                                "label": "成功", **extra}
+                    await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
+                reason = "unconfirmed"
+            else:
+                reason = "submit_write_failed"
+        return {"ok": None if draft["attempts"] else False, "reason": reason,
+                "attempts": draft["attempts"], "label": "未确认", "recovery_required": True,
+                "diagnostic_path": self._capture_submit_diagnostic(session, reason), **extra}
 
     def _tui_transcript_proof(
         self,
@@ -9020,6 +9306,10 @@ class HubSessionManager:
         tail: str,
     ) -> str:
         """K3 (fix 9): the transcript's proof of this submit ("" when it shows none yet)."""
+        if rules.get("transcript") == "exact_user_message":
+            expected = marks.get("expected_text")
+            return "transcript_user_message" if expected is not None and self._probe_transcript_for_user_submit(
+                session, size_before, probe, tail, expected_text=expected) else ""
         seq = int(getattr(session, "transcript_user_seq", 0) or 0)
         if seq > int(marks.get("user_seq") or 0) and self._composer_holds(
             str(getattr(session, "transcript_user_text", "") or ""), probe, tail
@@ -9085,6 +9375,15 @@ class HubSessionManager:
         limit = started + window
         if deadline is not None:
             limit = min(limit, deadline)
+        if rules.get("transcript") == "exact_user_message":
+            # Supported engines have native user records. Do not read screen contents to
+            # confirm their submission, even when a screen would offer an earlier answer.
+            while time.time() < limit:
+                proof = self._tui_transcript_proof(session, rules, size_before, marks, probe, tail)
+                if proof:
+                    return "confirmed", proof
+                await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
+            return "unknown", "unconfirmed"
         last_line: Optional[str] = None
         while time.time() < limit:
             await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
@@ -9103,7 +9402,7 @@ class HubSessionManager:
             glyph = rules.get("history_glyph") or ""
             if glyph and self._tui_history_rows_holding(screen, glyph, probe) > int(marks.get("history") or 0):
                 return "confirmed", "history_row"
-            if not marks.get("active") and self._tui_agent_active(screen):
+            if rules.get("transcript") != "exact_user_message" and not marks.get("active") and self._tui_agent_active(screen):
                 return "confirmed", "agent_active"
             if holds and (not echoed or (long_window and time.time() - started >= TUI_SUBMIT_CONFIRM_SEC)):
                 # K2: the text the hub typed is visibly sitting on the composer while nothing
@@ -9137,7 +9436,8 @@ class HubSessionManager:
         return key in haystack or (len(key) >= 12 and key[:-2] in haystack)
 
     async def _await_typed_text_settled(
-        self, session: AgentSession, engine: str, probe: str, tail: str, typed_len: int = 0
+        self, session: AgentSession, engine: str, probe: str, tail: str, typed_len: int = 0,
+        expected_text: Optional[str] = None,
     ) -> tuple:
         """K5 (fix 9b): wait until the typed text has settled on the composer; (screen, echoed, settled, waited).
 
@@ -9152,7 +9452,8 @@ class HubSessionManager:
         shown, so the cap is a safety net only: reaching it means detection failed, and it warns.
         """
         started = time.time()
-        cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC)
+        cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC,
+                            min(30.0, typed_len * .01) if engine == "codex" else 0)
         quiet_key: Any = object()
         quiet_since = started
         while True:
@@ -9164,6 +9465,10 @@ class HubSessionManager:
             shown = self._tui_typed_tail_shown(lines, span, tail) or self._tui_paste_placeholder_holds(
                 engine, line, typed_len
             )
+            if engine == "codex" and expected_text is not None:
+                # Repeated tails can appear before ConPTY has consumed the whole write.
+                shown = (re.sub(r"\s+", "", line or "") == re.sub(r"\s+", "", expected_text)
+                         or self._tui_paste_placeholder_holds(engine, line, typed_len))
             now = time.time()
             key = (line, shown)
             if key != quiet_key:
@@ -9173,7 +9478,7 @@ class HubSessionManager:
                 return screen, echoed, True, now - started
             if now >= cap:
                 logger.warning(
-                    "K5: %s typed text never settled on the composer after %.1fs; pressing Enter anyway",
+                    "K5: %s typed text never settled on the composer after %.1fs",
                     getattr(session, "session_id", "?"), now - started,
                 )
                 return screen, echoed, False, now - started
@@ -9210,6 +9515,8 @@ class HubSessionManager:
         still taking in a long typed burst becomes a newline in its box. The result carries
         echo_settled / echo_wait_sec, and `echoed` is that settled look.
         """
+        if str(session.engine or "").lower() == "codex":
+            return await self._submit_codex_text(session, text, submit_key)
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
             return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
@@ -9248,7 +9555,7 @@ class HubSessionManager:
         # K2: one evidence budget for the whole submit, not one per Enter.
         evidence_deadline = time.time() + TUI_SUBMIT_EVIDENCE_SEC
         # K3 (fix 9): the screen last read before each Enter is that Enter's starting point.
-        marks: Dict[str, Any] = {"screen": screen}
+        marks: Dict[str, Any] = {"screen": screen, "expected_text": clean}
         while attempts < TUI_SUBMIT_MAX_TRIES:
             attempts += 1
             marks.update(self._tui_submit_marks(session, marks.get("screen") or "", engine, probe))
@@ -9270,6 +9577,9 @@ class HubSessionManager:
                     result["retype"] = True
                 return result
             if state == "unknown":
+                if self._tui_submit_proof_rules(engine).get("transcript") == "exact_user_message":
+                    return {"ok": None, "reason": "unconfirmed", "attempts": attempts,
+                            "echoed": echoed, "extra_press": False, "label": "未确认", **extra}
                 # D3: nothing proved either way. Press Enter once more and watch a short window --
                 # but never while a known trust/update dialog is on screen, because that Enter
                 # would answer the dialog instead of submitting the task.
@@ -9328,7 +9638,15 @@ class HubSessionManager:
         """
         session.last_injection = result
         what = "消息提交" if result.get("mode") == "parent_message" else "启动文本注入"
-        if result.get("ok") is False:
+        if session.engine == "codex" and session.pty and result.get("ok") is not True:
+            # Native TUIs redraw differences against their own screen. Hub-added ANSI moves
+            # the emulator's cursor without moving that native screen and can introduce drift.
+            logger.warning("[%s] %s: %s", session.session_id, what, result.get("reason"))
+            await self.record_worker_event(session.session_id, {
+                "type": "input_delivery", "status": "warning", "content": result.get("reason", "unconfirmed"),
+                "request_id": result.get("submit_id"),
+            })
+        elif result.get("ok") is False:
             # W3: the red line is for a CONFIRMED failure only.
             session.emit_virtual_ansi(
                 f"\r\n\x1b[1;31m✖ {what}失败（{result.get('reason')}，尝试 {result.get('attempts')} 次）\x1b[0m\r\n"
@@ -9615,6 +9933,20 @@ class HubSessionManager:
         self._release_transcripts(session_id)
         self._user_terminated.discard(session_id)
 
+    async def _prepare_dsh_workspace(self, cwd: str, *, repair: bool = True) -> Dict[str, Any]:
+        return await asyncio.to_thread(
+            prepare_dsh_workspace, cwd, dsh_base_url(), self.data_dir, repair=repair,
+        )
+
+    async def _require_dsh_workspace(self, session: AgentSession) -> Dict[str, Any]:
+        preparation = await self._prepare_dsh_workspace(session.cwd)
+        session.sandbox_preparation = preparation
+        session.profile_snapshot["sandbox_preparation"] = preparation
+        await self.persist_session(session)
+        if not preparation["allowed"]:
+            raise ValueError(preparation["reason"])
+        return preparation
+
     async def _spawn_dsh_hub_job(self, session: AgentSession, task: Optional[str]):
         """Spawns a first-class in-host DSH session via <DSH host>/_dsh/dsh-crew/jobs (dsh_base_url)."""
         if session.terminated_by_user:
@@ -9641,10 +9973,31 @@ class HubSessionManager:
         session.emit_virtual_ansi(banner)
 
         if not task or not task.strip():
+            session.sandbox_preparation = await self._prepare_dsh_workspace(session.cwd, repair=False)
+            session.profile_snapshot["sandbox_preparation"] = session.sandbox_preparation
             session.emit_virtual_ansi(
                 "\x1b[90m✦ Ready. Type a task below or call send_to_subagent to dispatch into DSH Web Host.\x1b[0m\r\n> "
             )
             await self.persist_session(session)
+            return
+
+        try:
+            await self._require_dsh_workspace(session)
+        except ValueError as error:
+            if session.terminated_by_user:
+                return
+            session.status = "exited"
+            session.end_reason = "crashed"
+            session.ended_at = time.time()
+            session.current_activity = str(error)
+            session.emit_virtual_ansi(f"\x1b[1;31m✖ {error}\x1b[0m\r\n")
+            await self.persist_session(session)
+            await self.record_worker_event(session.session_id, {
+                "type": "error", "category": "lifecycle", "status": "failed",
+                "content": str(error), "sandbox_preparation": session.sandbox_preparation,
+            })
+            return
+        if session.terminated_by_user:
             return
 
         token = str(uuid.uuid4())
@@ -9995,6 +10348,17 @@ class HubSessionManager:
         option: `p` on a command prompt (codex writes a permanent allow rule for that command prefix
         into ~/.codex/rules/default.rules), `a` on an edit prompt (these files, this session)."""
         kind = parsed.get("prompt_kind") or "command"
+        if kind == "mcp":
+            opts = parsed["options"]
+            return await self.register_pending_interaction(
+                session=session, kind="approval_request", title="Codex MCP Tool Approval",
+                prompt=parsed["header"] + "\n" + parsed["arguments"],
+                options=[o["label"] for o in opts], source="codex_tui_screen_detector",
+                metadata={"codex_prompt": "mcp", "server": parsed["server"], "tool": parsed["tool"],
+                          "arguments": parsed["arguments"], "option_actions": [o["action"] for o in opts],
+                          "prompt_identity": self._codex_mcp_identity(parsed),
+                          "native_call_id": getattr(session, "_codex_last_tool_call_id", None)},
+            )
         opts = [o for o in parsed.get("options") or [] if o.get("action") != "persist"]
         offered = [o["label"] for o in opts]
         actions = [o["action"] for o in opts]
@@ -10267,9 +10631,38 @@ class HubSessionManager:
             pass
         return session.pending_interaction
 
+    @staticmethod
+    def _codex_mcp_identity(parsed: Dict[str, Any]) -> tuple:
+        return (parsed.get("server"), parsed.get("tool"), parsed.get("arguments"))
+
+    async def _refresh_codex_mcp_response(self, session: AgentSession) -> None:
+        inter = session.pending_interaction
+        meta = (inter or {}).get("metadata") or {}
+        if meta.get("codex_prompt") != "mcp":
+            return
+        screen = session.get_clean_screen_text(max_lines=max(38, session.rows))
+        if not screen.strip():
+            return
+        parsed = parse_codex_approval_prompt(screen)
+        if not parsed and "MCP server to run tool" in screen:
+            return  # An incomplete redraw is not an acknowledgement.
+        if not parsed or self._codex_mcp_identity(parsed) != tuple(meta.get("prompt_identity") or ()):
+            if meta.get("response_state") in ("sent", "unconfirmed"):
+                absent_since = meta.setdefault("absent_since", time.monotonic())
+                if time.monotonic() - absent_since < 0.1:
+                    return
+                meta["response_state"] = "confirmed"
+            await self.clear_pending_interaction(session, inter["request_id"])
+            # The MCP modal has actually left the screen; an identical following call is new.
+            session._prompt_quiet_until = 0
+        else:
+            meta.pop("absent_since", None)
+
     async def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Synchronously checks a live TUI session's hooks/transcript/screen once for approval or multi-choice prompts."""
         eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
+        if eng == "codex":
+            await self._refresh_codex_mcp_response(session)
         if eng == "claude":
             await self._drain_claude_hook_events(session)
         elif eng == "kimi":
@@ -10287,7 +10680,8 @@ class HubSessionManager:
         # 1) Codex TUI approval modal: a command prompt (y / p / esc) or an edit prompt (y / a / esc).
         codex_prompt = parse_codex_approval_prompt(scr) if eng == "codex" else None
         if codex_prompt is not None:
-            sig = f"codex_appr:{hash(scr.strip()[-400:])}"
+            sig = (f"codex_mcp:{self._codex_mcp_identity(codex_prompt)}" if codex_prompt.get("prompt_kind") == "mcp"
+                   else f"codex_appr:{hash(scr.strip()[-400:])}")
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
                 return await self._register_codex_screen_approval(session, codex_prompt, scr)
@@ -10442,6 +10836,7 @@ class HubSessionManager:
         thinking_level: Optional[str] = None,
         cwd: Optional[str] = None,
         env: Optional[Any] = None,
+        bypass_approvals: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
@@ -10673,7 +11068,8 @@ class HubSessionManager:
         # D1 (2026-11-07): high-risk approval is on for every engine unless the profile switches it
         # off (bypass_approvals, round 2). The profile's own bypass/mode flags (old files still carry
         # --auto-approve, --auto, ...) are stripped either way; the hub injects what the switch says.
-        bypass = profile_bypasses_approvals(prof)
+        policy = resolve_session_approval(eng, prof, bypass_approvals)
+        bypass = policy["bypass_approvals"]
         high_risk_approval = high_risk_approval_state(eng, bypass)
         ignored_approval = [
             label for label in approval_flags_in_args(eng, base_args)
@@ -10689,6 +11085,8 @@ class HubSessionManager:
         if bypass and high_risk_approval is False:
             notes.append(BYPASS_ON_NOTE)
         elif bypass:
+            notes.append(BYPASS_NO_EFFECT_NOTE.format(engine=eng))
+        if eng not in APPROVAL_ENGINES and (bypass_approvals is not None or profile_bypasses_approvals(prof)):
             notes.append(BYPASS_NO_EFFECT_NOTE.format(engine=eng))
 
         # Rule 5: cwd.
@@ -10740,6 +11138,7 @@ class HubSessionManager:
             'cli_model': cli_model,
             'dsh_spec': dsh_spec,
             'bypass_approvals': bypass,
+            **policy,
             'high_risk_approval': high_risk_approval,
             'notes': notes,
         }
@@ -10755,9 +11154,12 @@ class HubSessionManager:
         thinking_level: Optional[str] = None,
         env: Optional[Any] = None,
         launch_source: str = "user",
+        bypass_approvals: Optional[bool] = None,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
+        if bypass_approvals is not None and type(bypass_approvals) is not bool:
+            raise ValueError("bypass_approvals 只能是 true、false 或 null")
         loop = asyncio.get_running_loop()
 
         if profile_id == "desktop-gui" and hwnd:
@@ -10785,12 +11187,16 @@ class HubSessionManager:
                 "command": "", "args": [], "env": {}, "model": None, "thinking_level": None,
                 "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
                 "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
+                **resolve_session_approval("desktop_gui", {}, bypass_approvals),
             }
+            if bypass_approvals is not None:
+                sess.launch_notes = [BYPASS_NO_EFFECT_NOTE.format(engine="desktop_gui")]
             self.sessions[session_id] = sess
             await self.persist_session(sess)
             return sess
 
-        launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env)
+        launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
+                                     bypass_approvals=bypass_approvals)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -10888,6 +11294,7 @@ class HubSessionManager:
             # Round 2: whether this launch had the profile's approval off switch on (a resume
             # re-reads the profile's current value and overwrites this).
             "bypass_approvals": bool(launch.get("bypass_approvals")),
+            **resolve_session_approval_fields(launch),
         }
         sess.launch_notes = list(launch.get("notes") or [])
 
