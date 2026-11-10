@@ -5,6 +5,17 @@ from pathlib import Path
 import re
 
 
+def normalize_extra_args(value):
+    """Accept argv tokens without shell parsing or string coercion."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(arg, str) for arg in value):
+        raise ValueError("extra_args 必须是字符串数组，每项是一个完整命令行参数")
+    if any("\x00" in arg for arg in value):
+        raise ValueError("extra_args 不能包含 NUL 字符")
+    return list(value)
+
+
 def strip_legacy_worker_bridge_args(args, runtime_dir):
     def bridge_dir(value):
         # Also recognise snapshots from an earlier Hub data location.

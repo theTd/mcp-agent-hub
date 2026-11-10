@@ -241,6 +241,10 @@ async def spawn_subagent(
     title: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     bypass_approvals: Optional[bool] = None,
+    extra_args: Optional[List[str]] = None,
+    mcp_servers: Optional[Dict[str, Any]] = None,
+    disabled_mcp_servers: Optional[List[str]] = None,
+    strict_mcp_config: bool = False,
     wait_seconds: float = 5.0,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
@@ -248,6 +252,13 @@ async def spawn_subagent(
     Start an interactive subagent and return session_id, transcript_summary and background_poll_command.
     Provide a short, readable title (for example, "Fix build failure"). Choose model and
     thinking_level from list_agent_profiles. env overrides profile variables and survives resume.
+    extra_args is an argv string array appended to profile args, preserved on resume (TUI only).
+    Pass each flag and value separately; do not shell-quote tokens. Model/thinking and approval
+    controls still use the dedicated fields and Hub policy. Preview the resolved command first.
+    Codex/Claude accept session-only mcp_servers={name: {url, headers?} or {command, args?, env?}}
+    and disabled_mcp_servers=[name]. strict_mcp_config=true is Claude-only, including an empty set.
+    Native MCP overrides in profile args/extra_args/settings conflict with these structured fields.
+    MCP configuration is preserved on resume; it does not confirm a successful MCP connection.
     After launch follow next_action: reply, wait, collect_results or inspect. While
     unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments
     after processing each result. Background CLI waiting requires host completion notifications.
@@ -263,6 +274,10 @@ async def spawn_subagent(
         profile_id=agent_type,
         launch_source="agent",
         bypass_approvals=bypass_approvals,
+        extra_args=extra_args,
+        mcp_servers=mcp_servers,
+        disabled_mcp_servers=disabled_mcp_servers,
+        strict_mcp_config=strict_mcp_config,
         task=task,
         cwd=cwd,
         title=title,
@@ -1255,6 +1270,10 @@ async def api_launch_preview(req: Request):
             cwd=body.get("cwd"),
             env=body.get("env"),
             bypass_approvals=body.get("bypass_approvals"),
+            extra_args=body.get("extra_args"),
+            mcp_servers=body.get("mcp_servers"),
+            disabled_mcp_servers=body.get("disabled_mcp_servers"),
+            strict_mcp_config=body.get("strict_mcp_config", False),
         )
         if preview.get("engine") == "dsh":
             preview["sandbox_preparation"] = await hub._prepare_dsh_workspace(preview["cwd"], repair=False)
@@ -1296,6 +1315,10 @@ async def api_create_session(req: Request):
             thinking_level=thinking_level,
             env=env,
             bypass_approvals=body.get("bypass_approvals"),
+            extra_args=body.get("extra_args"),
+            mcp_servers=body.get("mcp_servers"),
+            disabled_mcp_servers=body.get("disabled_mcp_servers"),
+            strict_mcp_config=body.get("strict_mcp_config", False),
         )
     except ValueError as e:
         return bad_request(str(e))

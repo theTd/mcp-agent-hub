@@ -238,6 +238,8 @@ textarea { resize: vertical; min-height: 64px; line-height: 1.55; }
 .field-help.warn { color: var(--warning-text); }
 .field-error { font-size: 11.5px; line-height: 1.45; color: var(--danger-text); }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mcp-config > summary { display: list-item; cursor: pointer; }
+.mcp-config[open] > .field { margin-top: 8px; }
 
 .search-input { position: relative; display: block; flex: 1; min-width: 0; }
 .search-input .icon { z-index: 1; position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text-3); pointer-events: none; }

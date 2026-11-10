@@ -136,6 +136,29 @@
           <span class="field-label">环境变量 <span class="opt">可选</span></span>
           <textarea id="envInput" rows="2" class="mono-input" spellcheck="false" placeholder="每行一个 KEY=VALUE（可覆盖 Profile 内置环境变量）"></textarea>
         </label>
+        <label class="field" id="extraArgsField">
+          <span class="field-label">本次启动参数 <span class="opt">可选 · JSON 字符串数组</span></span>
+          <textarea id="extraArgsInput" rows="3" class="mono-input" spellcheck="false" placeholder='["-c", "mcp_servers.unused.enabled=false"]'></textarea>
+          <span class="field-help">追加到 Profile 参数后；每个参数或值各占一项。模型、思考等级和审批使用上方选项。仅用于本次会话及其恢复。</span>
+        </label>
+        <details class="field mcp-config" id="mcpConfigField" hidden>
+          <summary class="field-label">本次 MCP 配置 <span class="opt">可选</span></summary>
+          <label class="field">
+            <span class="field-label">新增服务器 <span class="opt">JSON 对象</span></span>
+            <textarea id="mcpServersInput" rows="4" class="mono-input" spellcheck="false" placeholder='{"docs":{"url":"https://example.com/mcp"}}'></textarea>
+            <span class="field-help">HTTP：url、headers；stdio：command、args、env。同名配置遵循 Agent 的原生合并规则。</span>
+          </label>
+          <label class="field">
+            <span class="field-label">禁用服务器 <span class="opt">JSON 名称数组</span></span>
+            <textarea id="disabledMcpInput" rows="2" class="mono-input" spellcheck="false" placeholder='["unused"]'></textarea>
+          </label>
+          <label class="field" id="strictMcpField" hidden>
+            <span><input id="strictMcpInput" type="checkbox" /> 仅加载本次指定 MCP</span>
+            <span class="field-help">Claude 独占模式；新增列表为空时不加载其他配置来源。企业策略仍然适用。</span>
+          </label>
+          <span class="field-help" id="codexMcpHint" hidden>Codex 仅逐项禁用普通 MCP，不能据此排除插件或其他未知来源。</span>
+          <span class="field-help">仅用于本次会话及恢复；连接与认证由 Agent 完成。高级选项可改用启动参数，不可同时重复配置 MCP。</span>
+        </details>
         <button class="btn btn-primary btn-lg btn-block" id="launchBtn" title="启动 Sub-Agent（Ctrl + Enter）">
           <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg>启动 <kbd>Ctrl ↵</kbd>
         </button>

@@ -42,6 +42,10 @@ export function initSessionLauncher() {
 
   $('#cwdInput').addEventListener('input', schedulePreview);
   $('#approvalSelect').addEventListener('change', schedulePreview);
+  $('#extraArgsInput').addEventListener('input', schedulePreview);
+  $('#mcpServersInput').addEventListener('input', schedulePreview);
+  $('#disabledMcpInput').addEventListener('input', schedulePreview);
+  $('#strictMcpInput').addEventListener('change', schedulePreview);
   if ($('#envInput')) $('#envInput').addEventListener('input', schedulePreview);
   $('#launchBtn').addEventListener('click', launchSession);
   // Ctrl+Enter starts from any field inside the launcher section.
@@ -103,6 +107,13 @@ function currentProfile() {
 
 function renderProfileDetails({ reset }) {
   const p = currentProfile();
+  $('#extraArgsField').hidden = p.engine === 'dsh' || (p.kind || 'tui') !== 'tui';
+  if (reset || $('#extraArgsField').hidden) $('#extraArgsInput').value = '';
+  $('#mcpConfigField').hidden = !['codex', 'claude'].includes(p.engine) || (p.kind || 'tui') !== 'tui';
+  $('#strictMcpField').hidden = $('#mcpConfigField').hidden || p.engine !== 'claude';
+  $('#codexMcpHint').hidden = $('#mcpConfigField').hidden || p.engine !== 'codex';
+  if (reset || $('#mcpConfigField').hidden) resetMcpConfig();
+  if ($('#strictMcpField').hidden) $('#strictMcpInput').checked = false;
   $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy'].includes(p.engine);
   if (reset || $('#approvalField').hidden) $('#approvalSelect').value = '';
   const models = engineModels(p.engine || '');
@@ -268,6 +279,15 @@ async function runPreview() {
     bypass_approvals: sessionApprovalOverride(),
   };
   try {
+    try {
+      body.extra_args = sessionExtraArgs();
+      Object.assign(body, sessionMcpConfig());
+    } catch (err) {
+      preview = { status: 'error', data: { error: err.message } };
+      renderPreview();
+      syncLaunchButton();
+      return;
+    }
     const data = await hubApi.launchPreview(body);
     if (seq !== previewSeq) return;
     if (data && data.ok === false) preview = { status: 'error', data };
@@ -309,6 +329,11 @@ function renderPreview() {
   const head = bits.length ? `将运行：${bits.join(' · ')}` : '将运行：该 Profile 不使用模型与思考等级';
   const notes = (Array.isArray(d.notes) ? d.notes : [])
     .map((note) => `<div class="preview-note">${escapeHtml(note)}</div>`).join('');
+  const added = Object.keys(d.mcp_servers || {});
+  const disabled = d.disabled_mcp_servers || [];
+  const mcpSummary = added.length || disabled.length || d.strict_mcp_config
+    ? `<div class="preview-note">MCP · ${d.strict_mcp_config ? '仅加载本次指定集合' : '保留其他配置来源'} · 新增：${escapeHtml(added.join('、') || '无')} · 禁用：${escapeHtml(disabled.join('、') || '无')}</div>`
+    : '';
   const args = Array.isArray(d.args) ? d.args : [];
   const commandLine = [d.command || '', ...args].map(quoteArg).join(' ').trim();
   // V-3b: dsh is launched through the hub API, so the pwsh wrapper says nothing about what runs.
@@ -320,6 +345,7 @@ function renderPreview() {
   box.innerHTML = `
     <div class="preview-head">${head}</div>
     ${notes}
+    ${mcpSummary}
     <details class="run-command">
       <summary>完整命令</summary>
       <pre class="run-pre">${escapeHtml(dshLine || commandLine)}</pre>
@@ -341,6 +367,59 @@ function syncLaunchButton() {
 }
 
 // ------------------------------------------------------------------ launch
+function resetMcpConfig() {
+  $('#mcpServersInput').value = '';
+  $('#disabledMcpInput').value = '';
+  $('#strictMcpInput').checked = false;
+  $('#mcpConfigField').open = false;
+}
+
+function sessionMcpConfig() {
+  if ($('#mcpConfigField').hidden) return {};
+  const parse = (id, fallback, label) => {
+    const raw = $(id).value.trim();
+    try { return raw ? JSON.parse(raw) : fallback; }
+    catch { throw new Error(`${label}必须是有效 JSON`); }
+  };
+  const servers = parse('#mcpServersInput', {}, '新增 MCP 服务器');
+  const disabled = parse('#disabledMcpInput', [], '禁用 MCP 服务器');
+  const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const string = (v) => typeof v === 'string' && !v.includes('\u0000');
+  if (!object(servers)) throw new Error('新增 MCP 服务器必须是 JSON 对象');
+  for (const [name, spec] of Object.entries(servers)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(name) || !object(spec)) throw new Error('MCP 名称只能含英文字母、数字、下划线、连字符；配置必须是对象');
+    const http = Object.hasOwn(spec, 'url');
+    if (http === Object.hasOwn(spec, 'command')) throw new Error(`MCP ${name} 必须且只能提供 url 或 command`);
+    const allowed = http ? ['url', 'headers'] : ['command', 'args', 'env'];
+    for (const [key, value] of Object.entries(spec)) {
+      if (!allowed.includes(key)) throw new Error(`MCP ${name} 不支持字段 ${key}`);
+      if (['url', 'command'].includes(key) && (!string(value) || !value.trim())) throw new Error(`MCP ${name}.${key} 必须是非空字符串`);
+      if (key === 'url' && !/^https?:\/\/[^/\s]+/i.test(value)) throw new Error(`MCP ${name}.url 必须是 HTTP(S) URL`);
+      if (key === 'args' && (!Array.isArray(value) || !value.every(string))) throw new Error(`MCP ${name}.args 必须是字符串数组`);
+      if (['headers', 'env'].includes(key) && (!object(value) || !Object.entries(value).every(([k, v]) => string(k) && k.trim() && string(v)))) throw new Error(`MCP ${name}.${key} 必须是字符串键值对象`);
+    }
+  }
+  if (!Array.isArray(disabled) || !disabled.every((v) => string(v) && v.trim() && v === v.trim())) throw new Error('禁用 MCP 服务器必须是非空名称的 JSON 字符串数组');
+  if (disabled.some((name) => Object.hasOwn(servers, name))) throw new Error('同一 MCP 不能同时新增和禁用');
+  return { mcp_servers: servers, disabled_mcp_servers: disabled, strict_mcp_config: !$('#strictMcpField').hidden && $('#strictMcpInput').checked };
+}
+
+function sessionExtraArgs() {
+  if ($('#extraArgsField').hidden) return [];
+  const text = $('#extraArgsInput').value.trim();
+  if (!text) return [];
+  let args;
+  try {
+    args = JSON.parse(text);
+  } catch {
+    throw new Error('本次启动参数必须是 JSON 字符串数组，例如 ["--flag", "value"]');
+  }
+  if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string' || arg.includes('\u0000'))) {
+    throw new Error('本次启动参数必须是字符串数组，且不能包含 NUL 字符');
+  }
+  return args;
+}
+
 function sessionApprovalOverride() {
   const value = $('#approvalField').hidden ? '' : $('#approvalSelect').value;
   return value === '' ? null : value === 'true';
@@ -368,11 +447,15 @@ async function launchSession() {
       cwd: cwd || null,
       env: env || null,
       bypass_approvals: sessionApprovalOverride(),
+      extra_args: sessionExtraArgs(),
+      ...sessionMcpConfig(),
     });
     const session = data.session;
     if (!session) throw new Error('服务端没有返回会话信息');
     $('#taskInput').value = '';
     $('#approvalSelect').value = '';
+    $('#extraArgsInput').value = '';
+    resetMcpConfig();
     schedulePreview();
     if (cwd) rememberCwd(cwd);
     upsertSession(session);

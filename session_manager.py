@@ -30,7 +30,11 @@ from winpty import PtyProcess
 REAL_PTY_PROCESS = PtyProcess
 
 from transcript_tail import TranscriptTail, read_complete_lines
-from native_session_launch import strip_legacy_worker_bridge_args
+from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
+from session_mcp_config import (
+    normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
+    build_mcp_args, merge_claude_settings, replace_claude_settings,
+)
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from parent_waiting import build_wait_contract, session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
@@ -4124,6 +4128,11 @@ class HubSessionManager:
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
         command = str(snapshot.get("command") or "")
         base_args = strip_legacy_worker_bridge_args([str(a) for a in (snapshot.get("args") or [])], self.runtime_configs_dir)
+        structured_claude = engine == "claude" and "mcp_settings_base" in snapshot
+        if structured_claude:
+            # The saved argv has the old merged approval overlay. Rebuild settings from the
+            # saved user/MCP settings before the current approval policy is applied.
+            base_args = replace_claude_settings(base_args, snapshot["mcp_settings_base"])
         profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
         prof_cur = self.profiles.get(profile_id) or {}
         env = normalize_env_map(prof_cur.get("env"))
@@ -4146,6 +4155,9 @@ class HubSessionManager:
                 built["notes"].append(BYPASS_ON_NOTE)
         elif bypass:
             built["notes"].append(BYPASS_NO_EFFECT_NOTE.format(engine=engine))
+        if structured_claude:
+            base_args, _ = merge_claude_settings(
+                base_args, cwd, approval_path=claude_approval_settings_path() if not bypass else None)
         if engine == "omp":
             built["args"] = [
                 f"--session-dir={ref.get('session_dir')}",
@@ -10837,6 +10849,10 @@ class HubSessionManager:
         cwd: Optional[str] = None,
         env: Optional[Any] = None,
         bypass_approvals: Optional[bool] = None,
+        extra_args: Optional[List[str]] = None,
+        mcp_servers: Optional[Dict[str, Any]] = None,
+        disabled_mcp_servers: Optional[List[str]] = None,
+        strict_mcp_config: bool = False,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
@@ -10853,9 +10869,18 @@ class HubSessionManager:
         eng = str(prof.get('engine') or 'generic').strip().lower()
         name = str(prof.get('name') or pid)
         kind = str(prof.get('kind') or 'tui')
+        mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
+        validate_mcp_engine(eng, kind, mcp_config)
         command = str(prof.get('command') or '')
         base_args = strip_legacy_worker_bridge_args([str(a) for a in (prof.get('args') or [])], self.runtime_configs_dir)
+        caller_args = normalize_extra_args(extra_args)
+        if caller_args and (eng == 'dsh' or kind != 'tui'):
+            raise ValueError(f"{name} 不通过 TUI 命令行启动，不支持 extra_args")
+        base_args.extend(caller_args)
         notes = []  # Chinese notes, e.g. substitutions
+        ignored_model = injected_flags_in_args(eng, caller_args)
+        if ignored_model:
+            notes.append(f"已忽略启动参数里的模型或思考等级参数（{'、'.join(ignored_model)}），请使用模型和思考等级字段")
         profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
         caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
         resolved_env: Dict[str, str] = dict(profile_env)
@@ -11078,7 +11103,7 @@ class HubSessionManager:
         args = apply_approval_flags(eng, args, bypass=bypass)
         if ignored_approval:
             notes.append(
-                f"已忽略 Profile 参数里的审批相关参数（{'、'.join(ignored_approval)}）："
+                f"已忽略启动参数里的审批相关参数（{'、'.join(ignored_approval)}）："
                 + ("由 bypass_approvals 开关决定，Hub 注入全自动参数" if bypass
                    else "Hub 统一以高风险操作需审批的模式启动")
             )
@@ -11121,6 +11146,17 @@ class HubSessionManager:
                 'effort': resolved_level or 'high',
             }
 
+        mcp_settings = {}
+        if mcp_config_active(mcp_config):
+            check_mcp_arg_conflicts(eng, base_args, work_dir)
+            args.extend(build_mcp_args(eng, mcp_config))
+            if eng == 'claude':
+                args, settings_base = merge_claude_settings(
+                    args, work_dir, approval_path=claude_approval_settings_path() if not bypass else None,
+                    disabled=mcp_config['disabled_mcp_servers'])
+                mcp_settings['mcp_settings_base'] = settings_base
+            notes.append('本次 MCP 配置已生成；连接、认证和工具发现由 Agent 启动后执行')
+
         return {
             'profile_id': pid,
             'profile_name': name,
@@ -11129,6 +11165,9 @@ class HubSessionManager:
             'command': command,
             'config_dir': resolved_env.get('CLAUDE_CONFIG_DIR') if eng == 'claude' else None,
             'args': args,
+            'extra_args': caller_args,
+            **mcp_config,
+            **mcp_settings,
             'env': resolved_env,
             'cwd': work_dir,
             'model': resolved_model,
@@ -11155,11 +11194,21 @@ class HubSessionManager:
         env: Optional[Any] = None,
         launch_source: str = "user",
         bypass_approvals: Optional[bool] = None,
+        extra_args: Optional[List[str]] = None,
+        mcp_servers: Optional[Dict[str, Any]] = None,
+        disabled_mcp_servers: Optional[List[str]] = None,
+        strict_mcp_config: bool = False,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
         if bypass_approvals is not None and type(bypass_approvals) is not bool:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
+        extra_args = normalize_extra_args(extra_args)
+        mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
+        if profile_id == "desktop-gui":
+            validate_mcp_engine("desktop_gui", "desktop_gui", mcp_config)
+        if extra_args and profile_id == "desktop-gui":
+            raise ValueError("桌面 GUI 会话不支持 extra_args")
         loop = asyncio.get_running_loop()
 
         if profile_id == "desktop-gui" and hwnd:
@@ -11196,7 +11245,7 @@ class HubSessionManager:
             return sess
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
-                                     bypass_approvals=bypass_approvals)
+                                     bypass_approvals=bypass_approvals, extra_args=extra_args, **mcp_config)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -11282,6 +11331,9 @@ class HubSessionManager:
             "command": launch["command"],
             "config_dir": launch.get("config_dir"),
             "args": launch_args,
+            "extra_args": list(launch.get("extra_args") or []),
+            **{key: launch[key] for key in ("mcp_servers", "disabled_mcp_servers", "strict_mcp_config")},
+            **({"mcp_settings_base": launch["mcp_settings_base"]} if "mcp_settings_base" in launch else {}),
             "env": dict(launch.get("env") or {}),
             "model": launch.get("model"),
             "thinking_level": launch.get("thinking_level"),

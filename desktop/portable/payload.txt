@@ -6,6 +6,7 @@ hub_database.py
 hub_persistence.py
 transcript_tail.py
 native_session_launch.py
+session_mcp_config.py
 model_discovery.py
 dsh_endpoint.py
 dsh_workspace_permissions.py
