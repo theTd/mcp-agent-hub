@@ -167,6 +167,21 @@ def _injection_report(session, pending: bool = False) -> Dict[str, Any]:
 
 HUB_VERSION = "4.1.7"
 
+
+async def _parent_continuation(session_id, after_seq=0, events=()):
+    """Use only delivered event cursors; status reads must never acknowledge unseen events."""
+    next_seq = events[-1]["seq"] if events else after_seq
+    state = await hub.parent_wait_state(session_id, next_seq)
+    arguments = state["next_wait_arguments"]
+    command = hub.build_poll_command(arguments["session_id"] if arguments else session_id, next_seq)
+    return {
+        **state,
+        "next_seq": next_seq,
+        "background_poll_command": command,
+        "next_poll_command": command,
+        "background_poll_hint": BACKGROUND_POLL_HINT,
+    }
+
 # ============================================================================
 # 1. 北向 MCP Server (/mcp) —— 暴露给【主 Agent / Parent Agent】的调度、遥测与双向通信接口
 # ============================================================================
@@ -227,7 +242,9 @@ async def spawn_subagent(
     Start an interactive subagent and return session_id, transcript_summary and background_poll_command.
     Provide a short, readable title (for example, "Fix build failure"). Choose model and
     thinking_level from list_agent_profiles. env overrides profile variables and survives resume.
-    Run the returned polling command in the host shell's background mode; see server instructions.
+    After launch follow next_action: reply, wait, collect_results or inspect. While
+    unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments
+    after processing each result. Background CLI waiting requires host completion notifications.
     High-risk actions pause for approval unless the user enabled the profile's bypass_approvals.
     high_risk_approval is true when enforced, false when bypassed, or null for engines without
     Hub approval. Questions and approvals set waiting_parent and pending_interaction; answer
@@ -276,6 +293,7 @@ async def spawn_subagent(
     )
 
     return {
+        **await _parent_continuation(session.session_id, next_seq, events),
         "session_id": session.session_id,
         "title": session.title,
         "agent_type": session.profile_id,
@@ -298,8 +316,6 @@ async def spawn_subagent(
         **_injection_report(session, injection_pending),
         "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
         "current_seq": next_seq,
-        "background_poll_command": hub.build_poll_command(session.session_id, next_seq),
-        "background_poll_hint": BACKGROUND_POLL_HINT,
         "worker_events": events,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
@@ -315,13 +331,15 @@ async def get_subagent_status_and_trace(
     """
     Read live or persisted progress: step_count, current_activity, recent_tool_calls,
     intermediate_messages, pending_question_id and final_response. Results remain readable
-    after exit. Intermediate text is progress, not proof of turn completion.
+    after exit. Intermediate text is progress, not proof of turn completion. Follow next_action;
+    a status lookup does not advance your event cursor. Preserve the cursor from your last wait.
     """
-    return await hub.get_subagent_status_and_trace(
+    result = await hub.get_subagent_status_and_trace(
         session_id=session_id,
         recent_tools_limit=recent_tools_limit,
         recent_messages_limit=recent_messages_limit,
     )
+    return {**await _parent_continuation(session_id), **result}
 
 
 @mcp.tool()
@@ -331,7 +349,8 @@ async def get_subagent_final_response(session_id: str) -> Dict[str, Any]:
     Check from_previous_turn: a resumed or continuing session retains its previous answer
     until the new turn produces one. An intermediate response does not confirm completion.
     """
-    return await hub.get_subagent_final_response(session_id=session_id)
+    result = await hub.get_subagent_final_response(session_id=session_id)
+    return {**await _parent_continuation(session_id), **result}
 
 
 @mcp.tool()
@@ -346,7 +365,8 @@ async def send_to_subagent(
     Send instructions or a follow-up message to a subagent, resuming an ended resumable session.
     If pending_interaction exists, text answers that native question or approval prompt.
     Otherwise it is delivered through the engine's terminal or native message API.
-    Check last_injection for submission status and use background_poll_command for further events.
+    Check last_injection for submission status, then follow next_action. Successful delivery
+    does not mean completion; keep waiting with next_wait_arguments while work remains.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -422,6 +442,7 @@ async def send_to_subagent(
     transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
+        **await _parent_continuation(session_id, next_seq, events),
         "session_id": session.session_id,
         "status": session.status,
         "resumed": resumed,
@@ -438,8 +459,6 @@ async def send_to_subagent(
         ),
         "worker_events": events,
         "next_seq": next_seq,
-        "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -457,6 +476,7 @@ async def resume_subagent(
     model and thinking level. Optional text starts a new turn; omit it to restore only.
     A live session returns its current state without starting another process.
     A non-resumable session raises an error with the reason.
+    Follow next_action and keep waiting with next_wait_arguments while work remains.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
@@ -508,6 +528,7 @@ async def resume_subagent(
     transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
+        **await _parent_continuation(session_id, next_seq, events),
         "session_id": session.session_id,
         "status": session.status,
         "resumed": bool(result.get("resumed")),
@@ -522,8 +543,6 @@ async def resume_subagent(
         ),
         "worker_events": events,
         "next_seq": next_seq,
-        "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -562,7 +581,10 @@ async def reply_to_subagent(
     answer: str,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Answer a pending native question or approval prompt; pass request_id to target that interaction."""
+    """Answer a pending native interaction using request_id. After answering, follow next_action
+    and rearm wait_subagent_events with next_wait_arguments while work remains.
+    """
+    start_seq = hub.global_seq
     delivery = await hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
@@ -583,15 +605,16 @@ async def reply_to_subagent(
             delivery["injection"] = "recorded"
             if cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
                 delivery["pty_written"] = True
-    if session and isinstance(delivery, dict):
-        return {
-            **delivery,
-            **_injection_report(
-                session,
-                bool(delivery.get("injection") == "pending" and session.last_injection is None),
-            ),
-        }
-    return delivery
+    events = hub.get_worker_events(session_id, start_seq)
+    return {
+        **await _parent_continuation(session_id, start_seq, events),
+        **delivery,
+        "worker_events": events,
+        **(_injection_report(
+            session,
+            bool(delivery.get("injection") == "pending" and session.last_injection is None),
+        ) if session else {}),
+    }
 
 
 @mcp.tool()
@@ -616,6 +639,7 @@ async def respond_to_subagent_approval_or_choice(
     in this session. Claude may persist an allow rule in .claude/settings.local.json when offered.
     Rule-triggered OMP prompts fall back to approve-once; Kimi session approval does not cover
     dangerous commands. Inspect the returned notes for the actual scope.
+    After responding, follow next_action and keep waiting with next_wait_arguments while work remains.
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -652,6 +676,7 @@ async def respond_to_subagent_approval_or_choice(
     transcript_summary = await hub.summarize_transcript(session_id)
 
     return {
+        **await _parent_continuation(session_id, next_seq, events),
         "session_id": session_id,
         "status": session.status,
         "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
@@ -661,8 +686,6 @@ async def respond_to_subagent_approval_or_choice(
         **_injection_report(session, False),
         "worker_events": events,
         "next_seq": next_seq,
-        "background_poll_command": hub.build_poll_command(session_id, next_seq),
-        "background_poll_hint": BACKGROUND_POLL_HINT,
         "wait_result": settle_info,
         "transcript_summary": transcript_summary,
     }
@@ -676,10 +699,17 @@ async def wait_subagent_events(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    Wait synchronously for events from a session or 'all' after after_seq.
-    Use only when the host lacks a shell or background task support. Otherwise run the returned
-    background_poll_command in background mode and yield for its completion notification.
+    Wait for events, pending interactions or terminal state, for at most 120 seconds.
+    Prefer explicit comma-separated session IDs; 'all' includes unrelated sessions.
+    Reuse next_wait_arguments after every progress batch or timeout while work remains.
+    Handle pending_interactions first, collect completed results and inspect failed/unknown IDs.
+    One completed session does not finish a group. Keep one waiter per session, and keep
+    the cursor returned by that wait. timeout_seconds=0 performs an immediate snapshot.
+    Use the background CLI only if the host reliably delivers completion notifications.
     """
+    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+        raise ValueError("timeout_seconds must be finite and nonnegative.")
+    timeout_seconds = min(timeout_seconds, 120.0)
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     elapsed = 0.0
     slice_sec = 5.0
@@ -692,8 +722,11 @@ async def wait_subagent_events(
             session_id=session_id,
             after_seq=after_seq,
             timeout_sec=min(slice_sec, rem),
+            wake_on_pending=True,
+            wake_on_state=True,
         )
-        if res.get("events"):
+        if (res.get("events") or res.get("pending_interactions")
+                or res.get("next_action") != "wait" or res.get("woke_reason") == "hub_shutdown"):
             return res
         elapsed += slice_sec
         if ctx:
@@ -703,7 +736,10 @@ async def wait_subagent_events(
                 message=f"Waiting for subagent [{session_id}] messages or completion ({int(elapsed)}s)...",
             )
 
-    return await hub.poll_worker_events(session_id=session_id, after_seq=after_seq, timeout_sec=0.1)
+    return await hub.poll_worker_events(
+        session_id=session_id, after_seq=after_seq, timeout_sec=0,
+        wake_on_pending=True, wake_on_state=True,
+    )
 
 
 @mcp.tool()
@@ -931,12 +967,14 @@ async def api_mailbox_poll(
     after_seq: int = Query(0),
     timeout: float = Query(25.0),
     wake_on_pending: bool = Query(False),
+    wake_on_state: bool = Query(False),
 ):
     return await hub.poll_worker_events(
         session_id=session_id,
         after_seq=after_seq,
         timeout_sec=min(max(0.1, timeout), 120.0),
         wake_on_pending=wake_on_pending,
+        wake_on_state=wake_on_state,
     )
 
 

@@ -1,12 +1,21 @@
 """English instructions authored by the Hub for parent agents."""
 
+CONTINUATION_HINT = (
+    "Handle pending interactions first. Collect completed results and inspect failed/unknown IDs. "
+    "While unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments "
+    "after processing this result. Progress, delivery and timeout do not mean completion."
+)
+
 BACKGROUND_POLL_HINT = (
-    "Run background_poll_command using the host shell's background mode "
-    "(for example, run_in_background=true or WaitMsBeforeAsync=500), then yield "
-    "for its completion notification or continue other work. Do not run it in "
-    "the foreground or repeatedly call wait_subagent_events. For several sessions, "
-    "use one hub_poll.py command with --session id1,id2,id3; do not write a polling loop. "
-    "If the host has no background shell support, use wait_subagent_events as a fallback."
+    CONTINUATION_HINT + " Do not finish the parent task with delegated work outstanding "
+    "unless the user explicitly requested a handoff or cancellation. "
+    "Use background_poll_command only when the host provides reliable background completion "
+    "notifications. A process/session ID alone is not a notification; otherwise use the MCP wait. "
+    "The CLI exits after one event batch or timeout: handle its output and rearm using "
+    "next_wait_arguments or next_poll_command if work remains. Keep at most one waiter per "
+    "session. For multiple sessions, wait on explicit comma-separated IDs with a shared cursor; "
+    "when combining separate cursors, start from the lowest unconsumed cursor and deduplicate "
+    "by event seq. Never advance a cursor using a status lookup or an unrelated session."
 )
 
 ROUTING_RULES = (
@@ -15,8 +24,7 @@ ROUTING_RULES = (
     "Choose an enabled profile, model and thinking_level from the catalog and its routing notes.",
     'Use env={"KEY": "VALUE"} for per-session environment overrides. These override profile '
     "values and are preserved on resume.",
-    "Use background_poll_command from spawn_subagent, send_to_subagent or resume_subagent "
-    "to wait for further events. " + BACKGROUND_POLL_HINT,
+    BACKGROUND_POLL_HINT,
     "Questions and approval requests set waiting_parent. Answer the native interaction with "
     "reply_to_subagent or respond_to_subagent_approval_or_choice, using its request_id.",
     "Subagents use their native questions and responses. The Hub observes native records; "

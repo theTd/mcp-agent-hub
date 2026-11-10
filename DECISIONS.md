@@ -2,6 +2,15 @@
 
 Design decisions confirmed by the owner. Change a line here before changing the behaviour it records.
 
+## Parent waiting protocol (2026-11-10, owner: systematic optimization)
+
+| id | decision |
+|---|---|
+| continuation | Parent-facing launch, send, resume, reply, approval, status, final-result and wait responses expose one shared continuation contract: next action, unfinished/completed/inspect IDs, and bounded MCP wait arguments. Delivery, progress, quiet output and wait timeout never imply task completion. |
+| wait-transport | Bounded MCP waiting is the portable default. Recommend the CLI only when the host delivers reliable background completion notifications; a process ID alone is insufficient. CLI wakeups are single batches and require rearming while work remains. |
+| scoped-cursor | Prefer explicit session IDs. A group wait continues on unfinished members. Only delivered events advance its cursor; unrelated sessions and status reads do not acknowledge unseen events. |
+| pending-and-failure | Waits wake for unresolved native interactions even after their event was read, and for known terminal/unknown state. Connection/protocol failures and Hub shutdown are explicit CLI errors, with continuation information, rather than successful empty timeouts. |
+
 ## Agent prompt language (2026-11-10, owner)
 
 | id | decision |

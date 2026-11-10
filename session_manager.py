@@ -6,6 +6,7 @@ import datetime
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ REAL_PTY_PROCESS = PtyProcess
 from transcript_tail import TranscriptTail, read_complete_lines
 from native_session_launch import strip_legacy_worker_bridge_args
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
+from parent_waiting import build_wait_contract, session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 
@@ -6746,9 +6748,7 @@ class HubSessionManager:
         }
 
     def get_worker_events(self, session_id: str = "all", after_seq: int = 0) -> List[Dict[str, Any]]:
-        target_ids = None
-        if session_id and session_id != "all":
-            target_ids = {s.strip() for s in session_id.split(",") if s.strip()}
+        target_ids = session_targets(session_id)
 
         results = []
         for ev in self.worker_events:
@@ -6761,9 +6761,7 @@ class HubSessionManager:
 
     async def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
         """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
-        target_ids = None
-        if session_id and session_id != "all":
-            target_ids = {s.strip() for s in session_id.split(",") if s.strip()}
+        target_ids = session_targets(session_id)
         pending: List[Dict[str, Any]] = []
         for sid, sess in list(self.sessions.items()):
             if target_ids and sid not in target_ids:
@@ -6776,44 +6774,89 @@ class HubSessionManager:
                 pending.append(item)
         return pending
 
+    async def parent_wait_state(
+        self, session_id: str, next_seq: int, pending_interactions=None, event_session_ids=(),
+    ) -> Dict[str, Any]:
+        pending = pending_interactions
+        if pending is None:
+            pending = await self.get_pending_interactions(session_id)
+        ids = session_targets(session_id)
+        if ids is None:
+            # 'all' is a legacy discovery scope, not ownership of every historical task.
+            ids = list(dict.fromkeys([
+                *(sid for sid, sess in self.sessions.items()
+                  if sess.status in ("starting", "running", "waiting_parent")),
+                *event_session_ids,
+            ]))
+        states = {}
+        for sid in ids:
+            sess = self.sessions.get(sid)
+            if sess is not None:
+                states[sid] = {
+                    "status": sess.status,
+                    "turn_completed": bool(sess.completion_reported),
+                    "from_previous_turn": bool(sess.final_response_from_previous_turn),
+                }
+            else:
+                rec = await self.db.get_session_record(sid)
+                states[sid] = {
+                    "status": (rec.get("end_reason") or rec.get("status")) if rec else "unknown",
+                    "from_previous_turn": bool((rec or {}).get("from_previous_turn")),
+                }
+        return {"pending_interactions": pending, **build_wait_contract(states, pending, next_seq)}
+
     async def poll_worker_events(
         self,
         session_id: str = "all",
         after_seq: int = 0,
         timeout_sec: float = 25.0,
         wake_on_pending: bool = False,
+        wake_on_state: bool = False,
     ) -> Dict[str, Any]:
-        immediate = self.get_worker_events(session_id=session_id, after_seq=after_seq)
-        pending_now = await self.get_pending_interactions(session_id=session_id)
-        if immediate:
-            next_seq = immediate[-1]["seq"]
+        session_targets(session_id)
+        if after_seq < 0 or not math.isfinite(timeout_sec) or timeout_sec < 0:
+            raise ValueError("after_seq and timeout must be finite and nonnegative.")
+        async def snapshot(reason):
+            pending = await self.get_pending_interactions(session_id)
+            # Read events after native interaction detection: it may emit a new event.
+            events = self.get_worker_events(session_id, after_seq)
+            next_seq = events[-1]["seq"] if events else after_seq
+            state = await self.parent_wait_state(
+                session_id, next_seq, pending, (event["session_id"] for event in events),
+            )
+            arguments = state["next_wait_arguments"]
+            command = self.build_poll_command(
+                arguments["session_id"] if arguments else session_id, next_seq,
+            )
             return {
-                "woke_reason": "events_available",
+                **state,
+                "woke_reason": reason,
                 "session_id": session_id,
                 "after_seq": after_seq,
                 "next_seq": next_seq,
-                "events": immediate,
-                "pending_interactions": pending_now,
-                "next_poll_command": self.build_poll_command(session_id, next_seq),
-            }
-        if wake_on_pending and pending_now:
-            next_seq = max(after_seq, self.global_seq)
-            return {
-                "woke_reason": "pending_interaction_waiting",
-                "session_id": session_id,
-                "after_seq": after_seq,
-                "next_seq": next_seq,
-                "events": [],
-                "pending_interactions": pending_now,
-                "next_poll_command": self.build_poll_command(session_id, next_seq),
+                "events": events,
+                "next_poll_command": command,
+                "background_poll_command": command,
             }
 
+        def ready(result):
+            return (bool(result["events"])
+                    or (wake_on_pending and bool(result["pending_interactions"]))
+                    or (wake_on_state and result["next_action"] != "wait"))
+
+        # Register before any awaited inspection, so an event arriving during inspection
+        # cannot fall between the initial snapshot and listener registration.
         waiter = asyncio.Event()
         self._event_waiters.add(waiter)
-        start = time.time()
+        deadline = time.monotonic() + timeout_sec
         try:
+            result = await snapshot("events_available")
+            if ready(result):
+                if not result["events"]:
+                    result["woke_reason"] = "pending_interaction_waiting" if result["pending_interactions"] else "session_state_available"
+                return result
             while not self._shutting_down:
-                remaining = timeout_sec - (time.time() - start)
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 try:
@@ -6823,42 +6866,13 @@ class HubSessionManager:
                 if self._shutting_down:
                     break
                 waiter.clear()
-                found = self.get_worker_events(session_id=session_id, after_seq=after_seq)
-                pending_after = await self.get_pending_interactions(session_id=session_id)
-                if found:
-                    next_seq = found[-1]["seq"]
-                    return {
-                        "woke_reason": "worker_event_triggered",
-                        "session_id": session_id,
-                        "after_seq": after_seq,
-                        "next_seq": next_seq,
-                        "events": found,
-                        "pending_interactions": pending_after,
-                        "next_poll_command": self.build_poll_command(session_id, next_seq),
-                    }
-                if wake_on_pending and pending_after:
-                    next_seq = max(after_seq, self.global_seq)
-                    return {
-                        "woke_reason": "pending_interaction_waiting",
-                        "session_id": session_id,
-                        "after_seq": after_seq,
-                        "next_seq": next_seq,
-                        "events": [],
-                        "pending_interactions": pending_after,
-                        "next_poll_command": self.build_poll_command(session_id, next_seq),
-                    }
+                result = await snapshot("worker_event_triggered")
+                if ready(result):
+                    return result
         finally:
             self._event_waiters.discard(waiter)
 
-        return {
-            "woke_reason": "timeout_no_new_events",
-            "session_id": session_id,
-            "after_seq": after_seq,
-            "next_seq": max(after_seq, self.global_seq),
-            "events": [],
-            "pending_interactions": await self.get_pending_interactions(session_id=session_id),
-            "next_poll_command": self.build_poll_command(session_id, after_seq),
-        }
+        return await snapshot("hub_shutdown" if self._shutting_down else "timeout_no_new_events")
 
     def build_poll_command(self, session_id: str, after_seq: int = 0, timeout: int = 1800) -> str:
         # Use the running Hub's interpreter; a worktree need not contain a local .venv.

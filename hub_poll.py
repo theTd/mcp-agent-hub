@@ -2,7 +2,7 @@
 """
 主 Agent 后台阻塞监听器 (Parent Agent Blocking Poll CLI).
 
-用法示例（主 Agent 在后台运行此命令，当 Sub-Agent 发来消息、提问、请求审批或完成任务时，此命令会立即打印 JSON 并退出，从而第一时间唤醒主 Agent）：
+用法示例（仅在宿主能发送后台完成通知时后台运行；每次收到一批事件就打印 JSON 并退出，任务未结束时需按返回参数续等）：
   python hub_poll.py --session <session_id> --after-seq 0 --timeout 1800
   python hub_poll.py --session <id1>,<id2>,<id3> --after-seq 0 --timeout 1800
   python hub_poll.py --session all --after-seq 0 --timeout 1800
@@ -12,95 +12,129 @@ K3: 这里不要再写死 <repo>/.venv 的解释器路径。后台轮询命令�
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
 import urllib.parse
 import urllib.request
 
-sys.stdout.reconfigure(encoding="utf-8")
+from agent_guidance import CONTINUATION_HINT
+from parent_waiting import session_targets
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Blocking long-poll waiter for Sub-Agent events")
-    parser.add_argument(
-        "--session",
-        default="all",
-        help="Sub-Agent session_id, comma-separated session_ids (id1,id2,...), or 'all' for any active session",
-    )
-    parser.add_argument("--after-seq", type=int, default=0, help="Only return events with seq > after_seq")
-    parser.add_argument("--timeout", type=float, default=1800.0, help="Max total seconds to block before returning")
-    parser.add_argument("--hub-url", default=os.environ.get("HUB_API_URL", "http://127.0.0.1:4444"), help="Hub base URL")
-    args = parser.parse_args()
-
-    deadline = time.time() + args.timeout
-    slice_sec = 25.0  # Each HTTP long-poll slice is at most 25s to avoid socket idle drops
-    cur_seq = args.after_seq
+def poll_events(session_id, after_seq, timeout, hub_url):
+    """Return one batch or an explicit failure; never hide transport failure as idle time."""
+    session_targets(session_id)
+    if after_seq < 0 or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("after_seq must be nonnegative and timeout must be finite and positive.")
+    deadline = time.monotonic() + timeout
+    cur_seq = after_seq
     first_slice = True
+    failures = 0
+    last_error = None
+    last_result = {}
+
+    def finish(reason, error=None):
+        arguments = last_result.get("next_wait_arguments") or {
+            "session_id": session_id, "after_seq": cur_seq, "timeout_seconds": 60.0,
+        }
+        # Retain the server's state and continuation fields even on a quiet timeout.
+        result = {
+            **last_result,
+            "woke_reason": reason,
+            "session_id": session_id,
+            "session": session_id,  # Legacy CLI alias.
+            "after_seq": after_seq,
+            "next_seq": cur_seq,
+            "events": [],
+            "pending_interactions": last_result.get("pending_interactions", []),
+            "next_wait_arguments": arguments,
+            "continuation_hint": CONTINUATION_HINT,
+        }
+        if error:
+            result.update(error=error, next_action="retry_wait", wait_required=True,
+                          next_wait_arguments=arguments,
+                          continuation_hint="The listener failed. Check Hub connectivity/version before retrying next_wait_arguments. Delegated tasks may still be running.")
+        return result
 
     while True:
-        remaining = deadline - time.time()
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
-            out = {
-                "woke_reason": "timeout",
-                "session": args.session,
-                "after_seq": cur_seq,
-                "events": [],
-                "pending_interactions": [],
-                "next_seq": cur_seq,
-            }
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            sys.exit(0)
+            if last_error or not last_result:
+                return finish("poll_error", last_error or "No successful Hub response before the deadline.")
+            return finish("timeout")
 
-        wait_slice = min(1.0 if first_slice else slice_sec, max(0.5, remaining))
+        wait_slice = min(1.0 if first_slice else 25.0, remaining)
         first_slice = False
         params = urllib.parse.urlencode({
-            "session_id": args.session,
+            "session_id": session_id,
             "after_seq": cur_seq,
             "timeout": round(wait_slice, 1),
             "wake_on_pending": "1",
+            "wake_on_state": "1",
         })
-        url = f"{args.hub_url}/api/mailbox/poll?{params}"
+        url = f"{hub_url.rstrip('/')}/api/mailbox/poll?{params}"
 
         try:
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=wait_slice + 10.0) as resp:
+            with urllib.request.urlopen(req, timeout=min(wait_slice + 10.0, remaining)) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+                    raise ValueError("Hub poll response must contain an events array.")
                 raw_events = data.get("events", [])
-                if raw_events:
-                    cur_seq = max(cur_seq, int(data.get("next_seq") or raw_events[-1].get("seq") or cur_seq))
+                # Only returned events acknowledge a cursor, including intentionally hidden noise.
+                delivered_seq = max([cur_seq, *(int(event["seq"]) for event in raw_events)])
                 events = [
                     ev for ev in raw_events
                     if not str(ev.get("content") or "").lstrip().startswith("[approval granted without asking")
                 ]
                 pending_interactions = data.get("pending_interactions")
-                if pending_interactions is None and args.session != "all":
-                    target_ids = {s.strip() for s in args.session.split(",") if s.strip()}
-                    try:
-                        with urllib.request.urlopen(f"{args.hub_url}/api/sessions", timeout=5.0) as sresp:
-                            sdata = json.loads(sresp.read().decode("utf-8"))
-                        pending_interactions = [
-                            s["pending_interaction"]
-                            for s in (sdata.get("sessions") or [])
-                            if s.get("session_id") in target_ids
-                            and s.get("status") == "waiting_parent"
-                            and s.get("pending_interaction")
-                        ]
-                    except Exception:
-                        pending_interactions = []
-                else:
-                    pending_interactions = pending_interactions or []
-                if events or pending_interactions:
-                    data["events"] = events
-                    data["pending_interactions"] = pending_interactions
-                    data["next_seq"] = cur_seq
-                    print(json.dumps(data, ensure_ascii=False, indent=2))
-                    sys.exit(0)
+                if (not isinstance(pending_interactions, list)
+                        or data.get("next_action") not in ("reply", "wait", "inspect", "collect_results", "done")):
+                    raise ValueError("Hub poll response lacks the parent continuation contract; update the Hub.")
+                arguments = data.get("next_wait_arguments")
+                if data.get("wait_required") and not isinstance(arguments, dict):
+                    raise ValueError("Hub poll response lacks next_wait_arguments for unfinished work.")
+                # A malformed response has not been delivered to the parent. Preserve its
+                # cursor for retry rather than silently acknowledging the omitted events.
+                cur_seq = delivered_seq
+                if isinstance(arguments, dict):
+                    data["next_wait_arguments"] = {**arguments, "after_seq": cur_seq}
+                data.update(events=events, pending_interactions=pending_interactions, next_seq=cur_seq)
+                last_result = data
+                failures, last_error = 0, None
+                if data.get("woke_reason") == "hub_shutdown":
+                    return finish("poll_error", "Hub shut down while waiting.")
+                if events or pending_interactions or data["next_action"] != "wait":
+                    return data
         except KeyboardInterrupt:
-            sys.exit(130)
-        except Exception:
-            time.sleep(1.0)
+            raise
+        except Exception as exc:
+            failures += 1
+            last_error = f"{type(exc).__name__}: {exc}"
+            if failures >= 3:
+                return finish("poll_error", last_error)
+            time.sleep(min(float(failures), max(0, deadline - time.monotonic())))
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description="Wait for one Sub-Agent event batch; rearm while work remains")
+    parser.add_argument("--session", default="all", help="Explicit comma-separated session IDs (preferred), or legacy 'all'")
+    parser.add_argument("--after-seq", type=int, default=0, help="Only return events with seq > after_seq")
+    parser.add_argument("--timeout", type=float, default=1800.0, help="Max total seconds to block before returning")
+    parser.add_argument("--hub-url", default=os.environ.get("HUB_API_URL", "http://127.0.0.1:4444"), help="Hub base URL")
+    args = parser.parse_args()
+    try:
+        result = poll_events(args.session, args.after_seq, args.timeout, args.hub_url)
+    except ValueError as exc:
+        parser.error(str(exc))
+    except KeyboardInterrupt:
+        return 130
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("error") else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
