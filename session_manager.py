@@ -208,7 +208,17 @@ END_REASONS = ("exited", "crashed", "terminated", "interrupted")
 TERMINATED_MESSAGES = {
     "console": "用户在总控台终止了会话",
     "mcp": "主 Agent 终止了会话",
+    "auto_cleanup": "Sub Agent 完成后闲置超时，Hub 自动关闭了会话",
 }
+DEFAULT_SUBAGENT_IDLE_TIMEOUT_MINUTES = 60
+SUBAGENT_CLEANUP_INTERVAL_SEC = 30.0
+INACTIVE_SESSION_STATUSES = frozenset({"completed", *END_REASONS})
+
+
+def normalize_subagent_idle_timeout(value: Any) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("subagent_idle_timeout_minutes 必须是非负整数（分钟，0 表示禁用自动关闭）。")
+    return value
 # Engines with a revive recipe (spec §4). Anything else cannot be resumed.
 RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh")
 ENGINE_RESUME_BLOCK_REASONS = {
@@ -1855,6 +1865,21 @@ class AgentSession:
         self._virtual_line_buf: str = ""
         self.on_virtual_line_cb: Optional[Callable[[str, str], Any]] = None
 
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        # Measure completed/ended inactivity, never terminal output silence or status polling.
+        # Repeated completion observations must not postpone cleanup. A new turn resets it.
+        if value in INACTIVE_SESSION_STATUSES:
+            if getattr(self, "_status", None) not in INACTIVE_SESSION_STATUSES:
+                self._inactive_since = time.monotonic()
+        else:
+            self._inactive_since = None
+        self._status = value
+
     def start_virtual(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -2560,6 +2585,7 @@ class HubSessionManager:
         self.engines_catalog: Dict[str, Any] = {}
         self.engine_policies: Dict[str, Dict[str, Any]] = {}
         self.global_routing_instructions: str = ""
+        self.subagent_idle_timeout_minutes = DEFAULT_SUBAGENT_IDLE_TIMEOUT_MINUTES
         self.sessions: Dict[str, AgentSession] = {}
         self.default_cols: int = 120
         self.default_rows: int = 36
@@ -2618,6 +2644,43 @@ class HubSessionManager:
             await self.db.close(timeout=0.5)
             raise
         self._schedule(self._scrollback_flush_loop())
+        self._schedule(self._subagent_cleanup_loop())
+
+    def _subagent_cleanup_due(self, sess: AgentSession, now: float) -> bool:
+        timeout = self.subagent_idle_timeout_minutes
+        since = getattr(sess, "_inactive_since", None)
+        return bool(
+            timeout > 0 and sess.launch_source == "agent"
+            and sess.status in INACTIVE_SESSION_STATUSES and since is not None
+            and now - since >= timeout * 60
+            and not sess.pending_interaction and not sess.pending_question_id
+            and not sess.tui_writer.busy()
+        )
+
+    async def cleanup_idle_subagents(self) -> int:
+        """Archive expired parent-owned sessions through the normal close path."""
+        closed = 0
+        for sid, sess in list(self.sessions.items()):
+            if self._shutting_down:
+                break
+            if not self._subagent_cleanup_due(sess, time.monotonic()):
+                continue
+            # A resume may replace the session while we wait for its lock.
+            async with self._resume_lock(sid):
+                if (self.sessions.get(sid) is not sess or self._shutting_down
+                        or not self._subagent_cleanup_due(sess, time.monotonic())):
+                    continue
+                try:
+                    result = await self._close_session(sid, source="auto_cleanup")
+                    closed += int(result["found"])
+                except Exception:
+                    logger.exception("Automatic cleanup failed for %s; will retry", sid)
+        return closed
+
+    async def _subagent_cleanup_loop(self):
+        while not self._shutting_down:
+            await asyncio.sleep(SUBAGENT_CLEANUP_INTERVAL_SEC)
+            await self.cleanup_idle_subagents()
 
     def _schedule(self, coroutine):
         """Track callback/watch tasks so shutdown cannot race their final snapshots."""
@@ -3188,6 +3251,11 @@ class HubSessionManager:
 
         self.engine_policies = data.get("engine_policies") or {}
         self.global_routing_instructions = str(data.get("global_routing_instructions") or "").strip()
+        try:
+            self.subagent_idle_timeout_minutes = normalize_subagent_idle_timeout(
+                data.get("subagent_idle_timeout_minutes", DEFAULT_SUBAGENT_IDLE_TIMEOUT_MINUTES))
+        except ValueError:
+            logger.warning("Invalid subagent_idle_timeout_minutes; keeping the current timeout")
 
         # Apply per-engine model enable/disable policies
         processed_engines: Dict[str, Any] = {}
@@ -3424,6 +3492,14 @@ class HubSessionManager:
         lines.append("")
         lines.append("## Dispatch and waiting")
         lines.extend(f"- {rule}" for rule in ROUTING_RULES)
+        timeout = self.subagent_idle_timeout_minutes
+        lines.append(
+            f"- Hub automatically closes agent-started sessions after {timeout} minutes "
+            "of completed/ended inactivity (checked every 30 seconds). Running sessions and "
+            "pending questions/approvals are excluded. A new turn resets the timer. "
+            "Console-started sessions are excluded."
+            if timeout else "- Automatic subagent cleanup is disabled; close unused sessions yourself."
+        )
         lines.append("")
         lines.append("## Profiles (agent_type)")
         for pid, p in self.profiles.items():
@@ -3635,9 +3711,12 @@ class HubSessionManager:
         self._reload_after_write(raw_data)
         return self.engines_catalog.get(eng, {})
 
-    def save_global_routing_instructions(self, instructions: str) -> str:
+    def save_global_routing_instructions(self, instructions: str, **settings) -> str:
         """Persists global routing instructions for Parent Agents into agent_profiles.json."""
         raw_data = self._read_profiles_file()
+        if "subagent_idle_timeout_minutes" in settings:
+            raw_data["subagent_idle_timeout_minutes"] = normalize_subagent_idle_timeout(
+                settings["subagent_idle_timeout_minutes"])
         raw_data["global_routing_instructions"] = instructions.strip()
         self._write_profiles_file(raw_data)
         self._reload_after_write(raw_data)
@@ -5000,6 +5079,10 @@ class HubSessionManager:
             await self.db.update_archive_fields(sid, **fields)
 
     async def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
+        async with self._resume_lock(session_id):
+            return await self._close_session(session_id, source)
+
+    async def _close_session(self, session_id: str, source: str) -> Dict[str, Any]:
         """B9: removes a session from the live list without rewriting the status an ended process already earned.
 
         A session whose process was alive is terminated and emits a `terminated` worker event; one
@@ -5007,7 +5090,7 @@ class HubSessionManager:
         the live list as an archived record (spec §5).
         K5: `source` says who did it -- "console" (the 总控台 pane) or "mcp" (the parent agent through
         terminate_subagent), because the event text used to claim the user did it even when the parent
-        had. Any other value is treated as the console, the only other caller there is.
+        had. "auto_cleanup" identifies the Hub's completed-session timeout.
         Returns {"found": bool, "was_alive": bool, "status": str}.
         """
         sess = self.sessions.get(session_id)
@@ -5017,23 +5100,26 @@ class HubSessionManager:
         terminated = sess.terminate()
         if terminated:
             sess.end_reason = "terminated"
+        if source == "auto_cleanup":
+            sess.current_activity = TERMINATED_MESSAGES["auto_cleanup"]
         await self._archive_session(sess)
-        del self.sessions[session_id]
+        if self.sessions.get(session_id) is sess:
+            del self.sessions[session_id]
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
         # of leaving the server side open and silent for the rest of the hub's life.
         sess.close_ws_frontends()
         if terminated:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
-        if terminated or (was_alive and sess.status == "terminated"):
+        if terminated or (was_alive and sess.status == "terminated") or source == "auto_cleanup":
             await self.record_worker_event(
                 session_id,
                 {
-                    "type": "terminated",
+                    "type": "terminated" if was_alive else "closed",
                     "category": "lifecycle",
-                    "status": "terminated",
+                    "status": sess.status,
                     "content": TERMINATED_MESSAGES.get(
-                        "mcp" if str(source or "").lower() == "mcp" else "console",
+                        str(source or "").lower(),
                         TERMINATED_MESSAGES["console"],
                     ),
                 },

@@ -1,9 +1,18 @@
 """English instructions authored by the Hub for parent agents."""
 
+CLEANUP_HINT = (
+    "After collecting a subagent's result, call terminate_subagent as soon as it is no longer "
+    "needed. Completion does not close its process. Before finishing the parent task, close "
+    "all subagents you started that no longer need to remain open. Saved results remain "
+    "readable after closing; use resume_subagent if you need the session again. Do not rely "
+    "on automatic cleanup as a substitute for prompt closure."
+)
+
 CONTINUATION_HINT = (
     "Handle pending interactions first. Collect completed results and inspect failed/unknown IDs. "
     "While unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments "
-    "after processing this result. Progress, delivery and timeout do not mean completion."
+    "after processing this result. Progress, delivery and timeout do not mean completion. "
+    + CLEANUP_HINT
 )
 
 BACKGROUND_POLL_HINT = (
@@ -19,6 +28,7 @@ BACKGROUND_POLL_HINT = (
 )
 
 ROUTING_RULES = (
+    CLEANUP_HINT,
     "Provide a short, readable title summarizing the task, such as 'Fix build failure' "
     "or 'Repair session resume'; do not use the full task as the title.",
     "Choose an enabled profile, model and thinking_level from the catalog and its routing notes.",

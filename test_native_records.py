@@ -248,7 +248,8 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(engine=engine):
                 self.hub.profiles[engine] = {"name": engine, "kind": "tui", "task_mode": mode}
                 launch = {"engine": engine, "cwd": str(self.root), "command": "unused", "args": [],
-                          "model": "fixture", "thinking_level": "low", "env": {}}
+                          "model": "fixture", "thinking_level": "low", "env": {},
+                          "mcp_servers": {}, "disabled_mcp_servers": [], "strict_mcp_config": False}
                 pending = []
                 def schedule(coro):
                     pending.append(coro.cr_frame.f_locals.copy())

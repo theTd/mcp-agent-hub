@@ -33,7 +33,10 @@ export const hubApi = {
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled }),
   setModelNote: (engine, model, enabled, note) =>
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled, note }),
-  saveRoutingGuide: (text) => request('POST', '/api/routing-guide', { global_routing_instructions: text }),
+  saveRoutingGuide: (text, timeoutMinutes) => request('POST', '/api/routing-guide', {
+    global_routing_instructions: text,
+    subagent_idle_timeout_minutes: timeoutMinutes,
+  }),
 
   listSessions: () => request('GET', '/api/sessions', undefined, { timeoutMs: 10000 }),
   // Archive spec §6: the 归档 list, one record, its raw scrollback, revive and delete.

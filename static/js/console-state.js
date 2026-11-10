@@ -6,6 +6,7 @@ export const state = {
   profilesLoaded: false,
   enginesCatalog: {},
   globalRoutingInstructions: '',
+  subagentIdleTimeoutMinutes: 60,
   routingGuideMarkdown: '',
   defaultCwd: '',
   hubPort: null,
@@ -73,6 +74,7 @@ export async function reloadProfiles(refreshDiscovery = false) {
   state.profiles = data.profiles || {};
   state.enginesCatalog = data.engines_catalog || {};
   state.globalRoutingInstructions = data.global_routing_instructions || '';
+  state.subagentIdleTimeoutMinutes = data.subagent_idle_timeout_minutes ?? 60;
   state.routingGuideMarkdown = data.routing_guide_markdown || '';
   state.defaultCwd = data.default_cwd || '';
   state.hubPort = Number.isFinite(data.hub_port) ? data.hub_port : null;

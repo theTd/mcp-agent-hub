@@ -7,6 +7,7 @@ let dirty = false;
 
 export function initRoutingGuide() {
   $('#routingInput').addEventListener('input', () => setDirty(true));
+  $('#subagentIdleTimeout').addEventListener('input', () => setDirty(true));
   $('#btnSaveRouting').addEventListener('click', saveRoutingGuide);
   $('#btnCopyRoutingPreview').addEventListener('click', () =>
     copyText($('#routingPreview').textContent, '已复制路由指南'));
@@ -14,18 +15,28 @@ export function initRoutingGuide() {
 }
 
 export function refreshRoutingGuide() {
-  if (!dirty) $('#routingInput').value = state.globalRoutingInstructions;
+  if (!dirty) {
+    $('#routingInput').value = state.globalRoutingInstructions;
+    $('#subagentIdleTimeout').value = state.subagentIdleTimeoutMinutes;
+  }
   $('#routingPreview').textContent = state.routingGuideMarkdown || '（暂无内容）';
 }
 
 export async function saveRoutingGuide() {
+  const input = $('#subagentIdleTimeout');
+  const timeout = Number(input.value);
+  if (!input.value.trim() || !Number.isSafeInteger(timeout) || timeout < 0) {
+    toast('自动关闭时间必须是非负整数（分钟，0 表示禁用）', 'error');
+    input.focus();
+    return;
+  }
   const btn = $('#btnSaveRouting');
   setBusy(btn, true);
   try {
-    await hubApi.saveRoutingGuide($('#routingInput').value);
+    await hubApi.saveRoutingGuide($('#routingInput').value, timeout);
     setDirty(false);
     await reloadProfiles(false);
-    toast('全局调度总则已保存', 'success');
+    toast('调度总则与自动关闭设置已保存', 'success');
   } catch (err) {
     toast(`保存失败：${err.message}`, 'error');
   } finally {
