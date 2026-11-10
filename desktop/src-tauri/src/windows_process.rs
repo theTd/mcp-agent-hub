@@ -43,6 +43,19 @@ unsafe impl Send for HubJob {}
 unsafe impl Sync for HubJob {}
 
 impl HubJob {
+    #[cfg(feature = "portable")]
+    pub fn contains_pid(&self, pid: u32) -> bool {
+        // SAFETY: query-only process handle and valid job handle; always close our handle.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() { return false; }
+            let mut inside = 0;
+            let ok = windows_sys::Win32::System::JobObjects::IsProcessInJob(process, self.handle, &mut inside);
+            CloseHandle(process);
+            ok != 0 && inside != 0
+        }
+    }
+
     pub fn new_kill_on_close() -> io::Result<Self> {
         // SAFETY: an anonymous job with default security; the handle is owned by the returned value.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };

@@ -11,6 +11,8 @@ mod hub_config;
 mod hub_log;
 mod hub_supervisor;
 mod owned_hub;
+#[cfg(feature = "portable")]
+mod portable_runtime;
 mod tray_menu;
 mod waiting_notifier;
 mod windows_process;
@@ -35,6 +37,22 @@ fn retry_hub(app: AppHandle, shell: State<'_, Arc<HubShell>>) {
 }
 
 fn main() {
+    #[cfg(feature = "portable")]
+    if std::env::args().any(|arg| arg == "--portable-prepare-only") {
+        // Non-GUI diagnostics can verify bootstrap without touching a live Hub.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let result = tauri::async_runtime::block_on(portable_runtime::prepare(
+            |message, detail| {
+                hub_log::desktop_log(&hub_config::log_dir(), &format!("{message} {detail}"))
+            },
+            &cancel,
+        ));
+        if let Err(error) = result {
+            hub_log::desktop_log(&hub_config::log_dir(), &error);
+            std::process::exit(1);
+        }
+        return;
+    }
     // Allow a second instance (e.g. launched by a shortcut or toast activation) to transfer
     // foreground activation rights to the running first instance before single-instance exits.
     unsafe {
@@ -54,7 +72,14 @@ fn main() {
     let setup_shell = shell.clone();
     let window_shell = shell.clone();
     let instance_shell = shell.clone();
+    let page_shell = shell.clone();
     let app = tauri::Builder::default()
+        .on_page_load(move |webview, payload| {
+            if webview.label() == "main" {
+                page_shell.log(&format!("page {:?}: {}", payload.event(), payload.url()));
+                page_shell.set_splash_url(payload.url().clone());
+            }
+        })
         // Must be first: a second launch hands over to this one and exits.
         .plugin(tauri_plugin_single_instance::init(
             move |app, argv, _cwd| {
@@ -76,6 +101,7 @@ fn main() {
         ))
         .plugin(
             tauri_plugin_autostart::Builder::new()
+                .app_name(desktop_toast::APP_DISPLAY_NAME)
                 .args(["--hidden"])
                 .build(),
         )
@@ -83,6 +109,8 @@ fn main() {
         .manage(shell.clone())
         .invoke_handler(tauri::generate_handler![splash_state, retry_hub])
         .setup(move |app| {
+            #[cfg(feature = "portable")]
+            assert_eq!(app.config().identifier, desktop_toast::APP_USER_MODEL_ID, "portable build requires tauri.portable.conf.json");
             let handle = app.handle().clone();
             desktop_toast::init(&handle);
             if let Some(window) = app.get_webview_window("main") {

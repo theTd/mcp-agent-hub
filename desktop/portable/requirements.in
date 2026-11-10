@@ -1,0 +1,8 @@
+# Direct runtime dependencies, pinned to the versions verified with this Hub.
+fastapi==0.162.0
+fastmcp==4.1.6
+httpx==0.28.1
+pillow==13.0.0
+pyte==0.8.2
+pywinpty==3.1.2
+uvicorn[standard]==0.54.0

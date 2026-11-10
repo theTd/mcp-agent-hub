@@ -2598,7 +2598,9 @@ class HubSessionManager:
     def __init__(self, profiles_path: Optional[Path] = None, base_dir: Optional[Path] = None,
                  data_dir: Optional[Path] = None):
         self.base_dir = (base_dir or Path(__file__).parent).resolve()
-        self.data_dir = (data_dir or self.base_dir).resolve()
+        data_override = (os.environ.get("HUB_DATA_DIR") or "").strip()
+        self.data_dir = (Path(data_dir) if data_dir is not None else
+                         Path(data_override) if data_override else self.base_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.profiles_path = (profiles_path or default_profiles_path(self.base_dir)).resolve()
         self.profiles_path.parent.mkdir(parents=True, exist_ok=True)

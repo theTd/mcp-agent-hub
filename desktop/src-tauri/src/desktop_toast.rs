@@ -19,7 +19,7 @@ use windows::UI::Notifications::{
 };
 use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegSetValueExW, HKEY,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_SET_VALUE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -27,8 +27,15 @@ use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use crate::hub_config;
 use crate::hub_supervisor::HubShell;
 
+#[cfg(not(feature = "portable"))]
 pub const APP_USER_MODEL_ID: &str = "local.mcp-agent-hub.desktop";
+#[cfg(feature = "portable")]
+pub const APP_USER_MODEL_ID: &str = "local.mcp-agent-hub.portable";
+#[cfg(not(feature = "portable"))]
 pub const APP_DISPLAY_NAME: &str = "MCP Agent Hub";
+#[cfg(feature = "portable")]
+pub const APP_DISPLAY_NAME: &str = "MCP Agent Hub Portable";
+#[cfg(not(feature = "portable"))]
 const LEGACY_ACTIVATOR_CLSID_KEY: &str =
     r"Software\Classes\CLSID\{D7A3B210-6C94-4A89-A2E1-95D4F18B4444}";
 
@@ -166,11 +173,12 @@ fn reg_delete_value(subkey: &str, value_name: &str) {
     }
 }
 
+#[cfg(not(feature = "portable"))]
 fn reg_delete_tree(subkey: &str) {
     let subkey_w = wide_null(subkey);
     // SAFETY: deleting our own legacy HKCU subkey if present.
     unsafe {
-        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, subkey_w.as_ptr());
+            let _ = windows_sys::Win32::System::Registry::RegDeleteTreeW(HKEY_CURRENT_USER, subkey_w.as_ptr());
     }
 }
 
@@ -197,6 +205,7 @@ fn ensure_toast_icon_file() -> Option<PathBuf> {
 fn register_aumid_in_hkcu(icon_path: Option<&Path>) -> Result<(), String> {
     let aumid_key = format!(r"Software\Classes\AppUserModelId\{APP_USER_MODEL_ID}");
     reg_delete_value(&aumid_key, "CustomActivator");
+    #[cfg(not(feature = "portable"))]
     reg_delete_tree(LEGACY_ACTIVATOR_CLSID_KEY);
     reg_set_sz(&aumid_key, Some("DisplayName"), APP_DISPLAY_NAME)?;
     reg_set_sz(&aumid_key, Some("IconBackgroundColor"), "00000000")?;

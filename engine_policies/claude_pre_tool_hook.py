@@ -150,7 +150,9 @@ def _record_permission_request(payload: dict) -> None:
     if env_path:
         targets.append(Path(env_path))
     if session_id and re.match(r"^[A-Za-z0-9_.\-]+$", session_id):
-        runtime_dir = Path(__file__).resolve().parent.parent / ".runtime_mcp_configs"
+        data_root = (os.environ.get("HUB_DATA_DIR") or "").strip()
+        runtime_dir = (Path(data_root).expanduser().resolve() if data_root else
+                       Path(__file__).resolve().parent.parent) / ".runtime_mcp_configs"
         default_path = runtime_dir / f"claude_hooks_{session_id}.jsonl"
         if default_path not in targets:
             targets.append(default_path)
