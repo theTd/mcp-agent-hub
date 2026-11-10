@@ -154,8 +154,88 @@ E:/configs/session-mcp-plugin/
 - MCP 定义若放在外部文件/插件目录中，恢复时该路径仍须存在；Hub 保存 argv，不快照这些外部文件内容。内联 JSON/TOML 则随 argv 一起保存。
 - DSH/非 TUI 会话拒绝非空 extra_args，UI 隐藏输入。切换 Profile 或启动成功后清空；不存为浏览器偏好。
 
-本次交付通用 argv 通道与调研，不新增统一 MCP 选择器或自动生成 MCP 文件。后续可先实现 Claude/Codex；无法证明排他加载的引擎应明确报告不支持，不能静默退回全部 MCP。
+上一批交付通用 argv 通道与调研。本次另为 Claude/Codex 增加以下结构化参数；其他引擎仍使用各自的原生途径，不支持时明确报错。
+
+## Codex / Claude 会话级结构化 MCP 配置
+
+`spawn_subagent`、HTTP `POST /api/sessions`、`POST /api/launch-preview` 共用三个可选字段：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `mcp_servers` | `{}`（也可省略/null） | 名称到新增服务器配置的对象 |
+| `disabled_mcp_servers` | `[]`（也可省略/null） | 按名称禁用；Codex 指普通 MCP 配置名称，不是插件 MCP |
+| `strict_mcp_config` | `false` | 仅 Claude 支持；只加载本次指定的集合，企业策略仍适用 |
+
+统一格式只接受 HTTP 的 `url`、可选 `headers`，或 stdio 的 `command`、可选 `args` / `env`。根据 url / command 推断传输类型，二者只能提供一个，不需要 type 字段。名称使用英文字母、数字、下划线、连字符；args 为字符串数组，env / headers 为字符串键值对象。高级传输、OAuth 和插件配置仍使用 extra_args，但不能与非空结构化配置同时重复控制 MCP。
+
+**新增 HTTP MCP，保留其他来源：**
+
+```json
+{
+  "agent_type": "codex",
+  "mcp_servers": {
+    "session_docs": {
+      "url": "https://mcp.example.invalid/mcp",
+      "headers": {"X-Tenant": "demo"}
+    }
+  }
+}
+```
+
+替换 agent_type 为已启用的 Claude Profile ID，同一份配置也可使用。HTTP API 将 agent_type 改为 profile_id。示例域名需替换成真实服务。
+
+**新增 stdio MCP：**
+
+```json
+{
+  "agent_type": "claude",
+  "mcp_servers": {
+    "session_tools": {
+      "command": "node",
+      "args": ["E:/tools with spaces/server.mjs"],
+      "env": {"MODE": "readonly"}
+    }
+  }
+}
+```
+
+**禁用指定名称：**
+
+```json
+{
+  "agent_type": "claude",
+  "disabled_mcp_servers": ["unused"]
+}
+```
+
+Claude 转为本次 `--settings` 中的 `deniedMcpServers:[{"serverName":"unused"}]`，是阻止加载，不是 permissions.deny 工具规则。名称按原生规则精确匹配；普通用户、项目、插件和 CLI 注入来源均受其限制，进程内 SDK 服务器例外。[官方设置说明](https://code.claude.com/docs/en/settings-reference#deniedmcpservers)。Codex 转为普通 MCP 项的 enabled=false，不覆盖插件 MCP。
+
+**Claude 空独占集合：**
+
+```json
+{
+  "agent_type": "claude",
+  "mcp_servers": {},
+  "strict_mcp_config": true
+}
+```
+
+需要独占但非空时填入 mcp_servers。Codex 对 strict=true 报错，不以空表冒充白名单。Claude 在工作站遇到企业 managed-mcp.json 时可能直接拒绝动态/strict 配置，Hub 不绕过原生策略。[企业策略说明](https://code.claude.com/docs/en/managed-mcp#servers-passed-with-mcp-config-or-strict-mcp-config)。
+
+实现与恢复：
+
+- Codex 将所有新增和禁用项放入一个 `-c mcp_servers={...}` TOML inline table；headers 映射为 http_headers，新增项 enabled=true。原生配置层会合并继承项。本机 CLI 的 -c 点路径不会解码带引号键名，因此把名称放在 TOML 值中交给真正的 TOML 解析器。这个非空覆盖仍不是 reset；同名服务器继续遵循原生合并规则，不保证移除旧传输字段。
+- Claude 使用一个 `--mcp-config=<内联JSON>`。普通 --settings 文件/JSON、MCP denylist 和 Hub 审批配置深度合并成单个内联 --settings；对象递归合并、数组保留唯一项，Hub hook 和 ask 规则保留。普通 settings 文件相对本次工作目录解析，合并后的内容随会话保存；恢复不再依赖该外部文件。
+- Profile / extra_args 中已有 MCP 原生覆盖时，与非空结构化配置报冲突；Claude settings 内的 MCP 控制项也报冲突。普通 settings 可以合并，无法读取则在启动前报错。字段类型错误、未知字段、NUL、新增与禁用同名均报错。
+- 最终 argv 和结构化输入存入现有 profile_snapshot。恢复只复用原生 MCP 参数，并从保存的普通 settings / denylist 重新合并当前 Hub 审批策略，不重复追加 MCP 参数。没有结构化配置的旧会话沿用原有行为。
+- 控制台仅为 Codex/Claude TUI 显示折叠配置区；预览列出新增/禁用名称和模式。切换 Profile 或启动成功清空，不存浏览器偏好。配置预览不代表连接或认证成功。
+
+原生隔离验证使用 Codex Profile CLI 0.167.0 和 Claude Code 2.1.322，一次性 CODEX_HOME / CLAUDE_CONFIG_DIR、本地假 HTTP/stdio MCP，不提交模型任务：
+
+- Codex app-server 的 mcpServerStatus/list 实际发现新增 HTTP / stdio 的 probe_marker 工具，保留继承 keep；drop 未收到连接，HTTP header 保持原值。
+- Claude SDK 控制协议 initialize / mcp_status 验证新增 HTTP / stdio 均 connected 并请求 tools/list；非 strict 保留 keep，strict 排除 keep，drop 在两种模式均未收到连接；空 strict 集合无服务器连接。stdio 环境变量同时验证保持原值。
+- 这证明原生配置加载、连接与工具发现；没有验证 OAuth 或完整模型会话中的最终工具调用。
 
 ## 验证
 
-test_session_launch_args 与 test_session_approvals 合计 20 项通过，mock PTY、不调用模型；覆盖 MCP/HTTP、参数类型/顺序/字面量、5 种 CLI 的持久化/恢复、既有审批回归。前端通过语法检查，在隔离静态站点配合 mock API 验证预览、非法输入阻止启动、DSH 切换清空，以及提交 payload 正确、成功后清空与收起。假会话的 PTY WebSocket 因静态测试服务器无该端点而返回预期 404；没有启动真实 Agent。
+test_session_mcp_config、test_session_launch_args 与 test_session_approvals 合计 31 项通过。mock PTY 测试覆盖 MCP/HTTP 接口一致、校验/冲突、JSON/TOML 转义、结构化配置持久化与恢复、Claude settings 内容快照和审批切换，及原有 5 种 CLI 参数恢复回归。前端通过语法检查，在隔离静态站点配合 mock API 验证 MCP 区域显示、预览名称与模式、非法输入阻止启动、Claude 空 strict、DSH 切换清空、提交 payload 正确、成功后清空与收起、不存浏览器偏好。假会话的 PTY WebSocket 因静态测试服务器无该端点而返回预期 404。原生 CLI 另按上节连接本地假 MCP，未提交模型任务。
