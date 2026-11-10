@@ -433,9 +433,14 @@
             </div>
             <p class="col-desc">主 Agent 调用 <code>list_agent_profiles</code> 或 <code>discover_agent_models_and_thinking_levels</code> 时，这段总则会与各 Profile 的 <code>when_to_use</code> 一起置顶返回。</p>
             <textarea id="routingInput" spellcheck="false" placeholder="在此编写多 Agent 协同与路由策略…"></textarea>
+            <label class="field">
+              <span class="field-label">Sub Agent 完成后自动关闭（分钟）</span>
+              <input id="subagentIdleTimeout" type="number" min="0" step="1" value="60">
+              <span class="col-desc">仅对主 Agent 启动的会话生效；完成或结束后闲置达到时限自动关闭并归档，每 30 秒检查一次。执行中、等待问题或审批时不关闭；新任务重新计时。0 表示禁用，保存后立即生效。</span>
+            </label>
             <div class="col-foot">
               <button class="btn btn-primary" id="btnSaveRouting" title="保存 (Ctrl + S)">
-                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-save"></use></svg>保存总则
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#i-save"></use></svg>保存设置
               </button>
             </div>
           </div>

@@ -97,6 +97,7 @@ async def profiles_payload() -> Dict[str, Any]:
         "profiles": hub.profiles,
         "engines_catalog": hub.engines_catalog,
         "global_routing_instructions": hub.global_routing_instructions,
+        "subagent_idle_timeout_minutes": hub.subagent_idle_timeout_minutes,
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "default_cwd": hub.hub_default_cwd(),
         "hub_port": hub_port(),
@@ -259,6 +260,8 @@ async def spawn_subagent(
     and disabled_mcp_servers=[name]. strict_mcp_config=true is Claude-only, including an empty set.
     Native MCP overrides in profile args/extra_args/settings conflict with these structured fields.
     MCP configuration is preserved on resume; it does not confirm a successful MCP connection.
+    After collecting the result, call terminate_subagent promptly when no further work is needed.
+    Completion leaves the session open; automatic idle cleanup is only a fallback.
     After launch follow next_action: reply, wait, collect_results or inspect. While
     unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments
     after processing each result. Background CLI waiting requires host completion notifications.
@@ -1117,7 +1120,8 @@ async def api_save_routing_guide(req: Request):
     if not isinstance(text, str):
         return bad_request("global_routing_instructions 必须是字符串。")
     try:
-        await asyncio.to_thread(hub.save_global_routing_instructions, text)
+        settings = {key: body[key] for key in ("subagent_idle_timeout_minutes",) if key in body}
+        await asyncio.to_thread(hub.save_global_routing_instructions, text, **settings)
     except ValueError as e:
         return bad_request(str(e))
     payload = await profiles_payload()
