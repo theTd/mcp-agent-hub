@@ -279,6 +279,19 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if frame == '{"type": "replay_end"}':
                 return websocket
 
+    async def test_mcp_and_console_launches_have_distinct_sources(self):
+        from unittest.mock import AsyncMock
+        with patch.object(self.module.hub, "create_session", new_callable=AsyncMock,
+                          return_value=self.session) as create:
+            await self.module.spawn_subagent("pwsh", wait_seconds=0)
+            self.assertEqual(create.call_args.kwargs["launch_source"], "agent")
+            create.reset_mock()
+            response = await self.client.post("/api/sessions", json={
+                "profile_id": "pwsh", "launch_source": "agent",
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(create.call_args.kwargs.get("launch_source", "user"), "user")
+
     async def test_worker_interfaces_are_removed(self):
         for path, method in [
             ("/worker-mcp", "post"),

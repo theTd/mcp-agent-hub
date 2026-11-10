@@ -237,6 +237,7 @@ async def spawn_subagent(
     start_seq = hub.global_seq
     session = await hub.create_session(
         profile_id=agent_type,
+        launch_source="agent",
         task=task,
         cwd=cwd,
         title=title,
@@ -851,6 +852,7 @@ async def attach_desktop_gui_window(
     target = matched[0]
     sess = await hub.create_session(
         profile_id="desktop-gui",
+        launch_source="agent",
         title=target["title"],
         hwnd=target["hwnd"],
     )
