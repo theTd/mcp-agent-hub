@@ -182,15 +182,16 @@ mod tests {
         let path = unpack(temp.path()).unwrap();
         for name in [
             "server.py",
+            "native_session_launch.py",
             "hub_poll.py",
-            "hub_worker.py",
-            "worker_bridge_mcp.py",
             "static/index.html",
             "requirements.lock",
         ] {
             assert!(path.join(name).is_file(), "{name}");
         }
         assert!(!FILES.iter().any(|(name, _)| name.contains("python.exe")
+            || name.ends_with("hub_worker.py")
+            || name.ends_with("worker_bridge_mcp.py")
             || name.ends_with(".db")
             || name.contains("agent_profiles")));
         fs::write(path.join("server.py"), "broken").unwrap();

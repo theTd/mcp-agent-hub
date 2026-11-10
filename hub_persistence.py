@@ -52,13 +52,15 @@ def logical_write(function):
         # Reserve before mutation, including archive JSON that can expand control
         # characters and duplicate messages. The fixed allowance covers raw scrollback.
         values = tuple(value.to_dict() if hasattr(value, "to_dict") else value for value in args)
+        named_values = {key: value.to_dict() if hasattr(value, "to_dict") else value
+                        for key, value in kwargs.items()}
         metadata = ()
         if session is not None:
             metadata = (session.profile_snapshot, session.conversation_ref, session.last_screen)
-            if function.__name__ in {"_archive_session", "deliver_parent_message"} or kwargs.get("final"):
+            if function.__name__ in {"_archive_session", "deliver_parent_message", "respond_to_interaction"} or kwargs.get("final"):
                 metadata += (self.parent_messages.get(session.session_id, []),
                              self._worker_message_logs.get(session.session_id, []))
-        estimate = 1024 * 1024 + 8 * len(pickle.dumps((values, kwargs, snapshot, metadata)))
+        estimate = 1024 * 1024 + 8 * len(pickle.dumps((values, named_values, snapshot, metadata)))
         async with self.db.unit(estimate):
             return await function(self, *args, **kwargs)
     return wrapped

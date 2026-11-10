@@ -118,6 +118,7 @@ def _strip_bridge_hint(text: str) -> str:
     idx = text.find("[Sub-Agent Bridge Info:")
     if idx != -1:
         text = text[:idx]
+    text = re.sub(r"\s*\[Hub Session: session_id=[^\]]+\]", "", text)
     idx2 = text.find("(When done run:")
     if idx2 != -1:
         text = text[:idx2]

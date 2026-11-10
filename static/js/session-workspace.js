@@ -217,6 +217,7 @@ function summarizeTaskForTitle(taskText, maxLen = 24) {
   if (!taskText) return '';
   let text = String(taskText).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   text = text.replace(/\[Sub-Agent Bridge Info[\s\S]*$/i, '').trim();
+  text = text.replace(/\s*\[Hub Session: session_id=[^\]]+\]/g, '').trim();
   const readExec = text.match(/^Read\s+(?:["'`]?[A-Za-z]:[\\/][^\s"'`]+["'`]?|["'`]?[^\s"'`:]+["'`]?)(?:\s+whole)?\s+and\s+(?:execute|run|implement|verify|fix|complete)\b\s*[:：]?\s*([\s\S]*)$/i);
   if (readExec) {
     const rest = (readExec[1] || '').trim();

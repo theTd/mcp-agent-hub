@@ -199,8 +199,6 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "global_routing_instructions": hub.global_routing_instructions,
         "hub_console_url": f"{base_url}/",
-        "worker_mcp_http_url": f"{base_url}/worker-mcp",
-        "worker_cli_script": str(BASE_DIR / "hub_worker.py"),
         "engines_catalog": hub.get_mcp_engines_catalog(),
         "profiles": hub.get_mcp_enabled_profiles(),
     }
@@ -362,7 +360,7 @@ async def send_to_subagent(
 ) -> Dict[str, Any]:
     """
     [主 Agent -> Sub-Agent] 向运行中的非无头 Sub-Agent 发送消息、补充指令或回答提问：
-    1. 如果该 Sub-Agent 当前正阻塞在 `hub_worker.py ask`（CLI 桥接）、`ask_parent`（`/worker-mcp` 桥接）或交互式审批/选项提示（`pending_interaction`）等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
+    1. 如果该 Sub-Agent 当前正等待原生提问或审批/选项提示（`pending_interaction`）等待主 Agent 回复，本调用会立即将 `text` 作为答案唤醒并传回给 Sub-Agent；
     2. 否则，会将 `text` 写入 Sub-Agent 的交互式虚拟终端（ConPTY）及主从邮箱，实现实时中途干预（Steering）或多轮对话。
     """
     await ensure_profiles_loaded()
@@ -586,7 +584,7 @@ async def reply_to_subagent(
     answer: str,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 通过 `hub_worker.py ask`、`ask_parent` 或交互式提示提出的问题/审批请求，立即解除 Sub-Agent 的等待阻塞。"""
+    """[主 Agent -> Sub-Agent] 专门用于回复 Sub-Agent 的原生交互提示提出的问题/审批请求，立即解除 Sub-Agent 的等待阻塞。"""
     delivery = await hub.deliver_parent_message(
         session_id=session_id,
         text=answer,
@@ -768,7 +766,7 @@ async def read_subagent_screen(
             "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
             "current_activity": session.current_activity,
             "pending_question_id": session.pending_question_id,
-            "final_response": session.final_response or transcript_summary.get("latest_conclusion"),
+            "final_response": session.final_response,
             "recent_events": hub.get_worker_events(session_id=session_id, after_seq=0)[-10:],
             "transcript_summary": transcript_summary,
             "sanitized_screen_lines": sanitize_tui_screen_text(raw_txt, max_lines=25, engine=session.engine),
@@ -899,102 +897,8 @@ async def attach_desktop_gui_window(
     }
 
 
-# ============================================================================
-# 2. 南向窄权限 MCP Server (/worker-mcp) —— 专门暴露给【Sub-Agent】主动向主 Agent 通信与上报步骤
-# ============================================================================
-worker_http_mcp = FastMCP(
-    "Parent-Agent-Narrow-Bridge",
-    instructions=(
-        "专门暴露给 Sub-Agent 的窄权限通信与遥测工具集：\n"
-        "- `report_step`：上报当前执行步骤、使用的工具或中间消息\n"
-        "- `message_parent`：主动向主 Agent 发送进度消息（立即唤醒主 Agent 监听器）\n"
-        "- `ask_parent`：向主 Agent 提问并同步阻塞等待回答\n"
-        "- `report_complete`：正式向主 Agent 交付最终结果 (`final_response`) 并持久化保存\n"
-        "- `poll_parent_instructions`：读取主 Agent 发来的补充指令"
-    ),
-)
-
-
-@worker_http_mcp.tool()
-async def report_step(
-    session_id: str,
-    step_title: str,
-    tool_name: Optional[str] = None,
-    tool_input_summary: Optional[str] = None,
-    intermediate_message: Optional[str] = None,
-) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 上报当前执行步骤、调用的工具或产出的中间结论。"""
-    return await hub.record_telemetry(
-        session_id,
-        {
-            "source": "worker_mcp",
-            "hook_event": "ReportStep",
-            "step_title": step_title,
-            "tool_name": tool_name,
-            "tool_input": tool_input_summary,
-            "intermediate_messages": [intermediate_message] if intermediate_message else [],
-        },
-    )
-
-
-@worker_http_mcp.tool()
-async def message_parent(
-    session_id: str,
-    message: str,
-    category: str = "progress",
-) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 主动向主 Agent 发送一条非阻塞消息（立即唤醒主 Agent 的后台监听进程）。"""
-    rec = await hub.record_worker_event(
-        session_id,
-        {"type": "message", "category": category, "content": message},
-    )
-    return {"delivered_to_parent": True, "event": rec}
-
-
-@worker_http_mcp.tool()
-async def ask_parent(
-    session_id: str,
-    question: str,
-    timeout_seconds: float = 300.0,
-) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 向主 Agent 提问并同步阻塞等待主 Agent 回复。"""
-    return await hub.ask_parent_and_wait(session_id, question, timeout_seconds)
-
-
-@worker_http_mcp.tool()
-async def report_complete(
-    session_id: str,
-    summary: str,
-    status: str = "success",
-    files_changed: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 宣告任务完成并交付最终总结（后台持久化入队后唤醒主 Agent）。"""
-    rec = await hub.record_worker_event(
-        session_id,
-        {
-            "type": "completed",
-            "category": "completion",
-            "status": status,
-            "content": summary,
-            "files_changed": files_changed or [],
-        },
-    )
-    return {"reported": True, "event": rec}
-
-
-@worker_http_mcp.tool()
-async def poll_parent_instructions(session_id: str) -> Dict[str, Any]:
-    """[Sub-Agent 专用] 读取主 Agent 发给当前 Sub-Agent 的所有补充指令或纠偏消息。"""
-    msgs = hub.parent_messages.get(session_id, [])
-    unread = [m for m in msgs if not m.get("read_by_worker")]
-    for m in unread:
-        m["read_by_worker"] = True
-    return {"session_id": session_id, "unread_count": len(unread), "unread_messages": unread, "all_messages": msgs}
-
-
-# Build both ASGI MCP apps and combine lifespans
+# Parent MCP app and Hub lifespan
 mcp_parent_app = mcp.http_app(path="/mcp", transport="streamable-http")
-mcp_worker_app = worker_http_mcp.http_app(path="/worker-mcp", transport="streamable-http")
 
 
 @asynccontextmanager
@@ -1003,7 +907,6 @@ async def combined_lifespan(app_instance: FastAPI):
         await hub.start()
         stack.push_async_callback(hub.archive_all_sessions_on_shutdown)
         await stack.enter_async_context(mcp_parent_app.lifespan(app_instance))
-        await stack.enter_async_context(mcp_worker_app.lifespan(app_instance))
         try:
             yield
         finally:
@@ -1031,12 +934,6 @@ async def reject_work_during_shutdown(request: Request, call_next):
 # ============================================================================
 # 3. 遥测与双向消息邮箱 HTTP API
 # ============================================================================
-@app.post("/api/telemetry/{session_id}")
-async def api_record_telemetry(session_id: str, req: Request):
-    body = await req.json()
-    return await hub.record_telemetry(session_id, body)
-
-
 @app.get("/api/sessions/{session_id}/trace")
 async def api_get_session_trace(session_id: str):
     try:
@@ -1084,30 +981,6 @@ async def api_mailbox_events(
         "events": events,
         "parent_messages": hub.parent_messages.get(session_id, []) if session_id != "all" else hub.parent_messages,
     }
-
-
-@app.post("/api/mailbox/{session_id}/worker-event")
-async def api_worker_emit_event(session_id: str, req: Request):
-    body = await req.json()
-    rec = await hub.record_worker_event(session_id, body)
-    return {"ok": True, "event": rec}
-
-
-@app.post("/api/mailbox/{session_id}/worker-ask")
-async def api_worker_ask_parent(session_id: str, req: Request):
-    body = await req.json()
-    question = body.get("question", "")
-    timeout_seconds = float(body.get("timeout_seconds", 300.0))
-    return await hub.ask_parent_and_wait(session_id, question, timeout_seconds)
-
-
-@app.get("/api/mailbox/{session_id}/parent-messages")
-async def api_get_parent_messages(session_id: str):
-    msgs = hub.parent_messages.get(session_id, [])
-    unread = [m for m in msgs if not m.get("read_by_worker")]
-    for m in unread:
-        m["read_by_worker"] = True
-    return {"session_id": session_id, "unread_count": len(unread), "unread_messages": unread, "all_messages": msgs}
 
 
 @app.post("/api/mailbox/{session_id}/reply")
@@ -1589,9 +1462,7 @@ async def api_hub_shutdown(req: Request):
     return JSONResponse({"ok": True}, background=BackgroundTask(_stop_hub_like_ctrl_c))
 
 
-# Mount both Parent MCP (/mcp) and Narrow Worker MCP (/worker-mcp)
-for route in mcp_worker_app.routes:
-    app.router.routes.append(route)
+# Mount Parent MCP (/mcp)
 for route in mcp_parent_app.routes:
     app.router.routes.append(route)
 
