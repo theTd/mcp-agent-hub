@@ -42,6 +42,7 @@ export function initSessionLauncher() {
 
   $('#cwdInput').addEventListener('input', schedulePreview);
   $('#approvalSelect').addEventListener('change', schedulePreview);
+  $('#extraArgsInput').addEventListener('input', schedulePreview);
   if ($('#envInput')) $('#envInput').addEventListener('input', schedulePreview);
   $('#launchBtn').addEventListener('click', launchSession);
   // Ctrl+Enter starts from any field inside the launcher section.
@@ -103,6 +104,8 @@ function currentProfile() {
 
 function renderProfileDetails({ reset }) {
   const p = currentProfile();
+  $('#extraArgsField').hidden = p.engine === 'dsh' || (p.kind || 'tui') !== 'tui';
+  if (reset || $('#extraArgsField').hidden) $('#extraArgsInput').value = '';
   $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy'].includes(p.engine);
   if (reset || $('#approvalField').hidden) $('#approvalSelect').value = '';
   const models = engineModels(p.engine || '');
@@ -268,6 +271,14 @@ async function runPreview() {
     bypass_approvals: sessionApprovalOverride(),
   };
   try {
+    try {
+      body.extra_args = sessionExtraArgs();
+    } catch (err) {
+      preview = { status: 'error', data: { error: err.message } };
+      renderPreview();
+      syncLaunchButton();
+      return;
+    }
     const data = await hubApi.launchPreview(body);
     if (seq !== previewSeq) return;
     if (data && data.ok === false) preview = { status: 'error', data };
@@ -341,6 +352,22 @@ function syncLaunchButton() {
 }
 
 // ------------------------------------------------------------------ launch
+function sessionExtraArgs() {
+  if ($('#extraArgsField').hidden) return [];
+  const text = $('#extraArgsInput').value.trim();
+  if (!text) return [];
+  let args;
+  try {
+    args = JSON.parse(text);
+  } catch {
+    throw new Error('本次启动参数必须是 JSON 字符串数组，例如 ["--flag", "value"]');
+  }
+  if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string' || arg.includes('\u0000'))) {
+    throw new Error('本次启动参数必须是字符串数组，且不能包含 NUL 字符');
+  }
+  return args;
+}
+
 function sessionApprovalOverride() {
   const value = $('#approvalField').hidden ? '' : $('#approvalSelect').value;
   return value === '' ? null : value === 'true';
@@ -368,11 +395,13 @@ async function launchSession() {
       cwd: cwd || null,
       env: env || null,
       bypass_approvals: sessionApprovalOverride(),
+      extra_args: sessionExtraArgs(),
     });
     const session = data.session;
     if (!session) throw new Error('服务端没有返回会话信息');
     $('#taskInput').value = '';
     $('#approvalSelect').value = '';
+    $('#extraArgsInput').value = '';
     schedulePreview();
     if (cwd) rememberCwd(cwd);
     upsertSession(session);

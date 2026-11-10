@@ -24,6 +24,10 @@ ROUTING_RULES = (
     "Choose an enabled profile, model and thinking_level from the catalog and its routing notes.",
     'Use env={"KEY": "VALUE"} for per-session environment overrides. These override profile '
     "values and are preserved on resume.",
+    'Use extra_args=["--flag", "value"] for per-session TUI CLI arguments appended to profile '
+    "args and preserved on resume. Tokens are passed literally, without shell parsing. "
+    "Use the dedicated model, thinking_level and bypass_approvals fields for those controls; "
+    "DSH and GUI sessions do not accept CLI arguments.",
     "Use bypass_approvals=null to inherit the profile, false to require approvals, or true to bypass "
     "them for this session. Explicit overrides survive resume and never change the profile.",
     "Local Windows DSH launches report sandbox_preparation. The Hub can add a root-only "

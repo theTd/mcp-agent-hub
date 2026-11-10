@@ -30,7 +30,7 @@ from winpty import PtyProcess
 REAL_PTY_PROCESS = PtyProcess
 
 from transcript_tail import TranscriptTail, read_complete_lines
-from native_session_launch import strip_legacy_worker_bridge_args
+from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from parent_waiting import build_wait_contract, session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
@@ -10837,6 +10837,7 @@ class HubSessionManager:
         cwd: Optional[str] = None,
         env: Optional[Any] = None,
         bypass_approvals: Optional[bool] = None,
+        extra_args: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
@@ -10855,7 +10856,14 @@ class HubSessionManager:
         kind = str(prof.get('kind') or 'tui')
         command = str(prof.get('command') or '')
         base_args = strip_legacy_worker_bridge_args([str(a) for a in (prof.get('args') or [])], self.runtime_configs_dir)
+        caller_args = normalize_extra_args(extra_args)
+        if caller_args and (eng == 'dsh' or kind != 'tui'):
+            raise ValueError(f"{name} 不通过 TUI 命令行启动，不支持 extra_args")
+        base_args.extend(caller_args)
         notes = []  # Chinese notes, e.g. substitutions
+        ignored_model = injected_flags_in_args(eng, caller_args)
+        if ignored_model:
+            notes.append(f"已忽略启动参数里的模型或思考等级参数（{'、'.join(ignored_model)}），请使用模型和思考等级字段")
         profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
         caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
         resolved_env: Dict[str, str] = dict(profile_env)
@@ -11078,7 +11086,7 @@ class HubSessionManager:
         args = apply_approval_flags(eng, args, bypass=bypass)
         if ignored_approval:
             notes.append(
-                f"已忽略 Profile 参数里的审批相关参数（{'、'.join(ignored_approval)}）："
+                f"已忽略启动参数里的审批相关参数（{'、'.join(ignored_approval)}）："
                 + ("由 bypass_approvals 开关决定，Hub 注入全自动参数" if bypass
                    else "Hub 统一以高风险操作需审批的模式启动")
             )
@@ -11129,6 +11137,7 @@ class HubSessionManager:
             'command': command,
             'config_dir': resolved_env.get('CLAUDE_CONFIG_DIR') if eng == 'claude' else None,
             'args': args,
+            'extra_args': caller_args,
             'env': resolved_env,
             'cwd': work_dir,
             'model': resolved_model,
@@ -11155,11 +11164,15 @@ class HubSessionManager:
         env: Optional[Any] = None,
         launch_source: str = "user",
         bypass_approvals: Optional[bool] = None,
+        extra_args: Optional[List[str]] = None,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
         if bypass_approvals is not None and type(bypass_approvals) is not bool:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
+        extra_args = normalize_extra_args(extra_args)
+        if extra_args and profile_id == "desktop-gui":
+            raise ValueError("桌面 GUI 会话不支持 extra_args")
         loop = asyncio.get_running_loop()
 
         if profile_id == "desktop-gui" and hwnd:
@@ -11196,7 +11209,7 @@ class HubSessionManager:
             return sess
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
-                                     bypass_approvals=bypass_approvals)
+                                     bypass_approvals=bypass_approvals, extra_args=extra_args)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -11282,6 +11295,7 @@ class HubSessionManager:
             "command": launch["command"],
             "config_dir": launch.get("config_dir"),
             "args": launch_args,
+            "extra_args": list(launch.get("extra_args") or []),
             "env": dict(launch.get("env") or {}),
             "model": launch.get("model"),
             "thinking_level": launch.get("thinking_level"),
