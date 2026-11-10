@@ -60,9 +60,42 @@ function toneOf(ev) {
 const LIFECYCLE_EVENT_TYPES = new Set(['exited', 'terminated']);
 
 function cleanContent(ev) {
+  // Render structured interactions for people; the event body contains English agent guidance.
+  const interaction = ev?.interaction;
+  if (interaction && ['question', 'approval_request'].includes(ev?.type)) {
+    const lines = [
+      ev.type === 'approval_request' ? '高风险操作审批请求' : '交互提问',
+      `来源引擎：${interaction.engine || ''}`,
+      `标题：${interaction.title || ''}`,
+      `详情：${interaction.prompt || ''}`,
+    ];
+    const options = Array.isArray(interaction.options) ? interaction.options : [];
+    if (options.length) {
+      lines.push('可选操作／选项：', ...options.map((option, index) => `  [${index + 1}] ${option}`));
+    } else lines.push('自由文本回复');
+    return lines.join('\n');
+  }
   // F2: the same status-text module the cards use, so an exit reads 进程已退出（退出码 N） here too.
   const text = String(ev?.content ?? '').replace(CALL_HINT_RE, '').replace(/\s+$/g, '').trim();
   if (!text) return '';
+  // Persisted events from earlier Hub runs contain the body but not the live interaction object.
+  if (['question', 'approval_request'].includes(ev?.type)
+      && /^(?:Approval request|Interactive question)\n- Engine: /.test(text)) {
+    const hint = text.lastIndexOf('\nUse respond_to_subagent_approval_or_choice(');
+    const body = hint < 0 ? text : text.slice(0, hint);
+    return body
+      .replace(/^Approval request\n/, '高风险操作审批请求\n')
+      .replace(/^Interactive question\n/, '交互提问\n')
+      .replace(/\n- Engine: ([^\n]*)/, (_, engine) => `\n来源引擎：${engine}`)
+      .replace(/\n- Title: /, '\n标题：')
+      .replace(/\n- Details: /, '\n详情：')
+      .replace(/\n- Options:\n/, '\n可选操作／选项：\n')
+      .replace(/\n  \(free-text reply\)$/, '\n自由文本回复');
+  }
+  if (LIFECYCLE_EVENT_TYPES.has(ev?.type)) {
+    const crash = text.match(/^Session crashed \(exit_code=(-?\d+)\)\. Last output:\n([\s\S]*)\nCall get_subagent_final_response\('[^']+'\)/);
+    if (crash) return `异常退出（退出码 ${crash[1]}）。最后输出：\n${crash[2] === '(no output)' ? '（无输出）' : crash[2]}`;
+  }
   if (LIFECYCLE_EVENT_TYPES.has(ev?.type) || isLifecycleSentence(text)) return activityLabel(text);
   return text;
 }

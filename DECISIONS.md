@@ -2,6 +2,12 @@
 
 Design decisions confirmed by the owner. Change a line here before changing the behaviour it records.
 
+## Agent prompt language (2026-11-10, owner)
+
+| id | decision |
+|---|---|
+| english-guidance | Hub-authored MCP instructions, tool descriptions, routing guidance and interaction reply instructions use concise English. Shared waiting rules have one source. User interface labels and messages stay Chinese. User-authored tasks, profile descriptions, routing notes and native records are preserved verbatim. |
+
 ## Background persistence (2026-11-10, Hub lock contention fix)
 
 | id | decision |

@@ -1,4 +1,5 @@
 server.py
+agent_guidance.py
 session_manager.py
 hub_database.py
 hub_persistence.py
