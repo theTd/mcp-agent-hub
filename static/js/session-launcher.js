@@ -41,6 +41,7 @@ export function initSessionLauncher() {
   pills.addEventListener('keydown', onPillsKeydown);
 
   $('#cwdInput').addEventListener('input', schedulePreview);
+  $('#approvalSelect').addEventListener('change', schedulePreview);
   if ($('#envInput')) $('#envInput').addEventListener('input', schedulePreview);
   $('#launchBtn').addEventListener('click', launchSession);
   // Ctrl+Enter starts from any field inside the launcher section.
@@ -102,6 +103,8 @@ function currentProfile() {
 
 function renderProfileDetails({ reset }) {
   const p = currentProfile();
+  $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy'].includes(p.engine);
+  if (reset || $('#approvalField').hidden) $('#approvalSelect').value = '';
   const models = engineModels(p.engine || '');
   // Engines without a model list (pwsh) get no model / thinking rows at all.
   const showModel = models.length > 0;
@@ -262,6 +265,7 @@ async function runPreview() {
     thinking_level: currentLevel || null,
     cwd: $('#cwdInput').value.trim() || null,
     env: ($('#envInput')?.value || '').trim() || null,
+    bypass_approvals: sessionApprovalOverride(),
   };
   try {
     const data = await hubApi.launchPreview(body);
@@ -301,6 +305,7 @@ function renderPreview() {
   const bits = [];
   if (d.model) bits.push(escapeHtml(d.model));
   if (d.thinking_level) bits.push(`思考 ${escapeHtml(d.thinking_level)}`);
+  if (d.high_risk_approval != null) bits.push(`${d.high_risk_approval ? '审批开启' : '绕过审批'} · ${d.approval_source === 'session' ? '本次会话' : 'Profile'}`);
   const head = bits.length ? `将运行：${bits.join(' · ')}` : '将运行：该 Profile 不使用模型与思考等级';
   const notes = (Array.isArray(d.notes) ? d.notes : [])
     .map((note) => `<div class="preview-note">${escapeHtml(note)}</div>`).join('');
@@ -336,6 +341,11 @@ function syncLaunchButton() {
 }
 
 // ------------------------------------------------------------------ launch
+function sessionApprovalOverride() {
+  const value = $('#approvalField').hidden ? '' : $('#approvalSelect').value;
+  return value === '' ? null : value === 'true';
+}
+
 async function launchSession() {
   const btn = $('#launchBtn');
   if (btn.disabled) return;
@@ -357,10 +367,13 @@ async function launchSession() {
       task: task || null,
       cwd: cwd || null,
       env: env || null,
+      bypass_approvals: sessionApprovalOverride(),
     });
     const session = data.session;
     if (!session) throw new Error('服务端没有返回会话信息');
     $('#taskInput').value = '';
+    $('#approvalSelect').value = '';
+    schedulePreview();
     if (cwd) rememberCwd(cwd);
     upsertSession(session);
     setActiveSession(session.session_id);

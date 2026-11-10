@@ -114,6 +114,14 @@
           <span class="field-label">思考等级</span>
           <div class="level-pills" id="thinkingPills" role="radiogroup" aria-label="思考等级"></div>
         </div>
+        <label class="field" id="approvalField" hidden>
+          <span class="field-label">本次会话审批</span>
+          <select id="approvalSelect">
+            <option value="">继承 Profile</option>
+            <option value="false">强制审批</option>
+            <option value="true">绕过审批（全自动）</option>
+          </select>
+        </label>
         <div class="run-preview" id="runPreview" hidden></div>
         <label class="field">
           <span class="field-label">初始任务 <span class="opt">可选</span></span>

@@ -3,6 +3,7 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 Set-StrictMode -Version Latest
 foreach ($module in @('Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility')) {
     Import-Module (Join-Path $PSHOME ("Modules/" + $module + "/" + $module + '.psd1')) -ErrorAction Stop

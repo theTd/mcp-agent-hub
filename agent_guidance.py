@@ -24,9 +24,18 @@ ROUTING_RULES = (
     "Choose an enabled profile, model and thinking_level from the catalog and its routing notes.",
     'Use env={"KEY": "VALUE"} for per-session environment overrides. These override profile '
     "values and are preserved on resume.",
+    "Use bypass_approvals=null to inherit the profile, false to require approvals, or true to bypass "
+    "them for this session. Explicit overrides survive resume and never change the profile.",
+    "Local Windows DSH launches report sandbox_preparation. The Hub can add a root-only "
+    "WRITE_OWNER grant to the matching host account on an owned workspace. A blocked check "
+    "prevents dispatch; skipped means the host could not be verified. Permission readiness "
+    "does not confirm native sandbox startup or access to existing descendants. Inspect the "
+    "reason instead of repeatedly retrying.",
     BACKGROUND_POLL_HINT,
     "Questions and approval requests set waiting_parent. Answer the native interaction with "
     "reply_to_subagent or respond_to_subagent_approval_or_choice, using its request_id.",
+    "An approval response's delivered flag means input was sent, not accepted by the CLI. "
+    "If response_state is unconfirmed, keep waiting; never resend automatically.",
     "Subagents use their native questions and responses. The Hub observes native records; "
     "do not ask subagents to call Hub reporting tools. Intermediate text does not confirm "
     "completion. Check the native turn completion and from_previous_turn flag before using a final answer.",
@@ -36,6 +45,9 @@ SERVER_INSTRUCTIONS = (
     "Manage interactive subagents in the Hub console. Call list_agent_profiles for enabled "
     "profiles, models, thinking levels and routing guidance. Use spawn_subagent to start work, "
     "send_to_subagent to steer it, and resume_subagent to restore an ended session. "
+    "Check delivery.delivered and the matching last_injection; null means unconfirmed, not success. "
+    "Never blindly resend a failed/unconfirmed Codex submission: inspect it, then clear an idle "
+    "nonempty draft with send_to_subagent(text='', clear_input=true) before sending new text. "
     "Inspect progress with get_subagent_status_and_trace; retrieve persisted answers with "
     "get_subagent_final_response even after a process exits.\n"
     + "\n".join(f"- {rule}" for rule in ROUTING_RULES)
