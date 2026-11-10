@@ -85,6 +85,36 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         await self.hub.archive_all_sessions_on_shutdown()
         self.temporary.cleanup()
 
+    async def test_launch_source_survives_persistence_resume_and_mailbox_delivery(self):
+        for source in ("agent", "user"):
+            sess = await self.hub.create_session(
+                "desktop-gui", hwnd=123, launch_source=source,
+            )
+            self.assertEqual(sess.to_dict()["launch_source"], source)
+            await self.hub.db.flush()
+            record = await self.hub.db.get_session_record(sess.session_id)
+            resumed = await self.hub._make_resumed_session(
+                sess.session_id, record, record["profile_snapshot"], {}, {},
+            )
+            self.hub.sessions[sess.session_id] = resumed
+            self.assertEqual(resumed.launch_source, source)
+            for kind, category in (("question", "question_waiting_reply"),
+                                   ("approval_request", "approval_waiting_reply")):
+                event = await self.hub.record_worker_event(sess.session_id, {
+                    "type": kind, "category": category, "content": "Reply?",
+                    # Callers cannot override the session's notification ownership.
+                    "launch_source": "user" if source == "agent" else "agent",
+                })
+                self.assertEqual(event["launch_source"], source)
+                self.assertEqual(self.hub.get_worker_events(sess.session_id)[-1], event)
+                self.assertEqual(resumed.status, "waiting_parent")
+
+    async def test_legacy_and_default_launches_keep_user_notifications(self):
+        legacy = self.session("codex", "-legacy")
+        self.assertEqual(legacy.launch_source, "user")
+        sess = await self.hub.create_session("desktop-gui", hwnd=123)
+        self.assertEqual(sess.launch_source, "user")
+
     def session(self, engine, suffix=""):
         sid = f"{engine}-native{suffix}"
         sess = AgentSession(sid, engine, engine, "tui", "Native fixture", str(self.root), "unused", [])

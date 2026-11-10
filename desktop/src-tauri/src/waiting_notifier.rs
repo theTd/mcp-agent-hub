@@ -1,5 +1,5 @@
 //! Toasts for sessions that wait on the parent: long-polls the hub's mailbox and shows one toast per
-//! approval or question (per request_id), unless the window is already in front of the user.
+//! approval or question (per request_id) from user-launched sessions, unless the window is in front.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -63,6 +63,11 @@ pub fn first_line_capped(text: &str, max: usize) -> String {
 
 /// Which mailbox events notify: `approval_waiting_reply` and `question_waiting_reply`, nothing else.
 pub fn waiting_toast_for(event: &Value) -> Option<WaitingToast> {
+    // The parent agent handles its children's questions and approvals through the mailbox.
+    // Missing provenance keeps older hubs compatible with the existing notification behavior.
+    if str_field(event, "launch_source") == Some("agent") {
+        return None;
+    }
     let kind = match str_field(event, "category")? {
         "approval_waiting_reply" => WaitKind::Approval,
         "question_waiting_reply" => WaitKind::Question,
@@ -269,6 +274,21 @@ mod tests {
         assert_eq!(t.kind, WaitKind::Question);
         assert_eq!(t.prompt_line, "Which branch?");
         assert_eq!(t.kind.toast_title(), "子 Agent 在提问");
+    }
+
+    #[test]
+    fn agent_launched_sessions_do_not_notify() {
+        for category in ["approval_waiting_reply", "question_waiting_reply"] {
+            for (source, notifies) in [("agent", false), ("user", true)] {
+                let ev = json!({"seq": 1, "session_id": "s1", "category": category,
+                    "launch_source": source, "request_id": "r", "content": "Reply?"});
+                assert_eq!(
+                    waiting_toast_for(&ev).is_some(),
+                    notifies,
+                    "{source}: {category}"
+                );
+            }
+        }
     }
 
     #[test]

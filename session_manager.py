@@ -2263,6 +2263,12 @@ class AgentSession:
             self.engine or snap.get("engine"), snap.get(BYPASS_APPROVALS_KEY) is True
         )
 
+    @property
+    def launch_source(self) -> str:
+        # Stored with the resolved launch so archive/resume keeps notification ownership.
+        # Older sessions have no provenance; preserve their existing notification behavior.
+        return str(self.profile_snapshot.get("launch_source") or "user")
+
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
         if not alive and self.pty is not None and self.status not in (
@@ -2271,6 +2277,7 @@ class AgentSession:
             self.status = "exited"
         return {
             "session_id": self.session_id,
+            "launch_source": self.launch_source,
             "profile_id": self.profile_id,
             "profile_name": self.profile_name,
             "engine": self.engine,
@@ -5208,6 +5215,7 @@ class HubSessionManager:
 
         record = {
             "session_id": session_id,
+            "launch_source": sess.launch_source if sess else None,
             "timestamp": round(time.time(), 3),
             "type": ev_type,
             "category": payload.get("category", ev_type),
@@ -10732,7 +10740,10 @@ class HubSessionManager:
         model: Optional[str] = None,
         thinking_level: Optional[str] = None,
         env: Optional[Any] = None,
+        launch_source: str = "user",
     ) -> AgentSession:
+        if launch_source not in ("user", "agent"):
+            raise ValueError("launch_source must be user or agent")
         loop = asyncio.get_running_loop()
 
         if profile_id == "desktop-gui" and hwnd:
@@ -10755,6 +10766,7 @@ class HubSessionManager:
             # Spec §3: even a non-resumable session keeps the launch it ran with, so the archive can
             # say why it cannot be revived instead of "no launch recorded".
             sess.profile_snapshot = {
+                "launch_source": launch_source,
                 "profile_id": "desktop-gui", "engine": "desktop_gui", "kind": "desktop_gui",
                 "command": "", "args": [], "env": {}, "model": None, "thinking_level": None,
                 "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
@@ -10843,6 +10855,7 @@ class HubSessionManager:
         if claude_session_uuid:
             sess.conversation_ref = {"session_id": claude_session_uuid}
         sess.profile_snapshot = {
+            "launch_source": launch_source,
             "profile_id": profile_id,
             "engine": engine,
             "kind": kind,
