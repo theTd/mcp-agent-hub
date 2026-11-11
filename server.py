@@ -1296,6 +1296,15 @@ async def api_session_transcript_summary(session_id: str):
         return not_found(f"找不到会话 {session_id}")
 
 
+@app.get("/api/sessions/{session_id}/transcript")
+async def api_session_transcript(session_id: str, limit: int = Query(80, ge=10, le=200)):
+    """Lightweight engine-neutral transcript feed for the console's default view."""
+    try:
+        return await hub.get_transcript_view(session_id, limit=limit)
+    except ValueError as e:
+        return not_found(f"找不到会话 {session_id}")
+
+
 @app.post("/api/sessions")
 async def api_create_session(req: Request):
     body = await req.json()
