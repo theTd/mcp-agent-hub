@@ -3356,6 +3356,8 @@ class HubSessionManager:
             eng = self._infer_engine(pid, prof)
             prof["engine"] = eng
             prof["enabled"] = bool(prof.get("enabled", True))
+            # The global routing guide is authoritative; when_to_use remains a supplemental
+            # hint for new or not-yet-benchmarked route cases.
             prof["when_to_use"] = prof.get("when_to_use") or ""
             try:
                 prof["env"] = normalize_env_map(prof.get("env"))
@@ -3533,7 +3535,7 @@ class HubSessionManager:
             lines.append(f"- `{pid}` — {name} | defaults: {def_mod} / {def_thk}")
             when_lines = [ln.strip() for ln in (p.get("when_to_use") or "").splitlines() if ln.strip()]
             if when_lines:
-                lines.append("  When to use: " + "\n  ".join(when_lines))
+                lines.append("  When to use (supplemental): " + "\n  ".join(when_lines))
         lines.append("")
         lines.append("## Available models and thinking levels (model / thinking_level)")
         for eng, info in self.engines_catalog.items():

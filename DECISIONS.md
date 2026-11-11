@@ -40,8 +40,8 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 
 | id | decision |
 |---|---|
-| profile-identity | A Profile is a launch recipe (engine, command, args, task mode, default model, default thinking level, when_to_use). Model and thinking level are chosen at launch; variants per model/thinking are not Profiles. Old variant ids were dropped without aliases. |
-| agent-guidance | Guidance for parent agents lives in three places: Profile `when_to_use`, per-model notes (`engine_policies.<engine>.model_notes`), and the thinking rule of thumb in `global_routing_instructions`. |
+| profile-identity | A Profile is a launch recipe (engine, command, args, task mode, default model, default thinking level, and optional `when_to_use` hint). Model and thinking level are chosen at launch; variants per model/thinking are not Profiles. Old variant ids were dropped without aliases. |
+| agent-guidance | Parent-agent routing uses the single global routing guide first, with per-model notes (`engine_policies.<engine>.model_notes`) as catalog metadata. Profile `when_to_use` is supplemental guidance for new or not-yet-benchmarked route cases, not a competing primary policy. |
 | thinking-injection | The hub injects model and thinking per engine and strips them from saved args: omp `--model=/--thinking=`, kimi `-m` + env `KIMI_MODEL_THINKING_EFFORT` (child only), agy model-name suffix, codex `-m` + `-c model_reasoning_effort`, dsh via the DSH spec. Saved args may not contain these flags. |
 | disabled-default | A disabled default model is replaced by the first enabled model, and the launcher, preview and toast say so; an engine with no enabled model refuses to launch. |
 | codex-synthesis | Codex profiles are no longer synthesised from ~/.codex config or recent configurations. |
