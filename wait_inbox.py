@@ -352,4 +352,4 @@ class WaitInbox:
     async def close(self) -> None:
         for handle, waiter in list(self._waiters.items()):
             waiter[1].set_result({"state": "superseded", "wait_handle": handle})
-        self._waiters.clear()\n
+        self._waiters.clear()
