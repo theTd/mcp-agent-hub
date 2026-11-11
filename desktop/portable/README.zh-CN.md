@@ -48,6 +48,8 @@
 在 `desktop` 目录运行 `pnpm install --frozen-lockfile`，再运行 `pnpm build:portable`。
 输出单 EXE 到 `desktop/dist`，同时提供带说明和示例配置的可选 ZIP。打包不下载或携带 Python；首次运行按上述规则准备环境。默认单个 Cargo 编译任务，可通过 `CARGO_BUILD_JOBS` 调整。
 
+完整的构建前置条件、并行编译设置、产物清单和普通安装版命令见仓库 [`docs/BUILDING.md`](../../docs/BUILDING.md)。
+
 构建使用逐文件资源清单和路径重映射；发布前扫描原始资源及 EXE 的 ASCII、UTF-8、UTF-16 和 PE 调试记录，拒绝构建机路径、用户名、机器名及凭据。扫描未通过不更新发布文件。成品旁提供 `.privacy.json` 和 `.sha256` 检查记录。
 
 `pnpm build` 继续生成原有 NSIS 安装版。源码后端未指定 `HUB_DATA_DIR` 时仍使用原数据位置；该变量可将数据库和运行配置放到独立目录。
