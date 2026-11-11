@@ -81,7 +81,7 @@ function cleanContent(ev) {
   // Persisted events from earlier Hub runs contain the body but not the live interaction object.
   if (['question', 'approval_request'].includes(ev?.type)
       && /^(?:Approval request|Interactive question)\n- Engine: /.test(text)) {
-    const hint = text.lastIndexOf('\nUse respond_to_subagent_approval_or_choice(');
+    const hint = text.lastIndexOf('\nUse respond_to_subagent(');
     const body = hint < 0 ? text : text.slice(0, hint);
     return body
       .replace(/^Approval request\n/, '高风险操作审批请求\n')

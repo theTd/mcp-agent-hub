@@ -37,9 +37,10 @@ from session_mcp_config import (
     build_mcp_args, merge_claude_settings, replace_claude_settings,
 )
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
-from parent_waiting import build_wait_contract, session_targets
+from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
+from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 
 from dsh_endpoint import dsh_base_url, dsh_url
 from dsh_workspace_permissions import prepare_dsh_workspace
@@ -900,7 +901,7 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
 
 # ── Approval by default (owner decision 2026-11-07, DECISIONS.md D1-D5/D9) ─────────────────────
 # Every engine runs in the mode where routine work runs on its own and high-risk operations stop
-# for approval (the main agent answers through respond_to_subagent_approval_or_choice). The hub
+# for approval (the main agent answers through respond_to_subagent). The hub
 # strips each engine's bypass/mode flags from the profile (or the archived snapshot on resume) and
 # injects its own, in the same place as the model/thinking injection. The only way out is the
 # profile's own `bypass_approvals: true` (round 2, see bypass_launch_flags below).
@@ -1855,6 +1856,9 @@ class AgentSession:
         on_tui_tool_cb: Optional[Callable[[str, str, str], None]] = None,
     ):
         self.session_id = session_id
+        # Parent-facing protocol identity.  It is opaque to callers except as a correlation value.
+        self.turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+        self.wait_handle: Optional[str] = None
         self.profile_id = profile_id
         self.profile_name = profile_name
         self.kind = kind  # "tui" | "web_gui" | "desktop_gui"
@@ -1895,6 +1899,7 @@ class AgentSession:
         self.files_changed: List[str] = []
         self.pending_question_id: Optional[str] = None
         self.pending_interaction: Optional[Dict[str, Any]] = None
+        self._responded_request_ids: Dict[str, Dict[str, Any]] = {}
         self.engine: str = "generic"
         self.transcript_path: Optional[Path] = None
         # K3 (fix 9): user messages the transcript watcher has read from this session's transcript
@@ -2466,6 +2471,8 @@ class AgentSession:
             self.status = "exited"
         return {
             "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "wait_handle": self.wait_handle,
             "launch_source": self.launch_source,
             "profile_id": self.profile_id,
             "profile_name": self.profile_name,
@@ -2685,6 +2692,7 @@ class HubSessionManager:
         self.runtime_configs_dir.mkdir(exist_ok=True)
 
         self.db = HubPersistence(self.data_dir / "hub_state.db")
+        self.wait_inbox = WaitInbox(self.data_dir / "wait_inbox.db")
         self._loop = None
         self._background_tasks = set()
         self._shutdown_task = None
@@ -2727,6 +2735,7 @@ class HubSessionManager:
         self.pending_questions: Dict[str, Dict[str, Any]] = {}
         self._event_waiters: Set[asyncio.Event] = set()
         self._shutting_down: bool = False
+        self.wait_inbox.set_state_provider(self._wait_state_snapshot)
 
         # B11: the constructor must never shell out to five CLIs. It loads the profile file at once
         # (using whatever discovery already has) and finishes discovery on a background thread, so
@@ -2754,6 +2763,44 @@ class HubSessionManager:
             raise
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
+
+    async def _wait_state_snapshot(self, session_ids: List[str]) -> Dict[str, Any]:
+        """Compact state provider used by WaitInbox after a restart or a quiet turn."""
+        pending = []
+        states = []
+        for sid in session_ids:
+            sess = self.sessions.get(sid)
+            if sess is not None:
+                if sess.pending_interaction:
+                    pending.append(dict(sess.pending_interaction))
+                states.append({
+                    "session_id": sid,
+                    "status": sess.status,
+                    "turn_id": sess.turn_id,
+                    "final_response": sess.final_response,
+                    "completion_reported": bool(sess.completion_reported),
+                })
+            else:
+                rec = await self.db.get_session_record(sid)
+                states.append({
+                    "session_id": sid,
+                    "status": (rec or {}).get("status", "unknown"),
+                    "turn_id": (rec or {}).get("turn_id"),
+                    "final_response": (rec or {}).get("final_response"),
+                    "completion_reported": bool((rec or {}).get("final_response")),
+                })
+        if pending:
+            return {"state": "ask", "requests": pending, "result_id": pending[0].get("request_id")}
+        if states and all(s["status"] in ("completed", "exited") and s.get("completion_reported") for s in states):
+            results = [
+                {"session_id": s["session_id"], "turn_id": s.get("turn_id"), "final_response": s.get("final_response") or ""}
+                for s in states
+            ]
+            rid = "group:" + ":".join(f"{r['session_id']}:{r.get('turn_id') or 'current'}" for r in results)
+            return {"state": "done", "result_id": rid, "final_response": results[0]["final_response"] if len(results) == 1 else None, "results": results}
+        if any(s["status"] in ("crashed", "terminated", "interrupted") for s in states):
+            return {"state": "failed", "error": "one or more sessions failed", "results": states}
+        return {"state": "waiting"}
 
     def _subagent_cleanup_due(self, sess: AgentSession, now: float) -> bool:
         timeout = self.subagent_idle_timeout_minutes
@@ -4477,6 +4524,8 @@ class HubSessionManager:
             on_tui_tool_cb=self._tool_callback,
         )
         sess.engine = engine
+        sess.turn_id = str(record.get("turn_id") or sess.turn_id)
+        sess.wait_handle = record.get("wait_handle")
         sess.effective_model = snapshot.get("model") or record.get("effective_model")
         sess.effective_thinking_level = snapshot.get("thinking_level") or record.get("effective_thinking_level")
         sess.last_task = str(record.get("last_task") or "")
@@ -5348,6 +5397,13 @@ class HubSessionManager:
             with self._transcript_lock:
                 self._claimed_transcripts.clear()
             self._notify_waiters()
+            # Parent waiters receive one durable terminal signal and then reconnect to the same
+            # opaque URL after the replacement Hub has restored the inbox.
+            try:
+                await self.wait_inbox.publish_shutdown()
+                await self.wait_inbox.close()
+            except Exception:
+                logger.exception("Could not publish Hub shutdown to wait inbox")
             for entry in self.pending_questions.values():
                 event = entry.get("event")
                 if isinstance(event, asyncio.Event):
@@ -5517,9 +5573,16 @@ class HubSessionManager:
             "files_changed": payload.get("files_changed", []),
             "request_id": payload.get("request_id"),
             "interaction": payload.get("interaction"),
+            "turn_id": getattr(sess, "turn_id", None),
         }
         seq = await self.db.insert_worker_event(record)
         record["seq"] = seq
+        if ev_type == "turn_completed":
+            record["result_id"] = f"result:{session_id}:{record.get('turn_id') or seq}"
+        # The parent inbox has its own durable cursor and only receives wake-worthy events.  Tool,
+        # progress and ordinary delivery telemetry remains in worker_events for the console/audit.
+        if ev_type in WAKE_EVENT_TYPES:
+            await self.wait_inbox.publish_event(record)
         if sess:
             await self.persist_session(sess)
         def publish():
@@ -5912,7 +5975,7 @@ class HubSessionManager:
             f"- Title: {title}\n"
             f"- Details: {prompt}\n"
             f"- Options:\n{opts_lines}\n"
-            f"Use respond_to_subagent_approval_or_choice(session_id='{session.session_id}', "
+            f"Use respond_to_subagent(session_id='{session.session_id}', "
             f"request_id='{req_id}') with decision='approve' / 'approve_session' / 'deny' for approvals, "
             "option_index=1..N for choices, or custom_input for free text. "
             "Free text alone denies an approval; approve_session may persist an engine allow rule."
@@ -6300,6 +6363,11 @@ class HubSessionManager:
         sess = self.sessions.get(session_id)
         if not sess:
             raise ValueError(f"Active session '{session_id}' not found.")
+
+        # request_id is the idempotency key for approvals/questions.  A retried deny or answer
+        # returns the original compact outcome and never writes another native key.
+        if request_id and request_id in getattr(sess, "_responded_request_ids", {}):
+            return dict(sess._responded_request_ids[request_id], idempotent=True)
 
         eng = (sess.engine or self._infer_engine(sess.profile_id, {})).lower()
         await self.poll_tui_screen_interactions_once(sess)
@@ -6718,7 +6786,7 @@ class HubSessionManager:
                 await asyncio.sleep(AGY_DENY_FEEDBACK_DELAY_SEC)
                 await self._deliver_deny_feedback(session_id, feedback_text)
 
-        return {
+        response = {
             "ok": True,
             "delivered": delivered,
             "response_state": response_state,
@@ -6737,6 +6805,9 @@ class HubSessionManager:
             "action_trace": action_trace,
             "notes": notes,
         }
+        if target_qid:
+            sess._responded_request_ids[target_qid] = dict(response)
+        return response
 
     def begin_new_turn(self, session: AgentSession, status: Optional[str] = None) -> None:
         """T1/D2: a message to a completed session (or a resume) starts a new turn.
@@ -6750,6 +6821,7 @@ class HubSessionManager:
         turn, so a later exit is judged on this turn's evidence.
         """
         session._turn_completion_emitted = False
+        session.turn_id = f"turn-{uuid.uuid4().hex[:12]}"
         session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
         session._seen_tui_prompt_signatures.clear()
@@ -7455,143 +7527,6 @@ class HubSessionManager:
                 item.setdefault("session_id", sid)
                 pending.append(item)
         return pending
-
-    async def parent_wait_state(
-        self, session_id: str, next_seq: int, pending_interactions=None, event_session_ids=(),
-    ) -> Dict[str, Any]:
-        pending = pending_interactions
-        if pending is None:
-            pending = await self.get_pending_interactions(session_id)
-        ids = session_targets(session_id)
-        if ids is None:
-            # 'all' is a legacy discovery scope, not ownership of every historical task.
-            ids = list(dict.fromkeys([
-                *(sid for sid, sess in self.sessions.items()
-                  if sess.status in ("starting", "running", "waiting_parent")),
-                *event_session_ids,
-            ]))
-        states = {}
-        for sid in ids:
-            sess = self.sessions.get(sid)
-            if sess is not None:
-                states[sid] = {
-                    "status": sess.status,
-                    "turn_completed": bool(sess.completion_reported),
-                    "from_previous_turn": bool(sess.final_response_from_previous_turn),
-                }
-            else:
-                rec = await self.db.get_session_record(sid)
-                states[sid] = {
-                    "status": (rec.get("end_reason") or rec.get("status")) if rec else "unknown",
-                    "from_previous_turn": bool((rec or {}).get("from_previous_turn")),
-                }
-        return {"pending_interactions": pending, **build_wait_contract(states, pending, next_seq)}
-
-    async def poll_worker_events(
-        self,
-        session_id: str = "all",
-        after_seq: int = 0,
-        timeout_sec: float = 25.0,
-        wake_on_pending: bool = False,
-        wake_on_state: bool = False,
-        include_results: bool = False,
-        include_deliveries: bool = False,
-    ) -> Dict[str, Any]:
-        session_targets(session_id)
-        if after_seq < 0 or not math.isfinite(timeout_sec) or timeout_sec < 0:
-            raise ValueError("after_seq and timeout must be finite and nonnegative.")
-        async def snapshot(reason):
-            pending = await self.get_pending_interactions(session_id)
-            # Read events after native interaction detection: it may emit a new event.
-            events = self.get_worker_events(session_id, after_seq)
-            next_seq = events[-1]["seq"] if events else after_seq
-            state = await self.parent_wait_state(
-                session_id, next_seq, pending, (event["session_id"] for event in events),
-            )
-            delivery_updates = [
-                event for event in events
-                if event.get("type") in ("input_delivery", "delivery_confirmed", "delivery_failed")
-            ] if include_deliveries else []
-            results = []
-            if include_results:
-                for completed_id in state.get("completed_session_ids") or []:
-                    try:
-                        results.append(await self.get_subagent_final_response(completed_id))
-                    except ValueError:
-                        pass
-            arguments = state["next_wait_arguments"]
-            if arguments:
-                arguments = {
-                    **arguments,
-                    "wake_on_pending": bool(wake_on_pending),
-                    "wake_on_state": bool(wake_on_state),
-                    "include_results": bool(include_results),
-                    "include_deliveries": bool(include_deliveries),
-                }
-            command = self.build_poll_command(
-                arguments["session_id"] if arguments else session_id, next_seq,
-            )
-            return {
-                **state,
-                "woke_reason": reason,
-                "session_id": session_id,
-                "after_seq": after_seq,
-                "next_seq": next_seq,
-                "events": events,
-                "delivery_updates": delivery_updates,
-                "results": results,
-                "next_poll_command": command,
-                "background_poll_command": command,
-            }
-
-        def ready(result):
-            return (bool(result["events"])
-                    or (include_results and bool(result["results"]))
-                    or (wake_on_pending and bool(result["pending_interactions"]))
-                    or (wake_on_state and result["next_action"] != "wait"))
-
-        # Register before any awaited inspection, so an event arriving during inspection
-        # cannot fall between the initial snapshot and listener registration.
-        waiter = asyncio.Event()
-        self._event_waiters.add(waiter)
-        deadline = time.monotonic() + timeout_sec
-        try:
-            result = await snapshot("events_available")
-            if ready(result):
-                if not result["events"]:
-                    result["woke_reason"] = "pending_interaction_waiting" if result["pending_interactions"] else "session_state_available"
-                return result
-            while not self._shutting_down:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    await asyncio.wait_for(waiter.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break
-                if self._shutting_down:
-                    break
-                waiter.clear()
-                result = await snapshot("worker_event_triggered")
-                if ready(result):
-                    return result
-        finally:
-            self._event_waiters.discard(waiter)
-
-        return await snapshot("hub_shutdown" if self._shutting_down else "timeout_no_new_events")
-
-    def build_poll_command(self, session_id: str, after_seq: int = 0, timeout: int = 1800) -> str:
-        # Use the running Hub's interpreter; a worktree need not contain a local .venv.
-        # Use forward slashes and only quote paths when they contain spaces, so the command runs
-        # directly as a command in both bash and PowerShell without needing a PowerShell-only `&`.
-        python_exe = str(Path(sys.executable).resolve()).replace("\\", "/")
-        poll_script = str((self.base_dir / "hub_poll.py").resolve()).replace("\\", "/")
-        py_token = f'"{python_exe}"' if " " in python_exe else python_exe
-        # R9: the poll command must reach the hub that issued it, not a hard-coded default port.
-        return (
-            f'{py_token} "{poll_script}" --session {session_id} '
-            f'--after-seq {after_seq} --timeout {timeout} --hub-url "{hub_api_base_url()}"'
-        )
 
     def _transcript_watch_alive(self, session: AgentSession) -> bool:
         """Follow all turns and briefly drain delayed native records after process exit."""

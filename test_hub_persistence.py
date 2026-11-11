@@ -415,7 +415,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             store.max_units = 1
             await store.add_tool_call("test-tui", 1, "capacity-filler", "")
             before = time.monotonic()
-            response = await self.client.post("/api/mailbox/test-tui/reply", json={"text": "must not publish", "also_write_pty": False})
+            response = await self.client.post("/api/sessions/test-tui/respond", json={"text": "must not publish"})
             elapsed = time.monotonic() - before
             self.assertEqual(response.status_code, 503, response.text)
             self.assertGreaterEqual(elapsed, 1.9)
@@ -428,7 +428,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             lock.rollback()
             lock.close()
         await store.flush()
-        response = await self.client.post("/api/mailbox/test-tui/reply", json={"text": "recovered", "also_write_pty": False})
+        response = await self.client.post("/api/sessions/test-tui/respond", json={"text": "recovered"})
         self.assertEqual(response.status_code, 200)
         await store.flush()
         self.assertEqual([row["content"] for row in self.module.hub.parent_messages["test-tui"]], ["recovered"])

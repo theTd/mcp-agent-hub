@@ -6,7 +6,7 @@
 # - omp's built-in critical list still asks (rm -rf on /, sudo rm, mkfs, dd of=/dev/..., curl | sh,
 #   shutdown/reboot, chmod -R ... /).
 # - Every pattern below also asks; the session then waits in waiting_parent with an
-#   approval_request until the main agent answers with respond_to_subagent_approval_or_choice.
+#   approval_request until the main agent answers with respond_to_subagent.
 #
 # Pattern rules (omp 2026-11, packages/coding-agent/src/tools/bash.ts):
 # - '*' is the only wildcard (any text, also empty); whitespace is collapsed; the match is anchored

@@ -11,7 +11,7 @@ model_discovery.py
 dsh_endpoint.py
 dsh_workspace_permissions.py
 transcript_summarizer.py
-hub_poll.py
+wait_inbox.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/omp-approval.yml

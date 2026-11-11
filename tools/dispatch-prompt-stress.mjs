@@ -28,8 +28,8 @@ function normalizeAction(value) {
   const v = value.toLowerCase().replace(/\s+/g, ' ').trim();
   for (const token of valid) if (v.includes(token)) return token;
   if (v.includes('terminate_subagent') || v.includes('close')) return 'terminate';
-  if (v.includes('wait_subagent_events') || v.includes('poll')) return 'wait';
-  if (v.includes('reply_to_subagent') || v.includes('respond')) return 'respond';
+  if (v.includes('wait_url') || v.includes('/api/wait/')) return 'wait';
+  if (v.includes('respond_to_subagent')) return 'respond';
   if (v.includes('inspect') || v.includes('check')) return 'inspect';
   return v;
 }

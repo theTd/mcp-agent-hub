@@ -1,4 +1,4 @@
-//! Toasts for sessions that wait on the parent: long-polls the hub's mailbox and shows one toast per
+//! Toasts for sessions that wait on the parent: reads the console telemetry stream and shows one toast per
 //! approval or question (per request_id) from user-launched sessions, unless the window is in front.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -12,7 +12,7 @@ use crate::desktop_toast::{self, ToastClick};
 use crate::hub_supervisor::HubShell;
 
 pub const PROMPT_MAX_CHARS: usize = 120;
-const POLL_TIMEOUT_SECS: u64 = 25;
+const TELEMETRY_INTERVAL_SECS: u64 = 2;
 const DEDUP_CAPACITY: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +151,8 @@ async fn pause(gen_rx: &mut tokio::sync::watch::Receiver<u64>, d: Duration) {
     }
 }
 
-/// Runs for the app's lifetime. The cursor starts at the hub's current `global_seq` (old events
-/// never notify) and is reset whenever the hub generation changes (restart, takeover) or a poll fails.
+/// Runs for the app's lifetime. This is a console telemetry cursor; parent wait handles remain
+/// entirely inside the Hub and are never consumed by the desktop notifier.
 pub async fn run(app: AppHandle, shell: Arc<HubShell>) {
     let mut dedup = ToastDeduper::new(DEDUP_CAPACITY);
     let mut gen_rx = shell.subscribe_generation();
@@ -166,26 +166,13 @@ pub async fn run(app: AppHandle, shell: Arc<HubShell>) {
         };
         let after = match cursor {
             Some((generation, seq)) if generation == target.generation => seq,
-            _ => match target.api.global_seq().await {
-                Ok(seq) => {
-                    shell.log(&format!(
-                        "notifier: watching events after seq {seq} (generation {})",
-                        target.generation
-                    ));
-                    seq
-                }
-                Err(_) => {
-                    cursor = None;
-                    pause(&mut gen_rx, Duration::from_secs(2)).await;
-                    continue;
-                }
-            },
+            _ => 0,
         };
-        let polled = tokio::select! {
-            r = target.api.poll(after, POLL_TIMEOUT_SECS) => Some(r),
+        let telemetry = tokio::select! {
+            r = target.api.telemetry(after) => Some(r),
             _ = gen_rx.changed() => None,
         };
-        let reply = match polled {
+        let reply = match telemetry {
             None => {
                 cursor = None;
                 continue;
@@ -197,17 +184,18 @@ pub async fn run(app: AppHandle, shell: Arc<HubShell>) {
             }
             Some(Ok(reply)) => reply,
         };
-        if reply.next_seq < after {
+        if reply.global_seq < after {
             // The hub's sequence went backwards (a different hub answers now): start over.
             cursor = None;
             continue;
         }
-        cursor = Some((target.generation, reply.next_seq));
+        cursor = Some((target.generation, reply.global_seq));
         if !reply.events.is_empty() {
             shell.refresh_counts_and_tray(&app).await;
         }
         let toasts = toasts_for_events(&reply.events, &mut dedup);
         if toasts.is_empty() {
+            pause(&mut gen_rx, Duration::from_secs(TELEMETRY_INTERVAL_SECS)).await;
             continue;
         }
         let titles: HashMap<String, String> = target
@@ -244,6 +232,7 @@ pub async fn run(app: AppHandle, shell: Arc<HubShell>) {
                 ToastClick::OpenSession(toast.session_id.clone()),
             );
         }
+        pause(&mut gen_rx, Duration::from_secs(TELEMETRY_INTERVAL_SECS)).await;
     }
 }
 

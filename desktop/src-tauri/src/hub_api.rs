@@ -87,15 +87,9 @@ struct SessionsReply {
 }
 
 #[derive(Debug, Deserialize)]
-struct EventsReply {
+pub struct TelemetryEvents {
     #[serde(default)]
-    global_seq: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PollReply {
-    #[serde(default)]
-    pub next_seq: u64,
+    pub global_seq: u64,
     #[serde(default)]
     pub events: Vec<Value>,
 }
@@ -165,24 +159,15 @@ impl HubApi {
         }
     }
 
-    /// The current event sequence: notifications start after it, so old events never notify.
-    pub async fn global_seq(&self) -> Result<u64, String> {
-        let reply: EventsReply = self
+    /// Console-only telemetry. This cursor is independent from parent wait handles.
+    pub async fn telemetry(&self, after_seq: u64) -> Result<TelemetryEvents, String> {
+        let reply: TelemetryEvents = self
             .get_json(
-                "/api/mailbox/events?session_id=all&after_seq=0",
+                &format!("/api/telemetry/events?session_id=all&after_seq={after_seq}"),
                 Duration::from_secs(10),
             )
             .await?;
-        Ok(reply.global_seq)
-    }
-
-    /// Long-poll for worker events after `after_seq` (the hub answers within `timeout_secs`).
-    pub async fn poll(&self, after_seq: u64, timeout_secs: u64) -> Result<PollReply, String> {
-        let path = format!(
-            "/api/mailbox/poll?session_id=all&after_seq={after_seq}&timeout={timeout_secs}"
-        );
-        self.get_json(&path, Duration::from_secs(timeout_secs + 10))
-            .await
+        Ok(reply)
     }
 }
 

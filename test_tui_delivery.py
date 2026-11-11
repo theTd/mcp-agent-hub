@@ -204,9 +204,9 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.sess.last_injection = {"submit_id": "old", "ok": True}
         with patch.object(server, "hub", self.hub), patch.object(server, "ensure_profiles_loaded", AsyncMock()):
             result = await server.send_to_subagent(self.sess.session_id, "do not append", wait_seconds=0)
-        self.assertEqual(result["next_action"], "inspect")
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["delivery"]["reason"], "input_recovery_required")
         self.assertFalse(result["delivery"]["delivered"])
-        self.assertIsNone(result["last_injection"])
 
 
 if __name__ == "__main__":

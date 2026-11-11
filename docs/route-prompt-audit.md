@@ -48,3 +48,7 @@ node E:\\codexworktrees\\subagent-launch-args\\mcp-agent-hub\\tools\\route-promp
 ## Dispatch and waiting 压测
 
 `Dispatch and waiting` 章节从 4,270 字符压缩到 2,412 字符。在相同的 11 个行为场景、3 次重复、每批 11 个输入下，压缩版为 `33/33`，输入 2,856 tokens；基线为 `32/33`，输入 3,918 tokens，减少约 27.1%。两版均无缺行或协议错误；基线唯一偏差是把“中间文本未确认完成”判为 inspect，压缩版保持为 wait。测试脚本为 `tools/dispatch-prompt-stress.mjs`，通过 `DISPATCH_PROMPT_FILE` 指定章节快照。Profile `when_to_use` 已恢复，定位为全局提示词覆盖之外的新路由补充提示。
+
+## 原生 wait handle 提示词压缩（2026-11-12）
+
+针对 `agent_guidance.py` 当前的 Dispatch/waiting 指令重新压缩并使用本机 8789 评测器压测。提示词从 3,459 字符降至 2,585 字符（减少 25.3%）；`tools/dispatch-prompt-stress.mjs` 以 11 个场景、3 次重复、每批 11 个输入运行，压缩前 `29/33`、输入 3,471 tokens，压缩后 `33/33`、输入 2,979 tokens（减少 14.2%）。两版均无缺行或协议错误；旧版把未确认审批和未确认完成误判为 inspect，当前版统一使用 wait_url 等待。

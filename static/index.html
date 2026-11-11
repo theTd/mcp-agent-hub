@@ -504,12 +504,12 @@
             <div class="tool-row"><code>list_agent_profiles</code><span>列出所有可调用的 Profile、路由指南与模型开关状态。</span></div>
             <div class="tool-row"><code>discover_agent_models_and_thinking_levels</code><span>重新扫描本机引擎的模型与思考等级，并返回可用列表。</span></div>
             <div class="tool-row"><code>spawn_subagent</code><span>按指定 Profile、模型与思考等级启动一个 Sub-Agent 会话。</span></div>
+            <div class="tool-row"><code>spawn_subagents</code><span>批量启动多个会话并返回一个 all_settled wait URL。</span></div>
             <div class="tool-row"><code>get_subagent_status_and_trace</code><span>查询会话执行到第几步、调用了哪些工具与当前活动。</span></div>
             <div class="tool-row"><code>get_subagent_final_response</code><span>读取会话的最终回复与任务总结，进程结束后仍可查询。</span></div>
             <div class="tool-row"><code>send_to_subagent</code><span>向运行中的 Sub-Agent 发送消息或补充指令。</span></div>
-            <div class="tool-row"><code>reply_to_subagent</code><span>回复 Sub-Agent 的提问或审批请求，解除它的等待。</span></div>
-            <div class="tool-row"><code>respond_to_subagent_approval_or_choice</code><span>代批高风险操作，或代选 Sub-Agent 的交互选项。</span></div>
-            <div class="tool-row"><code>wait_subagent_events</code><span>同步兜底监听工具（仅限不支持后台 Shell 命令的宿主使用；常规请后台异步跑 <code>background_poll_command</code>）。</span></div>
+            <div class="tool-row"><code>respond_to_subagent</code><span>使用 request_id 幂等回复问题、审批或拒绝反馈。</span></div>
+            <div class="tool-row"><code>GET wait_url</code><span>重复同一个 URL 等待 waiting、ask、done 或 failed。</span></div>
             <div class="tool-row"><code>summarize_subagent_transcript</code><span>解析引擎原生日志，返回高信噪比的执行摘要。</span></div>
             <div class="tool-row"><code>read_subagent_screen</code><span>读取 Sub-Agent 的终端画面，可选择附带原始 TUI 文本。</span></div>
             <div class="tool-row"><code>list_active_sessions</code><span>列出正在运行的会话，以及持久化的历史会话。</span></div>

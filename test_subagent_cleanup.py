@@ -10,7 +10,6 @@ from unittest.mock import patch
 import httpx
 
 from agent_guidance import CLEANUP_HINT, SERVER_INSTRUCTIONS
-from parent_waiting import build_wait_contract
 from session_manager import AgentSession, HubSessionManager
 
 
@@ -198,8 +197,7 @@ class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_guidance_reaches_server_routing_and_every_wait(self):
         self.assertIn(CLEANUP_HINT, SERVER_INSTRUCTIONS)
         self.assertIn(CLEANUP_HINT, self.hub.build_routing_guide_markdown())
-        result = build_wait_contract({"done": {"status": "completed"}}, [], 1)
-        self.assertIn("terminate_subagent", result["continuation_hint"])
+        self.assertIn("wait_url", SERVER_INSTRUCTIONS)
         self.assertIn("60 minutes", self.hub.build_routing_guide_markdown())
 
 

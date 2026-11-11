@@ -147,7 +147,7 @@ def scenario_token(log_dir: Path) -> None:
         def _hold_long_poll() -> None:
             try:
                 httpx.get(
-                    f"http://127.0.0.1:{PORT_TOKEN}/api/mailbox/poll?session_id=all&after_seq=999999&timeout=60",
+                    f"http://127.0.0.1:{PORT_TOKEN}/api/wait/wh_missing?timeout=60",
                     timeout=65.0,
                 )
             except Exception:

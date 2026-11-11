@@ -29,7 +29,7 @@ from session_manager import (
 )
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
-from agent_guidance import BACKGROUND_POLL_HINT, SERVER_INSTRUCTIONS
+from agent_guidance import SERVER_INSTRUCTIONS
 
 BASE_DIR = Path(__file__).parent.resolve()
 PROFILES_PATH = default_profiles_path(BASE_DIR)
@@ -173,32 +173,35 @@ def _injection_report(session, pending: bool = False, submit_id: Optional[str] =
 HUB_VERSION = "4.1.7"
 
 
-async def _parent_continuation(session_id, after_seq=0, events=()):
-    """Use only delivered event cursors; status reads must never acknowledge unseen events."""
-    next_seq = events[-1]["seq"] if events else after_seq
-    state = await hub.parent_wait_state(session_id, next_seq)
-    arguments = state["next_wait_arguments"]
-    command = hub.build_poll_command(arguments["session_id"] if arguments else session_id, next_seq)
-    http_arguments = {
-        **(arguments or {
-            "session_id": session_id,
-            "after_seq": next_seq,
-            "timeout_seconds": 60.0,
-        }),
-        "after_seq": next_seq,
-        "wake_on_pending": True,
-        "wake_on_state": True,
-        "include_results": True,
-        "include_deliveries": True,
-    }
+async def _wait_contract(session_ids, *, turn_ids=None, existing_handle=None, mode="all_settled"):
+    """Create or reuse the opaque parent wait handle for one session set."""
+    if existing_handle:
+        handle = existing_handle
+    else:
+        info = await hub.wait_inbox.ensure_for_sessions(session_ids, turn_ids, mode=mode)
+        handle = info["wait_handle"]
+    for sid in session_ids:
+        session = hub.sessions.get(sid)
+        if session is not None:
+            session.wait_handle = handle
     return {
-        **state,
-        "next_seq": next_seq,
-        "current_seq": next_seq,
-        "background_poll_command": command,
-        "next_poll_command": command,
-        "background_poll_hint": BACKGROUND_POLL_HINT,
-        "http_poll_arguments": http_arguments,
+        "wait_handle": handle,
+        "wait_url": f"{hub_api_base_url()}/api/wait/{handle}",
+    }
+
+
+def _control_status(session, *, accepted=True):
+    return {
+        "accepted": bool(accepted),
+        "session_id": session.session_id,
+        "turn_id": session.turn_id,
+        "wait_handle": session.wait_handle,
+        "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}" if session.wait_handle else None,
+        "status": session.status,
+        "approval": {
+            "high_risk_approval": session.high_risk_approval,
+            "approval_source": (session.profile_snapshot or {}).get("approval_source"),
+        },
     }
 
 # ============================================================================
@@ -260,34 +263,14 @@ async def spawn_subagent(
     disabled_mcp_servers: Optional[List[str]] = None,
     strict_mcp_config: bool = False,
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
-    wait_seconds: float = 5.0,
+    wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """
-    Start an interactive subagent and return session_id, transcript_summary and background_poll_command.
-    Provide a short, readable title (for example, "Fix build failure"). Choose model and
-    thinking_level from list_agent_profiles. env overrides profile variables and survives resume.
-    extra_args is an argv string array appended to profile args, preserved on resume (TUI only).
-    Pass each flag and value separately; do not shell-quote tokens. Model/thinking and approval
-    controls still use the dedicated fields and Hub policy. Preview the resolved command first.
-    Codex/Claude accept session-only mcp_servers={name: {url, headers?} or {command, args?, env?}}
-    and disabled_mcp_servers=[name]. strict_mcp_config=true is Claude-only, including an empty set.
-    Native MCP overrides in profile args/extra_args/settings conflict with these structured fields.
-    MCP configuration is preserved on resume; it does not confirm a successful MCP connection.
-    After collecting the result, call terminate_subagent promptly when no further work is needed.
-    Completion leaves the session open; automatic idle cleanup is only a fallback.
-    This MCP call is non-blocking. The deprecated wait_seconds argument is ignored for waiting;
-    use the returned HTTP poll arguments/background_poll_command for all waiting and completion.
-    After launch follow next_action through HTTP poll. While unfinished_session_ids is nonempty,
-    keep one HTTP long-poll connection per session/group.
-    bypass_approvals=null inherits the profile, false enforces approvals, true bypasses them
-    for this session and its resumes without changing the profile.
-    high_risk_approval is true when enforced, false when bypassed, or null for engines without
-    Hub approval. Questions and approvals set waiting_parent and pending_interaction; answer
-    with reply_to_subagent or respond_to_subagent_approval_or_choice.
+    """Start a subagent and return an opaque wait handle immediately.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
-    start_seq = hub.global_seq
     session = await hub.create_session(
         profile_id=agent_type,
         launch_source="agent",
@@ -304,55 +287,38 @@ async def spawn_subagent(
         thinking_level=thinking_level,
         env=env,
     )
+    wait = await _wait_contract([session.session_id], turn_ids={session.session_id: session.turn_id})
+    session.wait_handle = wait["wait_handle"]
+    await hub.persist_session(session)
+    return {**_control_status(session), **wait, "title": session.title, "agent_type": session.profile_id,
+            "engine": session.engine, "effective_model": session.effective_model,
+            "effective_thinking_level": session.effective_thinking_level,
+            "delivery": {"accepted": True, "state": "queued"}}
 
-    settle_info: Dict[str, Any] = {
-        "settled": False,
-        "reason": "mcp_nonblocking",
-        "wait_seconds_deprecated": wait_seconds,
-    }
 
-    events = hub.get_worker_events(session_id=session.session_id, after_seq=start_seq)
-    next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = await hub.summarize_transcript(session.session_id)
-    # W11: the initial task travels through the TUI only for task_mode=pty_input, and only if the
-    # wait did not see it typed yet.
-    injection_pending = (
-        bool(task)
-        and session.last_injection is None
-        and session.status in ("starting", "running")
-        and str((session.profile_snapshot or {}).get("task_mode") or "") == "pty_input"
-    )
-
+@mcp.tool()
+async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True) -> Dict[str, Any]:
+    """Start several subagents and return one group wait handle (all_settled by default)."""
+    if not specs:
+        raise ValueError("specs must contain at least one subagent")
+    sessions = []
+    for spec in specs:
+        item = dict(spec)
+        agent_type = item.pop("agent_type", item.pop("profile_id", None))
+        if not agent_type:
+            raise ValueError("each spec requires agent_type")
+        sessions.append(await hub.create_session(profile_id=agent_type, launch_source="agent", **item))
+    wait = await _wait_contract([s.session_id for s in sessions],
+                                turn_ids={s.session_id: s.turn_id for s in sessions},
+                                mode="all_settled" if all_settled else "any_settled")
+    for session in sessions:
+        session.wait_handle = wait["wait_handle"]
+        await hub.persist_session(session)
     return {
-        **await _parent_continuation(session.session_id, next_seq, events),
-        "session_id": session.session_id,
-        "title": session.title,
-        "agent_type": session.profile_id,
-        "engine": session.engine,
-        "effective_model": session.effective_model,
-        "effective_thinking_level": session.effective_thinking_level,
-        "env": dict((session.profile_snapshot or {}).get("env") or {}),
-        "kind": session.kind,
-        "status": session.status,
-        # Round 2: true = high-risk approval on; false = the profile's bypass_approvals is on
-        # (full-auto); null = the engine has no hub approval (dsh, pwsh).
-        "high_risk_approval": session.high_risk_approval,
-        **resolve_session_approval_fields(session.profile_snapshot),
-        "sandbox_preparation": session.sandbox_preparation,
-        # The launch's notes (ignored profile flags, substitutions, "bypass_approvals is on ...").
-        "launch_notes": list(getattr(session, "launch_notes", None) or []),
-        "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
-        "current_activity": session.current_activity,
-        "pending_interaction": session.pending_interaction,
-        # A10/W11: the real outcome of typing an initial pty_input task when the wait covered it,
-        # otherwise an honest "pending" plus a hint (never a bare last_injection:null).
-        **_injection_report(session, injection_pending),
-        "console_url": f"{hub_api_base_url()}/?session={session.session_id}",
-        "current_seq": next_seq,
-        "worker_events": events,
-        "wait_result": settle_info,
         "accepted": True,
-        "transcript_summary": transcript_summary,
+        "mode": "all_settled" if all_settled else "any_settled",
+        "sessions": [{"session_id": s.session_id, "turn_id": s.turn_id, "status": s.status} for s in sessions],
+        **wait,
     }
 
 
@@ -367,7 +333,15 @@ async def set_subagent_approval_rules(
     engine-wide bypass switch and expire with the session or their individual TTL.
     """
     result = await hub.set_auto_approval_rules(session_id, auto_approval_rules)
-    return {**result, **await _parent_continuation(session_id)}
+    session = hub.sessions.get(session_id)
+    response = {
+        "accepted": True,
+        "session_id": session_id,
+        "rules_applied": result.get("rules_applied", True),
+    }
+    if session is not None:
+        response.update(_control_status(session))
+    return response
 
 
 @mcp.tool()
@@ -376,29 +350,24 @@ async def get_subagent_status_and_trace(
     recent_tools_limit: int = 15,
     recent_messages_limit: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Read live or persisted progress: step_count, current_activity, recent_tool_calls,
-    intermediate_messages, pending_question_id and final_response. Results remain readable
-    after exit. Intermediate text is progress, not proof of turn completion. Follow next_action;
-    a status lookup does not advance your event cursor. Preserve the cursor from your last wait.
-    """
-    result = await hub.get_subagent_status_and_trace(
-        session_id=session_id,
-        recent_tools_limit=recent_tools_limit,
-        recent_messages_limit=recent_messages_limit,
-    )
-    return {**await _parent_continuation(session_id), **result}
+    """Read a compact status snapshot when diagnosis is explicitly needed."""
+    session = hub.sessions.get(session_id)
+    if session is None:
+        result = await hub.get_subagent_status_and_trace(session_id=session_id, recent_tools_limit=0, recent_messages_limit=0)
+        return {key: result.get(key) for key in ("session_id", "status", "current_activity", "pending_interaction", "final_response")}
+    return {
+        "session_id": session.session_id,
+        "turn_id": session.turn_id,
+        "status": session.status,
+        "current_activity": session.current_activity,
+        "pending_interaction": session.pending_interaction,
+    }
 
 
 @mcp.tool()
 async def get_subagent_final_response(session_id: str) -> Dict[str, Any]:
-    """
-    Retrieve the stored final_response, summary and terminal history after a turn or process ends.
-    Check from_previous_turn: a resumed or continuing session retains its previous answer
-    until the new turn produces one. An intermediate response does not confirm completion.
-    """
-    result = await hub.get_subagent_final_response(session_id=session_id)
-    return {**await _parent_continuation(session_id), **result}
+    """Compatibility read for callers that did not use the wait URL."""
+    return await hub.get_subagent_final_response(session_id=session_id)
 
 
 @mcp.tool()
@@ -406,23 +375,20 @@ async def send_to_subagent(
     session_id: str,
     text: str,
     press_enter: bool = True,
-    wait_seconds: float = 10.0,
+    wait_seconds: float = 10.0,  # deprecated compatibility field; never blocks
     ctx: Optional[Context] = None,
     clear_input: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Send instructions or a follow-up message to a subagent, resuming an ended resumable session.
-    If pending_interaction exists, text answers that native question or approval prompt.
-    Otherwise it is delivered through the engine's terminal or native message API.
-    To discard a failed Codex draft, send empty text with clear_input=true while idle. Never
-    resend after an unconfirmed submit without checking native state. Check the matching
-    submit_id in last_injection/recent_injections. This call never waits for injection confirmation
-    or task completion; use the returned HTTP poll arguments while work remains.
+    """Deliver a message immediately and return the session's existing opaque wait handle.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
     if not text.strip() and not clear_input:
-        return {"session_id": session_id, "delivery": {"delivered": False, "reason": "empty_text",
-                "pty_written": False, "injection": "none"}, "injection": "none", "last_injection": None}
+        session = hub.sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Session '{session_id}' not found.")
+        return {**_control_status(session, accepted=False), "delivery": {"delivered": False, "reason": "empty_text"}}
     start_seq = hub.global_seq
     session = hub.sessions.get(session_id)
     resumed = False
@@ -463,46 +429,15 @@ async def send_to_subagent(
             clear_input=clear_input,
         )
 
-    settle_info: Dict[str, Any] = {
-        "settled": False,
-        "reason": "mcp_nonblocking",
-        "wait_seconds_deprecated": wait_seconds,
-    }
-
-    events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
-    next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = await hub.summarize_transcript(session_id)
-
-    continuation = await _parent_continuation(session_id, next_seq, events)
-    if delivery.get("delivered") is not True and delivery.get("injection") != "pending" and not delivery.get("input_cleared"):
-        # A completed previous turn is not the outcome of a message that never submitted.
-        continuation["next_action"] = "inspect"
-
-    return {
-        **continuation,
-        "session_id": session.session_id,
-        "status": session.status,
-        "resumed": resumed,
-        "resume_count": session.resume_count,
-        # Explicit session overrides survive resume; inherited sessions follow the current profile.
-        "high_risk_approval": session.high_risk_approval,
-        **resolve_session_approval_fields(session.profile_snapshot),
-        **({"launch_notes": list(session.launch_notes)} if resumed and session.launch_notes else {}),
-        "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
-        "current_activity": session.current_activity,
-        "delivery": delivery,
-        "sandbox_preparation": session.sandbox_preparation,
-        **_injection_report(
-            session,
-            bool(delivery.get("injection") == "pending" and session.last_injection is None),
-            submit_id=delivery.get("submit_id", "") if not resumed else delivery.get("submit_id"),
-        ),
-        "worker_events": events,
-        "next_seq": next_seq,
-        "wait_result": settle_info,
-        "accepted": True,
-        "transcript_summary": transcript_summary,
-    }
+    if not session.wait_handle:
+        wait = await _wait_contract([session.session_id], turn_ids={session.session_id: session.turn_id})
+        session.wait_handle = wait["wait_handle"]
+    else:
+        # A follow-up message starts a fresh turn on the same session.  Re-arm the
+        # durable handle so a previous done result cannot be returned immediately.
+        await hub.wait_inbox.update_turn(session.wait_handle, session.session_id, session.turn_id)
+        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+    return {**_control_status(session), **wait, "resumed": resumed, "delivery": delivery}
 
 
 @mcp.tool()
@@ -510,18 +445,14 @@ async def resume_subagent(
     session_id: str,
     text: Optional[str] = None,
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
-    wait_seconds: float = 10.0,
+    wait_seconds: float = 10.0,  # deprecated compatibility field; never blocks
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """
-    Resume an ended or archived native conversation with the same session_id, working directory,
-    model and thinking level. Optional text starts a new turn; omit it to restore only.
-    A live session returns its current state without starting another process.
-    A non-resumable session raises an error with the reason.
-    This MCP call is non-blocking. Follow next_action through the returned HTTP poll arguments.
+    """Resume a native conversation and return a new turn id plus its existing wait handle.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
-    start_seq = hub.global_seq
     result = await hub.resume_subagent(
         session_id,
         text=text,
@@ -536,37 +467,14 @@ async def resume_subagent(
         "injection": result.get("injection") or "none",
     }
 
-    settle_info: Dict[str, Any] = {
-        "settled": False,
-        "reason": "mcp_nonblocking",
-        "wait_seconds_deprecated": wait_seconds,
-    }
-
-    events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
-    next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = await hub.summarize_transcript(session_id)
-
-    return {
-        **await _parent_continuation(session_id, next_seq, events),
-        "session_id": session.session_id,
-        "status": session.status,
-        "resumed": bool(result.get("resumed")),
-        "already_live": bool(result.get("already_live")),
-        "resume_count": session.resume_count,
-        "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
-        "current_activity": session.current_activity,
-        "sandbox_preparation": session.sandbox_preparation,
-        "delivery": delivery,
-        **_injection_report(
-            session,
-            bool(delivery.get("injection") == "pending" and session.last_injection is None),
-        ),
-        "worker_events": events,
-        "next_seq": next_seq,
-        "wait_result": settle_info,
-        "accepted": True,
-        "transcript_summary": transcript_summary,
-    }
+    if not session.wait_handle:
+        wait = await _wait_contract([session.session_id], turn_ids={session.session_id: session.turn_id})
+        session.wait_handle = wait["wait_handle"]
+    else:
+        await hub.wait_inbox.update_turn(session.wait_handle, session.session_id, session.turn_id)
+        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+    return {**_control_status(session), **wait, "resumed": bool(result.get("resumed")),
+            "already_live": bool(result.get("already_live")), "delivery": delivery}
 
 
 @mcp.tool()
@@ -597,132 +505,42 @@ async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -
 
 
 @mcp.tool()
-async def reply_to_subagent(
+async def respond_to_subagent(
     session_id: str,
-    answer: str,
-    request_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Answer a pending native interaction using request_id and return immediately.
-
-    The result includes next_action and next_wait_arguments for the HTTP poll while work remains.
-    """
-    start_seq = hub.global_seq
-    delivery = await hub.deliver_parent_message(
-        session_id=session_id,
-        text=answer,
-        request_id=request_id,
-        also_write_pty=True,
-    )
-    session = hub.sessions.get(session_id)
-    events = hub.get_worker_events(session_id, start_seq)
-    next_seq = events[-1]["seq"] if events else start_seq
-    return {
-        **await _parent_continuation(session_id, next_seq, events),
-        **delivery,
-        "accepted": True,
-        "worker_events": events,
-        **(_injection_report(
-            session,
-            bool(delivery.get("injection") == "pending" and session.last_injection is None),
-        ) if session else {}),
-    }
-
-
-@mcp.tool()
-async def respond_to_subagent_approval_or_choice(
-    session_id: str,
+    answer: Optional[str] = None,
     decision: Optional[str] = None,
     option_index: Optional[int] = None,
     custom_input: Optional[str] = None,
     request_id: Optional[str] = None,
-    wait_seconds: float = 8.0,
+    wait_seconds: float = 8.0,  # deprecated compatibility field; never blocks
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """
-    Answer a pending approval or choice using the engine's native keys or API.
-    decision is approve (once), approve_session (scope depends on engine), or deny.
-    Approvals require an explicit decision; empty arguments never approve.
-    option_index selects a 1-based entry in pending_interaction.options. custom_input answers
-    a question, or supplies denial feedback; custom_input alone denies an approval request.
-    AGY/OMP permanent global rules and AGY conversation-wide denial options are filtered out.
-    Codex command approve_session sends p and permanently saves the command prefix in
-    ~/.codex/rules/default.rules for ALL Codex sessions; edit approval sends a for these files
-    in this session. Claude may persist an allow rule in .claude/settings.local.json when offered.
-    Rule-triggered OMP prompts fall back to approve-once; Kimi session approval does not cover
-    dangerous commands. Inspect the returned notes for the actual scope.
-    After responding, use the returned HTTP poll arguments. This MCP call never waits for native
-    acknowledgement or task progress; response_state=unconfirmed is resolved by HTTP poll.
-    delivered means input was sent. response_state=confirmed means native acknowledgement;
-    unconfirmed retains the pending request: keep waiting and never resend automatically.
+    """Answer a question/approval once, or deliver ordinary feedback, by request_id.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     session = hub.sessions.get(session_id)
     if not session:
         raise ValueError(f"Session '{session_id}' not found in active sessions.")
-
-    start_seq = hub.global_seq
-    action_result = await hub.respond_to_interaction(
-        session_id=session_id,
-        decision=decision,
-        option_index=option_index,
-        custom_input=custom_input,
-        request_id=request_id,
-    )
-
-    settle_info: Dict[str, Any] = {
-        "settled": False,
-        "reason": "mcp_nonblocking",
-        "wait_seconds_deprecated": wait_seconds,
-    }
-
-    events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
-    next_seq = events[-1]["seq"] if events else start_seq
-    transcript_summary = await hub.summarize_transcript(session_id)
-
-    return {
-        **await _parent_continuation(session_id, next_seq, events),
-        "session_id": session_id,
-        "status": session.status,
-        "step_count": max(session.step_count, transcript_summary.get("step_count", 0)),
-        "current_activity": session.current_activity,
-        "pending_interaction": session.pending_interaction,
-        "action_result": action_result,
-        "accepted": bool(action_result.get("ok")),
-        "delivered": action_result.get("delivered"),
-        "response_state": action_result.get("response_state"),
-        "resolved_request_id": action_result.get("resolved_request_id"),
-        **_injection_report(session, False),
-        "worker_events": events,
-        "next_seq": next_seq,
-        "wait_result": settle_info,
-        "transcript_summary": transcript_summary,
-    }
-
-
-@mcp.tool()
-async def wait_subagent_events(
-    session_id: str = "all",
-    after_seq: int = 0,
-    timeout_seconds: float = 60.0,
-    ctx: Optional[Context] = None,
-) -> Dict[str, Any]:
-    """
-    Deprecated non-blocking compatibility snapshot. MCP never waits for Sub Agent events;
-    use the returned HTTP poll arguments or background_poll_command instead.
-    """
-    if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
-        raise ValueError("timeout_seconds must be finite and nonnegative.")
-    result = await hub.poll_worker_events(
-        session_id=session_id,
-        after_seq=after_seq,
-        timeout_sec=0,
-        wake_on_pending=True,
-        wake_on_state=True,
-        include_results=True,
-        include_deliveries=True,
-    )
-    result["nonblocking"] = True
-    result["timeout_seconds_ignored"] = timeout_seconds
-    return result
+    if answer is not None and decision is None and option_index is None and custom_input is None:
+        action_result = await hub.deliver_parent_message(
+            session_id=session_id, text=answer, request_id=request_id, also_write_pty=True,
+        )
+    else:
+        action_result = await hub.respond_to_interaction(
+            session_id=session_id, decision=decision, option_index=option_index,
+            custom_input=custom_input if custom_input is not None else answer,
+            request_id=request_id,
+        )
+        if request_id and session.wait_handle:
+            await hub.wait_inbox.resolve_request(session.wait_handle, request_id)
+    if not session.wait_handle:
+        wait = await _wait_contract([session_id], turn_ids={session_id: session.turn_id})
+        session.wait_handle = wait["wait_handle"]
+    else:
+        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+    return {**_control_status(session, accepted=bool(action_result.get("ok", True))), **wait,
+            "response": {key: action_result.get(key) for key in ("delivered", "response_state", "resolved_request_id", "idempotent") if key in action_result}}
 
 
 @mcp.tool()
@@ -921,7 +739,7 @@ async def reject_work_during_shutdown(request: Request, call_next):
 
 
 # ============================================================================
-# 3. 遥测与双向消息邮箱 HTTP API
+# 3. Durable parent wait URL and independent console telemetry API
 # ============================================================================
 @app.get("/api/sessions/{session_id}/trace")
 async def api_get_session_trace(session_id: str):
@@ -944,28 +762,16 @@ async def api_list_historical_sessions(limit: int = Query(30)):
     return {"sessions": await hub.db.list_persisted_sessions(limit=limit)}
 
 
-@app.get("/api/mailbox/poll")
-async def api_mailbox_poll(
-    session_id: str = Query("all"),
-    after_seq: int = Query(0),
-    timeout: float = Query(25.0),
-    wake_on_pending: bool = Query(False),
-    wake_on_state: bool = Query(False),
-    include_results: bool = Query(False),
-    include_deliveries: bool = Query(False),
-):
-    return await hub.poll_worker_events(
-        session_id=session_id,
-        after_seq=after_seq,
-        timeout_sec=min(max(0.1, timeout), 120.0),
-        wake_on_pending=wake_on_pending,
-        wake_on_state=wake_on_state,
-        include_results=include_results,
-        include_deliveries=include_deliveries,
-    )
+@app.get("/api/wait/{wait_handle}")
+async def api_wait(wait_handle: str, timeout: float = Query(25.0, ge=0.1, le=120.0)):
+    """Long-poll one opaque handle.  Repeating this URL is the complete parent protocol."""
+    try:
+        return await hub.wait_inbox.wait(wait_handle, timeout)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
-@app.get("/api/mailbox/events")
+@app.get("/api/telemetry/events")
 async def api_mailbox_events(
     session_id: str = Query("all"),
     after_seq: int = Query(0),
@@ -978,33 +784,28 @@ async def api_mailbox_events(
     }
 
 
-@app.post("/api/mailbox/{session_id}/reply")
-async def api_parent_reply(session_id: str, req: Request):
-    body = await req.json()
-    text = body.get("text", "")
-    request_id = body.get("request_id")
-    also_write_pty = bool(body.get("also_write_pty", True))
-    return await hub.deliver_parent_message(
-        session_id=session_id,
-        text=text,
-        request_id=request_id,
-        also_write_pty=also_write_pty,
-        press_enter=bool(body.get("press_enter", True)),
-        clear_input=bool(body.get("clear_input", False)),
-    )
+@app.get("/api/telemetry/snapshot")
+async def api_telemetry_snapshot():
+    """Console-only snapshot; it never advances a parent wait handle."""
+    return {"global_seq": hub.global_seq, "events": hub.worker_events[-200:], "sessions": [s.to_dict() for s in hub.sessions.values()]}
 
 
-@app.post("/api/mailbox/{session_id}/respond")
-async def api_parent_respond_interaction(session_id: str, req: Request):
+@app.post("/api/sessions/{session_id}/respond")
+async def api_parent_respond(session_id: str, req: Request):
     body = await req.json()
     try:
-        return await hub.respond_to_interaction(
-            session_id=session_id,
-            decision=body.get("decision"),
-            option_index=body.get("option_index"),
-            custom_input=body.get("custom_input"),
-            request_id=body.get("request_id"),
-        )
+        session = hub.sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Active session '{session_id}' not found.")
+        answer = body.get("answer", body.get("text"))
+        if answer is not None and not any(body.get(k) is not None for k in ("decision", "option_index", "custom_input")):
+            result = await hub.deliver_parent_message(session_id=session_id, text=answer, request_id=body.get("request_id"))
+        else:
+            result = await hub.respond_to_interaction(
+                session_id=session_id, decision=body.get("decision"), option_index=body.get("option_index"),
+                custom_input=body.get("custom_input", answer), request_id=body.get("request_id"),
+            )
+        return {**_control_status(session), "response": result}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

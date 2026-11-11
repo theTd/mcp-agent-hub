@@ -183,7 +183,7 @@ mod tests {
         for name in [
             "server.py",
             "native_session_launch.py",
-            "hub_poll.py",
+            "wait_inbox.py",
             "static/index.html",
             "requirements.lock",
         ] {

@@ -1,6 +1,6 @@
 # Sub Agent 及时关闭与超时回收
 
-主 Agent 收取结果、不再需要复用 Sub Agent 时，应立即调用 `terminate_subagent(session_id)`。任务完成只代表本轮结束，TUI 进程通常仍在运行。结束主任务前应关闭自己启动且已不再需要的所有 Sub Agent。此提醒包含在 MCP 服务说明、路由指南、启动工具说明和每次等待结果的 `continuation_hint` 中。
+主 Agent 从 `wait_url` 收到结果、不再需要复用 Sub Agent 时，应立即调用 `terminate_subagent(session_id)`。任务完成只代表本轮结束，TUI 进程通常仍在运行。结束主任务前应关闭自己启动且已不再需要的所有 Sub Agent。此提醒包含在 MCP 服务说明和路由指南中。
 
 ## 自动关闭
 

@@ -6,11 +6,11 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 
 | id | decision |
 |---|---|
-| continuation | Parent-facing launch, send, resume, reply, approval, status and final-result responses expose one shared continuation contract: next action, unfinished/completed/inspect IDs, HTTP poll arguments and event cursor. Delivery, progress, quiet output and poll timeout never imply task completion. |
-| wait-transport | MCP control calls are non-blocking. HTTP `/api/mailbox/poll` is the only parent wait transport; `hub_poll.py` may rearm finite HTTP long-poll requests while work remains. `wait_subagent_events` is a non-blocking compatibility snapshot. |
+| opaque-wait | Parent-facing control calls return only accepted/session/turn identity and an opaque wait handle. `GET /api/wait/<handle>` owns the durable state, lease, request inbox and result delivery. |
+| wait-transport | The wait URL is the only parent wait transport. A timeout is retried against the same URL; no cursor, session list or helper script is exposed. |
 | auto-approval | Automatic approval rules are session-scoped, bounded by structured request matching, expiry and use count, and lower priority than hard-deny and forced-manual-approval rules. |
-| scoped-cursor | Prefer explicit session IDs. A group wait continues on unfinished members. Only delivered events advance its cursor; unrelated sessions and status reads do not acknowledge unseen events. |
-| pending-and-failure | Waits wake for unresolved native interactions even after their event was read, and for known terminal/unknown state. Connection/protocol failures and Hub shutdown are explicit CLI errors, with continuation information, rather than successful empty timeouts. |
+| durable-inbox | Wait handles persist session sets, turn ids, request/result deduplication and leases. One active waiter is allowed; a replacement returns `superseded` to the old connection. |
+| wake-policy | Only approval/question, delivery failure, completion, exit/crash and Hub shutdown wake a parent. Tool/progress/delivery telemetry remains audit-only. |
 
 ## Agent prompt language (2026-11-10, owner)
 

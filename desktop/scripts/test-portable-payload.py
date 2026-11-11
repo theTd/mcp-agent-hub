@@ -117,9 +117,8 @@ def main():
                 check(client.get(base + "/static/vendor/" + asset).status_code == 200, f"offline terminal resource {asset} is served")
             check((data / "hub_state.db").is_file() and not (source / "hub_state.db").exists(), "database is stored separately from extracted code")
             check(client.get(base + "/api/sessions").json()["sessions"] == [], "isolated test Hub has no personal live sessions")
-            empty = client.post(base + "/api/mailbox/payload-empty-check/reply", json={"text": ""}).json()
-            check(empty.get("delivered") is False and empty.get("reason") == "empty_text"
-                  and empty.get("pty_written") is False, "delivered EXE rejects empty sends without phantom delivery")
+            empty = client.post(base + "/api/sessions/payload-empty-check/respond", json={"text": ""})
+            check(empty.status_code == 404, "delivered EXE rejects responses for unknown sessions")
             profile = {"id": "approval-payload-check", "name": "Approval payload check", "engine": "codex",
                        "command": str(python), "args": [], "kind": "tui", "task_mode": "codex_positional",
                        "enabled": True, "bypass_approvals": True}
@@ -161,7 +160,6 @@ def main():
                 check("portable-pty-ok" in output, "prepared Python can spawn and read a ConPTY session")
             finally:
                 pty.close(force=True)
-            subprocess.run([str(python), str(source / "hub_poll.py"), "--help"], env=api_env, cwd=root, check=True, capture_output=True, timeout=15)
             hook = subprocess.run([str(python), str(source / "engine_policies/claude_pre_tool_hook.py")], input=json.dumps({"hook_event_name": "PermissionRequest", "session_id": "portable-smoke", "tool_name": "Bash", "tool_input": {"command": "echo test"}}), text=True, env=api_env, cwd=root, capture_output=True, timeout=15)
             check(hook.returncode == 0 and (data / ".runtime_mcp_configs/claude_hooks_portable-smoke.jsonl").is_file(), "extracted Claude hook writes to the same data directory")
         finally:

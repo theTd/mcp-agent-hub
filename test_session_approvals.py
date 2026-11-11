@@ -147,14 +147,14 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         ))
 
     async def test_detection_wakes_parent_and_deduplicates(self):
-        before = self.hub.global_seq
         pending = await self.pending()
-        result = await self.server.wait_subagent_events(self.sess.session_id, before, timeout_seconds=1)
+        info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
+        result = await self.hub.wait_inbox.wait(info["wait_handle"], 1)
         self.assertEqual(self.sess.status, "waiting_parent")
-        self.assertEqual(result["next_action"], "reply")
-        self.assertEqual(result["pending_interactions"][0]["request_id"], pending["request_id"])
+        self.assertEqual(result["state"], "ask")
+        self.assertEqual(result["requests"][0]["request_id"], pending["request_id"])
         await self.pending()
-        self.assertEqual(len([e for e in self.hub.get_worker_events(self.sess.session_id, before)
+        self.assertEqual(len([e for e in self.hub.get_worker_events(self.sess.session_id, 0)
                               if e["type"] == "approval_request"]), 1)
 
     async def answer(self, decision="approve"):
@@ -284,7 +284,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
             async with Client(self.server.mcp) as client:
                 result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "bypass_approvals": False, "wait_seconds": 0})
                 data = result.data if result.data is not None else json.loads(result.content[0].text)
-                self.assertEqual(data["approval_source"], "session")
+                self.assertEqual(data["approval"]["approval_source"], "session")
 
 
 if __name__ == "__main__":

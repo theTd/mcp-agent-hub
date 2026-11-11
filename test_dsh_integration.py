@@ -5,13 +5,13 @@ import sys
 import time
 from pathlib import Path
 from fastmcp import Client
+import httpx
 
 sys.stdout.reconfigure(encoding="utf-8")
 
 HUB_DIR = Path(__file__).parent.resolve()
 # K3: the interpreter this suite runs on, not a guessed <repo>/.venv (a worktree has none).
 PYTHON_EXE = sys.executable
-HUB_POLL_SCRIPT = str((HUB_DIR / "hub_poll.py").resolve())
 MCP_PARENT_URL = "http://127.0.0.1:4444/mcp"
 
 
@@ -32,25 +32,7 @@ async def main():
         active_info = unwrap(await parent_client.call_tool("list_active_sessions", {}))
         base_seq = active_info["global_seq"]
 
-        # 1. 启动后台阻塞监听进程 hub_poll.py
-        poll_proc = subprocess.Popen(
-            [
-                PYTHON_EXE,
-                HUB_POLL_SCRIPT,
-                "--session",
-                "all",
-                "--after-seq",
-                str(base_seq),
-                "--timeout",
-                "45",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-
-        # 2. 通过 MCP spawn_subagent 拉起 dsh-flash-high，要求它先调用内置 message_parent(wait_for_reply=True) 提问
+        # 1. 通过 MCP spawn_subagent 拉起 dsh-flash-high，要求它先调用内置 message_parent(wait_for_reply=True) 提问
         task_prompt = (
             "Please call your `message_parent` tool with `message='What secret code should I include?'` and `wait_for_reply=true`. "
             "Once you receive the reply from the parent, include that exact secret code in your final response."
@@ -70,33 +52,20 @@ async def main():
         sid = spawned["session_id"]
         print(f"  🚀 已拉起 DSH 宿主内会话: {sid} | 控制台: {spawned['console_url']}")
 
-        # 3. 等待 hub_poll.py 被 DSH Worker 的 message_parent 唤醒
-        stdout, stderr = await asyncio.to_thread(poll_proc.communicate, timeout=45)
-        assert poll_proc.returncode == 0, f"hub_poll.py 异常退出: {stderr}"
-        poll_data = json.loads(stdout)
-        events = poll_data.get("events", [])
-        print(f"  ✓ 后台阻塞命令 hub_poll.py 被 DSH Worker 唤醒！收到事件: {[e['type'] + ':' + e['content'][:50] for e in events]}")
-
-        # 检查是否收到 question 事件
-        q_ev = next((e for e in events if e["type"] == "question"), None)
-        if not q_ev:
-            # 若第一个事件不是 question，继续等待 question 事件
-            w_res = unwrap(
-                await parent_client.call_tool(
-                    "wait_subagent_events",
-                    {"session_id": sid, "after_seq": poll_data["global_seq"], "timeout_seconds": 25.0},
-                )
-            )
-            q_ev = next((e for e in w_res.get("events", []) if e["type"] == "question"), None)
-
-        assert q_ev is not None, f"未收到 DSH Worker 的 question 事件: {events}"
+        # 2. 重复同一个 wait URL，直到服务端把状态提升为 ask。
+        async with httpx.AsyncClient(timeout=50.0) as http:
+            poll_data = await http.get(spawned["wait_url"])
+            poll_data.raise_for_status()
+            poll_data = poll_data.json()
+        assert poll_data["state"] == "ask", poll_data
+        q_ev = poll_data["requests"][0]
         req_id = q_ev["request_id"]
-        print(f"  ✓ 捕获到 DSH Worker 阻塞提问 (request_id={req_id}): {q_ev['content']}")
+        print(f"  ✓ wait URL returned question (request_id={req_id}): {q_ev.get('content', '')}")
 
-        # 4. 主 Agent 调用 reply_to_subagent 回答 DSH Worker 的提问
+        # 3. 主 Agent 调用统一 respond_to_subagent 回答 DSH Worker 的提问
         reply_res = unwrap(
             await parent_client.call_tool(
-                "reply_to_subagent",
+                "respond_to_subagent",
                 {
                     "session_id": sid,
                     "request_id": req_id,
@@ -104,7 +73,7 @@ async def main():
                 },
             )
         )
-        print(f"  ✓ 主 Agent 已通过 reply_to_subagent 回复答案 'DSH_SECRET_2026_OK': {reply_res}")
+        print(f"  ✓ 主 Agent 已通过 respond_to_subagent 回复答案 'DSH_SECRET_2026_OK': {reply_res}")
 
         # 5. 等待第一轮完成
         for _ in range(30):

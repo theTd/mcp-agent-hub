@@ -179,13 +179,12 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             final = {"kind": "event", "type": "agent.turn.ended"}
             new_turn = {"type": "turn.prompt", "origin": {"kind": "user"}, "input": [{"type": "text", "text": "continue"}]}
             watch = self.hub._watch_kimi_session(sess, self.root)
-        waiter = asyncio.create_task(self.hub.poll_worker_events(session_id=sess.session_id, after_seq=0, timeout_sec=3))
         task = self.hub._schedule(watch)
         try:
             self.append(path, ask)
             await self.until(lambda: sess.pending_interaction is not None)
-            received = await waiter
-            self.assertTrue(received["events"])
+            received = self.hub.get_worker_events(session_id=sess.session_id, after_seq=0)
+            self.assertTrue(received)
             self.assertEqual(sess.status, "waiting_parent")
             self.assertEqual(sess.pending_interaction["prompt"], "选择哪个分支？")
             await self.hub.respond_to_interaction(sess.session_id, option_index=1)
@@ -221,8 +220,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(saved["parent_messages"])
         finally:
             task.cancel()
-            waiter.cancel()
-            await asyncio.gather(task, waiter, return_exceptions=True)
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_codex_native_roundtrip(self):
         await self.exercise("codex")
@@ -293,10 +291,9 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_progress_persists_and_wakes_listener(self):
         sess = self.session("codex")
-        waiter = asyncio.create_task(self.hub.poll_worker_events(session_id=sess.session_id, after_seq=0, timeout_sec=3))
         await self.hub.record_telemetry(sess.session_id, {"hook_event": "PreToolUse", "tool_name": "read", "tool_input": "file"})
-        result = await waiter
-        self.assertEqual(result["events"][0]["type"], "tool_call")
+        result = self.hub.get_worker_events(session_id=sess.session_id, after_seq=0)
+        self.assertEqual(result[0]["type"], "tool_call")
         await self.hub.record_telemetry(sess.session_id, {"hook_event": "PostToolUse", "tool_name": "read", "tool_response": "contents"})
         await self.hub.record_telemetry(sess.session_id, {"hook_event": "AssistantMessage", "intermediate_messages": ["working"]})
         self.assertEqual([e["type"] for e in self.hub.worker_events], ["tool_call", "tool_result", "progress"])

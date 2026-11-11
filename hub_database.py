@@ -146,6 +146,8 @@ class HubDatabase:
                     files_changed_json TEXT DEFAULT '[]',
                     scrollback_text TEXT DEFAULT '',
                     transcript_path TEXT DEFAULT ''
+                    ,turn_id TEXT DEFAULT ''
+                    ,wait_handle TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -204,6 +206,8 @@ class HubDatabase:
                 "ALTER TABLE sessions ADD COLUMN last_resumed_at REAL",
                 "ALTER TABLE sessions ADD COLUMN resumable INTEGER",
                 "ALTER TABLE sessions ADD COLUMN resume_block_reason TEXT",
+                "ALTER TABLE sessions ADD COLUMN turn_id TEXT DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN wait_handle TEXT DEFAULT ''",
             ):
                 try:
                     conn.execute(ddl)
@@ -253,6 +257,8 @@ class HubDatabase:
             "files_changed_json": json.dumps(s_dict.get("files_changed", []), ensure_ascii=False),
             "scrollback_text": scrollback_text,
             "transcript_path": s_dict.get("transcript_path") or "",
+            "turn_id": s_dict.get("turn_id") or "",
+            "wait_handle": s_dict.get("wait_handle") or "",
             "end_reason": arc.get("end_reason"),
             "archived_at": arc.get("archived_at"),
             "spawned_at": arc.get("spawned_at"),
