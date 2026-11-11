@@ -228,7 +228,7 @@ async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Di
     return {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "engines": hub.get_mcp_engines_catalog(),
-        "usage_hint": "Pass any enabled `model` (from `available_models`) and `thinking_level` directly to `spawn_subagent(agent_type, task, model=..., thinking_level=...)`. Follow `routing_guide_markdown` and each profile's `when_to_use` annotation when choosing an agent.",
+        "usage_hint": "Pass any enabled `model` (from `available_models`) and `thinking_level` directly to `spawn_subagent(agent_type, task, model=..., thinking_level=...)`. Follow `routing_guide_markdown` first; use a profile's `when_to_use` only as a supplemental hint for new or not-yet-benchmarked routes.",
     }
 
 

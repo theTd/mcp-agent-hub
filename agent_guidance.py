@@ -1,65 +1,44 @@
 """English instructions authored by the Hub for parent agents."""
 
 CLEANUP_HINT = (
-    "After collecting a subagent's result, call terminate_subagent as soon as it is no longer "
-    "needed. Completion does not close its process. Before finishing the parent task, close "
-    "all subagents you started that no longer need to remain open. Saved results remain "
-    "readable after closing; use resume_subagent if you need the session again. Do not rely "
-    "on automatic cleanup as a substitute for prompt closure."
+    "After collecting a result, terminate_subagent when the subagent is no longer needed; "
+    "completion does not close it. Before the parent finishes, close started subagents unless "
+    "the user requested handoff/cancellation. Results remain readable and resumable."
 )
 
 CONTINUATION_HINT = (
-    "Handle pending interactions first. Collect completed results and inspect failed/unknown IDs. "
-    "While unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments "
-    "after processing this result. Progress, delivery and timeout do not mean completion. "
+    "Handle pending interactions first; collect completed results and inspect failed/unknown IDs. "
+    "If unfinished_session_ids remains, call wait_subagent_events with next_wait_arguments. "
+    "Progress, delivery and timeout are not completion. "
     + CLEANUP_HINT
 )
 
 BACKGROUND_POLL_HINT = (
-    CONTINUATION_HINT + " Do not finish the parent task with delegated work outstanding "
-    "unless the user explicitly requested a handoff or cancellation. "
-    "Use background_poll_command only when the host provides reliable background completion "
-    "notifications. A process/session ID alone is not a notification; otherwise use the MCP wait. "
-    "The CLI exits after one event batch or timeout: handle its output and rearm using "
-    "next_wait_arguments or next_poll_command if work remains. Keep at most one waiter per "
-    "session. For multiple sessions, wait on explicit comma-separated IDs with a shared cursor; "
-    "when combining separate cursors, start from the lowest unconsumed cursor and deduplicate "
-    "by event seq. Never advance a cursor using a status lookup or an unrelated session."
+    CONTINUATION_HINT + " Use background_poll_command only with reliable completion notifications; "
+    "otherwise use MCP wait. A process/session ID is not a notification. After each batch, rearm "
+    "with next_wait_arguments/next_poll_command if work remains; keep one waiter per session. "
+    "For multiple sessions, use explicit comma-separated IDs and a shared cursor; merge cursors "
+    "from the lowest unconsumed seq and deduplicate by event seq. Never advance a cursor from "
+    "status or an unrelated session."
 )
 
 ROUTING_RULES = (
-    CLEANUP_HINT,
-    "Provide a short, readable title summarizing the task, such as 'Fix build failure' "
-    "or 'Repair session resume'; do not use the full task as the title.",
-    "Choose an enabled profile, model and thinking_level from the catalog and its routing notes.",
-    'Use env={"KEY": "VALUE"} for per-session environment overrides. These override profile '
-    "values and are preserved on resume.",
-    'Use extra_args=["--flag", "value"] for per-session TUI CLI arguments appended to profile '
-    "args and preserved on resume. Tokens are passed literally, without shell parsing. "
-    "Use the dedicated model, thinking_level and bypass_approvals fields for those controls; "
-    "DSH and GUI sessions do not accept CLI arguments.",
-    'Codex/Claude accept mcp_servers={"docs":{"url":"https://example.com/mcp"}} or '
-    'mcp_servers={"local":{"command":"node","args":["server.mjs"],"env":{"MODE":"readonly"}}}. '
-    'HTTP supports headers. Use disabled_mcp_servers=["unused"] to disable named servers; '
-    'Codex names refer to ordinary mcp_servers, not plugin MCP. Claude alone supports '
-    'strict_mcp_config=true to load only the supplied set (an empty set is allowed). '
-    'These session settings survive resume. Do not combine with native MCP overrides in '
-    'profile args/extra_args/settings. Configuration does not confirm connection or authentication.',
-    "Use bypass_approvals=null to inherit the profile, false to require approvals, or true to bypass "
-    "them for this session. Explicit overrides survive resume and never change the profile.",
-    "Local Windows DSH launches report sandbox_preparation. The Hub can add a root-only "
-    "WRITE_OWNER grant to the matching host account on an owned workspace. A blocked check "
-    "prevents dispatch; skipped means the host could not be verified. Permission readiness "
-    "does not confirm native sandbox startup or access to existing descendants. Inspect the "
-    "reason instead of repeatedly retrying.",
+    "Use a short task title; do not use the full task.",
+    "Choose an enabled profile, model and thinking_level from the catalog and routing guide.",
+    'env={"KEY":"VALUE"} overrides profile env and survives resume.',
+    'extra_args=["--flag","value"] appends literal per-session TUI CLI tokens to profile args and survives resume. '
+    "Use model, thinking_level and bypass_approvals fields for those controls; DSH/GUI sessions reject CLI args.",
+    'Codex/Claude mcp_servers accept HTTP {"url","headers"} or stdio {"command","args","env"}; '
+    'disabled_mcp_servers disables names. Claude only: strict_mcp_config=true loads only supplied servers, including an empty set. '
+    "Settings survive resume; do not mix them with native MCP overrides; config does not prove connection/authentication.",
+    "bypass_approvals=null inherits the profile; false requires approval; true bypasses it for this session only.",
+    "Windows DSH reports sandbox_preparation. A blocked check prevents dispatch; skipped means unverified. Permission readiness does not prove sandbox/access; inspect the reason and do not blindly retry.",
     BACKGROUND_POLL_HINT,
-    "Questions and approval requests set waiting_parent. Answer the native interaction with "
-    "reply_to_subagent or respond_to_subagent_approval_or_choice, using its request_id.",
-    "An approval response's delivered flag means input was sent, not accepted by the CLI. "
-    "If response_state is unconfirmed, keep waiting; never resend automatically.",
-    "Subagents use their native questions and responses. The Hub observes native records; "
-    "do not ask subagents to call Hub reporting tools. Intermediate text does not confirm "
-    "completion. Check the native turn completion and from_previous_turn flag before using a final answer.",
+    "Questions and approvals set waiting_parent; answer with reply_to_subagent or "
+    "respond_to_subagent_approval_or_choice using request_id.",
+    "delivered=true means input was sent, not accepted; response_state=unconfirmed → wait, never resend.",
+    "Native records are authoritative; intermediate text is not completion. Check native turn completion "
+    "and from_previous_turn before reporting done.",
 )
 
 SERVER_INSTRUCTIONS = (

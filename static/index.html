@@ -286,8 +286,8 @@
                   </label>
                   <div class="field full">
                     <label class="field-label" for="editWhenToUse">何时调用 <code>when_to_use</code></label>
-                    <textarea id="editWhenToUse" rows="3" placeholder="例如：需要低延迟、高并发地执行简单代码搜索、日志分析或单文件小改动时优先调用。"></textarea>
-                    <span class="field-help">写给主 Agent 的调用时机说明：在什么任务、什么情况下应选择这个 Profile。</span>
+                    <textarea id="editWhenToUse" rows="3" placeholder="例如：新出现、尚未完成路由压测的任务类型可先参考此 Profile。"></textarea>
+                    <span class="field-help">全局路由总则优先；这里仅补充新增或尚未完成压测的路由场景。</span>
                   </div>
                   <label class="field full">
                     <span class="field-label">说明 <code>description</code></span>
@@ -431,7 +431,7 @@
               <div class="grow"></div>
               <span class="dirty-flag" id="routingDirty" hidden>未保存</span>
             </div>
-            <p class="col-desc">主 Agent 调用 <code>list_agent_profiles</code> 或 <code>discover_agent_models_and_thinking_levels</code> 时，这段总则会与各 Profile 的 <code>when_to_use</code> 一起置顶返回。</p>
+            <p class="col-desc">主 Agent 调用 <code>list_agent_profiles</code> 或 <code>discover_agent_models_and_thinking_levels</code> 时，这段统一总则会优先返回；各 Profile 的 <code>when_to_use</code> 仅作为新增或未压测场景的补充提示。</p>
             <textarea id="routingInput" spellcheck="false" placeholder="在此编写多 Agent 协同与路由策略…"></textarea>
             <label class="field">
               <span class="field-label">Sub Agent 完成后自动关闭（分钟）</span>

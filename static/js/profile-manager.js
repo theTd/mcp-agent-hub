@@ -133,7 +133,7 @@ function sortedProfileEntries() {
 // ------------------------------------------------------------- profile list
 function matchesFilter(id, p) {
   if (!filterText) return true;
-  return [id, p.name, p.engine, p.default_model, p.default_thinking_level, p.when_to_use]
+  return [id, p.name, p.engine, p.default_model, p.default_thinking_level, p.when_to_use, p.description]
     .some((value) => String(value || '').toLowerCase().includes(filterText));
 }
 

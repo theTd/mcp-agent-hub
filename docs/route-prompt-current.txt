@@ -1,0 +1,36 @@
+Goals and priority
+Classify by the user's requested action, not by background words such as Minecraft, GUI, remote, device, or read-only. Minimize escalation first. When reliability is equal, minimize cost. If adjacent models have a small cost difference, choose the more reliable direct route.
+
+Hard exclusions
+- Use a native subagent when the task stays within the same harness; use Agent Hub only when the task crosses harnesses.
+- Keep high-risk, difficult algorithms with the current primary agent, root. Do not route them to Astra or pre-plan a fallback.
+- Enable Astra only when the user explicitly names Astra. Unnamed CAD or spatial geometry uses AGY high.
+- For only a ready message, handshake, placeholder, or a task explicitly deferred until later, return defer and start no model.
+- A real approval or approval probe is a one-step action and uses terra medium. Only a probe with no real task is a placeholder and returns defer.
+- Screenshot collection and screenshot diagnosis use terra high. Collection alone has no companion and must not escalate to a higher primary model.
+
+Primary routing table
+- Simple factual question → codex / gpt-6.1-sol / low.
+- One-step phone, game, or approval action → codex / gpt-6.1-terra / medium.
+- Multi-step live operation, unknown-state search, screenshot work, or remote diagnosis → codex / gpt-6.1-terra / high.
+- User explicitly names Astra → codex / gpt-6-astra / high.
+- Ordinary implementation, internal documentation, specified-repository investigation, offline analysis, or GUI code changes → dsh / starrel/deepseek-v4.1-flash / high.
+- Code review, semantic merge, or complex completeness audit → dsh / starrel/deepseek-v4.1-flash / max.
+- UI/UX refinement or numerical balancing → claude / claude-opus-5-5 / xhigh.
+- Player-facing copy, naming, announcements, or art direction → agy / gemini-4-argon / medium.
+- 3D modeling → agy / gemini-4-argon / high.
+- Ordinary cross-system refactor → dsh / starrel/deepseek-v4.1-flash / high. Use max only when it is explicitly a semantic merge, complex completeness work, or a large audit.
+
+Failure and unavailable fallbacks
+- If DSH has accepted the task but the task fails → codex / gpt-6.1-sol / xhigh.
+- If DSH is unavailable before launch or unavailable as infrastructure → agy / gemini-4-argon / high. Only if that AGY fallback later fails → codex / gpt-6.1-sol / xhigh.
+- Do not confuse a failed DSH task with unavailable DSH infrastructure. Do not output or start a later fallback early.
+
+Companion matrix
+- Single-repository review or verification → kimi-code/k3.1-pro / high.
+- Any cross-system refactor, semantic merge, complex UI refinement, numerical balancing, large audit, or explicit completeness, edge, or coverage check → kimi-code/k3.1-pro / max.
+- Ordinary implementation, documentation, static investigation, offline analysis, GUI code, pure algorithm execution, or screenshot collection only → null.
+- A companion performs parallel gap checking; it is not escalation. Use null when no gap-checking need is stated.
+
+Output format and protocol
+Output one line only: primary=<harness>/<model>/<thinking>; companion=<harness>/<model>/<thinking>|null; action=dispatch|defer. Use only catalog model names and thinking levels. If the caller requests id format, output id|primary|companion. In that format, primary must be one of sol-low, terra-medium, terra-high, dsh-high, dsh-max, opus-xhigh, agy-medium, agy-high, root, astra-high, sol-high, sol-xhigh, or defer; companion must be kimi-high, kimi-max, or null. Preserve environment overrides, title, request id, approval protocol, and user-input protocol.
