@@ -437,6 +437,32 @@ class HubDatabase:
             ).fetchall()
             return [dict(r) for r in reversed(rows)]
 
+    def get_recent_worker_events(self, session_id: str, limit: int = 80) -> List[Dict[str, Any]]:
+        """Return the newest persisted mailbox events in chronological order.
+
+        The in-memory event ring is intentionally bounded and is not restored on Hub startup.
+        Transcript consumers therefore need a small persisted tail as a fallback for archived
+        sessions and for a page opened immediately after a restart.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT seq, session_id, timestamp, type, category, content, status,
+                       files_changed_json, request_id
+                FROM worker_events
+                WHERE session_id=?
+                ORDER BY seq DESC LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+            result = []
+            for row in reversed(rows):
+                item = dict(row)
+                item["files_changed"] = self._decode_json_column(item.pop("files_changed_json", None), [])
+                item["interaction"] = None
+                result.append(item)
+            return result
+
     def list_persisted_sessions(self, limit: int = 30, include_archived: bool = True) -> List[Dict[str, Any]]:
         """Session summary rows; `include_archived=False` is "live + ended-in-memory" (spec §6)."""
         where = "" if include_archived else "WHERE archived_at IS NULL"

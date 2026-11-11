@@ -538,6 +538,28 @@ def _store_root(env_name: str, default: Path) -> Path:
     return default
 
 
+def _directory_is_writable(path: Path) -> bool:
+    """Check whether a child process can create files below *path*.
+
+    ``os.access`` is not sufficient on Windows when the Hub runs under a restricted token, so
+    use the same create/delete operation the CLI will perform.  The probe is deliberately tiny
+    and is removed immediately.
+    """
+    probe = None
+    try:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".hub-write-probe-{uuid.uuid4().hex}"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except (OSError, PermissionError):
+        try:
+            if probe is not None:
+                probe.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
 def codex_sessions_root() -> Path:
     return _store_root("HUB_CODEX_SESSIONS_ROOT", Path(os.path.expanduser("~")) / ".codex" / "sessions")
 
@@ -7007,6 +7029,177 @@ class HubSessionManager:
             results.append(ev)
         return results
 
+    async def get_transcript_view(self, session_id: str, limit: int = 80) -> Dict[str, Any]:
+        """Build a small engine-neutral transcript for the console.
+
+        This deliberately does not invoke the CLI-specific transcript summarizer.  The console
+        polls this endpoint more frequently than the normal session list, so it uses the already
+        normalized worker events plus the persisted tool/message tails.  The raw TUI remains
+        available through the separate terminal view when a provider-specific diagnosis is needed.
+        """
+        try:
+            limit = max(10, min(200, int(limit)))
+        except (TypeError, ValueError):
+            limit = 80
+        sess = self.sessions.get(session_id)
+        if sess is not None:
+            meta = sess.to_dict()
+        else:
+            meta = await self.db.get_session_record(session_id)
+            if not meta:
+                raise ValueError(f"找不到会话 {session_id}")
+
+        # The memory ring is freshest, while SQLite fills the gap after a restart or when the
+        # session has already left the live map.  Sequence numbers make the merge deterministic.
+        persisted_events = await self.db.get_recent_worker_events(session_id, limit)
+        events_by_seq = {int(item.get("seq")): item for item in persisted_events if item.get("seq") is not None}
+        for item in self.get_worker_events(session_id=session_id, after_seq=0):
+            if item.get("seq") is not None:
+                events_by_seq[int(item["seq"])] = item
+        events = sorted(events_by_seq.values(), key=lambda item: (float(item.get("timestamp") or 0), int(item.get("seq") or 0)))
+
+        tools = await self.db.get_recent_tool_calls(session_id, 30)
+        messages = await self.db.get_recent_intermediate_messages(session_id, 30)
+
+        def text(value: Any, size: int = 4000) -> str:
+            return str(value or "").replace("\x00", "").strip()[:size]
+
+        def event_kind(ev_type: str) -> str:
+            if ev_type in ("tool_call", "tool_result"):
+                return "tool"
+            if ev_type in ("question", "approval_request"):
+                return "interaction"
+            if ev_type in ("exited", "terminated", "crashed"):
+                return "system"
+            return "assistant"
+
+        entries: List[Dict[str, Any]] = []
+        seen_content = set()
+        task = text(meta.get("last_task"), 3000)
+        task = re.sub(r"\s*\[Sub-Agent Bridge Info[\s\S]*$", "", task, flags=re.IGNORECASE).strip()
+        task = re.sub(r"\s*\[Hub Session: session_id=[^\]]+\]", "", task).strip()
+        if task:
+            entries.append({
+                "id": "task",
+                "kind": "user",
+                "label": "任务",
+                "text": task,
+                "timestamp": meta.get("created_at"),
+                "step": 0,
+                "source": "hub",
+            })
+
+        parent_messages = self.parent_messages.get(session_id)
+        if parent_messages is None:
+            parent_messages = meta.get("parent_messages") or []
+        for message in parent_messages:
+            body = text(message.get("content")) if isinstance(message, dict) else text(message)
+            if not body:
+                continue
+            entries.append({
+                "id": f"parent:{message.get('id') or message.get('message_id') or len(entries)}" if isinstance(message, dict) else f"parent:{len(entries)}",
+                "kind": "user",
+                "label": "主 Agent",
+                "text": body,
+                "timestamp": message.get("timestamp") if isinstance(message, dict) else None,
+                "step": None,
+                "source": "hub",
+            })
+
+        for ev in events:
+            ev_type = str(ev.get("type") or "message")
+            body = text(ev.get("content"))
+            interaction = ev.get("interaction")
+            if not body and not interaction:
+                continue
+            seen_content.add(body)
+            entries.append({
+                "id": f"event:{ev.get('seq') or len(entries)}",
+                "kind": event_kind(ev_type),
+                "label": {
+                    "tool_call": "调用工具", "tool_result": "工具结果", "turn_completed": "回复",
+                    "question": "提问", "approval_request": "需要审批", "progress": "进展",
+                    "message": "消息", "message_to_parent": "汇报", "exited": "进程结束",
+                    "terminated": "已终止", "crashed": "异常退出",
+                }.get(ev_type, "事件"),
+                "type": ev_type,
+                "text": body,
+                "timestamp": ev.get("timestamp"),
+                "step": None,
+                "source": text(ev.get("source") or ev.get("category"), 120),
+                "status": text(ev.get("status"), 40),
+                "interaction": interaction,
+                "final": ev_type == "turn_completed",
+            })
+
+        # Some engines report assistant text through telemetry without a separate worker event.
+        # Add those records only when their body is not already represented above.
+        for msg in messages:
+            body = text(msg.get("content"))
+            if not body or body in seen_content:
+                continue
+            seen_content.add(body)
+            source = text(msg.get("source"), 120)
+            thinking = bool(re.search(r"(?:think|reason|analysis)", f"{source} {body[:120]}".lower()))
+            entries.append({
+                "id": f"message:{msg.get('timestamp') or len(entries)}",
+                "kind": "thinking" if thinking else "assistant",
+                "label": "思考" if thinking else "进展",
+                "text": body,
+                "timestamp": msg.get("timestamp"),
+                "step": msg.get("step_num"),
+                "source": source,
+                "status": "info",
+            })
+
+        # Tool records are useful even when a provider did not emit a mailbox event.  Do not
+        # duplicate the common `name: input` event shape.
+        for tool in tools:
+            name = text(tool.get("tool_name"), 160)
+            body = text(tool.get("output_summary") or tool.get("input_summary"), 3500)
+            if not name:
+                continue
+            if any(item.get("kind") == "tool" and item.get("text", "").startswith(f"{name}:") for item in entries):
+                continue
+            entries.append({
+                "id": f"tool:{tool.get('timestamp') or len(entries)}",
+                "kind": "tool",
+                "label": "工具",
+                "text": f"{name}: {body}".strip(),
+                "timestamp": tool.get("timestamp"),
+                "step": tool.get("step_num"),
+                "source": text(tool.get("source"), 120),
+                "status": text(tool.get("status"), 40),
+            })
+
+        final_text = text(meta.get("final_response"), 5000)
+        if final_text and not any(item.get("final") or item.get("text") == final_text for item in entries):
+            entries.append({
+                "id": "final",
+                "kind": "assistant",
+                "label": "上轮回复" if meta.get("from_previous_turn") else "回复",
+                "text": final_text,
+                "timestamp": meta.get("ended_at") or meta.get("updated_at"),
+                "step": meta.get("step_count"),
+                "source": text(meta.get("final_response_source"), 120),
+                "status": "completed",
+                "final": True,
+            })
+
+        task_entry = entries[:1] if task else []
+        rest = sorted(entries[1:] if task else entries, key=lambda item: (float(item.get("timestamp") or 0), str(item.get("id"))))
+        entries = task_entry + rest[-limit:]
+        return {
+            "session_id": session_id,
+            "status": meta.get("status"),
+            "step_count": meta.get("step_count", 0),
+            "current_activity": meta.get("current_activity", ""),
+            "pending_interaction": sess.pending_interaction if sess else meta.get("pending_interaction"),
+            "final_response": final_text,
+            "updated_at": meta.get("updated_at"),
+            "entries": entries,
+        }
+
     async def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
         """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
         target_ids = session_targets(session_id)
@@ -10174,14 +10367,30 @@ class HubSessionManager:
         if session.terminated_by_user:
             # Q4: never attach, persist or emit for a session the user already terminated.
             return
-        log_file = log_path or Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
+        if log_path is not None:
+            log_file = Path(log_path)
+        else:
+            default_log = Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
+            # A restricted desktop token may be able to call the DSH API while it cannot read the
+            # host's default log directory.  In that case keep the watcher alive and rely on the
+            # job/messages endpoints; a writable Hub-local path also gives the transcript a stable
+            # location if the host is configured to mirror logs there.
+            if _directory_is_writable(default_log.parent):
+                log_file = default_log
+            else:
+                log_file = self.data_dir / "dsh-logs" / f"{job_id}.log"
+                log_file.parent.mkdir(parents=True, exist_ok=True)
         session.transcript_path = log_file
         await self.persist_session(session)
         tail = TranscriptTail(log_file)
         msg_cursor = 0
 
         async def drain_log_lines():
-            lines = await tail.read_batch()
+            try:
+                lines = await tail.read_batch()
+            except (OSError, PermissionError):
+                # Log access is auxiliary; DSH job status and mailbox polling remain authoritative.
+                lines = []
             for next_offset, line in lines:
                 if session.terminated_by_user or self._shutting_down:
                     return False
@@ -10970,6 +11179,26 @@ class HubSessionManager:
         profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
         caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
         resolved_env: Dict[str, str] = dict(profile_env)
+
+        # The desktop app can run the Hub under a restricted Windows token.  Several CLIs write
+        # their first-run state before rendering a prompt and otherwise exit immediately when the
+        # inherited user home is read-only (Kimi: ``storage write failed``; OMP: daemon state).
+        # Keep normal installations on their existing home, while giving those two engines a
+        # per-Hub writable home in the data directory when the inherited one cannot be written.
+        if eng in ("omp", "kimi"):
+            inherited_home = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
+            if not _directory_is_writable(inherited_home):
+                runtime_home = self.data_dir / ".agent_runtime" / eng
+                runtime_home.mkdir(parents=True, exist_ok=True)
+                resolved_env.setdefault("USERPROFILE", str(runtime_home))
+                resolved_env.setdefault("HOME", str(runtime_home))
+                resolved_env.setdefault("APPDATA", str(runtime_home / "AppData" / "Roaming"))
+                resolved_env.setdefault("LOCALAPPDATA", str(runtime_home / "AppData" / "Local"))
+                resolved_env.setdefault("TEMP", str(runtime_home / "Temp"))
+                resolved_env.setdefault("TMP", str(runtime_home / "Temp"))
+                if eng == "kimi":
+                    resolved_env.setdefault("KIMI_CODE_HOME", str(runtime_home))
+                notes.append(f"默认用户目录不可写，已为 {name} 切换到 Hub 运行目录")
 
         options = self.engine_model_options(eng)
         explicit_model = str(model).strip() if model and str(model).strip() else None
