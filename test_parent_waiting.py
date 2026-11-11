@@ -180,11 +180,9 @@ class ParentWaitingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_cancellation_cleans_listener(self):
         self.session("a")
-        task = asyncio.create_task(self.server.wait_subagent_events("a", 0, 60))
-        await asyncio.sleep(.01)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+        result = await asyncio.wait_for(self.server.wait_subagent_events("a", 0, 60), .5)
+        self.assertTrue(result["nonblocking"])
+        self.assertEqual(result["timeout_seconds_ignored"], 60)
         self.assertFalse(self.hub._event_waiters)
 
     async def test_wait_input_validation(self):
@@ -218,7 +216,7 @@ class ParentWaitingTests(unittest.IsolatedAsyncioTestCase):
         self.session("a")
         async with Client(self.server.mcp) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
-            self.assertIn("next_wait_arguments", tools["wait_subagent_events"].description)
+            self.assertIn("HTTP poll", tools["wait_subagent_events"].description)
             self.assertIn("next_action", tools["reply_to_subagent"].description)
             result = await client.call_tool("wait_subagent_events", {
                 "session_id": "a", "after_seq": 0, "timeout_seconds": 0,

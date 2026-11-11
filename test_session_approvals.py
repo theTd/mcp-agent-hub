@@ -11,7 +11,7 @@ import httpx
 from fastmcp import Client
 from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES,
                              parse_codex_approval_prompt, resolve_session_approval,
-                             bypass_launch_flags)
+                             bypass_launch_flags, normalize_auto_approval_rules)
 from test_native_records import FakePty
 
 MODAL = '''Field 1/1
@@ -25,6 +25,23 @@ enter to submit | esc to cancel'''
 
 
 class ApprovalParserTests(unittest.TestCase):
+    def test_auto_approval_rules_are_bounded_and_structured(self):
+        rule = {
+            "id": "readonly",
+            "effect": "approve_once",
+            "match": {"tool": ["Bash"], "command_argv": [["git", "status"]]},
+            "constraints": {"network": False, "outside_workspace": False, "shell_composition": False},
+            "max_uses": 2,
+            "expires_in_seconds": 60,
+        }
+        normalized = normalize_auto_approval_rules([rule])
+        self.assertEqual(normalized[0]["match"]["command_argv"], [["git", "status"]])
+        self.assertEqual(normalized[0]["max_uses"], 2)
+        with self.assertRaises(ValueError):
+            normalize_auto_approval_rules([dict(rule, effect="approve_always")])
+        with self.assertRaises(ValueError):
+            normalize_auto_approval_rules([dict(rule, expires_in_seconds=8 * 24 * 60 * 60)])
+
     def test_real_mcp_modal_and_wrapped_arguments(self):
         parsed = parse_codex_approval_prompt(MODAL.replace("phase-one", "phase-\none"))
         self.assertEqual(parsed["prompt_kind"], "mcp")
@@ -84,6 +101,51 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def pending(self):
         return await self.hub.poll_tui_screen_interactions_once(self.sess)
 
+    async def test_session_auto_rule_resolves_structured_request_once(self):
+        self.sess.engine = "pwsh"
+        self.sess.profile_snapshot = {
+            "auto_approval_rules": normalize_auto_approval_rules([{
+                "id": "workspace-readonly",
+                "effect": "approve_once",
+                "match": {"tool": ["Bash"], "command_argv": [["git", "status"]]},
+                "constraints": {"network": False, "outside_workspace": False, "shell_composition": False},
+                "max_uses": 1,
+                "expires_in_seconds": 900,
+            }]),
+        }
+        with patch.object(self.sess, "write_input", return_value=True):
+            interaction = await self.hub.register_pending_interaction(
+                self.sess,
+                kind="approval_request",
+                title="read-only command",
+                prompt="git status",
+                options=["Approve", "Deny"],
+                source="test",
+                metadata={"tool": "Bash", "command": "git status", "argv": ["git", "status"], "cwd": str(self.root)},
+            )
+        self.assertEqual(interaction["auto_approval"]["rule_id"], "workspace-readonly")
+        self.assertEqual(interaction["auto_approval"]["remaining_uses"], 0)
+        self.assertIsNone(self.sess.pending_interaction)
+        self.assertTrue(any(e["type"] == "approval_auto_resolved" for e in self.hub.get_worker_events(self.sess.session_id)))
+
+    async def test_auto_rule_rejects_shell_and_outside_workspace(self):
+        rule = normalize_auto_approval_rules([{
+            "id": "readonly",
+            "effect": "approve_once",
+            "match": {"tool": ["Bash"], "command_argv": [["rg", "*"]]},
+            "constraints": {"network": False, "outside_workspace": False, "shell_composition": False},
+        }])[0]
+        self.assertFalse(self.hub._auto_approval_rule_matches(
+            self.sess,
+            {"metadata": {"tool": "Bash", "command": "rg foo && rm -rf x", "argv": ["rg", "foo", "&&", "rm", "-rf", "x"]}},
+            rule,
+        ))
+        self.assertFalse(self.hub._auto_approval_rule_matches(
+            self.sess,
+            {"metadata": {"tool": "Bash", "command": "rg foo", "argv": ["rg", "foo"], "path": str(self.root.parent / "outside")}},
+            rule,
+        ))
+
     async def test_detection_wakes_parent_and_deduplicates(self):
         before = self.hub.global_seq
         pending = await self.pending()
@@ -106,9 +168,11 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_allow_and_identical_following_call(self):
         result = await self.answer()
-        self.assertEqual(result["response_state"], "confirmed")
+        self.assertEqual(result["response_state"], "unconfirmed")
         self.assertEqual(self.sess.pty.inputs, ["\x1b[A\x1b[A\r"])
-        self.assertIsNone(self.sess.pending_interaction)
+        self.assertIsNotNone(self.sess.pending_interaction)
+        await asyncio.sleep(.12)
+        self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
         self.screen = MODAL
         again = await self.pending()
         self.assertIsNotNone(again)
@@ -118,6 +182,8 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         result = await self.answer("deny")
         self.assertEqual(result["approval_action"], "deny")
         self.assertEqual(self.sess.pty.inputs[-1], "\x1b[A\x1b[A\x1b[B\r")
+        await asyncio.sleep(.12)
+        self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
         self.screen = MODAL
         result = await self.answer("approve_session")
         self.assertEqual(result["approval_action"], "approve_once")

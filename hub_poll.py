@@ -49,6 +49,8 @@ def poll_events(session_id, after_seq, timeout, hub_url):
             "next_seq": cur_seq,
             "events": [],
             "pending_interactions": last_result.get("pending_interactions", []),
+            "delivery_updates": last_result.get("delivery_updates", []),
+            "results": last_result.get("results", []),
             "next_wait_arguments": arguments,
             "continuation_hint": CONTINUATION_HINT,
         }
@@ -73,6 +75,8 @@ def poll_events(session_id, after_seq, timeout, hub_url):
             "timeout": round(wait_slice, 1),
             "wake_on_pending": "1",
             "wake_on_state": "1",
+            "include_results": "1",
+            "include_deliveries": "1",
         })
         url = f"{hub_url.rstrip('/')}/api/mailbox/poll?{params}"
 
@@ -90,7 +94,11 @@ def poll_events(session_id, after_seq, timeout, hub_url):
                     if not str(ev.get("content") or "").lstrip().startswith("[approval granted without asking")
                 ]
                 pending_interactions = data.get("pending_interactions")
+                delivery_updates = data.get("delivery_updates", [])
+                results = data.get("results", [])
                 if (not isinstance(pending_interactions, list)
+                        or not isinstance(delivery_updates, list)
+                        or not isinstance(results, list)
                         or data.get("next_action") not in ("reply", "wait", "inspect", "collect_results", "done")):
                     raise ValueError("Hub poll response lacks the parent continuation contract; update the Hub.")
                 arguments = data.get("next_wait_arguments")
@@ -101,12 +109,13 @@ def poll_events(session_id, after_seq, timeout, hub_url):
                 cur_seq = delivered_seq
                 if isinstance(arguments, dict):
                     data["next_wait_arguments"] = {**arguments, "after_seq": cur_seq}
-                data.update(events=events, pending_interactions=pending_interactions, next_seq=cur_seq)
+                data.update(events=events, pending_interactions=pending_interactions,
+                            delivery_updates=delivery_updates, results=results, next_seq=cur_seq)
                 last_result = data
                 failures, last_error = 0, None
                 if data.get("woke_reason") == "hub_shutdown":
                     return finish("poll_error", "Hub shut down while waiting.")
-                if events or pending_interactions or data["next_action"] != "wait":
+                if events or pending_interactions or delivery_updates or results or data["next_action"] != "wait":
                     return data
         except KeyboardInterrupt:
             raise

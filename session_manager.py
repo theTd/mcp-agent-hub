@@ -3,6 +3,7 @@ import base64
 import ctypes
 from ctypes import wintypes
 import datetime
+import fnmatch
 import io
 import json
 import logging
@@ -125,6 +126,92 @@ AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
 MAX_LAUNCH_ARGS = 4096
 MAX_ENV_VARS = 256
 _ENV_KEY_INVALID_RE = re.compile(r"[\s=\x00]")
+
+AUTO_APPROVAL_MAX_RULES = 64
+AUTO_APPROVAL_MAX_USES = 10000
+AUTO_APPROVAL_MAX_TTL_SEC = 7 * 24 * 60 * 60
+AUTO_APPROVAL_SHELL_META_RE = re.compile(r"[;&|<>`]|\$\(|\b(?:bash|sh|cmd|powershell|pwsh)\s+-c\b", re.IGNORECASE)
+AUTO_APPROVAL_HARD_RISK_RE = re.compile(
+    r"\b(?:rm|del|erase|rmdir|remove-item|format|diskpart|shutdown|restart-computer|"
+    r"stop-computer|stop-process|kill|taskkill|git\s+(?:reset\s+--hard|clean\s+-\S*f|push\s+(?:--force|-f|\+)|branch\s+-D)|"
+    r"sudo|runas|publish|invoke-webrequest|curl|wget|invoke-restmethod|irm)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_auto_approval_rules(raw_rules: Any) -> List[Dict[str, Any]]:
+    """Validate and normalize session-scoped automatic approval rules."""
+    if raw_rules is None:
+        return []
+    if not isinstance(raw_rules, list):
+        raise ValueError("auto_approval_rules must be a list")
+    if len(raw_rules) > AUTO_APPROVAL_MAX_RULES:
+        raise ValueError(f"auto_approval_rules accepts at most {AUTO_APPROVAL_MAX_RULES} rules")
+    normalized: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for raw in raw_rules:
+        if not isinstance(raw, dict):
+            raise ValueError("each auto approval rule must be an object")
+        rule_id = str(raw.get("id") or "").strip()
+        if not rule_id or rule_id in seen:
+            raise ValueError("auto approval rule ids must be non-empty and unique")
+        effect = str(raw.get("effect") or "approve_once").strip().lower()
+        if effect != "approve_once":
+            raise ValueError("automatic rules currently support only effect=approve_once")
+        match = raw.get("match")
+        if not isinstance(match, dict):
+            raise ValueError(f"auto approval rule {rule_id!r} requires a match object")
+        raw_tools = match.get("tool") or []
+        if (not isinstance(raw_tools, list) or not raw_tools
+                or any(not isinstance(item, str) or not item.strip() for item in raw_tools)):
+            raise ValueError(f"auto approval rule {rule_id!r} match.tool must be a list of names")
+        command_argv = match.get("command_argv") or []
+        if not isinstance(command_argv, list) or any(
+            not isinstance(pattern, list) or not pattern or any(not isinstance(token, str) for token in pattern)
+            for pattern in command_argv
+        ):
+            raise ValueError(f"auto approval rule {rule_id!r} command_argv must be a list of argv patterns")
+        constraints = raw.get("constraints") or {}
+        if not isinstance(constraints, dict):
+            raise ValueError(f"auto approval rule {rule_id!r} constraints must be an object")
+        cwd_scope = str(match.get("cwd_scope") or "workspace").strip().lower()
+        if cwd_scope != "workspace":
+            raise ValueError(f"auto approval rule {rule_id!r} cwd_scope must be 'workspace'")
+        if any(bool(constraints.get(key)) for key in ("network", "outside_workspace", "shell_composition")):
+            raise ValueError(
+                f"auto approval rule {rule_id!r} may only permit network=false, "
+                "outside_workspace=false and shell_composition=false"
+            )
+        try:
+            max_uses = int(raw.get("max_uses", 1))
+            ttl = int(raw.get("expires_in_seconds", 0))
+        except (TypeError, ValueError):
+            raise ValueError(f"auto approval rule {rule_id!r} max_uses/expires_in_seconds must be integers")
+        if max_uses < 1 or max_uses > AUTO_APPROVAL_MAX_USES:
+            raise ValueError(f"auto approval rule {rule_id!r} max_uses is out of range")
+        if ttl < 0 or ttl > AUTO_APPROVAL_MAX_TTL_SEC:
+            raise ValueError(f"auto approval rule {rule_id!r} expires_in_seconds is out of range")
+        normalized.append({
+            "id": rule_id,
+            "effect": effect,
+            "match": {
+                "tool": [str(item).strip() for item in raw_tools],
+                "command_argv": [list(pattern) for pattern in command_argv],
+                "cwd_scope": cwd_scope,
+                "path_glob": str(match.get("path_glob") or ""),
+            },
+            "constraints": {
+                "network": bool(constraints.get("network", False)),
+                "outside_workspace": bool(constraints.get("outside_workspace", False)),
+                "shell_composition": bool(constraints.get("shell_composition", False)),
+            },
+            "max_uses": max_uses,
+            "expires_in_seconds": ttl,
+            "_uses": 0,
+            "_created_at": time.time(),
+        })
+        seen.add(rule_id)
+    return normalized
 
 
 def normalize_env_map(raw_env: Any, *, field_label: str = "环境变量（env）") -> Dict[str, str]:
@@ -4478,7 +4565,12 @@ class HubSessionManager:
                 self._worker_message_logs = logs
             logs.setdefault(session_id, []).extend(worker_entries)
 
-    async def resume_subagent(self, session_id: str, text: Optional[str] = None) -> Dict[str, Any]:
+    async def resume_subagent(
+        self,
+        session_id: str,
+        text: Optional[str] = None,
+        auto_approval_rules: Any = None,
+    ) -> Dict[str, Any]:
         """Revive an ended session under the same id (spec §5).
 
         Returns {"session", "resumed", "already_live", "delivered", "delivery", "injection"}:
@@ -4490,10 +4582,11 @@ class HubSessionManager:
         sid = (session_id or "").strip()
         if not sid:
             raise ValueError("找不到会话 ")
+        normalized_rules = None if auto_approval_rules is None else normalize_auto_approval_rules(auto_approval_rules)
         lock = self._resume_lock(sid)
         async with lock:
             try:
-                return await self._resume_locked(sid, text)
+                return await self._resume_locked(sid, text, normalized_rules)
             except ValueError:
                 raise
             except PersistenceUnavailable:
@@ -4503,9 +4596,17 @@ class HubSessionManager:
                 # a Chinese 400 detail, never a 500.
                 raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
 
-    async def _resume_locked(self, sid: str, text: Optional[str]) -> Dict[str, Any]:
+    async def _resume_locked(
+        self,
+        sid: str,
+        text: Optional[str],
+        auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         existing = self.sessions.get(sid)
         if existing is not None and existing.is_process_alive():
+            if auto_approval_rules is not None:
+                existing.profile_snapshot["auto_approval_rules"] = auto_approval_rules
+                await self.persist_session(existing, final=True)
             # A2: another resume (or the session itself) won the race. The text still has to be
             # delivered — through the ordinary parent→child path, not the resume injection.
             delivery = None
@@ -4532,7 +4633,13 @@ class HubSessionManager:
             await self._mark_resumable(sid, False, reason)
             raise ValueError(reason)
         if engine == "dsh":
+            if auto_approval_rules is not None:
+                record["profile_snapshot"] = dict(record.get("profile_snapshot") or {})
+                record["profile_snapshot"]["auto_approval_rules"] = auto_approval_rules
             return await self._resume_dsh_session(sid, record, text)
+        if auto_approval_rules is not None:
+            record["profile_snapshot"] = dict(record.get("profile_snapshot") or {})
+            record["profile_snapshot"]["auto_approval_rules"] = auto_approval_rules
         return await self._resume_process_session(sid, record, text)
 
     @staticmethod
@@ -5594,6 +5701,105 @@ class HubSessionManager:
             "transcript_summary": transcript_summary,
         }
 
+    @staticmethod
+    def _auto_approval_argv_matches(argv: List[str], pattern: List[str]) -> bool:
+        return len(argv) == len(pattern) and all(fnmatch.fnmatchcase(actual, wanted) for actual, wanted in zip(argv, pattern))
+
+    def _auto_approval_rule_matches(self, session: AgentSession, interaction: Dict[str, Any], rule: Dict[str, Any]) -> bool:
+        """Match only structured, simple, low-risk requests against a session rule."""
+        metadata = interaction.get("metadata") or {}
+        argv = metadata.get("argv")
+        command = str(metadata.get("command") or metadata.get("raw_command") or "").strip()
+        # Automatic approval is intentionally limited to requests with a structured argv.  A
+        # display string is not sufficient evidence: splitting shell text would make wrappers,
+        # quoting and redirections ambiguous and could turn a safe-looking rule into execution.
+        if not isinstance(argv, list) or not argv \
+                or any(not isinstance(item, str) for item in argv) \
+                or AUTO_APPROVAL_SHELL_META_RE.search(command or " ".join(argv)) \
+                or AUTO_APPROVAL_HARD_RISK_RE.search(command or " ".join(argv)):
+            return False
+        if any(bool(metadata.get(key)) for key in (
+                "force_manual", "hard_deny", "requires_manual", "elevated", "credential_access",
+                "write", "delete", "upload", "process_control")):
+            return False
+        match = rule.get("match") or {}
+        tools = [str(item).lower() for item in (match.get("tool") or [])]
+        tool_name = str(metadata.get("tool") or metadata.get("tool_name") or "").lower()
+        if tools and tool_name not in tools:
+            return False
+        patterns = match.get("command_argv") or []
+        if not patterns:
+            return False
+        if not any(self._auto_approval_argv_matches([str(item) for item in argv], pattern) for pattern in patterns):
+            return False
+        constraints = rule.get("constraints") or {}
+        if bool(metadata.get("outside_workspace")):
+            return False
+        if constraints.get("network") is False and bool(metadata.get("network")):
+            return False
+        if constraints.get("shell_composition") is False and AUTO_APPROVAL_SHELL_META_RE.search(command):
+            return False
+        # Ordinary session rules never authorize workspace escapes.  The caller may include a
+        # path even for a read-only tool; rejecting it here keeps an underspecified rule from
+        # becoming an outside-workspace write grant.
+        try:
+            cwd = Path(session.cwd).resolve()
+            requested_cwd = metadata.get("cwd")
+            if requested_cwd and not Path(str(requested_cwd)).resolve().is_relative_to(cwd):
+                return False
+            requested_path = metadata.get("path") or metadata.get("destination")
+            if requested_path and not Path(str(requested_path)).resolve().is_relative_to(cwd):
+                return False
+        except (OSError, ValueError):
+            return False
+        path_glob = str(match.get("path_glob") or "")
+        if path_glob:
+            path_value = str(metadata.get("path") or metadata.get("destination") or "")
+            relative_value = ""
+            if path_value:
+                try:
+                    relative_value = str(Path(path_value).resolve().relative_to(cwd)).replace("\\", "/")
+                except (OSError, ValueError):
+                    relative_value = ""
+            if not path_value or not (
+                    fnmatch.fnmatchcase(path_value, path_glob)
+                    or fnmatch.fnmatchcase(relative_value, path_glob)):
+                return False
+        return True
+
+    def _consume_auto_approval_rule(self, session: AgentSession, interaction: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        snapshot = session.profile_snapshot if isinstance(session.profile_snapshot, dict) else {}
+        rules = snapshot.get("auto_approval_rules") or []
+        now = time.time()
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get("effect") != "approve_once":
+                continue
+            created = float(rule.get("_created_at") or now)
+            ttl = int(rule.get("expires_in_seconds") or 0)
+            uses = int(rule.get("_uses") or 0)
+            if (ttl and now >= created + ttl) or uses >= int(rule.get("max_uses") or 1):
+                continue
+            if not self._auto_approval_rule_matches(session, interaction, rule):
+                continue
+            rule["_uses"] = uses + 1
+            return {
+                "rule_id": rule.get("id"),
+                "decision": "approve_once",
+                "remaining_uses": max(0, int(rule.get("max_uses") or 1) - rule["_uses"]),
+                "expires_at": (created + ttl) if ttl else None,
+            }
+        return None
+
+    @logical_write
+    async def set_auto_approval_rules(self, session_id: str, rules: Any) -> Dict[str, Any]:
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Session '{session_id}' not found in active sessions.")
+        normalized = normalize_auto_approval_rules(rules)
+        session.profile_snapshot["auto_approval_rules"] = normalized
+        await self.persist_session(session, final=True)
+        return {"session_id": session_id, "auto_approval_rules": normalized}
+
     @logical_write
     async def register_pending_interaction(
         self,
@@ -5661,6 +5867,42 @@ class HubSessionManager:
             }
         else:
             self.pending_questions[req_id]["interaction"] = interaction
+
+        auto_match = None
+        if kind == "approval_request":
+            auto_match = self._consume_auto_approval_rule(session, interaction)
+        if auto_match is not None:
+            interaction["auto_approval"] = auto_match
+            try:
+                action_result = await self.respond_to_interaction(
+                    session.session_id,
+                    decision="approve",
+                    request_id=req_id,
+                )
+            except Exception:
+                logger.exception("[%s] automatic approval failed for %s", session.session_id, req_id)
+                for candidate in session.profile_snapshot.get("auto_approval_rules") or []:
+                    if isinstance(candidate, dict) and candidate.get("id") == auto_match.get("rule_id"):
+                        candidate["_uses"] = max(0, int(candidate.get("_uses") or 1) - 1)
+                        break
+                interaction.pop("auto_approval", None)
+            else:
+                await self.record_worker_event(
+                    session.session_id,
+                    {
+                        "type": "approval_auto_resolved",
+                        "category": "approval_auto_resolved",
+                        "status": action_result.get("response_state") or "sent",
+                        "decision": "approve_once",
+                        "request_id": req_id,
+                        "rule_id": auto_match["rule_id"],
+                        "remaining_uses": auto_match.get("remaining_uses"),
+                        "expires_at": auto_match.get("expires_at"),
+                        "content": f"Automatic approval rule {auto_match['rule_id']} matched",
+                        "interaction": interaction,
+                    },
+                )
+                return interaction
 
         opts_lines = "\n".join(f"  [{i + 1}] {opt}" for i, opt in enumerate(options)) if options else "  (free-text reply)"
         ev_type = "approval_request" if kind == "approval_request" else "question"
@@ -6303,16 +6545,13 @@ class HubSessionManager:
                     inter["metadata"] = meta
                     sess.write_input("\x1b[A" * len(options) + "\x1b[B" * idx + "\r")
                     action_trace = f"Codex MCP selector option {idx + 1} + Enter"
-                    deadline = time.monotonic() + 2.0
-                    while time.monotonic() < deadline:
-                        await self._refresh_codex_mcp_response(sess)
-                        if sess.pending_interaction is not inter:
-                            break
-                        await asyncio.sleep(0.05)
+                    # Make one immediate, non-waiting reconciliation pass.  Any later native
+                    # confirmation is observed by the watcher and surfaced by HTTP poll.
+                    await self._refresh_codex_mcp_response(sess)
                     response_state = "confirmed" if meta.get("response_state") == "confirmed" else "unconfirmed"
                     meta["response_state"] = response_state
                     if response_state == "unconfirmed":
-                        notes.append("输入已送达，但原生审批尚未确认；保留待处理请求，不自动重发")
+                        notes.append("输入已送达，原生审批确认将由 HTTP poll 返回；不会自动重发")
                     if feedback:
                         notes.append("MCP Cancel 不支持拒绝反馈输入；未向终端追加反馈")
                 elif approval_action in ("deny", "deny_feedback"):
@@ -7255,6 +7494,8 @@ class HubSessionManager:
         timeout_sec: float = 25.0,
         wake_on_pending: bool = False,
         wake_on_state: bool = False,
+        include_results: bool = False,
+        include_deliveries: bool = False,
     ) -> Dict[str, Any]:
         session_targets(session_id)
         if after_seq < 0 or not math.isfinite(timeout_sec) or timeout_sec < 0:
@@ -7267,7 +7508,26 @@ class HubSessionManager:
             state = await self.parent_wait_state(
                 session_id, next_seq, pending, (event["session_id"] for event in events),
             )
+            delivery_updates = [
+                event for event in events
+                if event.get("type") in ("input_delivery", "delivery_confirmed", "delivery_failed")
+            ] if include_deliveries else []
+            results = []
+            if include_results:
+                for completed_id in state.get("completed_session_ids") or []:
+                    try:
+                        results.append(await self.get_subagent_final_response(completed_id))
+                    except ValueError:
+                        pass
             arguments = state["next_wait_arguments"]
+            if arguments:
+                arguments = {
+                    **arguments,
+                    "wake_on_pending": bool(wake_on_pending),
+                    "wake_on_state": bool(wake_on_state),
+                    "include_results": bool(include_results),
+                    "include_deliveries": bool(include_deliveries),
+                }
             command = self.build_poll_command(
                 arguments["session_id"] if arguments else session_id, next_seq,
             )
@@ -7278,12 +7538,15 @@ class HubSessionManager:
                 "after_seq": after_seq,
                 "next_seq": next_seq,
                 "events": events,
+                "delivery_updates": delivery_updates,
+                "results": results,
                 "next_poll_command": command,
                 "background_poll_command": command,
             }
 
         def ready(result):
             return (bool(result["events"])
+                    or (include_results and bool(result["results"]))
                     or (wake_on_pending and bool(result["pending_interactions"]))
                     or (wake_on_state and result["next_action"] != "wait"))
 
@@ -9931,6 +10194,16 @@ class HubSessionManager:
         """
         session.last_injection = result
         what = "消息提交" if result.get("mode") == "parent_message" else "启动文本注入"
+        delivery_status = "confirmed" if result.get("ok") is True else (
+            "failed" if result.get("ok") is False else "unconfirmed"
+        )
+        await self.record_worker_event(session.session_id, {
+            "type": "input_delivery",
+            "category": f"delivery_{delivery_status}",
+            "status": delivery_status,
+            "content": str(result.get("reason") or result.get("label") or delivery_status),
+            "request_id": result.get("submit_id"),
+        })
         if session.engine == "codex" and session.pty and result.get("ok") is not True:
             # Native TUIs redraw differences against their own screen. Hub-added ANSI moves
             # the emulator's cursor without moving that native screen and can introduce drift.
@@ -11515,6 +11788,7 @@ class HubSessionManager:
         mcp_servers: Optional[Dict[str, Any]] = None,
         disabled_mcp_servers: Optional[List[str]] = None,
         strict_mcp_config: bool = False,
+        auto_approval_rules: Any = None,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
@@ -11522,6 +11796,7 @@ class HubSessionManager:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
         extra_args = normalize_extra_args(extra_args)
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
+        auto_approval_rules = normalize_auto_approval_rules(auto_approval_rules)
         if profile_id == "desktop-gui":
             validate_mcp_engine("desktop_gui", "desktop_gui", mcp_config)
         if extra_args and profile_id == "desktop-gui":
@@ -11553,6 +11828,7 @@ class HubSessionManager:
                 "command": "", "args": [], "env": {}, "model": None, "thinking_level": None,
                 "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
                 "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
+                "auto_approval_rules": auto_approval_rules,
                 **resolve_session_approval("desktop_gui", {}, bypass_approvals),
             }
             if bypass_approvals is not None:
@@ -11660,6 +11936,7 @@ class HubSessionManager:
             "startup_delay_sec": startup_delay,
             "submit_key": submit_key,
             "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
+            "auto_approval_rules": auto_approval_rules,
             # Round 2: whether this launch had the profile's approval off switch on (a resume
             # re-reads the profile's current value and overwrites this).
             "bypass_approvals": bool(launch.get("bypass_approvals")),

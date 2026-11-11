@@ -141,10 +141,9 @@ def _sanitize_json_floats(value: Any) -> Any:
 def _injection_report(session, pending: bool = False, submit_id: Optional[str] = None) -> Dict[str, Any]:
     """W11: spawn/resume/send report the real injection, or say honestly that it is still pending.
 
-    The call waits up to wait_seconds; a TUI that needs longer to become ready has not typed the
-    text yet, so last_injection is still null. The CALLER knows whether text was sent in this call
-    and whether it is still waiting (delivery.injection == "pending"), so it passes that in; this
-    helper must not guess it from task_mode, or a resume without text would claim a pending typing.
+    MCP callers receive the current injection record immediately. A TUI that is not ready leaves
+    the record pending; HTTP poll reconciles the eventual outcome. The CALLER knows whether text
+    was submitted in this call and whether it remains pending, so this helper must not guess it.
     K8 (fix 9d): with any record, the session's recent submit records (startup text, live messages,
     newest last) come along as recent_injections, so an earlier outcome stays visible.
     """
@@ -158,10 +157,10 @@ def _injection_report(session, pending: bool = False, submit_id: Optional[str] =
     if isinstance(injection, dict) and injection.get("pending"):
         # K6 (fix 9c): a live message is still being typed and proved in the background; the
         # record says so ("submitting") and its real outcome replaces it.
-        return {"injection": "pending", "last_injection": injection,
+        return {"injection": "pending", "submit_id": injection.get("submit_id"), "last_injection": injection,
                 "injection_hint": INJECTION_PENDING_HINT, **history}
     if isinstance(injection, dict) and injection:
-        return {"injection": "recorded", "last_injection": injection, **history}
+        return {"injection": "recorded", "submit_id": injection.get("submit_id"), "last_injection": injection, **history}
     if pending:
         return {
             "injection": "pending",
@@ -180,12 +179,26 @@ async def _parent_continuation(session_id, after_seq=0, events=()):
     state = await hub.parent_wait_state(session_id, next_seq)
     arguments = state["next_wait_arguments"]
     command = hub.build_poll_command(arguments["session_id"] if arguments else session_id, next_seq)
+    http_arguments = {
+        **(arguments or {
+            "session_id": session_id,
+            "after_seq": next_seq,
+            "timeout_seconds": 60.0,
+        }),
+        "after_seq": next_seq,
+        "wake_on_pending": True,
+        "wake_on_state": True,
+        "include_results": True,
+        "include_deliveries": True,
+    }
     return {
         **state,
         "next_seq": next_seq,
+        "current_seq": next_seq,
         "background_poll_command": command,
         "next_poll_command": command,
         "background_poll_hint": BACKGROUND_POLL_HINT,
+        "http_poll_arguments": http_arguments,
     }
 
 # ============================================================================
@@ -246,6 +259,7 @@ async def spawn_subagent(
     mcp_servers: Optional[Dict[str, Any]] = None,
     disabled_mcp_servers: Optional[List[str]] = None,
     strict_mcp_config: bool = False,
+    auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
     wait_seconds: float = 5.0,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
@@ -262,9 +276,10 @@ async def spawn_subagent(
     MCP configuration is preserved on resume; it does not confirm a successful MCP connection.
     After collecting the result, call terminate_subagent promptly when no further work is needed.
     Completion leaves the session open; automatic idle cleanup is only a fallback.
-    After launch follow next_action: reply, wait, collect_results or inspect. While
-    unfinished_session_ids is nonempty, call wait_subagent_events with next_wait_arguments
-    after processing each result. Background CLI waiting requires host completion notifications.
+    This MCP call is non-blocking. The deprecated wait_seconds argument is ignored for waiting;
+    use the returned HTTP poll arguments/background_poll_command for all waiting and completion.
+    After launch follow next_action through HTTP poll. While unfinished_session_ids is nonempty,
+    keep one HTTP long-poll connection per session/group.
     bypass_approvals=null inherits the profile, false enforces approvals, true bypasses them
     for this session and its resumes without changing the profile.
     high_risk_approval is true when enforced, false when bypassed, or null for engines without
@@ -281,6 +296,7 @@ async def spawn_subagent(
         mcp_servers=mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
         strict_mcp_config=strict_mcp_config,
+        auto_approval_rules=auto_approval_rules,
         task=task,
         cwd=cwd,
         title=title,
@@ -289,22 +305,11 @@ async def spawn_subagent(
         env=env,
     )
 
-    settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
-    if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
-        async def _progress(elapsed: float, snippet: str):
-            if ctx:
-                await ctx.report_progress(
-                    progress=min(elapsed, wait_seconds),
-                    total=wait_seconds,
-                    message=f"Subagent [{session.session_id}] is starting (step={session.step_count}, {int(elapsed)}s)...",
-                )
-
-        settle_info = await hub.wait_for_output_settle(
-            session,
-            timeout_sec=float(wait_seconds),
-            quiet_window_sec=2.5,
-            progress_cb=_progress,
-        )
+    settle_info: Dict[str, Any] = {
+        "settled": False,
+        "reason": "mcp_nonblocking",
+        "wait_seconds_deprecated": wait_seconds,
+    }
 
     events = hub.get_worker_events(session_id=session.session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -346,8 +351,23 @@ async def spawn_subagent(
         "current_seq": next_seq,
         "worker_events": events,
         "wait_result": settle_info,
+        "accepted": True,
         "transcript_summary": transcript_summary,
     }
+
+
+@mcp.tool()
+async def set_subagent_approval_rules(
+    session_id: str,
+    auto_approval_rules: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Set bounded, session-scoped automatic approval rules and return immediately.
+
+    Rules are evaluated only against structured low-risk requests. They never enable the
+    engine-wide bypass switch and expire with the session or their individual TTL.
+    """
+    result = await hub.set_auto_approval_rules(session_id, auto_approval_rules)
+    return {**result, **await _parent_continuation(session_id)}
 
 
 @mcp.tool()
@@ -396,8 +416,8 @@ async def send_to_subagent(
     Otherwise it is delivered through the engine's terminal or native message API.
     To discard a failed Codex draft, send empty text with clear_input=true while idle. Never
     resend after an unconfirmed submit without checking native state. Check the matching
-    submit_id in last_injection/recent_injections, then follow next_action. Successful delivery
-    does not mean completion; keep waiting with next_wait_arguments while work remains.
+    submit_id in last_injection/recent_injections. This call never waits for injection confirmation
+    or task completion; use the returned HTTP poll arguments while work remains.
     """
     await ensure_profiles_loaded()
     if not text.strip() and not clear_input:
@@ -443,38 +463,11 @@ async def send_to_subagent(
             clear_input=clear_input,
         )
 
-    if delivery.get("injection") == "pending":
-        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 15.0), 30.0)
-        while time.time() < inj_deadline:
-            cur_inj = _injection_report(session, submit_id=delivery.get("submit_id"))["last_injection"]
-            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-                break
-            await asyncio.sleep(0.15)
-        cur_inj = _injection_report(session, submit_id=delivery.get("submit_id"))["last_injection"]
-        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-            delivery = dict(delivery)
-            delivery["injection"] = "recorded"
-            delivery["delivered"] = cur_inj.get("ok")
-            delivery["reason"] = cur_inj.get("reason")
-            if cur_inj.get("pty_written") or cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
-                delivery["pty_written"] = True
-
-    settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
-    if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
-        async def _progress(elapsed: float, snippet: str):
-            if ctx:
-                await ctx.report_progress(
-                    progress=min(elapsed, wait_seconds),
-                    total=wait_seconds,
-                    message=f"Subagent [{session_id}] is processing the message (step={session.step_count}, {int(elapsed)}s)...",
-                )
-
-        settle_info = await hub.wait_for_output_settle(
-            session,
-            timeout_sec=float(wait_seconds),
-            quiet_window_sec=2.5,
-            progress_cb=_progress,
-        )
+    settle_info: Dict[str, Any] = {
+        "settled": False,
+        "reason": "mcp_nonblocking",
+        "wait_seconds_deprecated": wait_seconds,
+    }
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -507,6 +500,7 @@ async def send_to_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "wait_result": settle_info,
+        "accepted": True,
         "transcript_summary": transcript_summary,
     }
 
@@ -515,6 +509,7 @@ async def send_to_subagent(
 async def resume_subagent(
     session_id: str,
     text: Optional[str] = None,
+    auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
     wait_seconds: float = 10.0,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
@@ -523,11 +518,15 @@ async def resume_subagent(
     model and thinking level. Optional text starts a new turn; omit it to restore only.
     A live session returns its current state without starting another process.
     A non-resumable session raises an error with the reason.
-    Follow next_action and keep waiting with next_wait_arguments while work remains.
+    This MCP call is non-blocking. Follow next_action through the returned HTTP poll arguments.
     """
     await ensure_profiles_loaded()
     start_seq = hub.global_seq
-    result = await hub.resume_subagent(session_id, text=text)
+    result = await hub.resume_subagent(
+        session_id,
+        text=text,
+        auto_approval_rules=auto_approval_rules,
+    )
     session = result["session"]
     delivery = result.get("delivery") or {
         "delivered": bool(result.get("delivered")),
@@ -537,38 +536,11 @@ async def resume_subagent(
         "injection": result.get("injection") or "none",
     }
 
-    if isinstance(delivery, dict) and delivery.get("injection") == "pending":
-        inj_deadline = time.time() + min(max(float(wait_seconds or 0.0), 15.0), 30.0)
-        while time.time() < inj_deadline:
-            cur_inj = getattr(session, "last_injection", None)
-            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-                break
-            await asyncio.sleep(0.15)
-    if isinstance(delivery, dict) and delivery.get("injection") in ("argv", "pending"):
-        cur_inj = getattr(session, "last_injection", None)
-        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-            delivery = dict(delivery)
-            if delivery.get("injection") == "pending":
-                delivery["injection"] = "recorded"
-            if (cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0) and delivery.get("injection") == "recorded":
-                delivery["pty_written"] = True
-
-    settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
-    if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
-        async def _progress(elapsed: float, snippet: str):
-            if ctx:
-                await ctx.report_progress(
-                    progress=min(elapsed, wait_seconds),
-                    total=wait_seconds,
-                    message=f"Subagent [{session_id}] is resuming and processing the message (step={session.step_count}, {int(elapsed)}s)...",
-                )
-
-        settle_info = await hub.wait_for_output_settle(
-            session,
-            timeout_sec=float(wait_seconds),
-            quiet_window_sec=2.5,
-            progress_cb=_progress,
-        )
+    settle_info: Dict[str, Any] = {
+        "settled": False,
+        "reason": "mcp_nonblocking",
+        "wait_seconds_deprecated": wait_seconds,
+    }
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -592,6 +564,7 @@ async def resume_subagent(
         "worker_events": events,
         "next_seq": next_seq,
         "wait_result": settle_info,
+        "accepted": True,
         "transcript_summary": transcript_summary,
     }
 
@@ -629,8 +602,9 @@ async def reply_to_subagent(
     answer: str,
     request_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Answer a pending native interaction using request_id. After answering, follow next_action
-    and rearm wait_subagent_events with next_wait_arguments while work remains.
+    """Answer a pending native interaction using request_id and return immediately.
+
+    The result includes next_action and next_wait_arguments for the HTTP poll while work remains.
     """
     start_seq = hub.global_seq
     delivery = await hub.deliver_parent_message(
@@ -640,23 +614,12 @@ async def reply_to_subagent(
         also_write_pty=True,
     )
     session = hub.sessions.get(session_id)
-    if session and isinstance(delivery, dict) and delivery.get("injection") == "pending":
-        inj_deadline = time.time() + 4.0
-        while time.time() < inj_deadline:
-            cur_inj = getattr(session, "last_injection", None)
-            if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-                break
-            await asyncio.sleep(0.15)
-        cur_inj = getattr(session, "last_injection", None)
-        if isinstance(cur_inj, dict) and not cur_inj.get("pending"):
-            delivery = dict(delivery)
-            delivery["injection"] = "recorded"
-            if cur_inj.get("ok") is True or int(cur_inj.get("attempts") or 0) > 0:
-                delivery["pty_written"] = True
     events = hub.get_worker_events(session_id, start_seq)
+    next_seq = events[-1]["seq"] if events else start_seq
     return {
-        **await _parent_continuation(session_id, start_seq, events),
+        **await _parent_continuation(session_id, next_seq, events),
         **delivery,
+        "accepted": True,
         "worker_events": events,
         **(_injection_report(
             session,
@@ -687,7 +650,8 @@ async def respond_to_subagent_approval_or_choice(
     in this session. Claude may persist an allow rule in .claude/settings.local.json when offered.
     Rule-triggered OMP prompts fall back to approve-once; Kimi session approval does not cover
     dangerous commands. Inspect the returned notes for the actual scope.
-    After responding, follow next_action and keep waiting with next_wait_arguments while work remains.
+    After responding, use the returned HTTP poll arguments. This MCP call never waits for native
+    acknowledgement or task progress; response_state=unconfirmed is resolved by HTTP poll.
     delivered means input was sent. response_state=confirmed means native acknowledgement;
     unconfirmed retains the pending request: keep waiting and never resend automatically.
     """
@@ -704,22 +668,11 @@ async def respond_to_subagent_approval_or_choice(
         request_id=request_id,
     )
 
-    settle_info: Dict[str, Any] = {"settled": True, "reason": "no_wait"}
-    if wait_seconds and wait_seconds > 0 and session.kind in ("tui", "web_gui"):
-        async def _progress(elapsed: float, snippet: str):
-            if ctx:
-                await ctx.report_progress(
-                    progress=min(elapsed, wait_seconds),
-                    total=wait_seconds,
-                    message=f"Sent interaction response to subagent [{session_id}] ({action_result.get('chosen_label')}); waiting for progress ({int(elapsed)}s)...",
-                )
-
-        settle_info = await hub.wait_for_output_settle(
-            session,
-            timeout_sec=float(wait_seconds),
-            quiet_window_sec=2.5,
-            progress_cb=_progress,
-        )
+    settle_info: Dict[str, Any] = {
+        "settled": False,
+        "reason": "mcp_nonblocking",
+        "wait_seconds_deprecated": wait_seconds,
+    }
 
     events = hub.get_worker_events(session_id=session_id, after_seq=start_seq)
     next_seq = events[-1]["seq"] if events else start_seq
@@ -733,6 +686,10 @@ async def respond_to_subagent_approval_or_choice(
         "current_activity": session.current_activity,
         "pending_interaction": session.pending_interaction,
         "action_result": action_result,
+        "accepted": bool(action_result.get("ok")),
+        "delivered": action_result.get("delivered"),
+        "response_state": action_result.get("response_state"),
+        "resolved_request_id": action_result.get("resolved_request_id"),
         **_injection_report(session, False),
         "worker_events": events,
         "next_seq": next_seq,
@@ -749,47 +706,23 @@ async def wait_subagent_events(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
-    Wait for events, pending interactions or terminal state, for at most 120 seconds.
-    Prefer explicit comma-separated session IDs; 'all' includes unrelated sessions.
-    Reuse next_wait_arguments after every progress batch or timeout while work remains.
-    Handle pending_interactions first, collect completed results and inspect failed/unknown IDs.
-    One completed session does not finish a group. Keep one waiter per session, and keep
-    the cursor returned by that wait. timeout_seconds=0 performs an immediate snapshot.
-    Use the background CLI only if the host reliably delivers completion notifications.
+    Deprecated non-blocking compatibility snapshot. MCP never waits for Sub Agent events;
+    use the returned HTTP poll arguments or background_poll_command instead.
     """
     if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
         raise ValueError("timeout_seconds must be finite and nonnegative.")
-    timeout_seconds = min(timeout_seconds, 120.0)
-    deadline = asyncio.get_event_loop().time() + timeout_seconds
-    elapsed = 0.0
-    slice_sec = 5.0
-
-    while True:
-        rem = deadline - asyncio.get_event_loop().time()
-        if rem <= 0:
-            break
-        res = await hub.poll_worker_events(
-            session_id=session_id,
-            after_seq=after_seq,
-            timeout_sec=min(slice_sec, rem),
-            wake_on_pending=True,
-            wake_on_state=True,
-        )
-        if (res.get("events") or res.get("pending_interactions")
-                or res.get("next_action") != "wait" or res.get("woke_reason") == "hub_shutdown"):
-            return res
-        elapsed += slice_sec
-        if ctx:
-            await ctx.report_progress(
-                progress=min(elapsed, timeout_seconds),
-                total=timeout_seconds,
-                message=f"Waiting for subagent [{session_id}] messages or completion ({int(elapsed)}s)...",
-            )
-
-    return await hub.poll_worker_events(
-        session_id=session_id, after_seq=after_seq, timeout_sec=0,
-        wake_on_pending=True, wake_on_state=True,
+    result = await hub.poll_worker_events(
+        session_id=session_id,
+        after_seq=after_seq,
+        timeout_sec=0,
+        wake_on_pending=True,
+        wake_on_state=True,
+        include_results=True,
+        include_deliveries=True,
     )
+    result["nonblocking"] = True
+    result["timeout_seconds_ignored"] = timeout_seconds
+    return result
 
 
 @mcp.tool()
@@ -1018,6 +951,8 @@ async def api_mailbox_poll(
     timeout: float = Query(25.0),
     wake_on_pending: bool = Query(False),
     wake_on_state: bool = Query(False),
+    include_results: bool = Query(False),
+    include_deliveries: bool = Query(False),
 ):
     return await hub.poll_worker_events(
         session_id=session_id,
@@ -1025,6 +960,8 @@ async def api_mailbox_poll(
         timeout_sec=min(max(0.1, timeout), 120.0),
         wake_on_pending=wake_on_pending,
         wake_on_state=wake_on_state,
+        include_results=include_results,
+        include_deliveries=include_deliveries,
     )
 
 
@@ -1238,7 +1175,11 @@ async def api_resume_session(session_id: str, req: Request):
         body = {}
     text = body.get("text")
     try:
-        result = await hub.resume_subagent(session_id, text=(str(text) if text is not None else None))
+        result = await hub.resume_subagent(
+            session_id,
+            text=(str(text) if text is not None else None),
+            auto_approval_rules=body.get("auto_approval_rules"),
+        )
     except ValueError as e:
         # A9: every resume failure is a Chinese 400 (or a 404 for an unknown id), never a 500.
         message = str(e)
@@ -1259,6 +1200,16 @@ async def api_resume_session(session_id: str, req: Request):
         ),
         "session": session.to_dict(),
     }
+
+
+@app.put("/api/sessions/{session_id}/approval-rules")
+async def api_set_approval_rules(session_id: str, req: Request):
+    body = await req.json()
+    rules = body.get("auto_approval_rules") if isinstance(body, dict) else None
+    try:
+        return await hub.set_auto_approval_rules(session_id, rules)
+    except ValueError as e:
+        return bad_request(str(e))
 
 
 @app.post("/api/launch-preview")
@@ -1332,6 +1283,7 @@ async def api_create_session(req: Request):
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
+            auto_approval_rules=body.get("auto_approval_rules"),
         )
     except ValueError as e:
         return bad_request(str(e))

@@ -6,8 +6,9 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 
 | id | decision |
 |---|---|
-| continuation | Parent-facing launch, send, resume, reply, approval, status, final-result and wait responses expose one shared continuation contract: next action, unfinished/completed/inspect IDs, and bounded MCP wait arguments. Delivery, progress, quiet output and wait timeout never imply task completion. |
-| wait-transport | Bounded MCP waiting is the portable default. Recommend the CLI only when the host delivers reliable background completion notifications; a process ID alone is insufficient. CLI wakeups are single batches and require rearming while work remains. |
+| continuation | Parent-facing launch, send, resume, reply, approval, status and final-result responses expose one shared continuation contract: next action, unfinished/completed/inspect IDs, HTTP poll arguments and event cursor. Delivery, progress, quiet output and poll timeout never imply task completion. |
+| wait-transport | MCP control calls are non-blocking. HTTP `/api/mailbox/poll` is the only parent wait transport; `hub_poll.py` may rearm finite HTTP long-poll requests while work remains. `wait_subagent_events` is a non-blocking compatibility snapshot. |
+| auto-approval | Automatic approval rules are session-scoped, bounded by structured request matching, expiry and use count, and lower priority than hard-deny and forced-manual-approval rules. |
 | scoped-cursor | Prefer explicit session IDs. A group wait continues on unfinished members. Only delivered events advance its cursor; unrelated sessions and status reads do not acknowledge unseen events. |
 | pending-and-failure | Waits wake for unresolved native interactions even after their event was read, and for known terminal/unknown state. Connection/protocol failures and Hub shutdown are explicit CLI errors, with continuation information, rather than successful empty timeouts. |
 
