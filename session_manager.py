@@ -19,7 +19,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 import httpx
 import pyte
@@ -5473,6 +5473,19 @@ class HubSessionManager:
                 logger.exception("Shutdown could not flush every accepted write")
         return archived
 
+    async def record_reasoning_parts(self, session_id: str, source: str, thoughts: Iterable[Any]) -> None:
+        """Thinking from a native record: a console-only reasoning entry, never an intermediate message.
+
+        Joined into the reply text it reached parent agents as progress, showed in the transcript as
+        an ordinary message and hid the final reply's duplicate from the transcript's de-duplication.
+        """
+        for thought in thoughts:
+            text = str(thought or "").strip()
+            if text:
+                await self.record_telemetry(session_id, {
+                    "source": source, "hook_event": "AssistantReasoning", "reasoning": text,
+                })
+
     @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser."""
@@ -8072,7 +8085,7 @@ class HubSessionManager:
                                                 "multi": bool(q0.get("multi", False)),
                                             },
                                         )
-                            inter = thoughts + texts
+                            inter = texts
                             is_end_turn = not has_tool_use and msg.get("stopReason") in ("stop", "end_turn", "stop_sequence")
                             final_txt = "\n".join(texts).strip() if is_end_turn else None
                             if final_txt and not turn_has_step:
@@ -8086,6 +8099,7 @@ class HubSessionManager:
                                         "tool_input": final_txt[:200],
                                     },
                                 )
+                            await self.record_reasoning_parts(session.session_id, "omp_jsonl", thoughts)
                             await self.record_telemetry(
                                 session.session_id,
                                 {
@@ -8264,6 +8278,11 @@ class HubSessionManager:
 
         latest_assistant_text: Optional[str] = None
         turn_has_step = False
+        # Current Kimi writes every step twice: streamed loop events as it works, then the whole
+        # assistant / tool messages (agent.message.appended, batched at the end of a multi-step
+        # turn).  Once the stream is seen, the messages are a second copy of the same step.
+        streamed_steps = False
+        step_texts: List[str] = []  # streamed text parts of the current step
         while self._transcript_watch_alive(session):
             try:
                 await self._drain_kimi_wire_interactions_once(session)
@@ -8289,6 +8308,7 @@ class HubSessionManager:
                         ))
                         turn_has_step = False
                         latest_assistant_text = None
+                        step_texts = []
                         if session.status == "completed":
                             self.begin_new_turn(session, status="running")
                         continue
@@ -8316,25 +8336,25 @@ class HubSessionManager:
                                 "content": latest_assistant_text or "",
                             },
                         )
+                        step_texts = []
                         continue
 
                     if obj.get("type") == "context.append_loop_event":
                         ev = obj.get("event") or {}
                         ev_type = ev.get("type")
-                        if ev_type == "content.part":
+                        if ev_type in ("content.part", "tool.call", "tool.result"):
+                            streamed_steps = True
+                        if ev_type == "step.begin":
+                            step_texts = []
+                        elif ev_type == "content.part":
                             part = ev.get("part") or {}
                             if part.get("type") == "think" and part.get("think"):
-                                await self.record_telemetry(
-                                    session.session_id,
-                                    {
-                                        "source": "kimi_wire_jsonl",
-                                        "hook_event": "AssistantMessage",
-                                        "intermediate_messages": [str(part["think"]).strip()],
-                                    },
-                                )
+                                await self.record_reasoning_parts(session.session_id, "kimi_wire_jsonl", [part["think"]])
                             elif part.get("type") == "text" and part.get("text"):
                                 txt = str(part["text"]).strip()
-                                latest_assistant_text = txt
+                                # The step's whole text is the answer, as the skipped whole message had it.
+                                step_texts.append(txt)
+                                latest_assistant_text = "\n".join(step_texts)
                                 await self.record_telemetry(
                                     session.session_id,
                                     {
@@ -8374,29 +8394,30 @@ class HubSessionManager:
                     role = inner.get("role")
                     content = inner.get("content") or []
                     tool_calls = inner.get("toolCalls") or []
+                    if streamed_steps and role in ("assistant", "tool"):
+                        continue
 
                     if role == "assistant":
-                        inter = []
+                        thoughts = []
                         texts = []
                         if isinstance(content, list):
                             for part in content:
                                 if not isinstance(part, dict):
                                     continue
                                 if part.get("type") == "think" and part.get("think"):
-                                    inter.append(str(part["think"]).strip())
+                                    thoughts.append(str(part["think"]).strip())
                                 elif part.get("type") == "text" and part.get("text"):
-                                    txt = str(part["text"]).strip()
-                                    inter.append(txt)
-                                    texts.append(txt)
+                                    texts.append(str(part["text"]).strip())
                         if texts:
                             latest_assistant_text = "\n".join(texts)
-                        if inter:
+                        await self.record_reasoning_parts(session.session_id, "kimi_wire_jsonl", thoughts)
+                        if texts:
                             await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "kimi_wire_jsonl",
                                     "hook_event": "AssistantMessage",
-                                    "intermediate_messages": inter,
+                                    "intermediate_messages": texts,
                                     "final_assistant_text": latest_assistant_text,
                                 },
                             )
@@ -8574,14 +8595,14 @@ class HubSessionManager:
                                 tcalls = []
                         if not isinstance(tcalls, list):
                             tcalls = []
-                        inter = [x for x in (thinking, content) if x]
-                        if inter:
+                        await self.record_reasoning_parts(session.session_id, "agy_transcript", [thinking])
+                        if content:
                             await self.record_telemetry(
                                 session.session_id,
                                 {
                                     "source": "agy_transcript",
                                     "hook_event": "AssistantMessage",
-                                    "intermediate_messages": inter,
+                                    "intermediate_messages": [content],
                                     "final_assistant_text": content or None,
                                 },
                             )
@@ -8996,6 +9017,7 @@ class HubSessionManager:
                         think_toks = out_details.get("thinking_tokens")
                         out_toks = usage.get("output_tokens")
                         thoughts: List[str] = []
+                        readable_thoughts: List[str] = []  # thoughts without the redacted-thinking placeholders
                         texts: List[str] = []
                         has_tool_use = False
                         for part in content:
@@ -9005,6 +9027,7 @@ class HubSessionManager:
                             if ptype == "thinking":
                                 if part.get("thinking"):
                                     thoughts.append(str(part["thinking"]).strip())
+                                    readable_thoughts.append(thoughts[-1])
                                 else:
                                     meta_parts: List[str] = []
                                     if think_dur_ms is not None:
@@ -9090,7 +9113,7 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: {thoughts[-1].strip('[]')} — streaming response"
                             )
-                        inter = thoughts + texts
+                        inter = texts
                         is_end_turn = (
                             not has_tool_use
                             and stop_reason in ("end_turn", "stop_sequence")
@@ -9098,6 +9121,7 @@ class HubSessionManager:
                         if is_end_turn:
                             turn_completed_emitted = True
                         final_txt = "\n".join(texts).strip() if is_end_turn else None
+                        await self.record_reasoning_parts(session.session_id, "claude_jsonl", readable_thoughts)
                         if inter or is_end_turn:
                             await self.record_telemetry(
                                 session.session_id,
