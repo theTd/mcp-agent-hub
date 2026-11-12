@@ -23,7 +23,11 @@ ROUTING_RULES = (
     "bypass_approvals=null inherits profile, false requires approval, true bypasses it for this session.",
     "A blocked Windows DSH sandbox_preparation prevents dispatch; skipped is unverified. Permission readiness does not prove access; inspect the reason.",
     WAIT_HANDLE_HINT,
-    "For repeated low-risk read-only, workspace-local test/build approvals, prefer short-lived, session-scoped auto_approval_rules. Never use them for deletion, privilege escalation, credentials, uploads, process/service control, or outside-workspace changes.",
+    "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits, DSH workspace root), so work outside it turns into approvals; for DSH every call, reads included, and the hub cannot add roots. "
+    "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
+    "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
+    "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet.",
+    "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted; response_state=unconfirmed means GET wait_url and never resend. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
 

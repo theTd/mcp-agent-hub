@@ -6287,7 +6287,11 @@ class HubSessionManager:
             f"Use respond_to_subagent(session_id='{session.session_id}', "
             f"request_id='{req_id}') with decision='approve' / 'approve_session' / 'deny' for approvals, "
             "option_index=1..N for choices, or custom_input for free text. "
-            "Free text alone denies an approval; approve_session may persist an engine allow rule."
+            "Free text alone denies an approval; approve_session may persist an engine allow rule. "
+            "On a DSH full-access request it allows full shell access until the session ends: use approve "
+            "unless the user agreed. Repeated approvals outside the worker's cwd mean a wrong layout: "
+            "answer this one, then put the task's own outputs under cwd instead of approving each call; "
+            "leave files it did not create in place and never widen cwd to cover them."
         )
         await self.record_worker_event(
             session.session_id,
