@@ -7,6 +7,7 @@ hub_persistence.py
 transcript_tail.py
 transcript_feed.py
 native_session_launch.py
+compaction_threshold.py
 session_mcp_config.py
 model_discovery.py
 dsh_endpoint.py

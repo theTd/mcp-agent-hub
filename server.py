@@ -8,7 +8,7 @@ import signal
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -269,6 +269,7 @@ async def spawn_subagent(
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
     wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
     approval_mode: Optional[str] = None,
+    compaction_threshold: Optional[Union[int, str]] = None,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
@@ -290,6 +291,9 @@ async def spawn_subagent(
     cannot add roots. Only what the task creates belongs there: leave files it did not create
     (sources, shared or others' data, credentials) in place, and never widen ``cwd`` to a parent,
     home or drive root to cover them.
+    ``compaction_threshold`` sets this session's auto-compaction point: ``"70%"`` of the context
+    window or a token count (``200000``, ``"200k"``). omp takes both, claude only a percent (it can
+    only compact earlier than its default), codex only tokens; other engines reject it.
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -298,6 +302,7 @@ async def spawn_subagent(
         launch_source="agent",
         bypass_approvals=bypass_approvals,
         approval_mode=approval_mode,
+        compaction_threshold=compaction_threshold,
         extra_args=extra_args,
         mcp_servers=mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
@@ -1072,6 +1077,7 @@ async def api_launch_preview(req: Request):
             env=body.get("env"),
             bypass_approvals=body.get("bypass_approvals"),
             approval_mode=body.get("approval_mode"),
+            compaction_threshold=body.get("compaction_threshold"),
             extra_args=body.get("extra_args"),
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
@@ -1132,6 +1138,7 @@ async def api_create_session(req: Request):
             env=env,
             bypass_approvals=body.get("bypass_approvals"),
             approval_mode=body.get("approval_mode"),
+            compaction_threshold=body.get("compaction_threshold"),
             extra_args=body.get("extra_args"),
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
