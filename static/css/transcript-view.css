@@ -69,6 +69,11 @@
   -webkit-mask-image: linear-gradient(to bottom, #000 72%, transparent);
   mask-image: linear-gradient(to bottom, #000 72%, transparent);
 }
+.tx-msg:is([data-kind="task"], [data-kind="parent"]) > .tx-msg-body.is-clamped {
+  max-height: 36em;
+  -webkit-mask-image: linear-gradient(to bottom, #000 84%, transparent);
+  mask-image: linear-gradient(to bottom, #000 84%, transparent);
+}
 .tx-msg > .tx-link { margin-top: 2px; }
 .tx-plain { white-space: pre-wrap; }
 

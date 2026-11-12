@@ -33,8 +33,8 @@ REAL_PTY_PROCESS = PtyProcess
 
 from transcript_tail import TranscriptTail, read_complete_lines
 from transcript_feed import (
-    FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, tool_output_text,
-    interaction_view as transcript_interaction_view,
+    FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, json_valued_arguments, tool_output_text,
+    tool_title, interaction_view as transcript_interaction_view,
 )
 from dsh_session_record import (
     DshSessionRecordReader, RecordDecodeError, locate_dsh_session_record, native_events_to_telemetry,
@@ -5842,6 +5842,12 @@ class HubSessionManager:
                 tool_data["step_marker"] = True  # a step counter (`llm_inference`), not a real tool
             if data.get("tool_title"):
                 tool_data["title"] = str(data["tool_title"])[:300]
+            elif len(input_detail) > TOOL_DETAIL_LIMIT and hook_event != "ReportStep":
+                # The stored arguments are clipped and may lose the describing one (a long Bash
+                # command ahead of its description): name the call from the whole text now.
+                full_title = tool_title(str(tool_name or ""), input_detail)
+                if full_title:
+                    tool_data["title"] = full_title[:300]
 
         step_num = sess.step_count if sess else 0
 
@@ -8959,6 +8965,11 @@ class HubSessionManager:
                                         parsed_tc_args = {}
                                 if not isinstance(parsed_tc_args, dict):
                                     parsed_tc_args = {}
+                                # agy writes every argument value as JSON text
+                                # (`"CommandLine": "\"ls\""`); decode them once here.
+                                parsed_tc_args = json_valued_arguments(parsed_tc_args)
+                                if parsed_tc_args:
+                                    targs = parsed_tc_args
                                 tc_cmd = str(
                                     parsed_tc_args.get("CommandLine")
                                     or parsed_tc_args.get("command")

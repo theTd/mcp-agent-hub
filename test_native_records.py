@@ -307,6 +307,42 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         await self.keep_thinking_out_of_messages("agy")
     async def test_kimi_thinking_is_reasoning(self):
         await self.keep_thinking_out_of_messages("kimi")
+
+    async def test_agy_tool_arguments_are_decoded_and_titled_by_tool_summary(self):
+        """agy writes each argument value as JSON text; the feed shows its toolSummary as the title."""
+        sess = self.session("agy", "-tools")
+        work = self.root / "agy-tools"
+        path = work / ".system_generated/logs/transcript.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"brain_dir": str(work)}
+        call = {"name": "run_command", "args": {
+            "CommandLine": json.dumps("Get-ChildItem -Name"), "WaitMsBeforeAsync": "5000",
+            "toolSummary": json.dumps("List the files here")}}
+        task = self.hub._schedule(self.hub._watch_agy_transcript(sess, self.root))
+        try:
+            self.append(path, {"type": "PLANNER_RESPONSE", "content": "", "tool_calls": json.dumps([call])})
+            await self.until(lambda: sess._inflight_transcript_tool is not None)
+            self.assertEqual(sess._inflight_transcript_tool["command"], "Get-ChildItem -Name")
+            feed = await self.hub.get_transcript_view(sess.session_id)
+            tool = next(entry["tool"] for entry in feed["entries"] if entry["kind"] == "tool")
+            self.assertEqual(tool["title"], "List the files here")
+            self.assertEqual(json.loads(tool["input"])["WaitMsBeforeAsync"], 5000)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_clipped_tool_arguments_keep_a_title_from_the_whole_text(self):
+        sess = self.session("claude", "-long")
+        long_command = "echo " + "x" * 5000
+        await self.hub.record_telemetry(sess.session_id, {
+            "source": "claude_transcript", "hook_event": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": long_command, "description": "Print a long line"}})
+        feed = await self.hub.get_transcript_view(sess.session_id)
+        tool = next(entry["tool"] for entry in feed["entries"] if entry["kind"] == "tool")
+        self.assertEqual(tool["title"], "Print a long line")
+        self.assertIn("已截断", tool["input"])
     async def test_kimi_streamed_step_is_recorded_once(self):
         await self.keep_thinking_out_of_messages("kimi", streamed=True)
 

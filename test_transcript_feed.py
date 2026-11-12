@@ -1,11 +1,14 @@
 """The console transcript feed (transcript_feed.py): pairing, de-duplication, titles, interactions."""
+import json
 import time
 import unittest
 
 from transcript_feed import (
     build_transcript_feed,
     interaction_summary,
+    json_valued_arguments,
     parse_parent_notice,
+    pretty_tool_input,
     tool_title,
 )
 
@@ -72,6 +75,37 @@ class ToolEntryTests(unittest.TestCase):
 class ToolTitleTests(unittest.TestCase):
     def test_describing_argument_wins(self):
         self.assertEqual(tool_title("pwsh", '{"description": "Run tests", "command": "pytest"}'), "Run tests")
+
+    def test_agy_arguments_written_as_json_text(self):
+        agy = '{"CommandLine": "\\"ls -la\\"", "WaitMsBeforeAsync": "5000", "toolSummary": "\\"List files\\""}'
+        self.assertEqual(tool_title("run_command", agy), "List files")
+        self.assertEqual(tool_title("read_file", '{"Path": "\\"E:/a/b/c/d/x.py\\"", "StartLine": "1"}'), "…/x.py")
+        self.assertEqual(tool_title("call_mcp_tool", '{"Arguments": "{}", "ServerName": "\\"kb\\"", "ToolName": "\\"get_status\\""}'),
+                         "kb · get_status")
+        pretty = json.loads(pretty_tool_input(agy))
+        self.assertEqual(pretty, {"CommandLine": "ls -la", "WaitMsBeforeAsync": 5000, "toolSummary": "List files"})
+        # Ordinary string arguments are never decoded.
+        self.assertEqual(json_valued_arguments({"command": "ls", "n": "1"}), {"command": "ls", "n": "1"})
+
+    def test_agy_value_cut_by_agy_itself_still_decodes(self):
+        args = {"Content": '"line one\\nline tw\n<truncated 5872 bytes>', "Path": '"E:/out.md"'}
+        decoded = json_valued_arguments(args)
+        self.assertEqual(decoded["Path"], "E:/out.md")
+        self.assertTrue(decoded["Content"].startswith("line one\nline tw…"))
+
+    def test_clipped_json_is_titled_from_its_complete_head_fields(self):
+        clipped = '{"replace_all": false, "file_path": "E:/w/x/y/z/grid.py", "old_string": "    span = len(fs)\\n…'
+        self.assertEqual(tool_title("Edit", clipped), "…/grid.py")
+
+    def test_search_names_pattern_and_place(self):
+        self.assertEqual(tool_title("Grep", '{"pattern": "def foo", "path": "src/app"}'), "def foo · src/app")
+        self.assertEqual(tool_title("Glob", '{"pattern": "**/*.ts"}'), "**/*.ts")
+
+    def test_todo_lists_name_the_item_in_progress(self):
+        kimi = '{"todos": [{"title": "Read specs", "status": "done"}, {"title": "Audit", "status": "in_progress"}]}'
+        self.assertEqual(tool_title("TodoList", kimi), "待办 2 项 · 进行中：Audit")
+        claude = '{"todos": [{"content": "Fix", "activeForm": "Fixing the bug", "status": "in_progress"}]}'
+        self.assertEqual(tool_title("TodoWrite", claude), "待办 1 项 · 进行中：Fixing the bug")
 
     def test_json_without_a_describing_argument_lists_scalars(self):
         self.assertEqual(tool_title("wait", '{"cell_id": "88", "yield_time_ms": 30000, "flag": true}'),

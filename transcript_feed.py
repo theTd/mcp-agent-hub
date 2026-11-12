@@ -22,6 +22,9 @@ from typing import Any, Dict, Iterable, List, Optional
 FEED_DEFAULT_LIMIT = 80
 FEED_MAX_LIMIT = 400
 TEXT_LIMIT = 6000
+# The task and the messages sent to the agent are kept longer: a brief is often the longest text
+# of a session and the reader needs all of it (the view clamps it and offers 展开全文).
+PROMPT_TEXT_LIMIT = 20000
 # hub_database keeps this many characters of an intermediate message; the worker event that
 # carries the same text keeps more, so the two copies are matched on this head.
 STORED_MESSAGE_HEAD = 4000
@@ -86,8 +89,16 @@ MARKDOWN_EMPHASIS = re.compile(r"\*\*|`")
 GENERIC_ASK_LINES = frozenset({"Would you like to run the following command?"})
 # apply_patch input; inside a code cell the patch is a string literal with escaped newlines.
 PATCH_FILE_OP = re.compile(r"\*\*\* (Add|Update|Delete) File: (.+?)(?=\\n|\n|\"|$)")
-TITLE_KEYS = ("description", "title", "command", "cmd", "file_path", "path", "filePath",
-              "pattern", "query", "url", "prompt", "text")
+# Argument names that describe a call, best first, matched case-insensitively. `toolSummary` is
+# AGY's one-line description of each call; `CommandLine` / `Path` are AGY's spellings.
+TITLE_KEYS = ("toolsummary", "description", "title", "commandline", "command", "cmd", "file_path",
+              "filepath", "path", "pattern", "query", "url", "prompt", "text")
+# A search names its pattern first and the place searched second (`pattern · …\dir`).
+SEARCH_KEYS = ("pattern", "query")
+# AGY's own cut of a long argument value: the head of its JSON text and the bytes left out.
+AGY_TRUNCATED_VALUE = re.compile(r'^("[\s\S]*)\n<truncated (\d+) bytes>$')
+# One complete `"key": "string"` / `"key": number` pair in JSON whose tail was clipped.
+PARTIAL_JSON_FIELD = re.compile(r'"([A-Za-z_][\w-]*)"\s*:\s*(?:"((?:[^"\\]|\\.)*)"|(-?\d+(?:\.\d+)?)\b)')
 
 
 def _text(value: Any, limit: int = TEXT_LIMIT) -> str:
@@ -171,6 +182,98 @@ def tool_title(name: str, tool_input: str, explicit: str = "") -> str:
     return _compact_paths(_tool_title(tool_input, explicit))
 
 
+def json_valued_arguments(args: Any) -> Any:
+    """`{"Path": "\\"C:\\\\a.txt\\"", "StartLine": "1"}` -> `{"Path": "C:\\a.txt", "StartLine": 1}`.
+
+    AGY writes every argument value as JSON text. A dict is decoded only when all its values are
+    JSON text, so ordinary string arguments (`"ls -la"`) are never touched.
+    """
+    if not isinstance(args, dict) or not args or not all(isinstance(v, str) for v in args.values()):
+        return args
+    decoded = {}
+    for key, value in args.items():
+        try:
+            decoded[key] = json.loads(value)
+            continue
+        except ValueError:
+            pass
+        # agy cuts a long value itself: `"<head of the JSON string>\n<truncated 5872 bytes>`.
+        cut = AGY_TRUNCATED_VALUE.match(value)
+        head = _json_string_head(cut.group(1)) if cut else None
+        if cut is None or head is None:
+            return args
+        decoded[key] = f"{head}…（已截断 {cut.group(2)} 字节）"
+    return decoded
+
+
+def _json_string_head(text: str) -> Optional[str]:
+    """The decoded text of an unterminated JSON string literal, dropping a split escape at its end."""
+    for trim in range(0, 7):
+        try:
+            value = json.loads(text[:len(text) - trim] + '"')
+        except ValueError:
+            continue
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _partial_json_fields(text: str) -> Dict[str, Any]:
+    """The complete string and number fields at the head of JSON whose tail was clipped."""
+    fields: Dict[str, Any] = {}
+    for match in PARTIAL_JSON_FIELD.finditer(text):
+        key, raw, number = match.groups()
+        if key in fields:
+            continue
+        if number is not None:
+            fields[key] = number
+            continue
+        try:
+            fields[key] = json.loads(f'"{raw}"')
+        except ValueError:
+            fields[key] = raw
+    return fields
+
+
+def _todos_title(todos: List[Any]) -> str:
+    """`TodoWrite` / `TodoList`: how many items, and the one in progress."""
+    items = [item for item in todos if isinstance(item, dict)]
+    active = next((item for item in items if str(item.get("status") or "") == "in_progress"), None)
+    label = ""
+    if active:
+        label = str(active.get("activeForm") or active.get("content") or active.get("title") or "").strip()
+    return f"待办 {len(todos)} 项" + (f" · 进行中：{label}" if label else "")
+
+
+def _title_from_fields(fields: Dict[str, Any]) -> str:
+    lower: Dict[str, Any] = {}
+    for key, value in fields.items():
+        lower.setdefault(str(key).lower(), value)
+    todos = lower.get("todos")
+    if isinstance(todos, list) and todos:
+        return _todos_title(todos)
+    # A generic MCP bridge call (AGY `call_mcp_tool`): the server and tool say what it does.
+    mcp_tool = lower.get("toolname")
+    if isinstance(mcp_tool, str) and mcp_tool.strip():
+        server = lower.get("servername")
+        return f"{server} · {mcp_tool}" if isinstance(server, str) and server.strip() else mcp_tool
+    search = next((lower[key] for key in SEARCH_KEYS
+                   if isinstance(lower.get(key), str) and lower[key].strip()), "")
+    for key in TITLE_KEYS:
+        value = lower.get(key)
+        if isinstance(value, list):
+            value = " ".join(str(item) for item in value if not isinstance(item, (dict, list)))
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if search and key in ("file_path", "filepath", "path"):
+            return f"{_one_line(search, 120)} · {_one_line(value, 120)}"
+        return _one_line(value, 200)
+    # No describing argument: name the first few scalar ones (e.g. `cell_id=88`).
+    scalars = [f"{key}={value}" for key, value in fields.items()
+               if isinstance(value, (str, int, float)) and not isinstance(value, bool)
+               and str(value).strip()][:3]
+    return _one_line(" · ".join(scalars), 200) if scalars else ""
+
+
 def _tool_title(tool_input: str, explicit: str) -> str:
     if explicit and explicit.strip():
         return _one_line(explicit, 200)
@@ -181,20 +284,15 @@ def _tool_title(tool_input: str, explicit: str) -> str:
         try:
             parsed = json.loads(text)
         except ValueError:
-            parsed = None
+            # Stored arguments are clipped (see session_manager._clip_detail): the fields at the
+            # head still name the call.
+            parsed = json_valued_arguments(_partial_json_fields(text)) if text[:1] == "{" else None
+            if not parsed:
+                parsed = None
         if isinstance(parsed, dict):
-            for key in TITLE_KEYS:
-                value = parsed.get(key)
-                if isinstance(value, list):
-                    value = " ".join(str(item) for item in value)
-                if isinstance(value, str) and value.strip():
-                    return _one_line(value, 200)
-            # No describing argument: name the first few scalar ones (e.g. `cell_id=88`).
-            scalars = [f"{key}={value}" for key, value in parsed.items()
-                       if isinstance(value, (str, int, float)) and not isinstance(value, bool)
-                       and str(value).strip()][:3]
-            if scalars:
-                return _one_line(" · ".join(scalars), 200)
+            title = _title_from_fields(json_valued_arguments(parsed))
+            if title:
+                return title
     if "*** Begin Patch" in text:
         files = PATCH_FILE_OP.findall(text)
         if files:
@@ -239,7 +337,7 @@ def pretty_tool_input(text: str) -> str:
     stripped = str(text or "").strip()
     if stripped[:1] in "{[":
         try:
-            return json.dumps(json.loads(stripped), ensure_ascii=False, indent=2)
+            return json.dumps(json_valued_arguments(json.loads(stripped)), ensure_ascii=False, indent=2)
         except ValueError:
             pass
     return stripped
@@ -396,7 +494,7 @@ def build_transcript_feed(
     resolutions: Dict[str, Dict[str, Any]] = {}
     seen_text = set()  # heads (see STORED_MESSAGE_HEAD) of message texts already shown
 
-    task = _clean_task(_text(meta.get("last_task"), TEXT_LIMIT))
+    task = _clean_task(_text(meta.get("last_task"), PROMPT_TEXT_LIMIT))
     task_entry = {"id": "task", "kind": "task", "text": task, "timestamp": _ts(meta.get("created_at"))} if task else None
     sent = [task] if task else []  # texts the hub handed to the agent (see _is_sent_copy)
     typed: List[Dict[str, Any]] = []  # user prompts read from the engine's record
@@ -407,12 +505,12 @@ def build_transcript_feed(
                 # An archived thread keeps the Hub's worker->parent notices too; each one copies a
                 # worker event (approval, question, report, final answer) the feed already shows.
                 continue
-            body = _text(message.get("content"))
+            body = _text(message.get("content"), PROMPT_TEXT_LIMIT)
             mid = str(message.get("id") or message.get("message_id") or f"p{index}")
             stamp = _ts(message.get("timestamp"))
             resolved = str(message.get("resolved_question_id") or "")
         else:
-            body, mid, stamp, resolved = _text(message), f"p{index}", None, ""
+            body, mid, stamp, resolved = _text(message, PROMPT_TEXT_LIMIT), f"p{index}", None, ""
         if not body:
             continue
         sent.append(body)
