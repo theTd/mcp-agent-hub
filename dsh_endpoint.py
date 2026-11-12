@@ -4,13 +4,42 @@ dsh-crew keeps the host's address in its own config (`hub_url` in ~/.config/dsh-
 On 2026-11-07 the host moved from 127.0.0.1:3080 to 127.0.0.1:5149 while the hub still called the
 old port. Every hub call to DSH now builds its URL here, so the hub follows the address dsh-crew
 itself uses; the old port stays the fallback when the file or the key is missing.
+
+Every hub call to DSH also passes `verify=dsh_tls_context()`, so httpx does not build a new TLS
+context for each client (see dsh_tls_context).
 """
 import json
 import os
+import ssl
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+import httpx
+
 DSH_DEFAULT_BASE_URL = "http://127.0.0.1:3080"
+
+_tls_lock = threading.Lock()
+_tls_context: Optional[ssl.SSLContext] = None
+
+
+def dsh_tls_context() -> ssl.SSLContext:
+    """The one TLS context every hub call to the DSH host uses (pass it to httpx as `verify=`).
+
+    Without it httpx builds a context for each new client and loads the whole CA bundle into it,
+    mostly while holding the GIL: about 60 ms per client, several seconds for the first one on a
+    cold disk (measured in the live hub on 2026-11-12). The hub made a new client for every DSH
+    call, so each call stalled the event loop, even when it ran in a worker thread. The host is
+    plain http on 127.0.0.1 in practice and never uses the context, but dsh-crew's hub_url may be
+    https, so the context keeps httpx's default verification. It is built once and shared;
+    SessionManager.start builds it off the event loop.
+    """
+    global _tls_context
+    if _tls_context is None:
+        with _tls_lock:
+            if _tls_context is None:
+                _tls_context = httpx.create_ssl_context()
+    return _tls_context
 
 # (path, mtime_ns, size) of the config last read -> its base URL; re-read only when the file changes.
 _cache: Dict[str, Any] = {"key": None, "url": DSH_DEFAULT_BASE_URL}

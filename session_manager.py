@@ -52,7 +52,7 @@ from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
 from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 
-from dsh_endpoint import dsh_base_url, dsh_url
+from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
 from dsh_workspace_permissions import prepare_dsh_workspace
 from model_discovery import AgentModelDiscovery
 from transcript_summarizer import (
@@ -2497,7 +2497,7 @@ class AgentSession:
         if self.dsh_job_id and was_alive:
             job_id = self.dsh_job_id
             threading.Thread(
-                target=lambda: httpx.post(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0),
+                target=lambda: httpx.post(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0, verify=dsh_tls_context()),
                 daemon=True,
             ).start()
         if was_alive:
@@ -2866,6 +2866,8 @@ class HubSessionManager:
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
+        # Built off the loop now, so the first DSH call does not build it on the loop.
+        self._schedule(asyncio.to_thread(dsh_tls_context))
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
         if request is not None:
@@ -5004,7 +5006,7 @@ class HubSessionManager:
         if not job_id:
             return False
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
+            async with httpx.AsyncClient(timeout=8.0, verify=dsh_tls_context()) as client:
                 resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
                 if resp.status_code == 404:
                     return False
@@ -5034,7 +5036,7 @@ class HubSessionManager:
         if not job_id or not token or not clean:
             return None
         try:
-            async with httpx.AsyncClient(timeout=max(1.0, float(timeout))) as client:
+            async with httpx.AsyncClient(timeout=max(1.0, float(timeout)), verify=dsh_tls_context()) as client:
                 return await client.post(
                     dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/messages"),
                     headers={"x-dsh-crew-job-token": token},
@@ -5075,7 +5077,7 @@ class HubSessionManager:
         # Talk to DSH first: a failed continue/re-attach must not replace the archived record.
         if clean:
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
+                async with httpx.AsyncClient(timeout=15.0, verify=dsh_tls_context()) as client:
                     resp = await client.post(
                         dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/continue"),
                         json={"text": clean, "messaging_token": token},
@@ -5114,7 +5116,7 @@ class HubSessionManager:
             # unreadable / failed / cancelled / unknown job fails the resume with a Chinese reason
             # instead of leaving a pseudo-live "starting" session behind.
             try:
-                async with httpx.AsyncClient(timeout=8.0) as client:
+                async with httpx.AsyncClient(timeout=8.0, verify=dsh_tls_context()) as client:
                     resp = await client.get(
                         dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0}
                     )
@@ -5508,6 +5510,7 @@ class HubSessionManager:
             resp = httpx.post(
                 dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"),
                 timeout=max(0.2, float(timeout)),
+                verify=dsh_tls_context(),
             )
             return bool(resp.is_success)
         except Exception:
@@ -6776,6 +6779,7 @@ class HubSessionManager:
                     headers={"x-dsh-crew-job-token": dsh_token},
                     json={"message": reply_str, "reply_to": dsh_msg_id},
                     timeout=6.0,
+                    verify=dsh_tls_context(),
                 )
                 delivered = r.is_success
                 action_trace = f"DSH mailbox reply_to={dsh_msg_id} message={reply_str!r} (HTTP {r.status_code})"
@@ -6789,6 +6793,7 @@ class HubSessionManager:
                     dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/continue"),
                     json={"text": reply_str, "messaging_token": new_token},
                     timeout=10.0,
+                    verify=dsh_tls_context(),
                 )
                 cjob = r.json().get("job", {}) if r.is_success else {}
                 if cjob.get("id"):
@@ -7461,6 +7466,7 @@ class HubSessionManager:
                             headers={"x-dsh-crew-job-token": q_entry["dsh_token"]},
                             json={"message": text, "reply_to": q_entry["dsh_message_id"]},
                             timeout=5.0,
+                            verify=dsh_tls_context(),
                         )
                         dsh_replied = True
                         if sess:
@@ -7504,6 +7510,7 @@ class HubSessionManager:
                             headers={"x-dsh-crew-job-token": sess.dsh_token or ""},
                             json={"message": clean_txt},
                             timeout=5.0,
+                            verify=dsh_tls_context(),
                         )
                         if not r.is_success:
                             dsh_error = f"DSH 拒绝了这条消息（HTTP {r.status_code}）"
@@ -7517,6 +7524,7 @@ class HubSessionManager:
                             dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/continue"),
                             json={"text": clean_txt, "messaging_token": new_token},
                             timeout=10.0,
+                            verify=dsh_tls_context(),
                         )
                         cjob = (r.json() or {}).get("job", {}) if r.is_success else {}
                         if cjob.get("id"):
@@ -10729,7 +10737,7 @@ class HubSessionManager:
             "source": "mcp-agent-hub",
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, verify=dsh_tls_context()) as client:
                 r = await client.post(dsh_url("/_dsh/dsh-crew/jobs"), json=payload)
                 data = r.json()
                 if not r.is_success or not data.get("ok"):
@@ -10750,7 +10758,8 @@ class HubSessionManager:
                     # left them.
                     threading.Thread(
                         target=lambda: httpx.post(
-                            dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0
+                            dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0,
+                            verify=dsh_tls_context(),
                         ),
                         daemon=True,
                     ).start()
@@ -10803,7 +10812,7 @@ class HubSessionManager:
             after_seq, start_offset = -1, 0
         since_ms = None
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=5.0, verify=dsh_tls_context()) as client:
                 resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
             started = (resp.json().get("job") or {}).get("startedAt") if resp.is_success else None
             if started:
@@ -10986,7 +10995,7 @@ class HubSessionManager:
             await asyncio.sleep(0)
             return len(lines) == tail.batch_lines
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, verify=dsh_tls_context()) as client:
             while (
                 session.dsh_job_id == job_id
                 and not session.terminated_by_user

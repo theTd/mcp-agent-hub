@@ -216,6 +216,12 @@ class HubDatabase:
                 except sqlite3.OperationalError as exc:
                     if 'duplicate column name' not in str(exc).lower():
                         raise
+            # Every worker_events read filters by session. Without this index each one scanned the
+            # whole table (66k rows, ~65 ms on the live data of 2026-11-12, three scans per mailbox
+            # history); with it a lookup takes well under a millisecond.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_events_session ON worker_events(session_id, seq)"
+            )
 
     def get_max_seq(self) -> int:
         with self._conn() as conn:
