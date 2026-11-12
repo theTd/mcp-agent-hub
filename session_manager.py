@@ -40,6 +40,7 @@ from dsh_session_record import (
     DshSessionRecordReader, RecordDecodeError, locate_dsh_session_record, native_events_to_telemetry,
 )
 from dsh_mailbox_replay import DshMailboxReplay
+from restart_resume_request import RestartResumeGate, RestartResumeRequest, wait_for_port
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
@@ -2820,6 +2821,8 @@ class HubSessionManager:
         # Archive spec §5: only one resume per session at a time; the second call waits for the first
         # and then behaves as "already live".
         self._resume_locks: Dict[str, asyncio.Lock] = {}
+        # Closed while a resume-on-start request is being carried out; server.py holds requests on it.
+        self.restart_resume_gate = RestartResumeGate()
 
         # Bidirectional Mailbox & Sequenced Event Bus
         self.global_seq: int = 0
@@ -2857,13 +2860,54 @@ class HubSessionManager:
         try:
             await self.db.start()
             self.global_seq = await self.db.get_max_seq()
-            await self._normalize_archive_on_startup()
+            request = RestartResumeRequest.take(self.data_dir)
+            live_at_stop = await self._normalize_archive_on_startup()
             await self.db.flush()
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
+        if request is not None:
+            targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
+            logger.info("Resume-on-start request: %d of %d sessions live at the stop", len(targets), len(live_at_stop))
+            if targets:
+                self.restart_resume_gate.close()
+                self._schedule(self._resume_on_start(request, targets))
+            else:
+                request.write_result({}, time.time())
+
+    async def _resume_on_start(self, request: RestartResumeRequest, targets: Dict[str, Dict[str, str]]) -> None:
+        """Resume the sessions a deliberate restart interrupted, while requests wait at the gate.
+
+        It starts once the hub's own port is open: a resumed Codex or Claude connects to the hub's
+        MCP endpoint as it starts, and that connection now waits at the gate instead of being
+        refused. DSH sessions go first (they only re-attach to jobs that kept running), so the
+        terminal agents' MCP connections wait as briefly as possible.
+        """
+        started = time.time()
+        results: Dict[str, Dict[str, Any]] = {}
+        try:
+            if not await wait_for_port(hub_port()):
+                logger.warning("Resume-on-start: port %s did not open; resuming anyway", hub_port())
+            order = sorted(targets, key=lambda sid: (targets[sid].get("engine") != "dsh", sid))
+            for sid in order:
+                info = targets[sid]
+                text = request.text_for(info.get("engine", ""), info.get("status", ""))
+                try:
+                    res = await self.resume_subagent(sid, text=text, source="console")
+                    results[sid] = {"ok": True, "resumed": bool(res.get("resumed")),
+                                    "already_live": bool(res.get("already_live")), "continued": bool(text),
+                                    "status_at_stop": info.get("status")}
+                except Exception as exc:  # one session's failure must not keep the others down
+                    logger.warning("Resume-on-start of %s failed: %s", sid, exc)
+                    results[sid] = {"ok": False, "error": str(exc), "status_at_stop": info.get("status")}
+        finally:
+            self.restart_resume_gate.open()
+            request.write_result(results, started)
+            logger.info("Resume-on-start done in %.1fs: %d resumed, %d failed", time.time() - started,
+                        sum(1 for r in results.values() if r.get("ok")),
+                        sum(1 for r in results.values() if not r.get("ok")))
 
     async def _wait_state_snapshot(self, session_ids: List[str]) -> Dict[str, Any]:
         """Compact state provider used by WaitInbox after a restart or a quiet turn."""
@@ -5362,9 +5406,14 @@ class HubSessionManager:
             except PersistenceUnavailable:
                 logger.warning("Scrollback persistence delayed; will retry")
 
-    async def _normalize_archive_on_startup(self) -> None:
-        """Spec §1.5/§5: a stopped hub's live rows become interrupted + archived at the next start."""
+    async def _normalize_archive_on_startup(self) -> Dict[str, Dict[str, str]]:
+        """Spec §1.5/§5: a stopped hub's live rows become interrupted + archived at the next start.
+
+        Returns the rows that were live when the hub stopped: {session_id: {"engine", "status"}},
+        with the status they had then (a resume-on-start request needs it).
+        """
         now = time.time()
+        live_at_stop: Dict[str, Dict[str, str]] = {}
         status_to_reason = {
             "exited": "exited", "crashed": "crashed", "terminated": "terminated",
             "completed": "exited", "interrupted": "interrupted",
@@ -5381,6 +5430,7 @@ class HubSessionManager:
                 fields["archived_at"] = now
                 fields["ended_at"] = rec.get("ended_at") or now
                 if status in LIVE_STATUSES:
+                    live_at_stop[sid] = {"engine": str(rec.get("engine") or "").strip().lower(), "status": status}
                     fields["status"] = "interrupted"
                     fields["end_reason"] = "interrupted"
                     fields["current_activity"] = "Hub 停止时会话仍在运行（已中断）"
@@ -5395,6 +5445,7 @@ class HubSessionManager:
             fields["resumable"] = 1 if ok else 0
             fields["resume_block_reason"] = None if ok else reason
             await self.db.update_archive_fields(sid, **fields)
+        return live_at_stop
 
     async def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
         async with self._resume_lock(session_id):

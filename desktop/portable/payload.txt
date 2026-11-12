@@ -14,6 +14,7 @@ dsh_workspace_permissions.py
 dsh_session_record.py
 dsh_mailbox_replay.py
 windows_accept_guard.py
+restart_resume_request.py
 transcript_summarizer.py
 wait_inbox.py
 engine_policies/claude_pre_tool_hook.py

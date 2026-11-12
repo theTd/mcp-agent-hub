@@ -739,6 +739,16 @@ async def reject_work_during_shutdown(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def hold_requests_during_restart_resume(request: Request, call_next):
+    # After a deliberate restart (resume_on_start.json) the hub resumes the interrupted sessions
+    # once its port is open. Until that is done (at most 30 s) callers wait here instead of
+    # seeing those sessions interrupted or racing the resume; the desktop app's probes do not.
+    if not hub.restart_resume_gate.is_open and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
+        await hub.restart_resume_gate.wait()
+    return await call_next(request)
+
+
 # ============================================================================
 # 3. Durable parent wait URL and independent console telemetry API
 # ============================================================================
