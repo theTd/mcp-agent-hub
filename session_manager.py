@@ -10862,6 +10862,10 @@ class HubSessionManager:
                 cursor.after_seq = max(cursor.after_seq, seq)
                 # Kept current per payload, so a stop mid-batch never records one twice.
                 session.conversation_ref = dict(session.conversation_ref or {}, **{DSH_RECORD_SEQ_KEY: cursor.after_seq})
+                # record_telemetry rarely suspends, and each call renders and stores the session. A
+                # job's first read can return a long backlog; drained in one go, that held the loop
+                # for 1.0-1.4 s in the live hub (2026-11-12).
+                await asyncio.sleep(0)
         finally:
             if payloads or events:
                 session.conversation_ref = dict(session.conversation_ref or {}, **{

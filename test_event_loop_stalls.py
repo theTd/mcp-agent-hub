@@ -3,6 +3,7 @@
 Run: python -m unittest -v test_event_loop_stalls
 """
 import ast
+import asyncio
 import importlib
 import logging
 import sqlite3
@@ -10,6 +11,7 @@ import ssl
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import dsh_endpoint
@@ -73,6 +75,45 @@ class WorkerEventsIndexTests(unittest.TestCase):
                     with self.subTest(query=query):
                         self.assertIn("idx_worker_events_session", plan)
             conn.close()
+
+
+class DshRecordDrainTests(unittest.IsolatedAsyncioTestCase):
+    async def test_other_tasks_run_while_a_backlog_is_recorded(self):
+        # Each payload renders and stores the session; a long backlog held the loop for 1.0-1.4 s.
+        import session_manager
+
+        recorded = []
+
+        class Hub:
+            _shutting_down = False
+
+            async def record_telemetry(self, session_id, payload):
+                recorded.append(payload)
+
+            async def persist_session(self, session):
+                pass
+
+        session = SimpleNamespace(session_id="dsh-test", terminated_by_user=False, conversation_ref={})
+        cursor = SimpleNamespace(active=True, after_seq=-1, since_ms=None, tool_names={},
+                                 reader=SimpleNamespace(read_new_events=lambda: ["event"], resume_offset=7))
+        payloads = [{"native_seq": index, "hook_event": "PostToolUse"} for index in range(50)]
+        seen, done = [], asyncio.Event()
+
+        async def ticker():
+            while not done.is_set():
+                seen.append(len(recorded))
+                await asyncio.sleep(0)
+
+        ticks = asyncio.create_task(ticker())
+        with patch.object(session_manager, "native_events_to_telemetry", return_value=payloads):
+            changed = await session_manager.HubSessionManager._drain_dsh_session_record(Hub(), session, cursor)
+        done.set()
+        await ticks
+        self.assertTrue(changed)
+        self.assertEqual(len(recorded), 50)
+        self.assertEqual(session.conversation_ref[session_manager.DSH_RECORD_SEQ_KEY], 49)
+        self.assertEqual(session.conversation_ref[session_manager.DSH_RECORD_OFFSET_KEY], 7)
+        self.assertTrue(any(0 < count < 50 for count in seen), "the drain never let another task run")
 
 
 class FastmcpLoggingTests(unittest.TestCase):
