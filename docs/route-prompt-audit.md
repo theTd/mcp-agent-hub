@@ -117,3 +117,24 @@ Owner 要求：引擎有原生自动审批时默认使用，主 Agent 只有刻�
 | 定稿规则（5 次重复） | `124/125` | `modesafe` 1 次判 ask | 1,869 |
 
 初版只写“leave approval_mode unset”，`modesafe` 全部被“稳妥”带向 ask；定稿加上 “even to be explicit or careful: the default, auto, is the safe choice” 并把 ask 限定为“你或用户要亲自批每个高风险操作”后升到 `4/5`。基线不含 `approval_mode` 也能答对另三个新场景（场景文本已足够明确），所以它们只防回归。`parentdir` 的偶发 inplace 在基线中同样出现，与本次改动无关。提示词 3,927 字节（基线 3,389，+15.9%）。
+
+## terra 思考档位下调（2026-11-12）
+
+起因：旧路由把多步实机操作、未知状态查找、截图、远程诊断和 MCP 调研全部定为 terra high，从不产生 terra low，中档只给单步操作，实际派发几乎全是 terra high。
+
+实测（87 个 terra 会话，本机伪造的游戏/手机调试 API，脚本判分，普通审批模式）：简单档 7 类任务（读属性、带 409 恢复的多步设置、带诱饵的文件树查找、日志诊断并修复、读截图、过期锁备份、19–28 次调用的长链）low `14/14`、medium `14/14`、high `7/7`；困难档（根因在日志所指文件的下一跳、设置看似生效但被缓存掩盖）三档均 `6/6`。唯一区分点是判断：世界锁属于另一个仍在线的测试者时，low `3/3`、medium `2/3`、high `1/3` 仍强行解锁；brief 加一句“被他人在线状态挡住就停下报告，不得强制、删除或重置”后 low、medium `0/6`。
+
+改动（`docs/route-prompt-current.txt` 与 Hub 全局路由同步）：单步手机/游戏/审批与单张截图 → terra low；多步实机操作（含多步截图采集）、未知状态查找、截图诊断、远程诊断、MCP 只读调研 → terra medium；terra high 只留给无明确终点的多轮实机探查或 terra medium 失败后的重试；每个 terra brief 必须带上述停止规则。截图规则并入路由表，删去单独的截图排除行。
+
+`tools/route-prompt-stress.mjs` 新增 `terra-low` token 和 4 个场景：`livediag`（远程诊断并修复，medium）、`liveprobe`（无终点多轮实机探查，high）、`retry`（medium 失败后重试，high）、`mcpres`（MCP 只读调研，medium），并按新规则改写 phone、game、probe、shots、shotcapture、shotdiag、search 的期望。
+
+压测（本机 8789 评测器，`ROUTE_TEST_REPEATS=3`、`ROUTE_TEST_BATCH=5`，33 个场景）：
+
+| 版本 | 轮数 | primary 错误 | companion 错误 | 备注 |
+|---|---|---|---|---|
+| 初版 | 2 | `shots` 1 次判 low | `refactor` 1 次 | “截图采集用 low”与“多步用 medium”冲突 |
+| 截图规则澄清 | 2 | 0 | `refactor` 1 次 | |
+| 截图并入路由表（压缩） | 2 | 0 | `refactor` 3 次 | |
+| 定稿：refactor 行写明 companion kimi max | 3 | 0 | 0 | 已上线 |
+
+对照：未改的线上路由配旧场景 2 轮无错误，因此 refactor companion 的漏判归因于本次改动或新场景改变了分批，定稿在路由表行内直接写明 companion 后消除。所有版本（含 master 基线）都会偶发评测器格式噪声：id 后带冒号或整行缺失（基线一轮缺 9 行），不计入路由错误。线上路由从 3,831 字节增至 4,083 字节（+6.6%）；评测输入每次调用约 1,474 tokens，线上原版约 1,391（+6.0%）。

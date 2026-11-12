@@ -7,13 +7,17 @@ const batchSize = Math.max(1, Number(process.env.ROUTE_TEST_BATCH ?? 5));
 const prompt = readFileSync(new URL('../docs/route-prompt-current.txt', import.meta.url), 'utf8');
 const scenarios = [
   ['fact', '简单事实问答', 'sol-low', 'null'],
-  ['phone', '手机单步安装并确认', 'terra-medium', 'null'],
-  ['game', '游戏单步操作并回报', 'terra-medium', 'null'],
-  ['probe', '执行一次真实审批检查调用并返回结果（不是握手或占位）', 'terra-medium', 'null'],
-  ['shots', '多步骤远程脚本加一组 UI 截图，只采集证据', 'terra-high', 'null'],
-  ['shotcapture', '只采集一张本地截图并返回文件，不做解释或诊断', 'terra-high', 'null'],
-  ['shotdiag', '检查截图中的布局故障并解释原因，必要时提出修复', 'terra-high', 'null'],
-  ['search', '跨未知 worktree 查找状态', 'terra-high', 'null'],
+  ['phone', '手机单步安装并确认', 'terra-low', 'null'],
+  ['game', '游戏单步操作并回报', 'terra-low', 'null'],
+  ['probe', '执行一次真实审批检查调用并返回结果（不是握手或占位）', 'terra-low', 'null'],
+  ['shots', '多步骤远程脚本加一组 UI 截图，只采集证据', 'terra-medium', 'null'],
+  ['shotcapture', '只采集一张本地截图并返回文件，不做解释或诊断', 'terra-low', 'null'],
+  ['shotdiag', '检查截图中的布局故障并解释原因，必要时提出修复', 'terra-medium', 'null'],
+  ['search', '跨未知 worktree 查找状态', 'terra-medium', 'null'],
+  ['livediag', '远程主机上服务健康降级，查日志定位根因、修复并验证恢复', 'terra-medium', 'null'],
+  ['liveprobe', '在运行中的游戏里反复试验多轮，摸清一个未知的渲染卡顿现象，没有明确终点', 'terra-high', 'null'],
+  ['retry', 'terra medium 做多步真机操作失败了，重试这项任务', 'terra-high', 'null'],
+  ['mcpres', '只读调研，需要引擎知识库 MCP 工具查一个引擎接口的行为', 'terra-medium', 'null'],
   ['offline', '离线分析手机录像指标', 'dsh-high', 'null'],
   ['survey', '指定仓库事实调查，不审 commit', 'dsh-high', 'null'],
   ['impl', '按规格实现代码并补测试', 'dsh-high', 'null'],
@@ -47,6 +51,7 @@ function normalizePrimary(value, id) {
   if (v.includes('deepseek') && v.includes('max')) return 'dsh-max';
   if (v.includes('deepseek') && v.includes('high')) return 'dsh-high';
   if (v.includes('terra') && v.includes('medium')) return 'terra-medium';
+  if (v.includes('terra') && /(^|[^a-z])low/.test(v)) return 'terra-low';
   if (v.includes('terra') && v.includes('high')) return 'terra-high';
   if (v.includes('gemini-4-argon') && v.includes('medium')) return 'agy-medium';
   if (v.includes('gemini-4-argon') && v.includes('high')) return 'agy-high';
@@ -69,7 +74,7 @@ async function ask(batch) {
   const input = [
     '你是路由评测器。',
     prompt,
-    '输出每个输入一行，格式为 id|primary|companion；id 必须从输入中原样复制，大小写和字符都不能改。primary 必须使用 sol-low、terra-medium、terra-high、dsh-high、dsh-max、opus-xhigh、agy-medium、agy-high、root、astra-high、sol-high、sol-xhigh 或 defer；companion 只能使用 kimi-high、kimi-max 或 null。不要 JSON、代码围栏或解释。',
+    '输出每个输入一行，格式为 id|primary|companion；id 必须从输入中原样复制，大小写和字符都不能改。primary 必须使用 sol-low、terra-low、terra-medium、terra-high、dsh-high、dsh-max、opus-xhigh、agy-medium、agy-high、root、astra-high、sol-high、sol-xhigh 或 defer；companion 只能使用 kimi-high、kimi-max 或 null。不要 JSON、代码围栏或解释。',
     batch.map(([id, text]) => id + ': ' + text).join(nl),
   ].join(nl);
   const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
@@ -91,7 +96,7 @@ async function ask(batch) {
     }
     const primary = normalizePrimary(fields[1], fields[0]);
     const companion = normalizeCompanion(fields[2]);
-    const validPrimary = new Set(['sol-low', 'terra-medium', 'terra-high', 'dsh-high', 'dsh-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'root', 'astra-high', 'sol-high', 'sol-xhigh', 'defer']);
+    const validPrimary = new Set(['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'dsh-high', 'dsh-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'root', 'astra-high', 'sol-high', 'sol-xhigh', 'defer']);
     const validCompanion = new Set(['kimi-high', 'kimi-max', 'null']);
     if (!validPrimary.has(primary) || !validCompanion.has(companion)) {
       protocolErrors.push({ line: trimmed, reason: 'unknown token' });
