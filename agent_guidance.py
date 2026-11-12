@@ -7,10 +7,15 @@ CLEANUP_HINT = (
 )
 
 WAIT_HANDLE_HINT = (
-    "After spawn, resume, or send, GET the returned wait_url; retry the same URL after timeout. "
-    "States are waiting, ask, done, failed. For an ask (approval or question), immediately call "
-    "respond_to_subagent with request_id; responses are idempotent. "
-    "If a task is unfinished, or a response is unconfirmed, GET wait_url next. "
+    "Waiting: spawn, send, resume and respond return at once with wait_url, one URL per session or spawn group "
+    "for all its turns, with no cursor or session parameters. GET it, and again after a timeout. "
+    "States are waiting, ask, done, failed. Every ask is an open approval or question: answer it at once "
+    "with respond_to_subagent and its request_id (idempotent). After answering, and while any task is unfinished, "
+    "GET wait_url again; it returns the next ask or the result. "
+    "After a response with response_state=unconfirmed, GET wait_url; never inspect or resend. "
+    "An answered request never comes back: if wait_url repeats one, call get_subagent_status_and_trace and report a hub fault. "
+    "Never make a waiter skip, filter or dedupe asks by request_id; that hides the next request. "
+    "Wait on wait_url only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
     + CLEANUP_HINT
 )
 
@@ -30,20 +35,16 @@ ROUTING_RULES = (
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
     "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet.",
     "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
-    "delivered=true means sent, not accepted; response_state=unconfirmed means GET wait_url and never resend. Native records are authoritative; intermediate text is not completion—wait for done.",
+    "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
 
 SERVER_INSTRUCTIONS = (
     "Manage interactive subagents in the Hub console. Call list_agent_profiles for enabled "
     "profiles, models, thinking levels and routing guidance. Use spawn_subagent to start work, "
     "send_to_subagent to steer it, and resume_subagent to restore an ended session. "
-    "Control calls return immediately with opaque wait_handle and wait_url; GET that URL and retry it after timeout. "
-    "No cursor or session parameters are needed. "
-    "After any approval response, response_state=unconfirmed has priority: GET wait_url, never inspect or resend. "
     "Never blindly resend a failed/unconfirmed Codex submission: inspect it, then clear an idle "
     "nonempty draft with send_to_subagent(text='', clear_input=true) before sending new text. "
-    "Inspect progress with get_subagent_status_and_trace only when needed; retrieve persisted answers with "
-    "get_subagent_final_response only when an HTTP result is unavailable.\n"
+    "Retrieve persisted answers with get_subagent_final_response only when an HTTP result is unavailable.\n"
     + "\n".join(f"- {rule}" for rule in ROUTING_RULES)
 )
 
