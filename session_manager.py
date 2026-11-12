@@ -302,6 +302,12 @@ TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC = 5.0
 # so scan up to 512 KB to never miss the session_id marker.
 TRANSCRIPT_MARKER_SCAN_BYTES = 512 * 1024
 TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
+# User-role text an engine writes itself (Codex AGENTS.md and environment blocks, Claude command
+# wrappers and reminders, interrupt markers); not something the user typed.
+ENGINE_INJECTED_PROMPT = re.compile(
+    r"^(?:<[a-z][\w-]*>|# AGENTS\.md instructions|Caveat: The messages below|\[Request interrupted)",
+    re.IGNORECASE,
+)
 
 # ---- Archive & resume (spec archive-spec.md §1-§5) ------------------------------------------
 # Live statuses keep their meaning; an ended session carries one of these end reasons.
@@ -4167,6 +4173,7 @@ class HubSessionManager:
                 "content": msg.get("content", ""),
                 "message_id": msg.get("id"),
                 "resolved_question_id": msg.get("resolved_question_id"),
+                "source": msg.get("source") or "parent",
             })
         # A11: the worker side comes from the per-session log, not from the bounded event ring.
         for ev in getattr(self, "_worker_message_logs", {}).get(session_id, []):
@@ -4655,6 +4662,7 @@ class HubSessionManager:
                     "content": item.get("content", ""),
                     "resolved_question_id": item.get("resolved_question_id"),
                     "read_by_worker": True,
+                    "source": item.get("source") or "parent",
                 })
             elif item.get("direction") == "worker":
                 worker_entries.append({
@@ -4678,6 +4686,7 @@ class HubSessionManager:
         session_id: str,
         text: Optional[str] = None,
         auto_approval_rules: Any = None,
+        source: str = "parent",
     ) -> Dict[str, Any]:
         """Revive an ended session under the same id (spec §5).
 
@@ -4694,7 +4703,16 @@ class HubSessionManager:
         lock = self._resume_lock(sid)
         async with lock:
             try:
-                return await self._resume_locked(sid, text, normalized_rules)
+                result = await self._resume_locked(sid, text, normalized_rules, source)
+                if result.get("resumed") and text and str(text).strip():
+                    # The resume hands the text over at startup, so it never passes
+                    # deliver_parent_message; record who sent it for the transcript.
+                    self.parent_messages.setdefault(sid, []).append({
+                        "id": f"pmsg-{uuid.uuid4().hex[:8]}", "session_id": sid,
+                        "timestamp": round(time.time(), 3), "content": str(text),
+                        "resolved_question_id": None, "read_by_worker": True, "source": source,
+                    })
+                return result
             except ValueError:
                 raise
             except PersistenceUnavailable:
@@ -4709,6 +4727,7 @@ class HubSessionManager:
         sid: str,
         text: Optional[str],
         auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
+        source: str = "parent",
     ) -> Dict[str, Any]:
         existing = self.sessions.get(sid)
         if existing is not None and existing.is_process_alive():
@@ -4719,7 +4738,7 @@ class HubSessionManager:
             # delivered — through the ordinary parent→child path, not the resume injection.
             delivery = None
             if text and str(text).strip():
-                delivery = await self.deliver_parent_message(sid, str(text), also_write_pty=True)
+                delivery = await self.deliver_parent_message(sid, str(text), also_write_pty=True, source=source)
             return {
                 "session": existing,
                 "resumed": False,
@@ -5485,6 +5504,22 @@ class HubSessionManager:
                 await self.record_telemetry(session_id, {
                     "source": source, "hook_event": "AssistantReasoning", "reasoning": text,
                 })
+
+    async def note_native_user_prompt(self, session: "AgentSession", text: str, shown: bool = True) -> None:
+        """A user message read from the engine's own record.
+
+        The typed-submit check cites it, and the transcript shows it: a prompt typed straight into
+        the TUI exists nowhere else.  The feed drops the copies of the task and of the messages the
+        hub delivered itself.  Not a wake event, so parent waiters are unaffected.  Text the engine
+        wrote into the user role itself (`shown=False`, or ENGINE_INJECTED_PROMPT) is not shown.
+        """
+        text = str(text or "").strip()
+        session.note_transcript_user_message(text)
+        if text and shown and not ENGINE_INJECTED_PROMPT.match(text):
+            await self.record_worker_event(session.session_id, {
+                "type": "user_message", "category": "input", "status": "info",
+                "content": _clip_detail(text),
+            })
 
     @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -7180,7 +7215,9 @@ class HubSessionManager:
         also_write_pty: bool = True,
         press_enter: bool = True,
         clear_input: bool = False,
+        source: str = "parent",
     ) -> Dict[str, Any]:
+        """`source` names the sender for the transcript: "parent" (an agent over MCP) or "console"."""
         sess = self.sessions.get(session_id)
         if clear_input:
             if str(text).strip():
@@ -7287,6 +7324,7 @@ class HubSessionManager:
             "content": text,
             "resolved_question_id": resolved_question_id,
             "read_by_worker": bool(resolved_question_id),
+            "source": source,
         }
         box.append(msg_rec)
 
@@ -7693,7 +7731,7 @@ class HubSessionManager:
                                 and "<environment_context>" not in str(p.get("text"))
                             ]
                             if user_txts:
-                                session.note_transcript_user_message(" ".join(user_txts).strip())
+                                await self.note_native_user_prompt(session, " ".join(user_txts).strip())
                                 if session.pending_interaction:
                                     await self.clear_pending_interaction(session)
                                 turn_has_step = False
@@ -8024,7 +8062,7 @@ class HubSessionManager:
                             elif isinstance(content, str) and content.strip():
                                 user_txts.append(content.strip())
                             if user_txts:
-                                session.note_transcript_user_message(" ".join(user_txts).strip())
+                                await self.note_native_user_prompt(session, " ".join(user_txts).strip())
                             session._inflight_transcript_tool = None
                             if session.pending_interaction:
                                 await self.clear_pending_interaction(session)
@@ -8303,7 +8341,7 @@ class HubSessionManager:
                         # K3 (fix 9): kimi's record of a user message the TUI really accepted. The
                         # typed-submit check reads it from the session; no second reader of the file.
                         parts = obj.get("input") or []
-                        session.note_transcript_user_message(" ".join(
+                        await self.note_native_user_prompt(session, " ".join(
                             str(p.get("text") or "") for p in parts if isinstance(p, dict)
                         ))
                         turn_has_step = False
@@ -8560,7 +8598,7 @@ class HubSessionManager:
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
-                            session.note_transcript_user_message(user_txt)
+                            await self.note_native_user_prompt(session, user_txt)
                         session._inflight_transcript_tool = None
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
@@ -8898,7 +8936,7 @@ class HubSessionManager:
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
                                 await self.persist_session(session)
-                            session.note_transcript_user_message(content.strip())
+                            await self.note_native_user_prompt(session, content.strip(), shown=not obj.get("isMeta"))
                         elif isinstance(content, list):
                             user_texts = [
                                 str(b.get("text") or "")
@@ -8915,7 +8953,7 @@ class HubSessionManager:
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
                                     await self.persist_session(session)
-                                session.note_transcript_user_message(" ".join(user_texts))
+                                await self.note_native_user_prompt(session, " ".join(user_texts), shown=not obj.get("isMeta"))
                             for b in content:
                                 if not isinstance(b, dict) or b.get("type") != "tool_result":
                                     continue

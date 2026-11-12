@@ -551,42 +551,35 @@
 
   <!-- Session record (历史) -->
   <div class="modal-backdrop" id="historyModal" hidden>
-    <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle" tabindex="-1">
+    <div class="modal modal-xl history-modal" role="dialog" aria-modal="true" aria-labelledby="historyModalTitle" tabindex="-1">
       <header class="modal-head">
         <h3 class="modal-title" id="historyModalTitle">
           <svg class="icon" aria-hidden="true"><use href="#i-archive"></use></svg>会话记录
         </h3>
+        <div class="view-switch" role="group" aria-label="记录视图">
+          <button type="button" data-history-view="transcript" aria-pressed="true" title="结构化记录：消息、工具调用与审批">记录</button>
+          <button type="button" data-history-view="terminal" aria-pressed="false" title="原始终端画面的回放">终端记录</button>
+        </div>
         <div class="grow"></div>
         <button class="icon-btn" data-close-modal aria-label="关闭" title="关闭 (Esc)">
           <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
         </button>
       </header>
-      <div class="modal-body" id="historyBody">
+      <div class="modal-body flush history-body" id="historyBody">
         <section class="history-meta" id="historyMeta"></section>
-        <section class="history-block">
-          <div class="hb-head">
-            <h4>最终回复</h4>
-            <div class="grow"></div>
-            <button type="button" class="btn btn-ghost btn-sm" data-action="copy-final">
-              <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>复制
-            </button>
-          </div>
-          <pre class="history-pre" id="historyFinal"></pre>
-        </section>
-        <section class="history-block">
-          <div class="hb-head"><h4>过程摘要</h4></div>
-          <pre class="history-pre" id="historySummary"></pre>
-        </section>
-        <section class="history-block">
-          <details class="history-term" id="historyTermBox">
-            <summary>终端记录</summary>
-            <div class="history-term-host" id="historyTermHost"></div>
-          </details>
-        </section>
+        <div class="history-view" id="historyTranscriptBox">
+          <div class="transcript-slot" id="historyTranscriptHost"></div>
+        </div>
+        <div class="history-view history-term-view" id="historyTermBox" hidden>
+          <div class="history-term-host" id="historyTermHost"></div>
+        </div>
       </div>
       <footer class="modal-foot">
         <button type="button" class="btn btn-ghost btn-sm" data-action="delete-record" id="historyDeleteBtn" hidden>删除记录</button>
         <div class="grow"></div>
+        <button type="button" class="btn btn-ghost btn-sm" data-action="copy-final" id="historyCopyFinalBtn" disabled>
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#i-copy"></use></svg>复制最终回复
+        </button>
         <button type="button" class="btn btn-primary" data-action="resume-record" id="historyResumeBtn">恢复会话</button>
       </footer>
     </div>

@@ -62,10 +62,11 @@ export const hubApi = {
   createSession: (body) => request('POST', '/api/sessions', body),
   launchPreview: (body) => request('POST', '/api/launch-preview', body),
   sendInput: (id, text) => request('POST', `/api/sessions/${enc(id)}/input`, { text }),
+  // The transcript's message box: delivered to a live session, or resumes an ended one with it.
+  sendMessage: (id, text) => request('POST', `/api/sessions/${enc(id)}/message`, { text }),
   respondInteraction: (id, body) => request('POST', `/api/sessions/${enc(id)}/respond`, body),
   terminateSession: (id) => request('DELETE', `/api/sessions/${enc(id)}`),
   sessionFinal: (id) => request('GET', `/api/sessions/${enc(id)}/final`),
-  transcriptSummary: (id) => request('GET', `/api/sessions/${enc(id)}/transcript-summary`),
   // Bounded like listSessions: a hung request would otherwise stop this pane's refresh for good.
   transcript: (id, limit = 80) => request('GET', `/api/sessions/${enc(id)}/transcript?limit=${encodeURIComponent(limit)}`, undefined, { timeoutMs: 10000 }),
 

@@ -343,6 +343,26 @@ def _split_streamed_thoughts(entries: List[Dict[str, Any]]) -> List[Dict[str, An
     return [item for item in entries if id(item) not in drop]
 
 
+def _prompt_key(text: str) -> str:
+    """A prompt as compared across records: no hub markers or clip note, whitespace collapsed."""
+    return " ".join(_clean_task(CLIP_NOTE.sub("", str(text or ""))).split())
+
+
+def _is_sent_copy(key: str, sent_keys: List[str]) -> bool:
+    """`key` is one of the texts the hub sent, or a clipped copy of one (or the other way round)."""
+    if not key:
+        return True
+    for other in sent_keys:
+        if not other:
+            continue
+        if key == other:
+            return True
+        short, long = (key, other) if len(key) < len(other) else (other, key)
+        if len(short) >= 40 and long.startswith(short):
+            return True
+    return False
+
+
 def _text_before_reply(text: str, final: str) -> str:
     """The text in front of a (possibly clipped) copy of the final reply inside `text`, else ""."""
     reply = final.strip()
@@ -378,6 +398,8 @@ def build_transcript_feed(
 
     task = _clean_task(_text(meta.get("last_task"), TEXT_LIMIT))
     task_entry = {"id": "task", "kind": "task", "text": task, "timestamp": _ts(meta.get("created_at"))} if task else None
+    sent = [task] if task else []  # texts the hub handed to the agent (see _is_sent_copy)
+    typed: List[Dict[str, Any]] = []  # user prompts read from the engine's record
 
     for index, message in enumerate(parent_messages or ()):
         if isinstance(message, dict):
@@ -393,10 +415,12 @@ def build_transcript_feed(
             body, mid, stamp, resolved = _text(message), f"p{index}", None, ""
         if not body:
             continue
+        sent.append(body)
         if resolved:
             resolutions[resolved] = {"text": body, "timestamp": stamp, "by": "parent"}
             continue
-        entries.append({"id": f"parent:{mid}", "kind": "parent", "text": body, "timestamp": stamp})
+        origin = "console" if isinstance(message, dict) and message.get("source") == "console" else "parent"
+        entries.append({"id": f"parent:{mid}", "kind": "parent", "origin": origin, "text": body, "timestamp": stamp})
 
     open_tools: List[Dict[str, Any]] = []
     interactions: Dict[str, Dict[str, Any]] = {}
@@ -464,6 +488,10 @@ def build_transcript_feed(
             if content:
                 seen_text.add(content[:STORED_MESSAGE_HEAD])
                 entries.append({"id": f"final:{seq}", "kind": "final", "text": content, "timestamp": stamp})
+        elif ev_type == "user_message":
+            if content:
+                typed.append({"id": f"user:{seq}", "kind": "parent", "origin": "user", "text": content,
+                              "timestamp": stamp})
         elif ev_type in INTERACTION_EVENT_TYPES:
             interaction = ev.get("interaction") if isinstance(ev.get("interaction"), dict) else None
             if interaction is None and isinstance(data.get("interaction"), dict):
@@ -519,6 +547,11 @@ def build_transcript_feed(
             entries.append({"id": mid, "kind": "thinking", "text": body, "timestamp": stamp})
         else:
             entries.append({"id": mid, "kind": "assistant", "text": body, "timestamp": stamp})
+
+    # The engine's record repeats the task and every message the hub typed in; only prompts the
+    # user typed straight into the TUI are new.
+    sent_keys = [_prompt_key(text) for text in sent]
+    entries.extend(item for item in typed if not _is_sent_copy(_prompt_key(item["text"]), sent_keys))
 
     final_text = _text(meta.get("final_response"))
     if final_text and not any(item["kind"] == "final" and item.get("text") == final_text for item in entries):

@@ -241,6 +241,24 @@ class MessageTests(unittest.TestCase):
         ])
         self.assertEqual(kinds(result), ["task", "notice", "assistant"])
 
+    def test_messages_to_the_agent_say_who_sent_them(self):
+        long_steer = "请把第二步改成先跑单元测试，再看日志里的超时，然后告诉我结果。" * 3
+        result = feed(
+            [
+                # The engine's record repeats the task (with the hub's markers) and every hub message.
+                event(1, "user_message", "检查这个目录\n\n[Hub Session: session_id=s]"),
+                event(3, "user_message", "看一下 README"),
+                event(5, "user_message", long_steer[:60] + "…（已截断，原文 99 字符）"),
+                event(7, "user_message", "顺便   看下\n日志"),
+            ],
+            parent_messages=[
+                {"direction": "parent", "content": "顺便 看下 日志", "timestamp": 1006.0, "source": "console"},
+                {"direction": "parent", "content": long_steer, "timestamp": 1004.0},
+            ],
+        )
+        sent = [(entry["origin"], entry["text"]) for entry in result["entries"] if entry["kind"] == "parent"]
+        self.assertEqual(sent, [("user", "看一下 README"), ("parent", long_steer), ("console", "顺便 看下 日志")])
+
     def test_reasoning_and_reports(self):
         result = feed([event(1, "reasoning", "想一想"), event(2, "message_to_parent", "进度：一半")])
         self.assertEqual(kinds(result), ["task", "thinking", "assistant"])

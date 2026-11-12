@@ -121,6 +121,9 @@ let archiveLoaded = false;
 let archiveSearchTimer = 0;
 let historyScrollbackText = null;
 let historyTerm = null; // { term, host } read-only xterm inside the record modal
+let historyView = 'transcript'; // the record modal shows 'transcript' or 'terminal'
+let historyTranscript = null; // { id, ui, controller, data, limit, loading } of the record modal
+let historyFinalText = ''; // what 复制最终回复 copies
 
 export function initSessionWorkspace() {
   $('#sessionList').addEventListener('click', onSessionListClick);
@@ -143,15 +146,13 @@ export function initSessionWorkspace() {
     archiveQuery = ev.target.value.trim();
     loadArchive(true);
   });
-  // 终端记录 is collapsed by default and loads its scrollback on first open.
-  $('#historyTermBox').addEventListener('toggle', () => {
-    if ($('#historyTermBox').open) loadHistoryScrollback();
-  });
   registerModal(HISTORY_MODAL, {
     afterClose: () => {
       historyRecordId = null;
       historyScrollbackText = null;
-      $('#historyTermBox').open = false;
+      historyFinalText = '';
+      disposeHistoryTranscript();
+      setHistoryView('transcript');
       disposeHistoryTerminal();
       $('#historyTermHost').innerHTML = '';
     },
@@ -183,7 +184,7 @@ export function initSessionWorkspace() {
     const historyHost = $('#historyTermHost');
     if (historyHost) {
       const historyRo = new ResizeObserver(() => {
-        if (historyTerm?.fit && $('#historyTermBox')?.open) {
+        if (historyTerm?.fit && historyView === 'terminal') {
           try { historyTerm.fit.fit(); } catch { /* ignore */ }
         }
       });
@@ -896,6 +897,7 @@ function mountTranscript(pane, s) {
       refreshTranscript(s.session_id, true);
     },
     onRetry: () => refreshTranscript(s.session_id, true),
+    onSend: (text) => sendFromTranscript(s.session_id, text),
   });
   if (view.data) view.controller.update(view.data);
   refreshTranscript(s.session_id, true);
@@ -924,6 +926,26 @@ async function refreshTranscript(sessionId, force = false) {
     view.queued = false;
     refreshTranscript(sessionId, true);
   }
+}
+
+/** The transcript's message box: `{ ok, error? }` for the view, which keeps the text on failure. */
+async function sendMessage(id, text) {
+  try {
+    const res = await hubApi.sendMessage(id, text);
+    if (res?.session) upsertSession(res.session);
+    emit('sessions:refresh-request');
+    if (!res?.ok) return { ok: false, error: res?.error || '消息未送达', res };
+    return { ok: true, res };
+  } catch (err) {
+    return { ok: false, error: `发送失败：${err.message || err}` };
+  }
+}
+
+async function sendFromTranscript(id, text) {
+  const result = await sendMessage(id, text);
+  if (result.res?.resumed) toast('会话已恢复，消息已发送', 'success', 2200);
+  refreshTranscript(id, true);
+  return result;
 }
 
 async function respondFromTranscript(id, body, trigger) {
@@ -1371,50 +1393,101 @@ function openHistoryRecord(id) {
   historyRecordId = id;
   historyScrollbackText = null;
   historyRec = findHistoryRecord(id);
+  historyFinalText = '';
   disposeHistoryTerminal();
   $('#historyTermHost').innerHTML = '';
-  $('#historyTermBox').open = false;
+  mountHistoryTranscript(id);
+  setHistoryView('transcript');
   renderHistoryMeta(historyRec, null);
   updateHistoryActions(historyRec);
-  setHistoryText('#historyFinal', '加载中…');
-  setHistoryText('#historySummary', '加载中…');
   openModal(HISTORY_MODAL);
   loadHistoryRecord(id, historyRec);
 }
 
 async function loadHistoryRecord(id, rec) {
-  const [finalRes, summaryRes, recRes] = await Promise.allSettled([
+  const [finalRes, recRes] = await Promise.allSettled([
     hubApi.sessionFinal(id),
-    hubApi.transcriptSummary(id),
     hubApi.archiveRecord(id),
   ]);
   if (historyRecordId !== id) return;
 
-  let final = {};
-  if (finalRes.status === 'fulfilled') {
-    final = finalRes.value || {};
-    setHistoryText('#historyFinal', String(final.final_response || '').trim() || '（暂无最终回复）');
-  } else {
-    setHistoryText('#historyFinal', `加载失败：${finalRes.reason?.message || finalRes.reason}`, true);
-  }
-
+  const final = finalRes.status === 'fulfilled' ? finalRes.value || {} : {};
+  historyFinalText = String(final.final_response || '').trim();
   // The archive record carries 结束原因 / 可恢复 / 不可恢复原因; a live ended session has them too.
   historyRec = recRes.status === 'fulfilled'
     ? { ...(rec || {}), ...(recRes.value || {}) }
     : { ...(rec || {}) };
   renderHistoryMeta(historyRec, final);
   updateHistoryActions(historyRec);
+}
 
-  if (summaryRes.status === 'fulfilled') {
-    const summary = summaryRes.value || {};
-    const text = String(summary.digest_markdown || summary.latest_conclusion || '').trim();
-    setHistoryText('#historySummary', text || '（暂无过程摘要）');
-  } else {
-    setHistoryText('#historySummary', `加载失败：${summaryRes.reason?.message || summaryRes.reason}`, true);
+/** 记录 / 终端记录 in the record modal; the terminal replay loads on first view. */
+function setHistoryView(view) {
+  historyView = view === 'terminal' ? 'terminal' : 'transcript';
+  $$('#historyModal [data-history-view]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.historyView === historyView));
+  });
+  $('#historyTranscriptBox').hidden = historyView !== 'transcript';
+  $('#historyTermBox').hidden = historyView !== 'terminal';
+  if (historyView === 'terminal') loadHistoryScrollback();
+  else historyTranscript?.controller?.reveal();
+}
+
+// The record modal shows the same structured transcript as a pane: fetched once (an ended session
+// does not change), paged with 载入更早的记录, and its message box resumes the session.
+function mountHistoryTranscript(id) {
+  disposeHistoryTranscript();
+  const entry = { id, ui: createTranscriptUiState(), controller: null, data: null, limit: TRANSCRIPT_PAGE, loading: false };
+  entry.controller = createTranscriptView($('#historyTranscriptHost'), entry.ui, {
+    onRespond: async () => false, // an ended session has no reply card (see loadHistoryTranscript)
+    onLoadMore: () => {
+      entry.limit = Math.min(TRANSCRIPT_MAX, entry.limit + TRANSCRIPT_PAGE_STEP);
+      loadHistoryTranscript(entry);
+    },
+    onRetry: () => loadHistoryTranscript(entry),
+    onSend: (text) => continueFromHistory(id, text),
+  });
+  historyTranscript = entry;
+  loadHistoryTranscript(entry);
+}
+
+function disposeHistoryTranscript() {
+  historyTranscript?.controller?.dispose();
+  historyTranscript = null;
+  const host = $('#historyTranscriptHost');
+  if (host) host.innerHTML = '';
+}
+
+async function loadHistoryTranscript(entry) {
+  if (entry.loading) return;
+  entry.loading = true;
+  let data;
+  try {
+    data = (await hubApi.transcript(entry.id, entry.limit)) || { entries: [] };
+    // A question the session left open can no longer be answered: show it as history.
+    data = {
+      ...data,
+      pending_interaction: null,
+      entries: (data.entries || []).map((item) => (item.pending ? { ...item, pending: false } : item)),
+    };
+  } catch (err) {
+    data = { ...(entry.data || { entries: [] }), error: err.message || String(err) };
+  } finally {
+    entry.loading = false;
   }
+  if (historyTranscript !== entry) return;
+  entry.data = data;
+  entry.controller.update(data);
+}
 
-  // 终端记录 was opened while the record was still loading: fetch its scrollback now.
-  if ($('#historyTermBox').open) loadHistoryScrollback();
+async function continueFromHistory(id, text) {
+  const result = await sendMessage(id, text);
+  if (!result.ok) return result;
+  if (historyRecordId === id) closeModal(HISTORY_MODAL, { force: true });
+  setActiveSession(id);
+  toast(result.res?.resumed ? '会话已恢复，消息已发送' : '消息已发送', 'success', 2200);
+  if (sessionsMode === 'history') setTimeout(() => loadArchive(true, { quiet: true }), 400);
+  return result;
 }
 
 function renderHistoryMeta(rec, final) {
@@ -1453,13 +1526,10 @@ function updateHistoryActions(rec) {
   resumeBtn.disabled = !resumable;
   resumeBtn.title = resumable ? '恢复该会话（沿用同一个会话 ID）' : reason;
   deleteBtn.hidden = rec?.archived !== true;
-}
-
-function setHistoryText(selector, text, isError = false) {
-  const el = $(selector);
-  if (!el) return;
-  el.textContent = text;
-  el.classList.toggle('is-error', isError);
+  const copyBtn = $('#historyCopyFinalBtn');
+  if (copyBtn) copyBtn.disabled = !historyFinalText;
+  // Known not to be resumable: the message box would only fail, so it says why instead.
+  historyTranscript?.controller?.setCompose(rec?.resumable === false ? { disabled: true, hint: `无法继续：${reason}` } : null);
 }
 
 // ------------------------------------------------------------ 终端记录 (archive)
@@ -1582,12 +1652,16 @@ function onHistoryModalClick(ev) {
     deleteHistoryRecord(historyRecordId, deleteBtn);
     return;
   }
+  const viewBtn = ev.target.closest('[data-history-view]');
+  if (viewBtn) {
+    setHistoryView(viewBtn.dataset.historyView);
+    return;
+  }
   const btn = ev.target.closest('[data-action="copy-final"]');
   if (!btn) return;
-  const text = $('#historyFinal')?.textContent || '';
-  if (!text || text === '加载中…' || text === '（暂无最终回复）') {
+  if (!historyFinalText) {
     toast('没有可复制的最终回复', 'info', 2000);
     return;
   }
-  copyText(text, '已复制最终回复');
+  copyText(historyFinalText, '已复制最终回复');
 }

@@ -17,6 +17,9 @@ const CLAMP_CHARS = 1600; // longer agent messages start clamped
 const CLAMP_LINES = 26;
 const FOLLOW_SLACK = 72; // px from the bottom that still counts as reading the newest entry
 const LIVE_STATUSES = new Set(['starting', 'running']);
+// Statuses whose session takes a message as it is; any other one is resumed by the send.
+const RECEIVING_STATUSES = new Set(['starting', 'running', 'waiting_parent', 'completed']);
+const COMPOSE_MAX_PX = 168; // the message box grows with its text up to about seven lines
 
 const ROLE_LABELS = {
   task: '任务',
@@ -24,6 +27,9 @@ const ROLE_LABELS = {
   assistant: 'Agent',
   final: '最终回复',
 };
+// Who sent a message to the agent (transcript_feed.py): a parent agent, this console, or the
+// user typing straight into the TUI.
+const ORIGIN_LABELS = { parent: '主 Agent', console: '你', user: '你 · TUI' };
 const TOOL_STATUS_LABELS = { running: '运行中', ok: '完成', error: '失败', unknown: '无结果记录' };
 
 /** Fresh per-session UI state; keep it with the session, not with the DOM. */
@@ -37,6 +43,7 @@ export function createTranscriptUiState() {
     scrollTop: null,
     unseen: 0,
     draft: { requestId: '', text: '' },
+    compose: '', // the message being written in the message box
   };
 }
 
@@ -113,13 +120,14 @@ function entrySig(entry, ui) {
 function messageHtml(entry, ui) {
   const kind = entry.kind;
   const label = kind === 'final' && entry.previous_turn ? '上一轮回复'
-    : kind === 'assistant' && entry.channel === 'report' ? '汇报给主 Agent' : ROLE_LABELS[kind] || 'Agent';
+    : kind === 'assistant' && entry.channel === 'report' ? '汇报给主 Agent'
+      : kind === 'parent' ? ORIGIN_LABELS[entry.origin] || ROLE_LABELS.parent : ROLE_LABELS[kind] || 'Agent';
   const clampable = kind !== 'final' && isClampable(entry.text);
   const clamped = clampable && !ui.expanded.has(entry.id);
   const body = kind === 'parent'
     ? `<div class="tx-plain">${escapeHtml(entry.text)}</div>`
     : `<div class="tx-md">${renderMarkdown(entry.text)}</div>`;
-  return `<article class="tx-msg" data-kind="${kind}">
+  return `<article class="tx-msg" data-kind="${kind}"${kind === 'parent' ? ` data-origin="${escapeHtml(entry.origin || 'parent')}"` : ''}>
     <header class="tx-msg-head">
       ${kind === 'final' ? icon('check-circle', 'icon-xs') : ''}
       <span class="tx-role">${escapeHtml(label)}</span>
@@ -323,7 +331,11 @@ function reconcile(container, items, { key, sig, render, patch }) {
 }
 
 // ------------------------------------------------------------------ the view
-export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry }) {
+/**
+ * `onSend(text)` (optional) adds the message box under the transcript; it resolves to
+ * `{ ok, error? }` and the box keeps the text when the send fails.
+ */
+export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry, onSend = null }) {
   host.innerHTML = `
     <div class="tx">
       <div class="tx-list">
@@ -335,13 +347,25 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry 
       <div class="tx-dock" data-ref="dock">
         <button type="button" class="tx-jump" data-tx="jump" hidden>${icon('chevron-down', 'icon-xs')}<span data-ref="jump-text">回到最新</span></button>
         <div data-ref="pending"></div>
+        ${onSend ? `<form class="tx-compose" data-ref="compose" autocomplete="off">
+          <div class="tx-compose-row">
+            <textarea class="tx-compose-input" data-ref="compose-input" rows="1" aria-label="发送消息给 Agent"></textarea>
+            <button type="submit" class="btn btn-sm btn-primary tx-compose-send" data-ref="compose-send" title="发送（Enter）">发送</button>
+          </div>
+          <p class="tx-compose-note" data-ref="compose-note" hidden></p>
+        </form>` : ''}
       </div>
     </div>`;
   const ref = (name) => host.querySelector(`[data-ref="${name}"]`);
   const els = {
     top: ref('top'), blocks: ref('blocks'), live: ref('live'), liveText: ref('live-text'),
     empty: ref('empty'), jump: ref('jump-text').parentElement, jumpText: ref('jump-text'), pending: ref('pending'),
+    compose: ref('compose'), composeInput: ref('compose-input'), composeSend: ref('compose-send'),
+    composeNote: ref('compose-note'),
   };
+  if (els.composeInput) els.composeInput.value = ui.compose || '';
+  let sending = false;
+  let composeLock = null; // { hint } while the caller knows a send cannot succeed (see setCompose)
   const byId = new Map();
   let data = null;
   let lastEntryIds = new Set();
@@ -515,6 +539,78 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry 
     </section>`;
   }
 
+  // The message box stands in for the reply card's input while no question or approval waits.
+  function renderCompose() {
+    if (!els.compose) return;
+    const waiting = Boolean(els.pending.firstElementChild);
+    if (els.compose.hidden !== waiting) els.compose.hidden = waiting;
+    const status = String(data?.status || '');
+    const hint = composeLock ? composeLock.hint
+      : !data || RECEIVING_STATUSES.has(status) ? '发消息给 Agent（Enter 发送，Shift+Enter 换行）'
+        : '继续这个会话：发送后自动恢复（Enter 发送，Shift+Enter 换行）';
+    if (els.composeInput.placeholder !== hint) els.composeInput.placeholder = hint;
+    const locked = Boolean(composeLock);
+    if (els.composeInput.disabled !== locked) {
+      els.composeInput.disabled = locked;
+      els.composeSend.disabled = locked || sending;
+    }
+  }
+
+  function fitCompose() {
+    const input = els.composeInput;
+    if (!input || !input.isConnected) return;
+    input.style.height = 'auto';
+    input.style.height = `${Math.min(input.scrollHeight + 2, COMPOSE_MAX_PX)}px`;
+    if (ui.follow && host.clientHeight) scrollToBottom();
+  }
+
+  function composeNote(text, tone = 'error') {
+    if (!els.composeNote) return;
+    els.composeNote.hidden = !text;
+    els.composeNote.textContent = text || '';
+    els.composeNote.dataset.tone = tone;
+  }
+
+  async function send() {
+    const input = els.composeInput;
+    if (!input || sending || composeLock) return;
+    const text = input.value;
+    if (!text.trim()) {
+      input.focus();
+      input.classList.add('is-invalid');
+      setTimeout(() => input.classList.remove('is-invalid'), 900);
+      return;
+    }
+    sending = true;
+    input.readOnly = true;
+    els.composeSend.disabled = true;
+    els.composeSend.textContent = '发送中…';
+    composeNote('');
+    let result;
+    try {
+      result = await onSend(text);
+    } catch (err) {
+      result = { ok: false, error: err?.message || String(err) };
+    }
+    sending = false;
+    input.readOnly = false;
+    els.composeSend.disabled = false;
+    els.composeSend.textContent = '发送';
+    if (result?.ok) {
+      // Only clear what was sent: text typed while the send was in flight stays.
+      input.value = input.value === text ? '' : input.value;
+      ui.compose = input.value;
+      ui.follow = true;
+      ui.unseen = 0;
+      updateJump();
+      if (result.note) composeNote(result.note, 'info');
+    } else {
+      composeNote(result?.error || '发送失败', 'error');
+    }
+    fitCompose();
+    if (input.isConnected) input.focus();
+  }
+
   function renderEmpty(entries) {
     let text = '';
     if (!entries.length) {
@@ -563,6 +659,8 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry 
 
     renderTop();
     renderPending(entries);
+    renderCompose();
+    if (!rendered && ui.compose) fitCompose(); // a draft kept from an earlier mount
     renderEmpty(entries);
     const live = LIVE_STATUSES.has(String(next?.status || '')) && !next?.pending_interaction
       && !entries.some((e) => e.kind === 'interaction' && e.pending);
@@ -708,27 +806,50 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry 
   }
 
   function onKeydown(ev) {
-    if (!ev.target.matches?.('[data-ref="reply"]')) return;
-    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+    // Enter sends; Shift+Enter is a new line; Enter that confirms an IME composition is neither.
+    const plainEnter = ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229;
+    if (ev.target.matches?.('[data-ref="reply"]')) {
+      if (plainEnter) {
+        ev.preventDefault();
+        submit(els.pending.querySelector('[data-tx="submit"]'), null);
+      }
+    } else if (ev.target === els.composeInput && plainEnter && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
       ev.preventDefault();
-      submit(els.pending.querySelector('[data-tx="submit"]'), null);
+      send();
     }
   }
 
   function onInput(ev) {
     if (ev.target.matches?.('[data-ref="reply"]')) ui.draft.text = ev.target.value;
+    else if (ev.target === els.composeInput) {
+      ui.compose = ev.target.value;
+      fitCompose();
+    }
+  }
+
+  function onSubmit(ev) {
+    if (ev.target !== els.compose) return;
+    ev.preventDefault();
+    send();
   }
 
   host.addEventListener('click', onClick);
   host.addEventListener('keydown', onKeydown);
   host.addEventListener('input', onInput);
+  host.addEventListener('submit', onSubmit);
 
   return {
     update,
     /** Called after the pane becomes visible again (a hidden pane cannot measure). */
     reveal() {
+      fitCompose();
       if (ui.follow) scrollToBottom();
       else if (ui.scrollTop != null) host.scrollTop = ui.scrollTop;
+    },
+    /** `{ disabled: true, hint }` locks the message box with the reason; null unlocks it. */
+    setCompose(lock) {
+      composeLock = lock?.disabled ? { hint: String(lock.hint || '') } : null;
+      renderCompose();
     },
     dispose() {
       resizeObserver?.disconnect();
@@ -736,6 +857,7 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry 
       host.removeEventListener('click', onClick);
       host.removeEventListener('keydown', onKeydown);
       host.removeEventListener('input', onInput);
+      host.removeEventListener('submit', onSubmit);
     },
   };
 }
