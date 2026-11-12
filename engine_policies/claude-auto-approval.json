@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python engine_policies/claude_pre_tool_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

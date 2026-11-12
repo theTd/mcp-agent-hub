@@ -101,3 +101,19 @@ $env:DISPATCH_TEST_REPEATS="5"
 $env:DISPATCH_TEST_BATCH="21"
 node tools/dispatch-prompt-stress.mjs
 ```
+
+## 默认原生自动审批（2026-11-12，D13）
+
+Owner 要求：引擎有原生自动审批时默认使用，主 Agent 只有刻意传参才换模式。`agent_guidance.py` 把 `bypass_approvals=null inherits profile…` 一行换成 `approval_mode` 规则（不传即 auto，Codex `--approve-for-me`、Claude auto mode；`ask` 只在主 Agent 或用户要亲自批每个高风险操作时用；`bypass` 只在用户要求或任务需要时用；`bypass_approvals` 为旧开关，不得同时传），并把 cwd 一行里的 “Claude acceptEdits” 限定为 ask 模式。
+
+`tools/dispatch-prompt-stress.mjs` 新增 4 个场景与动作 `omit`、`ask`、`bypass`：`modedefault`（普通 Codex 任务，期望 omit）、`modesafe`（想“显式又稳妥”时的反射式覆盖，期望 omit）、`modeself`（用户要亲自批，期望 ask）、`modenone`（用户明确要求不审批，期望 bypass）。
+
+本机 8789 评测器，25 个场景、每批 25 个输入：
+
+| 版本 | 结果 | 偏差 | 输入 tokens/轮 |
+|---|---|---|---|
+| 基线（master，3 次重复） | `72/75` | `modesafe` 2 次判 ask，`parentdir` 1 次判 inplace | 1,742 |
+| 初版规则（3 次重复） | `71/75` | `modesafe` 3/3 判 ask，`parentdir` 1 次判 inplace | 1,849 |
+| 定稿规则（5 次重复） | `124/125` | `modesafe` 1 次判 ask | 1,869 |
+
+初版只写“leave approval_mode unset”，`modesafe` 全部被“稳妥”带向 ask；定稿加上 “even to be explicit or careful: the default, auto, is the safe choice” 并把 ask 限定为“你或用户要亲自批每个高风险操作”后升到 `4/5`。基线不含 `approval_mode` 也能答对另三个新场景（场景文本已足够明确），所以它们只防回归。`parentdir` 的偶发 inplace 在基线中同样出现，与本次改动无关。提示词 3,927 字节（基线 3,389，+15.9%）。

@@ -276,7 +276,7 @@ async function runPreview() {
     thinking_level: currentLevel || null,
     cwd: $('#cwdInput').value.trim() || null,
     env: ($('#envInput')?.value || '').trim() || null,
-    bypass_approvals: sessionApprovalOverride(),
+    approval_mode: sessionApprovalOverride(),
   };
   try {
     try {
@@ -308,6 +308,8 @@ function quoteArg(value) {
   return /[\s"']/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
 }
 
+const APPROVAL_MODE_LABELS = { auto: '自动审批', ask: '高风险需审批', bypass: '绕过审批' };
+
 function renderPreview() {
   const box = $('#runPreview');
   if (!box) return;
@@ -325,7 +327,7 @@ function renderPreview() {
   const bits = [];
   if (d.model) bits.push(escapeHtml(d.model));
   if (d.thinking_level) bits.push(`思考 ${escapeHtml(d.thinking_level)}`);
-  if (d.high_risk_approval != null) bits.push(`${d.high_risk_approval ? '审批开启' : '绕过审批'} · ${d.approval_source === 'session' ? '本次会话' : 'Profile'}`);
+  if (d.approval_mode) bits.push(`${APPROVAL_MODE_LABELS[d.approval_mode] || escapeHtml(d.approval_mode)} · ${d.approval_source === 'session' ? '本次会话' : 'Profile'}`);
   const head = bits.length ? `将运行：${bits.join(' · ')}` : '将运行：该 Profile 不使用模型与思考等级';
   const notes = (Array.isArray(d.notes) ? d.notes : [])
     .map((note) => `<div class="preview-note">${escapeHtml(note)}</div>`).join('');
@@ -420,9 +422,10 @@ function sessionExtraArgs() {
   return args;
 }
 
+/** D13: null inherits (auto by default, bypass if the profile says so); else auto / ask / bypass. */
 function sessionApprovalOverride() {
   const value = $('#approvalField').hidden ? '' : $('#approvalSelect').value;
-  return value === '' ? null : value === 'true';
+  return value === '' ? null : value;
 }
 
 async function launchSession() {
@@ -446,7 +449,7 @@ async function launchSession() {
       task: task || null,
       cwd: cwd || null,
       env: env || null,
-      bypass_approvals: sessionApprovalOverride(),
+      approval_mode: sessionApprovalOverride(),
       extra_args: sessionExtraArgs(),
       ...sessionMcpConfig(),
     });

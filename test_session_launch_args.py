@@ -58,8 +58,10 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
     async def test_preview_order_policy_and_no_profile_mutation(self):
         extra = ["-c", "mcp_servers.hidden.enabled=false", "--dangerously-bypass-approvals-and-sandbox"]
         launch = self.hub.resolve_launch("codex", cwd=str(self.root), extra_args=extra)
-        self.assertEqual(launch["args"], ["-a", "on-request", "-s", "workspace-write",
+        self.assertEqual(launch["args"], ["--approve-for-me",
                                            "--profile-arg", "-c", "mcp_servers.hidden.enabled=false"])
+        ask = self.hub.resolve_launch("codex", cwd=str(self.root), extra_args=extra, approval_mode="ask")
+        self.assertEqual(ask["args"][:4], ["-a", "on-request", "-s", "workspace-write"])
         self.assertEqual(launch["extra_args"], extra)
         self.assertTrue(launch["notes"])
         self.assertEqual(self.hub.profiles["codex"]["args"], ["--profile-arg"])

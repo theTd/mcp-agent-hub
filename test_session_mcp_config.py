@@ -134,9 +134,19 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
         merged = settings(sess.args)
         self.assertEqual(merged["env"], {"A": "1", "B": "2"})
         self.assertIn("Read(secret)", merged["permissions"]["deny"])
-        self.assertGreater(len(merged["hooks"]["PreToolUse"]), 1)
-        self.assertGreater(len(merged["permissions"]["ask"]), 1)
+        # D13: auto mode (the default) adds only the PermissionRequest relay; ask rules stay the user's.
+        self.assertEqual(sess.args[sess.args.index("--permission-mode") + 1], "auto")
+        self.assertEqual(merged["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"])
+        self.assertEqual(len(merged["hooks"]["PermissionRequest"]), 1)
+        self.assertEqual(merged["permissions"]["ask"], user["permissions"]["ask"])
         self.assertEqual(merged["deniedMcpServers"], [{"serverName": "old"}])
+        with patch.object(AgentSession, "start_pty"), patch.object(self.hub, "_schedule", lambda coro: coro.close()):
+            ask_sess = await self.hub.create_session("claude", cwd=str(self.root), disabled_mcp_servers=["old"],
+                                                     approval_mode="ask")
+        asked = settings(ask_sess.args)
+        self.assertEqual(ask_sess.args[ask_sess.args.index("--permission-mode") + 1], "acceptEdits")
+        self.assertGreater(len(asked["hooks"]["PreToolUse"]), 1)
+        self.assertGreater(len(asked["permissions"]["ask"]), 1)
         record = {"engine": "claude", "profile_id": "claude", "profile_snapshot": sess.profile_snapshot,
                   "conversation_ref": {"session_id": "fixture"}}
         path.unlink()  # Settings content is snapshotted; no live external file needed on resume.

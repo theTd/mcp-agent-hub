@@ -118,9 +118,10 @@
         <label class="field" id="approvalField" hidden>
           <span class="field-label">本次会话审批</span>
           <select id="approvalSelect">
-            <option value="">继承 Profile</option>
-            <option value="false">强制审批</option>
-            <option value="true">绕过审批（全自动）</option>
+            <option value="">继承 Profile（默认自动审批）</option>
+            <option value="auto">自动审批（引擎自带审核）</option>
+            <option value="ask">高风险操作需审批</option>
+            <option value="bypass">绕过审批（全自动）</option>
           </select>
         </label>
         <div class="run-preview" id="runPreview" hidden></div>

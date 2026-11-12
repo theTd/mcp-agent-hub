@@ -202,6 +202,7 @@ def _control_status(session, *, accepted=True):
         "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}" if session.wait_handle else None,
         "status": session.status,
         "approval": {
+            "approval_mode": resolve_session_approval_fields(session.profile_snapshot)["approval_mode"],
             "high_risk_approval": session.high_risk_approval,
             "approval_source": (session.profile_snapshot or {}).get("approval_source"),
         },
@@ -267,16 +268,28 @@ async def spawn_subagent(
     strict_mcp_config: bool = False,
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
     wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
+    approval_mode: Optional[str] = None,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
 
+    ``approval_mode`` decides who approves the worker's risky actions:
+    - omitted (the default): the engine's own auto-approval reviewer where it has one (Codex
+      ``--approve-for-me``, Claude auto mode); only what the reviewer escalates comes to you. Other
+      engines run ``"ask"``. Leave it omitted, even to be explicit or careful: auto is the safe choice.
+    - ``"ask"``: high-risk actions stop and come to you (respond_to_subagent); only when you or the
+      user want to approve every one yourselves.
+    - ``"bypass"``: no checks at all; only when the user asked for it or the task needs it.
+    ``bypass_approvals`` is the legacy switch (true = ``"bypass"``, false = the default); never pass
+    both. A profile with ``bypass_approvals`` on defaults to ``"bypass"``.
+
     For every engine, create the task's own worktree, scratch, logs and results under ``cwd``:
-    sandboxes and auto-accept cover only ``cwd`` (Codex workspace-write, Claude acceptEdits, DSH
-    workspace root), so work outside it turns into parent approvals; for DSH every call, reads
-    included, and the hub cannot add roots. Only what the task creates belongs there: leave files
-    it did not create (sources, shared or others' data, credentials) in place, and never widen
-    ``cwd`` to a parent, home or drive root to cover them.
+    sandboxes and auto-accept cover only ``cwd`` (Codex workspace-write, Claude acceptEdits in ask
+    mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in
+    auto mode, yours in ask mode and for DSH); for DSH every call, reads included, and the hub
+    cannot add roots. Only what the task creates belongs there: leave files it did not create
+    (sources, shared or others' data, credentials) in place, and never widen ``cwd`` to a parent,
+    home or drive root to cover them.
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -284,6 +297,7 @@ async def spawn_subagent(
         profile_id=agent_type,
         launch_source="agent",
         bypass_approvals=bypass_approvals,
+        approval_mode=approval_mode,
         extra_args=extra_args,
         mcp_servers=mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
@@ -307,7 +321,9 @@ async def spawn_subagent(
 
 @mcp.tool()
 async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True) -> Dict[str, Any]:
-    """Start several subagents and return one group wait handle (all_settled by default)."""
+    """Start several subagents and return one group wait handle (all_settled by default).
+
+    Each spec takes spawn_subagent's fields; approval_mode follows the same default (auto)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
     sessions = []
@@ -1055,6 +1071,7 @@ async def api_launch_preview(req: Request):
             cwd=body.get("cwd"),
             env=body.get("env"),
             bypass_approvals=body.get("bypass_approvals"),
+            approval_mode=body.get("approval_mode"),
             extra_args=body.get("extra_args"),
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
@@ -1114,6 +1131,7 @@ async def api_create_session(req: Request):
             thinking_level=thinking_level,
             env=env,
             bypass_approvals=body.get("bypass_approvals"),
+            approval_mode=body.get("approval_mode"),
             extra_args=body.get("extra_args"),
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),

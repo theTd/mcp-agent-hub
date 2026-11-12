@@ -20,10 +20,12 @@ ROUTING_RULES = (
     "are literal per-session TUI argv (DSH/GUI reject them).",
     'Codex/Claude mcp_servers use HTTP {"url","headers"} or stdio {"command","args","env"}; '
     "disabled_mcp_servers and Claude strict_mcp_config are session-only. Do not mix these with native overrides; config does not prove connection/authentication.",
-    "bypass_approvals=null inherits profile, false requires approval, true bypasses it for this session.",
+    "Approvals: leave approval_mode unset, even to be explicit or careful: the default, auto, is the safe choice. Codex and Claude then run their own auto-approval reviewer (Codex --approve-for-me, Claude auto mode) and only what it escalates comes to you; other engines bring you their high-risk actions. "
+    'Set approval_mode="ask" only when you or the user want to approve every high-risk action yourselves, "bypass" (no checks) only when the user asked for it or the task needs it. '
+    "bypass_approvals is the legacy switch (true = bypass, false = the default); never pass both.",
     "A blocked Windows DSH sandbox_preparation prevents dispatch; skipped is unverified. Permission readiness does not prove access; inspect the reason.",
     WAIT_HANDLE_HINT,
-    "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits, DSH workspace root), so work outside it turns into approvals; for DSH every call, reads included, and the hub cannot add roots. "
+    "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
     "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet.",
@@ -52,7 +54,7 @@ PROFILE_DESCRIPTIONS = {
     "kimi": "Kimi Code CLI; model uses -m and per-session thinking uses KIMI_MODEL_THINKING_EFFORT. The status bar still shows the global setting.",
     "agy": "Antigravity CLI; the Hub appends the selected thinking level to the model name.",
     "codex": "Codex CLI; model uses -m and thinking uses -c model_reasoning_effort.",
-    "claude": "Claude Code CLI; model and thinking use --model / --effort. High-risk commands require approval by default.",
+    "claude": "Claude Code CLI; model and thinking use --model / --effort. Runs in Claude's auto mode by default: its classifier approves or blocks each tool call.",
     "dsh": "Native session created through the DSH Hub API, with live events in the console.",
     "pwsh": "Interactive PowerShell 7 terminal.",
 }
