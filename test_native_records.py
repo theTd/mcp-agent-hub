@@ -366,6 +366,18 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
 
+    async def test_marker_head_is_read_once_it_is_complete(self):
+        transcript = self.root / "growing.jsonl"
+        head = self.hub._task_with_session_marker("codex-grow", "task") + "\n"
+        transcript.write_text(head + "x" * 64 + "\n", encoding="utf-8")
+        with patch("session_manager.TRANSCRIPT_MARKER_SCAN_BYTES", len(head)):
+            self.assertEqual(self.hub._transcript_marker_ids(transcript), {"codex-grow"})
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write('{"type":"event_msg"}\n')
+            # The record grew at its end only: the cached head answers without reading the file.
+            with patch("builtins.open", side_effect=AssertionError("head read again")):
+                self.assertEqual(self.hub._transcript_marker_ids(transcript), {"codex-grow"})
+
     async def test_marker_prevents_cross_session_attach(self):
         first, second = self.session("codex", "-a"), self.session("codex", "-b")
         transcript = self.root / "marked.jsonl"

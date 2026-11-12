@@ -1,6 +1,7 @@
 """Engine-neutral transcript feed regressions."""
 import asyncio
 import importlib
+import logging
 import tempfile
 from pathlib import Path
 import unittest
@@ -102,6 +103,64 @@ class TranscriptViewTests(unittest.IsolatedAsyncioTestCase):
         # Tool details live in the event's structured data, which is persisted with it.
         restored_tool = next(item["tool"] for item in restored["entries"] if item["kind"] == "tool")
         self.assertEqual(restored_tool["input"], "README.md")
+
+    async def test_unchanged_poll_is_answered_without_building_the_feed(self):
+        first = await self.hub.get_transcript_view("view")
+        version = first["version"]
+        self.assertTrue(version)
+        with patch("session_manager.build_transcript_feed", side_effect=AssertionError("feed built")), \
+                patch.object(self.hub, "get_worker_events", side_effect=AssertionError("events read")):
+            same = await self.hub.get_transcript_view("view", since=version)
+        self.assertEqual(same, {"session_id": "view", "unchanged": True, "version": version})
+        # Another page size is another transcript.
+        self.assertNotIn("unchanged", await self.hub.get_transcript_view("view", limit=200, since=version))
+
+    async def test_every_transcript_input_changes_the_version(self):
+        session = self.hub.sessions["view"]
+
+        async def changes(action):
+            before = self.hub.transcript_version("view", 80)
+            result = action()
+            if asyncio.iscoroutine(result):
+                await result
+            after = self.hub.transcript_version("view", 80)
+            self.assertNotEqual(before, after)
+            feed = await self.hub.get_transcript_view("view", since=before)
+            self.assertNotIn("unchanged", feed)
+            self.assertEqual(feed["version"], after)
+
+        await changes(lambda: self.hub.record_worker_event("view", {"type": "progress", "content": "第一步"}))
+        await changes(lambda: self.hub.record_telemetry("view", {
+            "hook_event": "AssistantMessage", "intermediate_messages": ["中间消息"], "source": "test"}))
+        await changes(lambda: self.hub._add_transcript_message("view", 1, "只存了消息", source="agent"))
+        await changes(lambda: self.hub.parent_messages.setdefault("view", []).append(
+            {"id": "pmsg-1", "content": "再看看", "timestamp": 1.0}))
+        await changes(lambda: setattr(session, "status", "completed"))
+        await changes(lambda: setattr(session, "final_response", "完成了"))
+        await changes(lambda: setattr(session, "pending_interaction", {"request_id": "q1", "prompt": "继续吗？"}))
+        await changes(lambda: setattr(session, "last_task", "新的任务"))
+
+    async def test_archived_session_has_no_version_and_is_always_built(self):
+        await self.hub.record_worker_event("view", {"type": "progress", "content": "存档前的进展"})
+        await self.hub.db.flush()
+        self.hub.sessions.pop("view")
+        feed = await self.hub.get_transcript_view("view", since="anything")
+        self.assertIsNone(feed["version"])
+        self.assertNotIn("unchanged", feed)
+
+    def test_transcript_polls_stay_out_of_the_access_log(self):
+        with patch("session_manager.HubSessionManager", return_value=self.hub):
+            server = importlib.import_module("server")
+        quiet = server.TranscriptPollLogFilter()
+
+        def access(path, status=200, method="GET"):
+            return logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                                     ("127.0.0.1:1", method, path, "1.1", status), None)
+
+        self.assertFalse(quiet.filter(access("/api/sessions/view/transcript?limit=80&since=abc")))
+        self.assertTrue(quiet.filter(access("/api/sessions/view/transcript?limit=80", status=404)))
+        self.assertTrue(quiet.filter(access("/api/sessions/view/transcript-summary")))
+        self.assertTrue(quiet.filter(access("/api/sessions")))
 
     async def test_unknown_session_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -102,10 +102,15 @@ const archiveRows = new Map(); // session_id -> { el, sig } for the 归档 list 
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
 const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
 const streams = new Map(); // session_id -> { stopped, timer }
-const transcriptViews = new Map(); // session_id -> { mode, data, loading, limit, ui, controller }
+const transcriptViews = new Map(); // session_id -> { mode, data, version, fullAt, loading, limit, ui, controller }
 const TRANSCRIPT_PAGE = 80;
 const TRANSCRIPT_PAGE_STEP = 120;
 const TRANSCRIPT_MAX = 400;
+// Visible transcripts are polled this often; a poll that finds nothing new costs the hub almost
+// nothing (the answer is { unchanged: true }), so the pace sets the delay, not the load.
+const TRANSCRIPT_POLL_MS = 250;
+// A full transcript is fetched at least this often anyway, as a safety net.
+const TRANSCRIPT_FULL_REFRESH_MS = 10000;
 
 let sessionsMode = 'live'; // 'live' | 'history'
 let historyRecordId = null;
@@ -192,7 +197,7 @@ export function initSessionWorkspace() {
     }
   }
   setInterval(tickSessionDurations, 1000);
-  setInterval(refreshVisibleTranscripts, 1000);
+  setInterval(refreshVisibleTranscripts, TRANSCRIPT_POLL_MS);
   // Alt+↑ / Alt+↓ also works while the terminal has focus (capture phase sees it first).
   document.addEventListener('keydown', onGlobalKeydown, true);
   renderAll();
@@ -844,8 +849,8 @@ function transcriptState(sessionId) {
   let view = transcriptViews.get(sessionId);
   if (!view) {
     view = {
-      mode: 'transcript', data: null, loading: false, queued: false, limit: TRANSCRIPT_PAGE,
-      ui: createTranscriptUiState(), controller: null,
+      mode: 'transcript', data: null, version: null, fullAt: 0, loading: false, queued: false,
+      limit: TRANSCRIPT_PAGE, ui: createTranscriptUiState(), controller: null,
     };
     transcriptViews.set(sessionId, view);
   }
@@ -912,8 +917,21 @@ async function refreshTranscript(sessionId, force = false) {
     return;
   }
   view.loading = true;
+  // A forced refresh, or one past the safety interval, asks for the whole transcript.
+  const since = !force && view.version && Date.now() - view.fullAt < TRANSCRIPT_FULL_REFRESH_MS ? view.version : '';
+  let changed = true;
   try {
-    view.data = (await hubApi.transcript(sessionId, view.limit)) || { entries: [] };
+    const res = (await hubApi.transcript(sessionId, view.limit, since)) || { entries: [] };
+    if (res.unchanged) {
+      // Nothing new; only a refresh error shown since the last full answer goes away.
+      changed = Boolean(view.data?.error);
+      if (changed) view.data = { ...view.data, error: undefined };
+    } else {
+      view.data = res;
+      view.version = res.version || null;
+      view.fullAt = Date.now();
+      noteTranscriptStatus(sessionId, res.status);
+    }
   } catch (err) {
     // A session can disappear between the session poll and this request: keep the last readable
     // transcript and say that the refresh failed.
@@ -921,11 +939,17 @@ async function refreshTranscript(sessionId, force = false) {
   } finally {
     view.loading = false;
   }
-  view.controller?.update(view.data);
+  if (changed) view.controller?.update(view.data);
   if (view.queued && transcriptViews.get(sessionId) === view) {
     view.queued = false;
     refreshTranscript(sessionId, true);
   }
+}
+
+/** The pane header comes from the slower session list: refresh it when the transcript is ahead. */
+function noteTranscriptStatus(sessionId, status) {
+  const session = state.sessions.find((item) => item.session_id === sessionId);
+  if (session && status && session.status !== status) emit('sessions:refresh-request');
 }
 
 /** The transcript's message box: `{ ok, error? }` for the view, which keeps the text on failure. */
