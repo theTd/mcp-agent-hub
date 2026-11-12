@@ -9,7 +9,12 @@ come back finds its sessions already running instead of interrupted, and cannot 
 File contents (all optional):
     {"session_ids": ["codex-…", …],          # default: every session live when the hub stopped
      "continue_unfinished_turns": true,       # default true
+     "continue_session_ids": ["codex-…", …],  # default: decided from each session's status at the stop
      "continue_text": "…"}                    # default CONTINUE_TEXT
+
+A listed session that an earlier start already archived as interrupted (and nobody resumed since)
+is resumed too. Its status at the stop is no longer known, so it gets the message only when it is
+in `continue_session_ids`.
 """
 from __future__ import annotations
 
@@ -44,6 +49,7 @@ PORT_POLL_SEC = 0.05
 class RestartResumeRequest:
     session_ids: Optional[FrozenSet[str]]
     continue_unfinished_turns: bool
+    continue_session_ids: Optional[FrozenSet[str]]
     continue_text: str
     data_dir: Path
 
@@ -64,10 +70,12 @@ class RestartResumeRequest:
             logger.warning("Ignoring the resume-on-start request %s: not a JSON object", source)
             return None
         ids = raw.get("session_ids")
+        cont = raw.get("continue_session_ids")
         text = str(raw.get("continue_text") or "").strip() or CONTINUE_TEXT
         return cls(
             session_ids=frozenset(str(i) for i in ids) if isinstance(ids, list) else None,
             continue_unfinished_turns=raw.get("continue_unfinished_turns", True) is not False,
+            continue_session_ids=frozenset(str(i) for i in cont) if isinstance(cont, list) else None,
             continue_text=text,
             data_dir=Path(data_dir),
         )
@@ -75,7 +83,7 @@ class RestartResumeRequest:
     def wants(self, session_id: str) -> bool:
         return self.session_ids is None or session_id in self.session_ids
 
-    def text_for(self, engine: str, status_at_stop: str) -> Optional[str]:
+    def text_for(self, session_id: str, engine: str, status_at_stop: str) -> Optional[str]:
         """The message a resumed session gets: only a terminal agent whose turn the stop cut off.
 
         A DSH job keeps running in DSH Host while the hub is down, so its session is only
@@ -83,6 +91,8 @@ class RestartResumeRequest:
         """
         if not self.continue_unfinished_turns or engine == "dsh":
             return None
+        if self.continue_session_ids is not None:
+            return self.continue_text if session_id in self.continue_session_ids else None
         return self.continue_text if status_at_stop in UNFINISHED_TURN_STATUSES else None
 
     def write_result(self, results: Dict[str, Dict[str, Any]], started_at: float) -> None:

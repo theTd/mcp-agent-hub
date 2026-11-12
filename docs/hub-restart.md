@@ -7,10 +7,10 @@ Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并�
 主 Agent 可能一直在等 Hub 回来：如果 Hub 先开端口、再由人逐个恢复，主 Agent 会先看到子 Agent「已中断」（等待接口回答 `failed`），可能当成失败处理，或与人工恢复同时调用恢复。为避免这一点，重启前在 Hub 的数据目录（便携版为 `%LOCALAPPDATA%\mcp-agent-hub-portable\portable\data`）放一个 `resume_on_start.json`：
 
 ```json
-{"session_ids": ["codex-…"], "continue_unfinished_turns": true, "continue_text": "…"}
+{"session_ids": ["codex-…"], "continue_unfinished_turns": true, "continue_session_ids": ["codex-…"], "continue_text": "…"}
 ```
 
-三个字段都可省略：不写 `session_ids` 表示「停止时仍在运行的全部会话」；`continue_unfinished_turns` 默认开启；`continue_text` 有默认文字。
+各字段都可省略：不写 `session_ids` 表示「停止时仍在运行的全部会话」；`continue_unfinished_turns` 默认开启；`continue_text` 有默认文字。`session_ids` 里列出的会话如果已经被更早的一次启动归档为「已中断」（之后没有恢复过），也会恢复；这时已不知道它停止时的状态，所以只有列在 `continue_session_ids` 里的会话才附带继续消息。写了 `continue_session_ids` 时，附带消息只看这个列表。
 
 下次启动时 Hub：
 

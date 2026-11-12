@@ -42,12 +42,17 @@ class RequestTests(unittest.TestCase):
         (self.dir / REQUEST_NAME).write_text("{}", encoding="utf-8")
         request = RestartResumeRequest.take(self.dir)
         self.assertTrue(request.wants("anything"))
-        self.assertEqual(request.text_for("codex", "running"), CONTINUE_TEXT)
-        self.assertEqual(request.text_for("claude", "waiting_parent"), CONTINUE_TEXT)
-        self.assertIsNone(request.text_for("codex", "completed"))
-        self.assertIsNone(request.text_for("dsh", "running"))
+        self.assertEqual(request.text_for("a", "codex", "running"), CONTINUE_TEXT)
+        self.assertEqual(request.text_for("a", "claude", "waiting_parent"), CONTINUE_TEXT)
+        self.assertIsNone(request.text_for("a", "codex", "completed"))
+        self.assertIsNone(request.text_for("a", "dsh", "running"))
         (self.dir / REQUEST_NAME).write_text(json.dumps({"continue_unfinished_turns": False}), encoding="utf-8")
-        self.assertIsNone(RestartResumeRequest.take(self.dir).text_for("codex", "running"))
+        self.assertIsNone(RestartResumeRequest.take(self.dir).text_for("a", "codex", "running"))
+        (self.dir / REQUEST_NAME).write_text(json.dumps({"continue_session_ids": ["a", "d"]}), encoding="utf-8")
+        request = RestartResumeRequest.take(self.dir)
+        self.assertEqual(request.text_for("a", "codex", "interrupted"), CONTINUE_TEXT)
+        self.assertIsNone(request.text_for("b", "codex", "running"))
+        self.assertIsNone(request.text_for("d", "dsh", "interrupted"))
 
 
 class GateTests(unittest.IsolatedAsyncioTestCase):
@@ -145,6 +150,35 @@ class HubStartTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["claude-idle"]["ok"])
         self.assertTrue(result["codex-run"]["continued"])
         self.assertEqual(result["codex-run"]["status_at_stop"], "running")
+
+    async def test_listed_sessions_an_earlier_start_archived_are_resumed(self):
+        await self.stopped_hard([
+            ("codex-run", "codex", "running"),
+            ("kimi-idle", "kimi", "completed"),
+            ("codex-done", "codex", "exited"),
+        ])
+        early = self.make_hub()  # an earlier start without the request archived them already
+        await early.start()
+        await early.db.flush()
+        self.hubs.remove(early)
+        for task in list(early._background_tasks):
+            task.cancel()
+        await asyncio.gather(*early._background_tasks, return_exceptions=True)
+        await early.db.close()
+        (self.root / REQUEST_NAME).write_text(json.dumps({
+            "session_ids": ["codex-run", "kimi-idle", "codex-done", "missing"],
+            "continue_session_ids": ["codex-run"]}), encoding="utf-8")
+        hub = self.make_hub()
+        calls = []
+
+        async def resume(sid, text=None, auto_approval_rules=None, source="parent"):
+            calls.append((sid, text))
+            return {"resumed": True}
+
+        with patch.object(hub, "resume_subagent", side_effect=resume),                 patch("session_manager.wait_for_port", new_callable=AsyncMock, return_value=True):
+            await hub.start()
+            await asyncio.wait_for(hub.restart_resume_gate._open.wait(), 5)
+        self.assertEqual(sorted(calls), [("codex-run", CONTINUE_TEXT), ("kimi-idle", None)])
 
     async def test_start_without_request_leaves_the_gate_open(self):
         await self.stopped_hard([("codex-run", "codex", "running")])
