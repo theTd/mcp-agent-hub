@@ -92,6 +92,12 @@
 }
 .tx-msg[data-kind="parent"] .tx-role { color: var(--accent-text); }
 .tx-msg[data-kind="parent"] .tx-msg-body { font-size: 13px; }
+/* Sent by the person at the console (or typed into the TUI) rather than by a parent agent. */
+.tx-msg[data-kind="parent"]:is([data-origin="console"], [data-origin="user"]) {
+  border-color: var(--line-2);
+  background: var(--bg-3);
+}
+.tx-msg[data-kind="parent"]:is([data-origin="console"], [data-origin="user"]) .tx-role { color: var(--text-1); }
 
 .tx-msg[data-kind="final"] {
   padding: 10px 16px 12px;
@@ -361,6 +367,46 @@
 .tx-reply-input:focus { border-color: var(--accent-line); outline: 0; box-shadow: 0 0 0 3px var(--accent-soft); }
 .tx-reply-input.is-invalid { border-color: var(--danger); }
 
+/* The message box: always at the bottom while no question or approval waits. */
+.tx-dock:has(.tx-compose:not([hidden])) { background: linear-gradient(to bottom, transparent, var(--bg-term) 22px); padding-top: 14px; }
+.tx-compose[hidden] { display: none; }
+.tx-compose-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 7px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-lg);
+  background: var(--bg-2);
+  box-shadow: var(--shadow-pop);
+}
+.tx-compose-row:focus-within { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-pop); }
+/* The row is the visible box: the console's own textarea frame, minimum height and focus ring are off. */
+.tx-compose-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  max-height: 168px;
+  padding: 5px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-1);
+  font: 13px/1.5 var(--font-ui);
+  resize: none;
+  overflow-y: auto;
+}
+.tx-compose-input:focus, .tx-compose-input:focus-visible { outline: 0; box-shadow: none; }
+.tx-compose-input::placeholder { color: var(--text-3); }
+.tx-compose-input.is-invalid::placeholder { color: var(--danger-text); }
+.tx-compose-input[readonly] { color: var(--text-2); }
+.tx-compose-input:disabled { cursor: not-allowed; }
+.tx-compose-row:has(.tx-compose-input:disabled) { background: var(--bg-1); box-shadow: none; }
+.tx-compose-send { flex: none; }
+.tx-compose-note { margin: 6px 4px 0; color: var(--danger-text); font-size: 12px; }
+.tx-compose-note[data-tone="info"] { color: var(--text-3); }
+
 /* ------------------------------------------------------------ narrow panes (tiled layout) */
 @container transcript (max-width: 620px) {
   .tx-list { padding: 12px 12px 6px; }
@@ -379,6 +425,8 @@
   .tx-choices { margin-bottom: 6px; }
   .tx-choice { padding: 3px 11px; }
   .tx-reply-input { height: 28px; }
+  .tx-compose-row { padding: 4px 4px 4px 10px; }
+  .tx-compose-input { max-height: 96px; }
 }
 @container transcript (max-width: 420px) {
   .tx-row-head > .tx-row-meta { display: none; }

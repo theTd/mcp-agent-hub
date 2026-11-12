@@ -203,6 +203,13 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(sess.completion_reported)
             self.append(path, new_turn)
             await self.until(lambda: sess.final_response_from_previous_turn)
+            # A prompt typed straight into the TUI shows in the transcript as the user's message.
+            typed = [e["content"] for e in self.hub.worker_events
+                     if e["session_id"] == sess.session_id and e["type"] == "user_message"]
+            self.assertEqual(typed, ["continue"])
+            feed = await self.hub.get_transcript_view(sess.session_id)
+            self.assertIn({"origin": "user", "text": "continue"},
+                          [{"origin": e.get("origin"), "text": e.get("text")} for e in feed["entries"] if e["kind"] == "parent"])
             await self.hub.record_telemetry(sess.session_id, {"hook_event": "AssistantMessage", "intermediate_messages": ["还在工作？"], "final_assistant_text": "还在工作？"})
             result = await self.hub.get_subagent_final_response(sess.session_id)
             self.assertEqual(result["final_response"], "原生最终结果")
@@ -232,6 +239,132 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         await self.exercise("claude")
     async def test_kimi_native_roundtrip(self):
         await self.exercise("kimi")
+
+    async def keep_thinking_out_of_messages(self, engine, streamed=False):
+        """Thinking parts become console-only reasoning; parents and the final reply only get the text."""
+        sess = self.session(engine, "-think")
+        work = self.root / f"{engine}-think"
+        work.mkdir()
+        path = work / "native.jsonl"
+        ref = {"session_id": "fixture", "session_file": str(path), "transcript_path": str(path)}
+        thought, reply = "先想一想：要不要再读一遍文件", "答复正文：两处都改好了"
+        if engine == "omp":
+            rows = [{"type": "message", "message": {"role": "assistant", "stopReason": "stop", "content": [
+                {"type": "thinking", "thinking": thought}, {"type": "text", "text": reply}]}}]
+            watch = self.hub._watch_omp_session(sess, work)
+        elif engine == "claude":
+            rows = [{"type": "assistant", "message": {"stop_reason": "end_turn", "content": [
+                {"type": "thinking", "thinking": thought}, {"type": "thinking", "thinking": ""},
+                {"type": "text", "text": reply}]}}]
+            watch = self.hub._watch_claude_session(sess, work)
+        elif engine == "agy":
+            path = work / ".system_generated/logs/transcript.jsonl"
+            path.parent.mkdir(parents=True)
+            ref["brain_dir"] = str(work)
+            rows = [{"type": "PLANNER_RESPONSE", "thinking": thought, "content": reply, "tool_calls": "[]"}]
+            watch = self.hub._watch_agy_transcript(sess, self.root)
+        else:
+            path = work / "agents/main/wire.jsonl"
+            path.parent.mkdir(parents=True)
+            ref["session_dir"] = str(work)
+            whole = {"type": "agent.message.appended", "message": {"message": {"role": "assistant", "content": [
+                {"type": "think", "think": thought}, {"type": "text", "text": reply}]}}}
+            rows = [whole, {"kind": "event", "type": "agent.turn.ended"}]
+            if streamed:
+                # Current Kimi: the streamed parts first, then the same step again as one message.
+                stream = [{"type": "context.append_loop_event", "event": {"type": "content.part", "part": part}}
+                          for part in ({"type": "think", "think": thought}, {"type": "text", "text": reply})]
+                rows = stream + rows
+            watch = self.hub._watch_kimi_session(sess, self.root)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = ref
+        task = self.hub._schedule(watch)
+        try:
+            self.append(path, *rows)
+            await self.until(lambda: sess.final_response == reply)
+            events = [e for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual([e["content"] for e in events if e["type"] == "reasoning"], [thought])
+            self.assertLessEqual(sum(e["type"] == "progress" and e["content"] == reply for e in events), 1)
+            self.assertFalse([e for e in events if e["type"] != "reasoning" and "想" in str(e.get("content") or "")])
+            self.assertFalse([e for e in events if "Thinking completed" in str(e.get("content") or "")])
+            stored = await self.hub.db.get_recent_intermediate_messages(sess.session_id, 40)
+            self.assertFalse([m for m in stored if "想" in str(m.get("content") or "")])
+            feed = await self.hub.get_transcript_view(sess.session_id)
+            kinds = [entry["kind"] for entry in feed["entries"]]
+            self.assertIn("thinking", kinds)
+            self.assertEqual(kinds.count("final"), 1)
+            self.assertNotIn(reply, [entry.get("text") for entry in feed["entries"] if entry["kind"] == "assistant"])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_omp_thinking_is_reasoning(self):
+        await self.keep_thinking_out_of_messages("omp")
+    async def test_claude_thinking_is_reasoning(self):
+        await self.keep_thinking_out_of_messages("claude")
+    async def test_agy_thinking_is_reasoning(self):
+        await self.keep_thinking_out_of_messages("agy")
+    async def test_kimi_thinking_is_reasoning(self):
+        await self.keep_thinking_out_of_messages("kimi")
+    async def test_kimi_streamed_step_is_recorded_once(self):
+        await self.keep_thinking_out_of_messages("kimi", streamed=True)
+
+    async def test_kimi_final_joins_the_last_steps_streamed_text_parts(self):
+        sess = self.session("kimi", "-parts")
+        work = self.root / "kimi-parts"
+        path = work / "agents/main/wire.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_dir": str(work)}
+        loop = lambda event: {"type": "context.append_loop_event", "event": event}
+        text = lambda value: loop({"type": "content.part", "part": {"type": "text", "text": value}})
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            self.append(path, loop({"type": "step.begin"}), text("先看文件。"),
+                        loop({"type": "step.begin"}), text("第一段结论。"), text("第二段结论。"),
+                        {"kind": "event", "type": "agent.turn.ended"})
+            await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "第一段结论。\n第二段结论。")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_text_the_engine_writes_as_the_user_is_not_a_typed_prompt(self):
+        for engine in ("codex", "claude"):
+            with self.subTest(engine=engine):
+                sess = self.session(engine, "-injected")
+                work = self.root / f"{engine}-injected"
+                work.mkdir()
+                path = work / "native.jsonl"
+                path.touch()
+                sess.resume_attach = True
+                sess.conversation_ref = {"session_id": "fixture", "rollout_path": str(path),
+                                         "session_file": str(path), "transcript_path": str(path)}
+                if engine == "codex":
+                    user = lambda text: {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                                              "content": [{"type": "input_text", "text": text}]}}
+                    rows = [user("# AGENTS.md instructions for E:\\work\n\n<INSTRUCTIONS>be brief</INSTRUCTIONS>"),
+                            user("<environment_context>\n  <cwd>E:\\work</cwd>\n</environment_context>"),
+                            user("真正输入的问题")]
+                    watch = self.hub._watch_codex_rollout(sess, work)
+                else:
+                    rows = [{"type": "user", "isMeta": True, "message": {"content": "Caveat: generated by commands"}},
+                            {"type": "user", "message": {"content": "<command-name>/clear</command-name>"}},
+                            {"type": "user", "message": {"content": [{"type": "text", "text": "真正输入的问题"}]}}]
+                    watch = self.hub._watch_claude_session(sess, work)
+                task = self.hub._schedule(watch)
+                try:
+                    self.append(path, *rows)
+                    events = lambda: [e["content"] for e in self.hub.worker_events
+                                      if e["session_id"] == sess.session_id and e["type"] == "user_message"]
+                    await self.until(lambda: bool(events()))
+                    await asyncio.sleep(0.1)
+                    self.assertEqual(events(), ["真正输入的问题"])
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
 
     async def test_marker_prevents_cross_session_attach(self):
         first, second = self.session("codex", "-a"), self.session("codex", "-b")

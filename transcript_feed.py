@@ -44,6 +44,12 @@ NOTICE_EVENTS = {
 # Intermediate-message sources that only trace Hub plumbing; their content reaches the feed
 # through the parent message or the interaction resolution instead.
 HIDDEN_MESSAGE_SOURCES = frozenset({"parent_approval_proxy"})
+# Engines whose record readers used to join the model's thinking and its reply into one message
+# (now recorded as separate reasoning events): in older records the text in front of a repeated
+# final reply is that thinking.
+THINKING_JOINED_ENGINES = frozenset({"claude", "kimi", "omp", "agy"})
+# The note the hub appends to text it clipped before storing it (session_manager._clip_detail).
+CLIP_NOTE = re.compile(r"\s*…（已截断，原文 \d+ 字符）\s*$")
 TASK_SUFFIXES = (
     re.compile(r"\s*\[Sub-Agent Bridge Info[\s\S]*$", re.IGNORECASE),
     re.compile(r"\s*\[Hub Session: session_id=[^\]]+\]"),
@@ -308,8 +314,65 @@ def _same_or_clipped(text: str, final: str) -> bool:
         return False
     if text == final:
         return True
-    head = " ".join(text.split()).rstrip("…").rstrip(".").rstrip()
+    head = " ".join(CLIP_NOTE.sub("", text).split()).rstrip("…").rstrip(".").rstrip()
     return len(head) >= 40 and " ".join(final.split()).startswith(head)
+
+
+def _split_streamed_thoughts(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Older Kimi records hold each step twice: the streamed thought, later thought + text joined.
+
+    When a later, longer message starts with an earlier one, the earlier one is that step's
+    thinking; the later one keeps only its own text and goes away when that text is already shown.
+    """
+    assistants = [item for item in entries if item["kind"] == "assistant" and not item.get("channel")]
+    drop = set()
+    for index, early in enumerate(assistants):
+        head = early["text"].strip()
+        if len(head) < 40 or id(early) in drop:
+            continue
+        for later in assistants[index + 1:]:
+            body = later["text"].strip()
+            if id(later) in drop or len(body) <= len(head) or not body.startswith(head):
+                continue
+            early["kind"] = "thinking"
+            rest = body[len(head):].strip()
+            later["text"] = rest
+            if not rest or any(other is not later and other["text"].strip() == rest for other in assistants):
+                drop.add(id(later))
+            break
+    return [item for item in entries if id(item) not in drop]
+
+
+def _prompt_key(text: str) -> str:
+    """A prompt as compared across records: no hub markers or clip note, whitespace collapsed."""
+    return " ".join(_clean_task(CLIP_NOTE.sub("", str(text or ""))).split())
+
+
+def _is_sent_copy(key: str, sent_keys: List[str]) -> bool:
+    """`key` is one of the texts the hub sent, or a clipped copy of one (or the other way round)."""
+    if not key:
+        return True
+    for other in sent_keys:
+        if not other:
+            continue
+        if key == other:
+            return True
+        short, long = (key, other) if len(key) < len(other) else (other, key)
+        if len(short) >= 40 and long.startswith(short):
+            return True
+    return False
+
+
+def _text_before_reply(text: str, final: str) -> str:
+    """The text in front of a (possibly clipped) copy of the final reply inside `text`, else ""."""
+    reply = final.strip()
+    probe = reply[:200]
+    if len(probe) < 40:
+        return ""
+    at = text.find(probe)
+    if at <= 0 or not _same_or_clipped(text[at:].strip(), reply):
+        return ""
+    return text[:at].rstrip()
 
 
 def build_transcript_feed(
@@ -335,6 +398,8 @@ def build_transcript_feed(
 
     task = _clean_task(_text(meta.get("last_task"), TEXT_LIMIT))
     task_entry = {"id": "task", "kind": "task", "text": task, "timestamp": _ts(meta.get("created_at"))} if task else None
+    sent = [task] if task else []  # texts the hub handed to the agent (see _is_sent_copy)
+    typed: List[Dict[str, Any]] = []  # user prompts read from the engine's record
 
     for index, message in enumerate(parent_messages or ()):
         if isinstance(message, dict):
@@ -350,10 +415,12 @@ def build_transcript_feed(
             body, mid, stamp, resolved = _text(message), f"p{index}", None, ""
         if not body:
             continue
+        sent.append(body)
         if resolved:
             resolutions[resolved] = {"text": body, "timestamp": stamp, "by": "parent"}
             continue
-        entries.append({"id": f"parent:{mid}", "kind": "parent", "text": body, "timestamp": stamp})
+        origin = "console" if isinstance(message, dict) and message.get("source") == "console" else "parent"
+        entries.append({"id": f"parent:{mid}", "kind": "parent", "origin": origin, "text": body, "timestamp": stamp})
 
     open_tools: List[Dict[str, Any]] = []
     interactions: Dict[str, Dict[str, Any]] = {}
@@ -421,6 +488,10 @@ def build_transcript_feed(
             if content:
                 seen_text.add(content[:STORED_MESSAGE_HEAD])
                 entries.append({"id": f"final:{seq}", "kind": "final", "text": content, "timestamp": stamp})
+        elif ev_type == "user_message":
+            if content:
+                typed.append({"id": f"user:{seq}", "kind": "parent", "origin": "user", "text": content,
+                              "timestamp": stamp})
         elif ev_type in INTERACTION_EVENT_TYPES:
             interaction = ev.get("interaction") if isinstance(ev.get("interaction"), dict) else None
             if interaction is None and isinstance(data.get("interaction"), dict):
@@ -472,10 +543,15 @@ def build_transcript_feed(
         mid = f"im:{message.get('timestamp') or len(entries)}"
         if NOTICE_TAG.match(body) or source.endswith("_notice"):
             entries.append({"id": mid, "kind": "notice", "tone": "info", "text": body, "timestamp": stamp})
-        elif re.search(r"(?:think|reason|analysis)", f"{source} {body[:120]}".lower()):
+        elif re.search(r"(?:think|reason)", source.lower()):
             entries.append({"id": mid, "kind": "thinking", "text": body, "timestamp": stamp})
         else:
             entries.append({"id": mid, "kind": "assistant", "text": body, "timestamp": stamp})
+
+    # The engine's record repeats the task and every message the hub typed in; only prompts the
+    # user typed straight into the TUI are new.
+    sent_keys = [_prompt_key(text) for text in sent]
+    entries.extend(item for item in typed if not _is_sent_copy(_prompt_key(item["text"]), sent_keys))
 
     final_text = _text(meta.get("final_response"))
     if final_text and not any(item["kind"] == "final" and item.get("text") == final_text for item in entries):
@@ -509,16 +585,34 @@ def build_transcript_feed(
             entry["resolution"] = resolutions[key]
 
     entries.sort(key=lambda item: (item.get("timestamp") or 0.0))
-    # Drop an assistant message that only repeats (or previews) the final reply after it.
+    engine = str(meta.get("engine") or "").strip().lower()
+    if engine in THINKING_JOINED_ENGINES:
+        entries = _split_streamed_thoughts(entries)
+    # Drop an assistant message that only repeats (or previews) the final reply; one that holds
+    # text in front of the reply keeps that text (older records: the thinking).
     finals = [item for item in entries if item["kind"] == "final"]
     if finals:
         drop = set()
+        turn_final = None  # the final reply of the current turn, once it has been shown
         for index, item in enumerate(entries):
+            if item["kind"] == "final":
+                turn_final = item
+                continue
+            if item["kind"] == "parent":
+                turn_final = None
+                continue
             if item["kind"] != "assistant":
                 continue
             following = next((later for later in entries[index + 1:] if later["kind"] == "final"), None)
-            if following and _same_or_clipped(item["text"], following["text"]):
+            # A stored copy of the reply can be timestamped just after the final itself.
+            if any(final and _same_or_clipped(item["text"], final["text"]) for final in (following, turn_final)):
                 drop.add(id(item))
+                continue
+            before = _text_before_reply(item["text"], following["text"]) if following and not item.get("channel") else ""
+            if before:
+                item["text"] = before
+                if engine in THINKING_JOINED_ENGINES:
+                    item["kind"] = "thinking"
         entries = [item for item in entries if id(item) not in drop]
 
     # A call whose result never arrives (screen-detected tools, engines without result records)

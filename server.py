@@ -980,6 +980,7 @@ async def api_resume_session(session_id: str, req: Request):
             session_id,
             text=(str(text) if text is not None else None),
             auto_approval_rules=body.get("auto_approval_rules"),
+            source="console",
         )
     except ValueError as e:
         # A9: every resume failure is a Chinese 400 (or a 404 for an unknown id), never a 500.
@@ -1100,11 +1101,54 @@ async def api_send_input(session_id: str, req: Request):
     text = body.get("text", "")
     try:
         delivery = await hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True,
-            press_enter=bool(body.get("press_enter", False)), clear_input=bool(body.get("clear_input", False)))
+            press_enter=bool(body.get("press_enter", False)), clear_input=bool(body.get("clear_input", False)),
+            source="console")
     except ValueError as e:
         return bad_request(str(e))
     return {"ok": delivery.get("delivered") is True or delivery.get("input_cleared") is True,
             "delivery": delivery}
+
+
+@app.post("/api/sessions/{session_id}/message")
+async def api_send_message(session_id: str, req: Request):
+    """The transcript view's message box: what send_to_subagent does, sent by the console user.
+
+    A live session gets the checked delivery with Enter (TUI submit / DSH steer or continue); an
+    ended or archived one is resumed with the text.  Parent wait handles are left alone, as for
+    text typed into the TUI.
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    text = str((body or {}).get("text") or "")
+    if not text.strip():
+        return bad_request("消息为空")
+    session = hub.sessions.get(session_id)
+    try:
+        if session is not None and _session_can_receive(session):
+            if not session.last_task:
+                session.last_task = text
+            session.current_activity = f"Message from the console: {text[:80]}"
+            delivery = await hub.deliver_parent_message(session_id=session_id, text=text, also_write_pty=True,
+                                                        press_enter=True, source="console")
+            resumed = False
+        else:
+            result = await hub.resume_subagent(session_id, text=text, source="console")
+            session = result.get("session") or hub.sessions.get(session_id)
+            delivery = result.get("delivery") or {"delivered": bool(result.get("delivered")),
+                                                  "injection": result.get("injection") or "none"}
+            resumed = bool(result.get("resumed"))
+    except ValueError as e:
+        message = str(e)
+        return not_found(message) if message.startswith("找不到会话") else bad_request(message)
+    # "pending": typed once the TUI is ready (resume) or handed to the checked background submit.
+    accepted = delivery.get("delivered") is True or delivery.get("injection") in ("pending", "argv")
+    reply = {"ok": bool(accepted), "resumed": resumed, "delivery": delivery,
+             "session": session.to_dict() if session is not None else None}
+    if not accepted:
+        reply["error"] = str(delivery.get("reason") or "消息未送达")
+    return reply
 
 
 @app.delete("/api/sessions/{session_id}")

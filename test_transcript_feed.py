@@ -174,12 +174,90 @@ class MessageTests(unittest.TestCase):
                       messages=[{"timestamp": 1001.0, "content": text[:4000], "source": "dsh_job_log"}])
         self.assertEqual(kinds(result), ["task", "assistant"])
 
+    def test_older_joined_thinking_and_reply_split_into_thinking_and_final(self):
+        thinking, reply = "Now respond under 800 words. Keep it short.", "1. **Pending replies can vanish** — the feed drops them. " * 3
+        result = feed([event(1, "progress", f"{thinking}\n{reply.strip()}"), event(2, "turn_completed", reply.strip())],
+                      meta={"status": "completed", "last_task": "t", "engine": "kimi"})
+        self.assertEqual(kinds(result), ["task", "thinking", "final"])
+        self.assertEqual(result["entries"][1]["text"], thinking)
+
+    def test_older_kimi_steps_recorded_twice_show_once(self):
+        step_thought = 'User asks in Chinese "简单看一下" — read the readme and the package file first.'
+        step_text = "我看一下项目入口和说明文件，判断它的用途。"
+        last_thought = "I have enough. I'll respond with a simple summary in Chinese, citing files."
+        reply = "这是一个 **MCP Agent Hub** 的项目目录：一个用于统一启动、管理和监控多个 AI 编程子代理的本地中枢。"
+        result = feed([
+            event(1, "progress", step_thought), event(2, "progress", step_text),
+            event(3, "tool_call", data={"tool": "Glob", "call_id": "g1", "input": '{"pattern": "*.md"}'}),
+            event(4, "tool_result", data={"tool": "Glob", "call_id": "g1", "output": "README.md", "ok": True}),
+            event(5, "progress", last_thought), event(6, "progress", reply),
+            event(7, "progress", f"{step_thought}\n{step_text}"), event(8, "progress", f"{last_thought}\n{reply}"),
+            event(9, "turn_completed", reply),
+        ], meta={"status": "completed", "last_task": "t", "engine": "kimi"})
+        self.assertEqual(kinds(result), ["task", "thinking", "assistant", "tool", "thinking", "final"])
+        self.assertEqual([e["text"] for e in result["entries"] if e["kind"] == "thinking"], [step_thought, last_thought])
+
+    def test_clipped_joined_message_still_splits(self):
+        reply = "## Review result\nZero functional bugs found in the four requested areas. " * 20
+        joined = ("I need to respond in Chinese. " + reply)[:600] + "…"
+        result = feed([event(1, "progress", joined), event(2, "turn_completed", reply)],
+                      meta={"status": "completed", "last_task": "t", "engine": "agy"})
+        self.assertEqual(kinds(result), ["task", "thinking", "final"])
+        self.assertEqual(result["entries"][1]["text"], "I need to respond in Chinese.")
+
+    def test_reply_copy_with_the_clip_note_is_a_duplicate(self):
+        reply = "## Review result\n\n**Zero functional bugs found in the four requested areas.** " * 30
+        clipped = reply[:900] + "\n…（已截断，原文 7218 字符）"
+        result = feed([event(1, "progress", clipped), event(2, "turn_completed", reply)])
+        self.assertEqual(kinds(result), ["task", "final"])
+
+    def test_other_engines_keep_the_text_in_front_of_a_repeated_reply_as_a_message(self):
+        reply = "All four checks pass and nothing was committed in the worktree."
+        result = feed([event(1, "message", f"Progress: tests are green.\n\n{reply}"), event(2, "turn_completed", reply)],
+                      meta={"status": "completed", "last_task": "t", "engine": "codex"})
+        self.assertEqual(kinds(result), ["task", "assistant", "final"])
+        self.assertEqual(result["entries"][1]["text"], "Progress: tests are green.")
+
+    def test_stored_copy_after_the_final_is_dropped_but_a_later_turn_keeps_it(self):
+        reply = "Report: the probe moved, the card fades, and the strict wire check passes. " * 4
+        later = [{"timestamp": 1003.0, "content": reply[:200] + "…", "source": "dsh_job_log"}]
+        result = feed([event(1, "turn_completed", reply)], messages=later)
+        self.assertEqual(kinds(result), ["task", "final"])
+        result = feed([event(1, "turn_completed", reply)], messages=later,
+                      parent_messages=[{"direction": "parent", "content": "again", "timestamp": 1002.0}])
+        self.assertEqual(kinds(result), ["task", "final", "parent", "assistant"])
+
+    def test_stored_message_is_thinking_only_by_its_source(self):
+        result = feed([], messages=[
+            {"timestamp": 1001.0, "content": "The reason this fails is the stale offset.", "source": "agent"},
+            {"timestamp": 1002.0, "content": "weighing the options", "source": "claude_thinking"},
+        ])
+        self.assertEqual(kinds(result), ["task", "assistant", "thinking"])
+
     def test_bracket_tags_are_notices_but_leading_links_are_messages(self):
         result = feed([], messages=[
             {"timestamp": 1001.0, "content": "[Parent replied] 好的", "source": "hub"},
             {"timestamp": 1002.0, "content": "[Report](https://a.io/r) is ready", "source": "agent"},
         ])
         self.assertEqual(kinds(result), ["task", "notice", "assistant"])
+
+    def test_messages_to_the_agent_say_who_sent_them(self):
+        long_steer = "请把第二步改成先跑单元测试，再看日志里的超时，然后告诉我结果。" * 3
+        result = feed(
+            [
+                # The engine's record repeats the task (with the hub's markers) and every hub message.
+                event(1, "user_message", "检查这个目录\n\n[Hub Session: session_id=s]"),
+                event(3, "user_message", "看一下 README"),
+                event(5, "user_message", long_steer[:60] + "…（已截断，原文 99 字符）"),
+                event(7, "user_message", "顺便   看下\n日志"),
+            ],
+            parent_messages=[
+                {"direction": "parent", "content": "顺便 看下 日志", "timestamp": 1006.0, "source": "console"},
+                {"direction": "parent", "content": long_steer, "timestamp": 1004.0},
+            ],
+        )
+        sent = [(entry["origin"], entry["text"]) for entry in result["entries"] if entry["kind"] == "parent"]
+        self.assertEqual(sent, [("user", "看一下 README"), ("parent", long_steer), ("console", "顺便 看下 日志")])
 
     def test_reasoning_and_reports(self):
         result = feed([event(1, "reasoning", "想一想"), event(2, "message_to_parent", "进度：一半")])
