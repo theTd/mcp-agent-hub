@@ -15,6 +15,11 @@ const GROUP_MIN = 3; // consecutive tool/reasoning entries fold into one activit
 const GROUP_TAIL = 8; // an open group first shows only its newest rows
 const CLAMP_CHARS = 1600; // longer agent messages start clamped
 const CLAMP_LINES = 26;
+// The task and the messages sent to the agent are often read whole: they clamp later and show
+// more while clamped (transcript-view.css).
+const PROMPT_CLAMP_CHARS = 2800;
+const PROMPT_CLAMP_LINES = 40;
+const PROMPT_KINDS = new Set(['task', 'parent']);
 const FOLLOW_SLACK = 72; // px from the bottom that still counts as reading the newest entry
 const LIVE_STATUSES = new Set(['starting', 'running']);
 // Statuses whose session takes a message as it is; any other one is resumed by the send.
@@ -78,9 +83,11 @@ function copyButton(id, field, title = '复制') {
   return `<button type="button" class="tx-icon-btn" data-tx="copy" data-id="${escapeHtml(id)}" data-field="${field}" title="${title}" aria-label="${title}">${icon('copy')}</button>`;
 }
 
-function isClampable(text) {
+function isClampable(text, kind) {
   const t = String(text ?? '');
-  return t.length > CLAMP_CHARS || t.split('\n').length > CLAMP_LINES;
+  const prompt = PROMPT_KINDS.has(kind);
+  return t.length > (prompt ? PROMPT_CLAMP_CHARS : CLAMP_CHARS)
+    || t.split('\n').length > (prompt ? PROMPT_CLAMP_LINES : CLAMP_LINES);
 }
 
 // ------------------------------------------------------------------ blocks
@@ -122,7 +129,7 @@ function messageHtml(entry, ui) {
   const label = kind === 'final' && entry.previous_turn ? '上一轮回复'
     : kind === 'assistant' && entry.channel === 'report' ? '汇报给主 Agent'
       : kind === 'parent' ? ORIGIN_LABELS[entry.origin] || ROLE_LABELS.parent : ROLE_LABELS[kind] || 'Agent';
-  const clampable = kind !== 'final' && isClampable(entry.text);
+  const clampable = kind !== 'final' && isClampable(entry.text, kind);
   const clamped = clampable && !ui.expanded.has(entry.id);
   const body = kind === 'parent'
     ? `<div class="tx-plain">${escapeHtml(entry.text)}</div>`
@@ -485,7 +492,7 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
       key: (entry) => entry.id,
       sig: (entry) => (entry.kind === '__more' ? `more|${entry.hidden}` : entrySig(entry, ui)),
       render: (entry) => (entry.kind === '__more'
-        ? nodeFromHtml(`<button type="button" class="tx-link tx-group-more" data-tx="group-all" data-key="${escapeHtml(block.key)}">显示前面 ${entry.hidden} 个步骤</button>`)
+        ? nodeFromHtml(`<button type="button" class="tx-link tx-group-more" data-tx="group-all" data-group="${escapeHtml(block.key)}">显示前面 ${entry.hidden} 个步骤</button>`)
         : nodeFromHtml(entryHtml(entry, ui))),
     });
   }
@@ -760,7 +767,8 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
         break;
       }
       case 'group-all':
-        ui.groupAll.add(target.dataset.key);
+        // Not data-key: reconcile() stamps the row key (`more:<group>`) on the button's data-key.
+        ui.groupAll.add(target.dataset.group);
         if (data) update(data);
         break;
       case 'clamp': {
