@@ -267,6 +267,65 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
         self.assertEqual(pending["metadata"]["response_state"], "confirmed")
 
+    async def test_wait_url_follows_answers_from_send_and_console(self):
+        # 2026-11-12 regression (codex-97e45358): an approval answered with send_to_subagent(text="y")
+        # stayed on the wait URL, which then hid the second approval and the turn's end.
+        def write(text):
+            self.sess.pty.inputs.append(text)
+            self.screen = "Working..."
+        # The handle exists before the first approval, as after a spawn, so every ask enters its inbox.
+        info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
+        handle = self.sess.wait_handle = info["wait_handle"]
+        first = await self.pending()
+        self.assertEqual((await self.hub.wait_inbox.wait(handle, 0.1))["requests"][0]["request_id"], first["request_id"])
+        with patch.object(self.sess, "write_input", write):
+            async with Client(self.server.mcp) as client:
+                sent = await client.call_tool("send_to_subagent", {"session_id": self.sess.session_id, "text": "y"})
+        data = sent.data if sent.data is not None else json.loads(sent.content[0].text)
+        self.assertEqual(data["wait_handle"], handle)
+        self.assertEqual(data["delivery"]["resolved_question_id"], first["request_id"])
+        # Sent but not natively confirmed yet: answered all the same, so the URL never repeats it.
+        self.assertEqual((await self.hub.wait_inbox.wait(handle, 0.1))["state"], "waiting")
+        await asyncio.sleep(.12)
+        self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
+        self.screen = MODAL
+        second = await self.pending()
+        self.assertNotEqual(second["request_id"], first["request_id"])
+        result = await self.hub.wait_inbox.wait(handle, 0.1)
+        self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", second["request_id"]))
+        with patch.object(self.sess, "write_input", write):
+            await self.hub.deliver_parent_message(self.sess.session_id, "approve", source="console")
+        await asyncio.sleep(.12)
+        self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
+        await self.hub.record_worker_event(self.sess.session_id, {"type": "turn_completed", "content": "finished"})
+        done = await self.hub.wait_inbox.wait(handle, 0.1)
+        self.assertEqual((done["state"], done["final_response"]), ("done", "finished"))
+
+    async def test_ask_of_an_ended_session_leaves_the_wait_url(self):
+        info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
+        await self.pending()
+        self.assertEqual((await self.hub.wait_inbox.wait(info["wait_handle"], 0.1))["state"], "ask")
+        self.hub.sessions.pop(self.sess.session_id)
+        await self.hub.wait_inbox.publish_event({"session_id": self.sess.session_id, "type": "exited", "content": "gone"})
+        self.assertEqual((await self.hub.wait_inbox.wait(info["wait_handle"], 0.1))["state"], "failed")
+        self.hub.sessions[self.sess.session_id] = self.sess
+
+    async def test_retired_tool_names_answer_with_their_replacement(self):
+        async with Client(self.server.mcp) as client:
+            names = {t.name for t in await client.list_tools()}
+            for old in self.server.RETIRED_TOOL_HINTS:
+                self.assertNotIn(old, names)
+            result = await client.call_tool(
+                "respond_to_subagent_approval_or_choice",
+                {"session_id": self.sess.session_id, "request_id": "int-1", "decision": "approve"},
+                raise_on_error=False,
+            )
+        self.assertTrue(result.is_error)
+        text = result.content[0].text
+        self.assertIn("respond_to_subagent", text)
+        self.assertIn("send_to_subagent", text)
+        self.assertIn("reconnect", text)
+
     def profile(self, engine, bypass):
         self.hub.profiles[engine] = {"name": engine, "engine": engine, "enabled": True, "kind": "tui",
                                      "command": "unused", "args": [], "bypass_approvals": bypass}
