@@ -11,7 +11,9 @@ import httpx
 from fastmcp import Client
 from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES,
                              parse_codex_approval_prompt, resolve_session_approval,
-                             bypass_launch_flags, normalize_auto_approval_rules)
+                             bypass_launch_flags, normalize_auto_approval_rules,
+                             apply_approval_flags, resolve_session_approval_fields,
+                             AUTO_ON_NOTE, AUTO_UNSUPPORTED_NOTE, CLAUDE_AUTO_SETTINGS_NAME)
 from test_native_records import FakePty
 
 MODAL = '''Field 1/1
@@ -68,6 +70,49 @@ class ApprovalParserTests(unittest.TestCase):
         policy = resolve_session_approval("pwsh", {}, True)
         self.assertEqual(policy["approval_source"], "not_applicable")
         self.assertFalse(policy["bypass_approvals"])
+
+    def test_d13_mode_defaults_overrides_and_conflicts(self):
+        mode = lambda engine, profile=None, bypass=None, requested=None: resolve_session_approval(
+            engine, profile or {}, bypass, requested)["approval_mode"]
+        for engine in ("codex", "claude"):
+            self.assertEqual(mode(engine), "auto")
+            self.assertEqual(mode(engine, bypass=False), "auto")  # false = not bypassed, not ask
+            self.assertEqual(mode(engine, requested="ask"), "ask")
+        for engine in ("kimi", "omp", "agy"):
+            self.assertEqual(mode(engine), "ask")
+            self.assertEqual(mode(engine, requested="auto"), "ask")
+        self.assertEqual(mode("codex", {"bypass_approvals": True}), "bypass")
+        self.assertEqual(mode("codex", {"bypass_approvals": True}, False), "auto")
+        self.assertEqual(mode("codex", {"bypass_approvals": True}, requested="ask"), "ask")
+        self.assertEqual(mode("claude", bypass=True), "bypass")
+        self.assertEqual(mode("claude", requested=" Bypass "), "bypass")
+        self.assertIsNone(mode("dsh", requested="ask"))
+        policy = resolve_session_approval("codex", {}, None, "ask")
+        self.assertEqual((policy["approval_source"], policy["bypass_approvals"]), ("session", False))
+        for bypass, requested in ((True, "ask"), (True, "auto"), (False, "bypass")):
+            with self.subTest(bypass=bypass, requested=requested), self.assertRaises(ValueError):
+                resolve_session_approval("codex", {}, bypass, requested)
+        for bad in ("manual", "", True, 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                resolve_session_approval("codex", {}, None, bad)
+
+    def test_d13_flags_replace_profile_modes(self):
+        self.assertEqual(apply_approval_flags("codex", ["-a", "never", "--full-auto", "--x"], mode="auto"),
+                         ["--approve-for-me", "--x"])
+        claude = apply_approval_flags("claude", ["--permission-mode", "plan", "--x"], mode="auto")
+        self.assertEqual(claude[:2], ["--permission-mode", "auto"])
+        self.assertTrue(claude[2].startswith("--settings=") and claude[2].endswith(CLAUDE_AUTO_SETTINGS_NAME))
+        self.assertEqual(claude[3:], ["--x"])
+        # The hub's own overlays (either mode) are recognized and replaced on the next launch.
+        self.assertEqual(apply_approval_flags("claude", claude, mode="ask")[:2], ["--permission-mode", "acceptEdits"])
+        self.assertEqual(apply_approval_flags("claude", claude, mode="bypass"), ["--dangerously-skip-permissions", "--x"])
+        self.assertEqual(apply_approval_flags("kimi", ["--yolo"], mode="auto"), ["-y"])
+
+    def test_d13_legacy_fields_report_the_mode_they_ran(self):
+        self.assertEqual(resolve_session_approval_fields({"engine": "codex"})["approval_mode"], "ask")
+        self.assertEqual(resolve_session_approval_fields({"engine": "codex", "bypass_approvals": True})["approval_mode"], "bypass")
+        self.assertIsNone(resolve_session_approval_fields({"engine": "dsh"})["approval_mode"])
+        self.assertEqual(resolve_session_approval_fields({"engine": "claude", "approval_mode": "auto"})["approval_mode"], "auto")
 
 
 class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
@@ -273,6 +318,54 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(self.hub, "create_session", create):
                 response = await client.post("/api/sessions", json={"profile_id": "codex", "bypass_approvals": False})
                 self.assertEqual(response.status_code, 200)
+
+    async def test_d13_launch_notes_and_resume_keep_an_explicit_mode(self):
+        for engine in ("codex", "claude", "kimi"):
+            self.profile(engine, False)
+        codex = self.hub.resolve_launch("codex", cwd=str(self.root))
+        self.assertEqual((codex["approval_mode"], codex["approval_source"]), ("auto", "profile"))
+        self.assertEqual(codex["args"][0], "--approve-for-me")
+        self.assertIn(AUTO_ON_NOTE, codex["notes"])
+        kimi = self.hub.resolve_launch("kimi", cwd=str(self.root), approval_mode="auto")
+        self.assertEqual(kimi["approval_mode"], "ask")
+        self.assertIn(AUTO_UNSUPPORTED_NOTE.format(engine="kimi"), kimi["notes"])
+        self.assertNotIn(AUTO_UNSUPPORTED_NOTE.format(engine="kimi"),
+                         self.hub.resolve_launch("kimi", cwd=str(self.root))["notes"])
+        for requested, resumed_mode in ((None, "auto"), ("ask", "ask")):
+            with self.subTest(requested=requested):
+                launch = self.hub.resolve_launch("claude", cwd=str(self.root), approval_mode=requested)
+                snapshot = dict(launch, task_mode="pty_input")
+                record = {"engine": "claude", "profile_id": "claude", "profile_snapshot": snapshot,
+                          "conversation_ref": {"session_id": "fixture"}}
+                resumed = self.hub.build_resume_launch(record)
+                self.assertEqual(resumed["approval_mode"], resumed_mode)
+                flag = resumed["args"][resumed["args"].index("--permission-mode") + 1]
+                self.assertEqual(flag, "auto" if resumed_mode == "auto" else "acceptEdits")
+
+    async def test_d13_http_and_mcp_forward_approval_mode(self):
+        self.profile("codex", False)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+            preview = (await client.post("/api/launch-preview", json={
+                "profile_id": "codex", "cwd": str(self.root), "approval_mode": "ask"})).json()
+            self.assertEqual((preview["approval_mode"], preview["approval_source"]), ("ask", "session"))
+            bad = await client.post("/api/launch-preview", json={"profile_id": "codex", "approval_mode": "manual"})
+            self.assertFalse(bad.json()["ok"])  # the preview reports invalid input in-band
+            self.assertIn("approval_mode", bad.json()["error"])
+            clash = await client.post("/api/sessions", json={
+                "profile_id": "codex", "approval_mode": "ask", "bypass_approvals": True})
+            self.assertEqual(clash.status_code, 400)
+        async def create(**kw):
+            self.assertEqual(kw["approval_mode"], "ask")
+            self.sess.profile_snapshot = {"engine": "codex", "approval_mode": "ask", "approval_mode_override": "ask",
+                                          "bypass_approvals": False, "approval_source": "session"}
+            return self.sess
+        with patch.object(self.hub, "create_session", create):
+            async with Client(self.server.mcp) as client:
+                tools = {t.name: t for t in await client.list_tools()}
+                self.assertIn("approval_mode", tools["spawn_subagent"].inputSchema["properties"])
+                result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "approval_mode": "ask"})
+                data = result.data if result.data is not None else json.loads(result.content[0].text)
+                self.assertEqual(data["approval"]["approval_mode"], "ask")
 
     async def test_mcp_spawn_schema_and_override(self):
         async def create(**kw):

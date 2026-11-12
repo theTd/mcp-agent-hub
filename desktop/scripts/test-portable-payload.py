@@ -127,7 +127,8 @@ def main():
             preview = client.post(base + "/api/launch-preview", json={"profile_id": profile["id"],
                                   "cwd": str(root), "bypass_approvals": False}, timeout=30).json()
             check(preview.get("high_risk_approval") is True and preview.get("approval_source") == "session"
-                  and preview.get("bypass_approvals_override") is False,
+                  and preview.get("bypass_approvals_override") is False
+                  and preview.get("approval_mode") == "auto",
                   "delivered EXE supports per-session approval overriding a bypassed profile")
             check(client.delete(base + "/api/profiles/" + profile["id"]).status_code == 200,
                   "isolated test profile is removed")

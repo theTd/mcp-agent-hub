@@ -19,6 +19,7 @@ transcript_summarizer.py
 wait_inbox.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
+engine_policies/claude-auto-approval.json
 engine_policies/omp-approval.yml
 static/index.html
 static/css/hub-console.css

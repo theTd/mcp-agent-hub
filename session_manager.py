@@ -930,15 +930,22 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
     return [str(a) for i, a in enumerate(args) if i not in drop]
 
 
-# ── Approval by default (owner decision 2026-11-07, DECISIONS.md D1-D5/D9) ─────────────────────
-# Every engine runs in the mode where routine work runs on its own and high-risk operations stop
-# for approval (the main agent answers through respond_to_subagent). The hub
-# strips each engine's bypass/mode flags from the profile (or the archived snapshot on resume) and
-# injects its own, in the same place as the model/thinking injection. The only way out is the
-# profile's own `bypass_approvals: true` (round 2, see bypass_launch_flags below).
+# ── Approval modes (owner decisions 2026-11-07 D1-D5/D9, 2026-11-12 D13) ──────────────────────
+# The hub strips each engine's bypass/mode flags from the profile (or the archived snapshot on
+# resume) and injects its own, in the same place as the model/thinking injection. What it injects
+# depends on the session's approval mode:
+# - auto (default, D13): the engine's own auto-approval reviewer decides (codex --approve-for-me,
+#   claude --permission-mode auto); only what it escalates reaches the main agent. Engines without
+#   one run ask instead.
+# - ask: routine work runs on its own and high-risk operations stop for the main agent
+#   (respond_to_subagent).
+# - bypass: no checks (the profile's `bypass_approvals: true`, or a session override).
 ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
 OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
 CLAUDE_APPROVAL_SETTINGS_NAME = "claude-approval.json"
+CLAUDE_AUTO_SETTINGS_NAME = "claude-auto-approval.json"
+APPROVAL_MODES = ("auto", "ask", "bypass")
+NATIVE_AUTO_APPROVAL_ENGINES = ("codex", "claude")
 # D5: agy's `--mode auto` falls back to `default` at launch (its check runs before sign-in ends);
 # `--settings` (this session only, never saved) applies agentMode after sign-in, before turn one.
 AGY_SESSION_SETTINGS: Dict[str, Any] = {"agentMode": "auto"}
@@ -949,16 +956,17 @@ def omp_approval_overlay_path() -> Path:
     return ENGINE_POLICIES_DIR / OMP_APPROVAL_OVERLAY_NAME
 
 
-def claude_approval_settings_path() -> Path:
-    """The Claude Code settings overlay shipped in the repo (high-risk PowerShell/Bash patterns ask)."""
-    template_path = ENGINE_POLICIES_DIR / CLAUDE_APPROVAL_SETTINGS_NAME
+def _render_claude_overlay(name: str, events: tuple) -> Path:
+    """A shipped Claude settings overlay with this interpreter's hook command, written to
+    .runtime_mcp_configs; the shipped template itself when that fails."""
+    template_path = ENGINE_POLICIES_DIR / name
     hook_script = ENGINE_POLICIES_DIR / "claude_pre_tool_hook.py"
     if template_path.is_file() and hook_script.is_file():
         expected_cmd = f'"{sys.executable}" "{hook_script}"'
         try:
             data = json.loads(template_path.read_text(encoding="utf-8"))
             hooks_map = data.setdefault("hooks", {})
-            for event_key, default_matcher in (("PreToolUse", "Bash|PowerShell"), ("PermissionRequest", "")):
+            for event_key, default_matcher in events:
                 entries = hooks_map.get(event_key)
                 if not isinstance(entries, list) or not entries:
                     hooks_map[event_key] = [
@@ -973,7 +981,7 @@ def claude_approval_settings_path() -> Path:
                         inner[0]["command"] = expected_cmd
             runtime_dir = ENGINE_POLICIES_DIR.parent / ".runtime_mcp_configs"
             runtime_dir.mkdir(exist_ok=True)
-            runtime_path = runtime_dir / CLAUDE_APPROVAL_SETTINGS_NAME
+            runtime_path = runtime_dir / name
             rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
             if not runtime_path.is_file() or runtime_path.read_text(encoding="utf-8", errors="replace") != rendered:
                 runtime_path.write_text(rendered, encoding="utf-8")
@@ -983,6 +991,26 @@ def claude_approval_settings_path() -> Path:
     return template_path
 
 
+def claude_approval_settings_path() -> Path:
+    """The Claude Code settings overlay shipped in the repo (high-risk PowerShell/Bash patterns ask)."""
+    return _render_claude_overlay(
+        CLAUDE_APPROVAL_SETTINGS_NAME, (("PreToolUse", "Bash|PowerShell"), ("PermissionRequest", "")))
+
+
+def claude_auto_settings_path() -> Path:
+    """D13: the overlay for Claude's auto mode. Only the PermissionRequest hook, so a prompt the
+    classifier escalates still reaches the main agent; no ask rules and no PreToolUse hook, which
+    would pull the hub's high-risk list back out of the classifier's hands."""
+    return _render_claude_overlay(CLAUDE_AUTO_SETTINGS_NAME, (("PermissionRequest", ""),))
+
+
+def claude_overlay_path(mode: Optional[str]) -> Optional[Path]:
+    """The hub settings overlay a Claude launch carries in `mode` (none when bypassed)."""
+    if mode == "bypass":
+        return None
+    return claude_auto_settings_path() if mode == "auto" else claude_approval_settings_path()
+
+
 def _is_omp_overlay_path(value: str) -> bool:
     raw = str(value or "").strip().strip('"').strip("'")
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_OVERLAY_NAME
@@ -990,7 +1018,8 @@ def _is_omp_overlay_path(value: str) -> bool:
 
 def _is_claude_approval_settings_path(value: str) -> bool:
     raw = str(value or "").strip().strip('"').strip("'")
-    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == CLAUDE_APPROVAL_SETTINGS_NAME
+    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() in (
+        CLAUDE_APPROVAL_SETTINGS_NAME, CLAUDE_AUTO_SETTINGS_NAME)
 
 
 def _approval_flag_tokens(engine: str, args: List[str]):
@@ -1120,13 +1149,27 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
     return []
 
 
+def auto_approval_launch_flags(engine: str) -> List[str]:
+    """D13: the flags that hand approvals to the engine's own reviewer; [] if it has none."""
+    eng = (engine or "").strip().lower()
+    if eng == "codex":
+        # Approval requests go to Codex's automatic review; the sandbox stays workspace-write.
+        return ["--approve-for-me"]
+    if eng == "claude":
+        # The classifier decides each tool call; the overlay only relays what it escalates.
+        return ["--permission-mode", "auto", f"--settings={claude_auto_settings_path()}"]
+    return []
+
+
 # Round 2 (owner, decision page approval-by-default-2026-11-07): a profile may switch approval off
 # with `bypass_approvals: true`. The hub then injects that engine's full-bypass flag instead of the
 # approval flags. Only the engines below have approval flags; dsh and pwsh ignore the key.
 APPROVAL_ENGINES = ("omp", "kimi", "codex", "claude", "agy")
 BYPASS_APPROVALS_KEY = "bypass_approvals"
 BYPASS_ON_NOTE = "bypass_approvals is on：本次会话已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
-BYPASS_NO_EFFECT_NOTE = "bypass_approvals 对 {engine} 引擎不适用（该引擎没有 Hub 注入的审批参数），已忽略"
+AUTO_ON_NOTE = "approval_mode=auto：由引擎自带的自动审批审核每次操作，只有它升级出来的审批才会交给主 Agent"
+AUTO_UNSUPPORTED_NOTE = "approval_mode=auto：{engine} 没有原生自动审批，本次以 ask 模式启动（高风险操作交给主 Agent 审批）"
+BYPASS_NO_EFFECT_NOTE = "approval_mode / bypass_approvals 对 {engine} 引擎不适用（该引擎没有 Hub 注入的审批参数），已忽略"
 
 
 def profile_bypasses_approvals(profile: Optional[Dict[str, Any]]) -> bool:
@@ -1134,16 +1177,58 @@ def profile_bypasses_approvals(profile: Optional[Dict[str, Any]]) -> bool:
     return isinstance(profile, dict) and profile.get(BYPASS_APPROVALS_KEY) is True
 
 
-def resolve_session_approval(engine: str, profile: Dict[str, Any], override: Optional[bool]) -> Dict[str, Any]:
-    """Resolve a session-only override without changing the stored profile."""
+def normalize_approval_mode(value: Any) -> Optional[str]:
+    """None, or one of APPROVAL_MODES; anything else is rejected."""
+    if value is None:
+        return None
+    mode = value.strip().lower() if isinstance(value, str) else None
+    if mode not in APPROVAL_MODES:
+        raise ValueError(f"approval_mode 只能是 auto、ask、bypass 或 null，收到的是 {json.dumps(value, ensure_ascii=False)}")
+    return mode
+
+
+def resolve_session_approval(engine: str, profile: Dict[str, Any], override: Optional[bool],
+                             mode_override: Any = None) -> Dict[str, Any]:
+    """Resolve a session-only choice without changing the stored profile (D11, D13).
+
+    approval_mode wins; bypass_approvals is its legacy alias (true = bypass, false = not bypassed,
+    which is the default). With neither, the profile's bypass switch decides, else auto. Auto on an
+    engine without its own reviewer runs ask."""
     if override is not None and type(override) is not bool:
         raise ValueError("bypass_approvals 只能是 true、false 或 null")
-    applicable = engine in APPROVAL_ENGINES
+    mode_override = normalize_approval_mode(mode_override)
+    if mode_override is not None and override is not None and override != (mode_override == "bypass"):
+        raise ValueError("approval_mode 与 bypass_approvals 冲突：只传 approval_mode 即可")
+    if engine not in APPROVAL_ENGINES:
+        return {"approval_mode": None, "approval_mode_override": mode_override,
+                "bypass_approvals_override": override, "bypass_approvals": False,
+                "approval_source": "not_applicable"}
+    if mode_override is not None:
+        requested, source = mode_override, "session"
+    elif override is not None:
+        requested, source = ("bypass" if override else "auto"), "session"
+    else:
+        requested, source = ("bypass" if profile_bypasses_approvals(profile) else "auto"), "profile"
+    mode = "ask" if requested == "auto" and engine not in NATIVE_AUTO_APPROVAL_ENGINES else requested
     return {
+        "approval_mode": mode,
+        "approval_mode_override": mode_override,
         "bypass_approvals_override": override,
-        "bypass_approvals": (profile_bypasses_approvals(profile) if override is None else override) if applicable else False,
-        "approval_source": ("profile" if override is None else "session") if applicable else "not_applicable",
+        "bypass_approvals": mode == "bypass",
+        "approval_source": source,
     }
+
+
+def approval_mode_notes(engine: str, policy: Dict[str, Any]) -> List[str]:
+    """The launch notes that say which approval mode a session runs in."""
+    mode = policy.get("approval_mode")
+    if mode == "bypass":
+        return [BYPASS_ON_NOTE]
+    if mode == "auto":
+        return [AUTO_ON_NOTE]
+    if mode == "ask" and policy.get("approval_mode_override") == "auto":
+        return [AUTO_UNSUPPORTED_NOTE.format(engine=engine)]
+    return []
 
 
 def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bool]:
@@ -1165,7 +1250,14 @@ def resolve_session_approval_fields(snapshot: Optional[Dict[str, Any]]) -> Dict[
     if not isinstance(snapshot, dict):
         snapshot = {}
     snapshot = snapshot or {}
-    return {"bypass_approvals": snapshot.get("bypass_approvals") is True,
+    bypass = snapshot.get("bypass_approvals") is True
+    mode = snapshot.get("approval_mode")
+    if mode not in APPROVAL_MODES:
+        # Launches from before D13 ran either the ask flags or the bypass flags.
+        mode = ("bypass" if bypass else "ask") if snapshot.get("engine") in APPROVAL_ENGINES else None
+    return {"approval_mode": mode,
+            "approval_mode_override": snapshot.get("approval_mode_override"),
+            "bypass_approvals": bypass,
             "bypass_approvals_override": snapshot.get("bypass_approvals_override"),
             "approval_source": snapshot.get("approval_source") or (
                 "profile" if snapshot.get("engine") in APPROVAL_ENGINES else "not_applicable")}
@@ -1191,13 +1283,18 @@ def bypass_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -
     return []
 
 
-def apply_approval_flags(engine: str, args: List[str], bypass: bool = False) -> List[str]:
-    """D1/D9: strip every approval/bypass/mode flag, then inject the hub's own at the front: the
-    approval flags, or the engine's full-bypass flag when the profile has bypass_approvals on."""
+def apply_approval_flags(engine: str, args: List[str], bypass: bool = False,
+                         mode: Optional[str] = None) -> List[str]:
+    """D1/D9/D13: strip every approval/bypass/mode flag, then inject the hub's own at the front for
+    `mode` (auto / ask / bypass; without one, `bypass` picks bypass or ask)."""
+    mode = mode or ("bypass" if bypass else "ask")
     raw = [str(a) for a in args]
     drop = {idx for idx, _label in _approval_flag_tokens(engine, raw)}
     kept = [a for i, a in enumerate(raw) if i not in drop]
-    inject = bypass_launch_flags(engine, raw) if bypass else approval_launch_flags(engine, raw)
+    if mode == "bypass":
+        inject = bypass_launch_flags(engine, raw)
+    else:
+        inject = (mode == "auto" and auto_approval_launch_flags(engine)) or approval_launch_flags(engine, raw)
     return inject + kept
 
 
@@ -3501,7 +3598,7 @@ class HubSessionManager:
                 "startup_delay_sec": 2.0,
                 "submit_key": "\r",
                 "enabled": True,
-                "description": "Anthropic Claude Code CLI。模型与思考等级在启动时传入（--model / --effort），高风险命令默认暂停审批。",
+                "description": "Anthropic Claude Code CLI。模型与思考等级在启动时传入（--model / --effort），默认以 Claude 自带的 auto 模式运行（由分类器逐次批准或拦截工具调用）。",
             },
             "dsh": {
                 "id": "dsh",
@@ -4533,20 +4630,18 @@ class HubSessionManager:
         # D9 (2026-11-07): the snapshot goes through the same strip+inject as a fresh launch, so a
         # session archived before approval-by-default (with --auto-approve, --auto, ...) resumes in
         # the safe mode too. omp's in-memory "approve for this session" is gone after a resume anyway.
-        # Explicit session overrides survive; legacy/inherited sessions follow the current profile.
-        policy = resolve_session_approval(engine, prof_cur, snapshot.get("bypass_approvals_override"))
+        # Explicit session overrides survive; legacy/inherited sessions follow the current profile
+        # (and, since D13, the auto default).
+        policy = resolve_session_approval(engine, prof_cur, snapshot.get("bypass_approvals_override"),
+                                          snapshot.get("approval_mode_override"))
         built.update(policy)
-        bypass = policy["bypass_approvals"]
+        mode = policy["approval_mode"]
         built["notes"] = []
         if engine in APPROVAL_ENGINES:
-            base_args = apply_approval_flags(engine, base_args, bypass=bypass)
-            if bypass:
-                built["notes"].append(BYPASS_ON_NOTE)
-        elif bypass:
-            built["notes"].append(BYPASS_NO_EFFECT_NOTE.format(engine=engine))
+            base_args = apply_approval_flags(engine, base_args, mode=mode)
+            built["notes"].extend(approval_mode_notes(engine, policy))
         if structured_claude:
-            base_args, _ = merge_claude_settings(
-                base_args, cwd, approval_path=claude_approval_settings_path() if not bypass else None)
+            base_args, _ = merge_claude_settings(base_args, cwd, approval_path=claude_overlay_path(mode))
         if engine == "omp":
             built["args"] = [
                 f"--session-dir={ref.get('session_dir')}",
@@ -11713,6 +11808,7 @@ class HubSessionManager:
         mcp_servers: Optional[Dict[str, Any]] = None,
         disabled_mcp_servers: Optional[List[str]] = None,
         strict_mcp_config: bool = False,
+        approval_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
@@ -11970,28 +12066,27 @@ class HubSessionManager:
                 os.path.expandvars(os.path.expanduser(str(resolved_env['CLAUDE_CONFIG_DIR']).strip()))
             )
 
-        # D1 (2026-11-07): high-risk approval is on for every engine unless the profile switches it
-        # off (bypass_approvals, round 2). The profile's own bypass/mode flags (old files still carry
-        # --auto-approve, --auto, ...) are stripped either way; the hub injects what the switch says.
-        policy = resolve_session_approval(eng, prof, bypass_approvals)
+        # D1/D13: every approval engine starts in the session's approval mode: the engine's own
+        # auto-approval reviewer by default, ask (high-risk operations go to the main agent) or
+        # bypass on request. The profile's own bypass/mode flags (old files still carry
+        # --auto-approve, --auto, ...) are stripped either way; the hub injects what the mode says.
+        policy = resolve_session_approval(eng, prof, bypass_approvals, approval_mode)
+        mode = policy["approval_mode"]
         bypass = policy["bypass_approvals"]
         high_risk_approval = high_risk_approval_state(eng, bypass)
         ignored_approval = [
             label for label in approval_flags_in_args(eng, base_args)
             if label not in ("--settings", "--settings=")
         ]
-        args = apply_approval_flags(eng, args, bypass=bypass)
+        args = apply_approval_flags(eng, args, mode=mode)
         if ignored_approval:
             notes.append(
                 f"已忽略启动参数里的审批相关参数（{'、'.join(ignored_approval)}）："
-                + ("由 bypass_approvals 开关决定，Hub 注入全自动参数" if bypass
-                   else "Hub 统一以高风险操作需审批的模式启动")
+                f"审批模式由 approval_mode 决定，本次为 {mode}"
             )
-        if bypass and high_risk_approval is False:
-            notes.append(BYPASS_ON_NOTE)
-        elif bypass:
-            notes.append(BYPASS_NO_EFFECT_NOTE.format(engine=eng))
-        if eng not in APPROVAL_ENGINES and (bypass_approvals is not None or profile_bypasses_approvals(prof)):
+        if eng in APPROVAL_ENGINES:
+            notes.extend(approval_mode_notes(eng, policy))
+        elif bypass_approvals is not None or approval_mode is not None or profile_bypasses_approvals(prof):
             notes.append(BYPASS_NO_EFFECT_NOTE.format(engine=eng))
 
         # Rule 5: cwd.
@@ -12032,7 +12127,7 @@ class HubSessionManager:
             args.extend(build_mcp_args(eng, mcp_config))
             if eng == 'claude':
                 args, settings_base = merge_claude_settings(
-                    args, work_dir, approval_path=claude_approval_settings_path() if not bypass else None,
+                    args, work_dir, approval_path=claude_overlay_path(mode),
                     disabled=mcp_config['disabled_mcp_servers'])
                 mcp_settings['mcp_settings_base'] = settings_base
             notes.append('本次 MCP 配置已生成；连接、认证和工具发现由 Agent 启动后执行')
@@ -12079,11 +12174,13 @@ class HubSessionManager:
         disabled_mcp_servers: Optional[List[str]] = None,
         strict_mcp_config: bool = False,
         auto_approval_rules: Any = None,
+        approval_mode: Optional[str] = None,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
         if bypass_approvals is not None and type(bypass_approvals) is not bool:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
+        approval_mode = normalize_approval_mode(approval_mode)
         extra_args = normalize_extra_args(extra_args)
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
         auto_approval_rules = normalize_auto_approval_rules(auto_approval_rules)
@@ -12119,16 +12216,17 @@ class HubSessionManager:
                 "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
                 "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
                 "auto_approval_rules": auto_approval_rules,
-                **resolve_session_approval("desktop_gui", {}, bypass_approvals),
+                **resolve_session_approval("desktop_gui", {}, bypass_approvals, approval_mode),
             }
-            if bypass_approvals is not None:
+            if bypass_approvals is not None or approval_mode is not None:
                 sess.launch_notes = [BYPASS_NO_EFFECT_NOTE.format(engine="desktop_gui")]
             self.sessions[session_id] = sess
             await self.persist_session(sess)
             return sess
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
-                                     bypass_approvals=bypass_approvals, extra_args=extra_args, **mcp_config)
+                                     bypass_approvals=bypass_approvals, approval_mode=approval_mode,
+                                     extra_args=extra_args, **mcp_config)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
