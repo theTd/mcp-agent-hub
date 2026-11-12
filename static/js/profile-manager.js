@@ -28,7 +28,7 @@ const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'claude', 'dsh', 'pwsh'];
 // Keys the editor renders itself, so the read-only "高级" box shows only what is left.
 const SHOWN_KEYS = new Set([
   'id', 'name', 'engine', 'kind', 'command', 'config_dir', 'args', 'env', 'default_model', 'default_thinking_level',
-  'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'gui_url', 'dsh_tier',
+  'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'dsh_tier',
   'bypass_approvals',
 ]);
 // Engines whose launch the hub injects approval flags into; bypass_approvals does nothing elsewhere.
@@ -206,7 +206,6 @@ function profileDraft(id, p) {
     envText: formatEnvText(p.env),
     task_mode: p.task_mode || '',
     delayText: p.startup_delay_sec ?? '',
-    gui_url: p.gui_url || '',
     dsh_tier: p.dsh_tier === 'pro' ? 'pro' : 'flash',
     bypass_approvals: p.bypass_approvals === true,
     extra: p,
@@ -237,7 +236,6 @@ function readDraft() {
     envText: $('#editEnv') ? $('#editEnv').value : '',
     task_mode: $('#editTaskMode').value,
     delayText: $('#editDelay').value,
-    gui_url: $('#editGuiUrl').value.trim(),
     dsh_tier: $('#editDshTier').value,
     bypass_approvals: $('#editBypassApprovals').checked,
     extra: selectedId ? state.profiles[selectedId] : null,
@@ -270,7 +268,6 @@ function writeDraft(d) {
   ensureOption($('#editTaskMode'), d.task_mode);
   $('#editTaskMode').value = d.task_mode || '';
   $('#editDelay').value = d.delayText;
-  $('#editGuiUrl').value = d.gui_url;
   $('#editDshTier').value = d.dsh_tier;
   $('#editBypassApprovals').checked = d.bypass_approvals === true;
 
@@ -677,7 +674,6 @@ async function startNewProfile() {
     envText: '',
     task_mode: '',
     delayText: 2.5,
-    gui_url: '',
     dsh_tier: 'flash',
     bypass_approvals: false,
     extra: null,
@@ -761,7 +757,8 @@ async function saveProfile() {
     env: !isDsh && Object.keys(env).length ? env : null,
     task_mode: d.task_mode || null,
     startup_delay_sec: Number.isFinite(delay) ? delay : null,
-    gui_url: isDsh ? (d.gui_url || null) : null,
+    // The DSH web page is no longer embedded; saving drops the old address from the profile.
+    gui_url: null,
     dsh_tier: isDsh ? d.dsh_tier : null,
     // Round 2: always a bool (false clears the key). For dsh / pwsh the box is disabled and keeps
     // the stored value, so a save there never changes it.

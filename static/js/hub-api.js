@@ -66,7 +66,8 @@ export const hubApi = {
   terminateSession: (id) => request('DELETE', `/api/sessions/${enc(id)}`),
   sessionFinal: (id) => request('GET', `/api/sessions/${enc(id)}/final`),
   transcriptSummary: (id) => request('GET', `/api/sessions/${enc(id)}/transcript-summary`),
-  transcript: (id, limit = 80) => request('GET', `/api/sessions/${enc(id)}/transcript?limit=${encodeURIComponent(limit)}`),
+  // Bounded like listSessions: a hung request would otherwise stop this pane's refresh for good.
+  transcript: (id, limit = 80) => request('GET', `/api/sessions/${enc(id)}/transcript?limit=${encodeURIComponent(limit)}`, undefined, { timeoutMs: 10000 }),
 
   listWin32Windows: () => request('GET', '/api/win32/windows'),
   windowFrame: (id) => request('GET', `/api/sessions/${enc(id)}/frame`),

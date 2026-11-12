@@ -31,6 +31,13 @@ from winpty import PtyProcess
 REAL_PTY_PROCESS = PtyProcess
 
 from transcript_tail import TranscriptTail, read_complete_lines
+from transcript_feed import (
+    FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, tool_output_text,
+    interaction_view as transcript_interaction_view,
+)
+from dsh_session_record import (
+    DshSessionRecordReader, RecordDecodeError, locate_dsh_session_record, native_events_to_telemetry,
+)
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
@@ -112,6 +119,15 @@ FINAL_SOURCE_PRIORITY = {
 }
 
 NATIVE_TRANSCRIPT_DRAIN_SEC = 3.0
+# Tool arguments/output kept on a worker event for the console transcript (characters).
+TOOL_DETAIL_LIMIT = 4000
+
+
+def _clip_detail(text: str) -> str:
+    """Keep the head of a long tool detail and say that the rest was cut."""
+    if len(text) <= TOOL_DETAIL_LIMIT:
+        return text
+    return f"{text[:TOOL_DETAIL_LIMIT]}\n…（已截断，原文 {len(text)} 字符）"
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
@@ -1833,6 +1849,50 @@ class TuiWriterQueue:
         return any(mode is None or c.mode == mode for c in self._open)
 
 
+# Lines of a DSH worker question that instruct the parent agent how to reply; the console shows
+# the options as buttons, so its copy of the prompt leaves them out.
+DSH_PARENT_INSTRUCTION_PREFIXES = (
+    "[approval request from the worker", "[question from the worker", "Options:",
+    "Reply with exactly one option label",
+)
+
+
+def _dsh_display_prompt(text: str) -> str:
+    lines = [line for line in str(text or "").splitlines()
+             if not line.strip().startswith(DSH_PARENT_INSTRUCTION_PREFIXES)]
+    return "\n".join(lines).strip()
+
+
+DSH_RECORD_SEQ_KEY = "dsh_record_seq"
+DSH_RECORD_OFFSET_KEY = "dsh_record_offset"
+# DSH creates the record a moment after the job starts (about 1.7 s measured); the watcher holds
+# the job log back this long while it looks, so no tool is recorded from both sources.
+DSH_RECORD_LOCATE_WAIT_SEC = 20.0
+# After DSH reports the job finished, its last frames can still be on their way to disk.
+DSH_RECORD_SETTLE_INTERVAL_SEC = 0.5
+DSH_RECORD_SETTLE_MAX_PASSES = 6
+
+
+class _DshRecordCursor:
+    """Read position of one DSH watcher in the session record (see _drain_dsh_session_record)."""
+
+    def __init__(self, reader: DshSessionRecordReader, *, after_seq: int, since_ms: Optional[float]):
+        self.reader = reader
+        self.after_seq = after_seq
+        self.since_ms = since_ms
+        self.active = True
+        self.tool_names: Dict[str, str] = {}  # call id -> tool name, for results read later
+
+
+def _keep_dsh_record_seq(old_ref: Optional[Dict[str, Any]], new_ref: Dict[str, Any]) -> Dict[str, Any]:
+    """A rebuilt DSH conversation reference keeps how far the session record was read."""
+    for key in (DSH_RECORD_SEQ_KEY, DSH_RECORD_OFFSET_KEY):
+        value = old_ref.get(key) if isinstance(old_ref, dict) else None
+        if value is not None:
+            new_ref[key] = value
+    return new_ref
+
+
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -3363,7 +3423,6 @@ class HubSessionManager:
                 "submit_key": "\r",
                 "enabled": True,
                 "description": "通过 DSH Hub API 创建的原生会话，总控台显示其实时事件流。",
-                "gui_url": "http://127.0.0.1:3080",
                 "dsh_tier": "flash",
             },
             "pwsh": {
@@ -5003,11 +5062,11 @@ class HubSessionManager:
             active_token = token if dsh_send_mode == "continue" else old_token
             sess.dsh_job_id = active_job
             sess.dsh_token = active_token
-            sess.conversation_ref = {
+            sess.conversation_ref = _keep_dsh_record_seq(sess.conversation_ref, {
                 "dsh_job_id": active_job,
                 "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
                 "dsh_token": active_token,
-            }
+            })
             sess.status = "running"
             if dsh_send_mode == "message":
                 sess.current_activity = f"Messaged running DSH job ({active_job}): {clean[:60]}"
@@ -5045,7 +5104,7 @@ class HubSessionManager:
                 sess, new_job, sess.dsh_token or token
             ))
         elif jstatus in ("running", "needs_input"):
-            self._schedule(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token))
+            self._schedule(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token, reattach=True))
         injection = "dsh_continue" if clean else "dsh_attach"
         delivery = {
             "delivered": bool(clean),
@@ -5441,6 +5500,26 @@ class HubSessionManager:
         elif tool_response is not None:
             resp_str = str(tool_response)[:600]
 
+        # The transcript feed shows a tool's arguments and output; the 600-character summaries
+        # above stay as they were for status/trace consumers.
+        call_id = str(data.get("call_id") or "").strip()
+        if isinstance(tool_input, (dict, list)):
+            input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+        else:
+            input_detail = "" if tool_input is None else str(tool_input)
+        output_detail = tool_output_text(tool_response) if tool_response is not None else ""
+        tool_data: Dict[str, Any] = {"tool": tool_name or "", "call_id": call_id}
+        if hook_event == "PostToolUse":
+            tool_data["output"] = _clip_detail(output_detail)
+            if isinstance(data.get("tool_ok"), bool):
+                tool_data["ok"] = data["tool_ok"]
+        else:
+            tool_data["input"] = _clip_detail(input_detail)
+            if hook_event == "ReportStep":
+                tool_data["step_marker"] = True  # a step counter (`llm_inference`), not a real tool
+            if data.get("tool_title"):
+                tool_data["title"] = str(data["tool_title"])[:300]
+
         step_num = sess.step_count if sess else 0
 
         if hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected"):
@@ -5474,12 +5553,27 @@ class HubSessionManager:
             if msg and str(msg).strip():
                 await self.db.add_intermediate_message(session_id, step_num, str(msg).strip(), source=source)
 
-        if tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected", "PostToolUse"):
+        if (tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected")) or (
+            hook_event == "PostToolUse" and (tool_name or tool_response is not None)
+        ):
+            # A result without a tool name (Claude, Kimi, AGY records) still closes its call in the
+            # transcript; the feed pairs it by call id or call order.
+            body = resp_str if hook_event == "PostToolUse" else input_str
             await self.record_worker_event(session_id, {
                 "type": "tool_result" if hook_event == "PostToolUse" else "tool_call",
                 "category": "progress",
                 "status": "running",
-                "content": f"{tool_name}: {resp_str if hook_event == 'PostToolUse' else input_str}",
+                "content": f"{tool_name}: {body}" if tool_name else body,
+                "data": tool_data,
+            })
+        elif hook_event == "AssistantReasoning" and str(data.get("reasoning") or "").strip():
+            # Reasoning is console-only: it is not an intermediate message, so status/trace
+            # readers (parent agents) do not receive it.
+            await self.record_worker_event(session_id, {
+                "type": "reasoning",
+                "category": "progress",
+                "status": "running",
+                "content": _clip_detail(str(data["reasoning"]).strip()),
             })
         elif hook_event == "AssistantMessage" and intermediate_list:
             await self.record_worker_event(session_id, {
@@ -5575,6 +5669,13 @@ class HubSessionManager:
             "interaction": payload.get("interaction"),
             "turn_id": getattr(sess, "turn_id", None),
         }
+        data = dict(payload["data"]) if isinstance(payload.get("data"), dict) else {}
+        if isinstance(payload.get("interaction"), dict):
+            # The persisted tail has no interaction column; keep its display fields (never the
+            # engine metadata with tokens) so a restored transcript still shows the question.
+            data["interaction"] = transcript_interaction_view(payload["interaction"])
+        if data:
+            record["data"] = data
         seq = await self.db.insert_worker_event(record)
         record["seq"] = seq
         if ev_type == "turn_completed":
@@ -7213,11 +7314,11 @@ class HubSessionManager:
                         if cjob.get("id"):
                             sess.dsh_job_id = cjob["id"]
                             sess.dsh_token = new_token
-                            sess.conversation_ref = {
+                            sess.conversation_ref = _keep_dsh_record_seq(sess.conversation_ref, {
                                 "dsh_job_id": cjob["id"],
                                 "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
                                 "dsh_token": new_token,
-                            }
+                            })
                             sess.status = "running"
                             # B9: last_task stays the initial task; follow-ups live in current_activity.
                             if not sess.last_task:
@@ -7342,18 +7443,17 @@ class HubSessionManager:
             results.append(ev)
         return results
 
-    async def get_transcript_view(self, session_id: str, limit: int = 80) -> Dict[str, Any]:
-        """Build a small engine-neutral transcript for the console.
+    async def get_transcript_view(self, session_id: str, limit: int = FEED_DEFAULT_LIMIT) -> Dict[str, Any]:
+        """Build the engine-neutral transcript the console shows by default (see transcript_feed).
 
         This deliberately does not invoke the CLI-specific transcript summarizer.  The console
-        polls this endpoint more frequently than the normal session list, so it uses the already
-        normalized worker events plus the persisted tool/message tails.  The raw TUI remains
-        available through the separate terminal view when a provider-specific diagnosis is needed.
+        polls this endpoint every second for visible panes, so it only gathers the normalized
+        worker events and small persisted tails; `transcript_feed` does the shaping.
         """
         try:
-            limit = max(10, min(200, int(limit)))
+            limit = max(10, min(FEED_MAX_LIMIT, int(limit)))
         except (TypeError, ValueError):
-            limit = 80
+            limit = FEED_DEFAULT_LIMIT
         sess = self.sessions.get(session_id)
         if sess is not None:
             meta = sess.to_dict()
@@ -7362,156 +7462,31 @@ class HubSessionManager:
             if not meta:
                 raise ValueError(f"找不到会话 {session_id}")
 
-        # The memory ring is freshest, while SQLite fills the gap after a restart or when the
-        # session has already left the live map.  Sequence numbers make the merge deterministic.
-        persisted_events = await self.db.get_recent_worker_events(session_id, limit)
+        # A tool is two events and the feed hides plumbing, so read a wider event window than the
+        # entry limit.  The memory ring is freshest; SQLite fills the gap after a restart or once
+        # the session has left the live map.  Sequence numbers make the merge deterministic.
+        window = limit * 3 + 60
+        persisted_events = await self.db.get_recent_worker_events(session_id, window)
         events_by_seq = {int(item.get("seq")): item for item in persisted_events if item.get("seq") is not None}
         for item in self.get_worker_events(session_id=session_id, after_seq=0):
             if item.get("seq") is not None:
                 events_by_seq[int(item["seq"])] = item
-        events = sorted(events_by_seq.values(), key=lambda item: (float(item.get("timestamp") or 0), int(item.get("seq") or 0)))
-
-        tools = await self.db.get_recent_tool_calls(session_id, 30)
-        messages = await self.db.get_recent_intermediate_messages(session_id, 30)
-
-        def text(value: Any, size: int = 4000) -> str:
-            return str(value or "").replace("\x00", "").strip()[:size]
-
-        def event_kind(ev_type: str) -> str:
-            if ev_type in ("tool_call", "tool_result"):
-                return "tool"
-            if ev_type in ("question", "approval_request"):
-                return "interaction"
-            if ev_type in ("exited", "terminated", "crashed"):
-                return "system"
-            return "assistant"
-
-        entries: List[Dict[str, Any]] = []
-        seen_content = set()
-        task = text(meta.get("last_task"), 3000)
-        task = re.sub(r"\s*\[Sub-Agent Bridge Info[\s\S]*$", "", task, flags=re.IGNORECASE).strip()
-        task = re.sub(r"\s*\[Hub Session: session_id=[^\]]+\]", "", task).strip()
-        if task:
-            entries.append({
-                "id": "task",
-                "kind": "user",
-                "label": "任务",
-                "text": task,
-                "timestamp": meta.get("created_at"),
-                "step": 0,
-                "source": "hub",
-            })
+        events = sorted(events_by_seq.values(), key=lambda item: int(item.get("seq") or 0))[-window:]
+        messages = await self.db.get_recent_intermediate_messages(session_id, 40)
 
         parent_messages = self.parent_messages.get(session_id)
         if parent_messages is None:
             parent_messages = meta.get("parent_messages") or []
-        for message in parent_messages:
-            body = text(message.get("content")) if isinstance(message, dict) else text(message)
-            if not body:
-                continue
-            entries.append({
-                "id": f"parent:{message.get('id') or message.get('message_id') or len(entries)}" if isinstance(message, dict) else f"parent:{len(entries)}",
-                "kind": "user",
-                "label": "主 Agent",
-                "text": body,
-                "timestamp": message.get("timestamp") if isinstance(message, dict) else None,
-                "step": None,
-                "source": "hub",
-            })
-
-        for ev in events:
-            ev_type = str(ev.get("type") or "message")
-            body = text(ev.get("content"))
-            interaction = ev.get("interaction")
-            if not body and not interaction:
-                continue
-            seen_content.add(body)
-            entries.append({
-                "id": f"event:{ev.get('seq') or len(entries)}",
-                "kind": event_kind(ev_type),
-                "label": {
-                    "tool_call": "调用工具", "tool_result": "工具结果", "turn_completed": "回复",
-                    "question": "提问", "approval_request": "需要审批", "progress": "进展",
-                    "message": "消息", "message_to_parent": "汇报", "exited": "进程结束",
-                    "terminated": "已终止", "crashed": "异常退出",
-                }.get(ev_type, "事件"),
-                "type": ev_type,
-                "text": body,
-                "timestamp": ev.get("timestamp"),
-                "step": None,
-                "source": text(ev.get("source") or ev.get("category"), 120),
-                "status": text(ev.get("status"), 40),
-                "interaction": interaction,
-                "final": ev_type == "turn_completed",
-            })
-
-        # Some engines report assistant text through telemetry without a separate worker event.
-        # Add those records only when their body is not already represented above.
-        for msg in messages:
-            body = text(msg.get("content"))
-            if not body or body in seen_content:
-                continue
-            seen_content.add(body)
-            source = text(msg.get("source"), 120)
-            thinking = bool(re.search(r"(?:think|reason|analysis)", f"{source} {body[:120]}".lower()))
-            entries.append({
-                "id": f"message:{msg.get('timestamp') or len(entries)}",
-                "kind": "thinking" if thinking else "assistant",
-                "label": "思考" if thinking else "进展",
-                "text": body,
-                "timestamp": msg.get("timestamp"),
-                "step": msg.get("step_num"),
-                "source": source,
-                "status": "info",
-            })
-
-        # Tool records are useful even when a provider did not emit a mailbox event.  Do not
-        # duplicate the common `name: input` event shape.
-        for tool in tools:
-            name = text(tool.get("tool_name"), 160)
-            body = text(tool.get("output_summary") or tool.get("input_summary"), 3500)
-            if not name:
-                continue
-            if any(item.get("kind") == "tool" and item.get("text", "").startswith(f"{name}:") for item in entries):
-                continue
-            entries.append({
-                "id": f"tool:{tool.get('timestamp') or len(entries)}",
-                "kind": "tool",
-                "label": "工具",
-                "text": f"{name}: {body}".strip(),
-                "timestamp": tool.get("timestamp"),
-                "step": tool.get("step_num"),
-                "source": text(tool.get("source"), 120),
-                "status": text(tool.get("status"), 40),
-            })
-
-        final_text = text(meta.get("final_response"), 5000)
-        if final_text and not any(item.get("final") or item.get("text") == final_text for item in entries):
-            entries.append({
-                "id": "final",
-                "kind": "assistant",
-                "label": "上轮回复" if meta.get("from_previous_turn") else "回复",
-                "text": final_text,
-                "timestamp": meta.get("ended_at") or meta.get("updated_at"),
-                "step": meta.get("step_count"),
-                "source": text(meta.get("final_response_source"), 120),
-                "status": "completed",
-                "final": True,
-            })
-
-        task_entry = entries[:1] if task else []
-        rest = sorted(entries[1:] if task else entries, key=lambda item: (float(item.get("timestamp") or 0), str(item.get("id"))))
-        entries = task_entry + rest[-limit:]
-        return {
-            "session_id": session_id,
-            "status": meta.get("status"),
-            "step_count": meta.get("step_count", 0),
-            "current_activity": meta.get("current_activity", ""),
-            "pending_interaction": sess.pending_interaction if sess else meta.get("pending_interaction"),
-            "final_response": final_text,
-            "updated_at": meta.get("updated_at"),
-            "entries": entries,
-        }
+        return build_transcript_feed(
+            session_id=session_id,
+            meta=meta,
+            events=events,
+            messages=messages,
+            parent_messages=parent_messages,
+            pending_interaction=sess.pending_interaction if sess else meta.get("pending_interaction"),
+            limit=limit,
+            window_saturated=len(persisted_events) >= window,
+        )
 
     async def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
         """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
@@ -7638,6 +7613,7 @@ class HubSessionManager:
                                     "hook_event": "ToolCall",
                                     "tool_name": tname,
                                     "tool_input": targs,
+                                    "call_id": payload.get("call_id"),
                                 },
                             )
                             if tname in ("request_user_input", "request_user_input_async"):
@@ -7673,6 +7649,7 @@ class HubSessionManager:
                                     "hook_event": "PostToolUse",
                                     "tool_name": payload.get("name") or payload.get("call_id") or ptype,
                                     "tool_response": out_val,
+                                    "call_id": payload.get("call_id"),
                                 },
                             )
                             if (
@@ -8936,6 +8913,8 @@ class HubSessionManager:
                                         "source": "claude_jsonl",
                                         "hook_event": "PostToolUse",
                                         "tool_response": res_content or "",
+                                        "call_id": b.get("tool_use_id"),
+                                        "tool_ok": False if b.get("is_error") is True else None,
                                     },
                                 )
                     elif otype == "queue-operation":
@@ -9066,6 +9045,7 @@ class HubSessionManager:
                                         "hook_event": "PreToolUse",
                                         "tool_name": tname,
                                         "tool_input": tinput,
+                                        "call_id": part.get("id"),
                                     },
                                 )
                                 if tname == "AskUserQuestion" and isinstance(tinput, dict):
@@ -10569,7 +10549,93 @@ class HubSessionManager:
             session.status = "exited"
             await self.persist_session(session)
 
-    async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str, *, log_path: Optional[Path] = None):
+    async def _open_dsh_session_record(
+        self, session: AgentSession, job_id: str, *, reattach: bool = False
+    ) -> Optional["_DshRecordCursor"]:
+        """This DSH session's native record, or None while DSH has not created it (yet)."""
+        if not session.dsh_session_id:
+            return None
+        path = await asyncio.to_thread(locate_dsh_session_record, session.dsh_session_id)
+        if path is None:
+            return None
+        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
+        try:
+            after_seq = int(ref.get(DSH_RECORD_SEQ_KEY, -1))
+            # The byte position only saves re-reading; it is meaningless without the sequence.
+            start_offset = int(ref.get(DSH_RECORD_OFFSET_KEY) or 0) if after_seq >= 0 else 0
+        except (TypeError, ValueError):
+            after_seq, start_offset = -1, 0
+        since_ms = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
+            started = (resp.json().get("job") or {}).get("startedAt") if resp.is_success else None
+            if started:
+                # A continued job shares the record with earlier turns that are already recorded.
+                since_ms = datetime.datetime.fromisoformat(str(started).replace("Z", "+00:00")).timestamp() * 1000 - 2000
+        except Exception:
+            since_ms = None
+        cursor = _DshRecordCursor(DshSessionRecordReader(path, start_offset=start_offset),
+                                  after_seq=after_seq, since_ms=since_ms)
+        if reattach and after_seq < 0:
+            # A Hub that never stored a position (an older version, or a crash before the first
+            # batch was saved) recorded this job from its log: only what DSH writes from now on
+            # is new.  Reading the existing events once also learns the open calls' tool names.
+            try:
+                existing = await asyncio.to_thread(cursor.reader.read_new_events)
+            except Exception as error:
+                logger.warning("[%s] DSH session record unreadable, using the job log: %s", session.session_id, error)
+                return None
+            seqs = [int(ev["seq"]) for ev in existing if isinstance(ev.get("seq"), int)]
+            cursor.after_seq = max(seqs, default=-1)
+            native_events_to_telemetry(existing, after_seq=cursor.after_seq, tool_names=cursor.tool_names)
+        return cursor
+
+    async def _drain_dsh_session_record(self, session: AgentSession, cursor: "_DshRecordCursor") -> bool:
+        """Record tool calls, results, text and reasoning appended to the DSH session record.
+
+        Returns whether anything new was recorded."""
+        if not cursor.active or session.terminated_by_user or self._shutting_down:
+            return False
+        try:
+            events = await asyncio.to_thread(cursor.reader.read_new_events)
+            payloads = native_events_to_telemetry(events, after_seq=cursor.after_seq, since_ms=cursor.since_ms,
+                                                  tool_names=cursor.tool_names)
+        except Exception as error:
+            # Corrupt data, a missing decoder or an unexpected record shape: the job log keeps the
+            # transcript going (tool names only) from here on, and the watcher keeps running.
+            logger.warning("[%s] DSH session record unreadable, using the job log: %s", session.session_id, error)
+            cursor.active = False
+            return False
+        try:
+            for payload in payloads:
+                if session.terminated_by_user or self._shutting_down:
+                    break
+                seq = int(payload.pop("native_seq"))
+                payload.pop("timestamp", None)
+                await self.record_telemetry(session.session_id, payload)
+                cursor.after_seq = max(cursor.after_seq, seq)
+                # Kept current per payload, so a stop mid-batch never records one twice.
+                session.conversation_ref = dict(session.conversation_ref or {}, **{DSH_RECORD_SEQ_KEY: cursor.after_seq})
+        finally:
+            if payloads or events:
+                session.conversation_ref = dict(session.conversation_ref or {}, **{
+                    DSH_RECORD_SEQ_KEY: cursor.after_seq, DSH_RECORD_OFFSET_KEY: cursor.reader.resume_offset})
+                await self.persist_session(session)
+        return bool(payloads)
+
+    async def _settle_dsh_session_record(self, session: AgentSession, cursor: "_DshRecordCursor") -> None:
+        """Read the frames DSH writes just after it reports the job finished."""
+        await self._drain_dsh_session_record(session, cursor)
+        for _ in range(DSH_RECORD_SETTLE_MAX_PASSES):
+            if not cursor.active:
+                return
+            await asyncio.sleep(DSH_RECORD_SETTLE_INTERVAL_SEC)
+            if not await self._drain_dsh_session_record(session, cursor):
+                return
+
+    async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str, *,
+                                 log_path: Optional[Path] = None, reattach: bool = False):
         """
         Tails ~/.config/dsh-crew/logs/<job_id>.log for real-time steps/tools/thoughts AND
         polls /_dsh/dsh-crew/jobs/<job_id>/messages for bidirectional worker->parent messages & questions!
@@ -10594,6 +10660,23 @@ class HubSessionManager:
         await self.persist_session(session)
         tail = TranscriptTail(log_file)
         msg_cursor = 0
+        # The DSH session record carries what the job log leaves out (tool arguments and output,
+        # full assistant text, reasoning).  The source is chosen once per watcher so a tool is never
+        # recorded from both; the job log still drives steps and errors either way.  DSH creates the
+        # record shortly after the job starts, so the job log waits until it is found or given up.
+        record = await self._open_dsh_session_record(session, job_id, reattach=reattach)
+        record_deadline = None if record is not None else time.monotonic() + DSH_RECORD_LOCATE_WAIT_SEC
+
+        async def look_for_record(final: bool = False):
+            nonlocal record, record_deadline
+            if record is not None or record_deadline is None:
+                return
+            record = await self._open_dsh_session_record(session, job_id, reattach=reattach)
+            if record is not None:
+                record_deadline = None
+            elif final or time.monotonic() >= record_deadline:
+                record_deadline = None
+                logger.info("[%s] DSH session record not found; transcript uses the job log", session.session_id)
 
         async def drain_log_lines():
             try:
@@ -10619,6 +10702,8 @@ class HubSessionManager:
                     session.current_activity = f"Step {s_num} (Turn {t_num})"
                     session.emit_virtual_ansi(f"\r\n\x1b[1;36m▶ [Step {s_num} · Turn {t_num}]\x1b[0m\r\n")
                     await self.persist_session(session)
+                elif kind in ("tool_call", "tool_result", "text") and record is not None and record.active:
+                    pass  # recorded from the session record with full detail
                 elif kind == "tool_call":
                     tname = ev.get("tool") or summary or "dsh_tool"
                     await self.record_telemetry(
@@ -10667,7 +10752,10 @@ class HubSessionManager:
                 and not session.terminated_by_user
                 and session.status in ("starting", "running", "waiting_parent")
             ):
-                if await drain_log_lines():
+                await look_for_record()
+                if record is not None:
+                    await self._drain_dsh_session_record(session, record)
+                if record_deadline is None and await drain_log_lines():
                     continue
 
                 # Poll DSH WorkerMailbox for worker->parent messages or blocking questions
@@ -10722,6 +10810,7 @@ class HubSessionManager:
                                             "dsh_job_id": job_id,
                                             "dsh_token": token,
                                             "dsh_message_id": mid,
+                                            "display_prompt": _dsh_display_prompt(mtext),
                                         },
                                     )
                                 else:
@@ -10795,8 +10884,11 @@ class HubSessionManager:
                                 # Q4: the job ended, but the user's termination is the final word on
                                 # this session's status, persistence and events.
                                 return
+                            await look_for_record(final=True)
                             while await drain_log_lines():
                                 pass  # Each batch yields; preserve every trailing telemetry record.
+                            if record is not None:
+                                await self._settle_dsh_session_record(session, record)
                             full_res = (jview.get("result") or jview.get("error") or "").strip()
                             if full_res:
                                 session.set_final_response(full_res, "dsh_hub_completion")
@@ -10820,10 +10912,10 @@ class HubSessionManager:
                                 session.status = "crashed"
                                 session.end_reason = "crashed"
                                 session.exit_code = 1
-                            session.conversation_ref = {
+                            session.conversation_ref = _keep_dsh_record_seq(session.conversation_ref, {
                                 "dsh_job_id": job_id,
                                 "dsh_session_id": session.dsh_session_id or "",
-                            }
+                            })
                             tokens_info = jview.get("tokens") or {}
                             session.current_activity = (
                                 f"DSH {jstatus} (steps={session.step_count}, tools={jview.get('toolCalls', 0)}, "

@@ -3,6 +3,7 @@ import importlib.util
 import ast
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -55,6 +56,17 @@ class PortableDataTests(unittest.IsolatedAsyncioTestCase):
                     local = module.split(".")[0] + ".py"
                     if (root / local).is_file():
                         self.assertIn(local, payload, f"{filename} imports an unpackaged module")
+
+    def test_payload_includes_console_modules_and_styles(self):
+        root = Path(__file__).parent
+        payload = set((root / "desktop/portable/payload.txt").read_text(encoding="utf-8").splitlines())
+        index = (root / "static/index.html").read_text(encoding="utf-8")
+        needed = {f"static/{path}" for path in re.findall(r'(?:href|src)="/static/([\w/.-]+\.(?:css|js))"', index)}
+        for filename in [name for name in payload if name.startswith("static/js/") and name.endswith(".js")]:
+            source = (root / filename).read_text(encoding="utf-8")
+            needed |= {f"static/js/{name}" for name in re.findall(r"from '\./([\w.-]+\.js)'", source)}
+        self.assertTrue(needed)
+        self.assertEqual(sorted(needed - payload), [], "the console loads files the portable build leaves out")
 
     def test_claude_hook_uses_same_data_root(self):
         path = Path(__file__).parent / "engine_policies" / "claude_pre_tool_hook.py"
