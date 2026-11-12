@@ -269,6 +269,12 @@ async def spawn_subagent(
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
 
+    For every engine, create the task's own worktree, scratch, logs and results under ``cwd``:
+    sandboxes and auto-accept cover only ``cwd`` (Codex workspace-write, Claude acceptEdits, DSH
+    workspace root), so work outside it turns into parent approvals; for DSH every call, reads
+    included, and the hub cannot add roots. Only what the task creates belongs there: leave files
+    it did not create (sources, shared or others' data, credentials) in place, and never widen
+    ``cwd`` to a parent, home or drive root to cover them.
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -328,10 +334,19 @@ async def set_subagent_approval_rules(
     session_id: str,
     auto_approval_rules: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Set bounded, session-scoped automatic approval rules and return immediately.
+    """Store bounded, session-scoped automatic approval rules and return immediately.
 
-    Rules are evaluated only against structured low-risk requests. They never enable the
-    engine-wide bypass switch and expire with the session or their individual TTL.
+    A rule answers approve_once only for an approval request that reports a structured argv
+    matching ``match.command_argv`` inside the session cwd, without shell composition, network,
+    write, delete, credential, upload, process-control or escalation. No engine reports a
+    structured argv yet (DSH approvals are free text), so stored rules currently match nothing
+    and ``rules_applied`` confirms storage only. For approvals outside cwd, fix the cwd layout.
+
+    Rule shape: {"id": "read-logs", "match": {"tool": ["Bash"], "command_argv": [["cat", "logs/*.log"]]},
+    "max_uses": 20, "expires_in_seconds": 1800}; argv tokens are fnmatch patterns and the optional
+    match.path_glob also requires a request path. effect must be approve_once, match.cwd_scope
+    workspace and every constraint false; other values are rejected.
+    Rules never enable the engine-wide bypass switch and expire with the session or their TTL.
     """
     result = await hub.set_auto_approval_rules(session_id, auto_approval_rules)
     session = hub.sessions.get(session_id)
