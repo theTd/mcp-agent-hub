@@ -2870,6 +2870,10 @@ class HubSessionManager:
         self._schedule(self._subagent_cleanup_loop())
         if request is not None:
             targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
+            for sid in sorted(request.session_ids or ()):
+                rec = None if sid in targets else await self.db.get_session_record(sid)
+                if rec and rec.get("status") == "interrupted" and sid not in self.sessions:
+                    targets[sid] = {"engine": str(rec.get("engine") or "").strip().lower(), "status": "interrupted"}
             logger.info("Resume-on-start request: %d of %d sessions live at the stop", len(targets), len(live_at_stop))
             if targets:
                 self.restart_resume_gate.close()
@@ -2893,7 +2897,7 @@ class HubSessionManager:
             order = sorted(targets, key=lambda sid: (targets[sid].get("engine") != "dsh", sid))
             for sid in order:
                 info = targets[sid]
-                text = request.text_for(info.get("engine", ""), info.get("status", ""))
+                text = request.text_for(sid, info.get("engine", ""), info.get("status", ""))
                 try:
                     res = await self.resume_subagent(sid, text=text, source="console")
                     results[sid] = {"ok": True, "resumed": bool(res.get("resumed")),
