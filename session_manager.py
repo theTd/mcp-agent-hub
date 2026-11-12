@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 import datetime
 import fnmatch
+import hashlib
 import io
 import json
 import logging
@@ -297,6 +298,12 @@ PROFILE_FILE_LOCKED_MESSAGE = "配置文件被其他程序占用，请稍后重�
 TRANSCRIPT_SCAN_FAST_WINDOW_SEC = 60.0
 TRANSCRIPT_SCAN_FAST_INTERVAL_SEC = 1.0
 TRANSCRIPT_SCAN_SLOW_INTERVAL_SEC = 5.0
+# Once attached, a reader looks for new lines this often (one small incremental read per file), so
+# the console sees a step within about a quarter second of the engine writing it.
+TRANSCRIPT_TAIL_INTERVAL_SEC = 0.25
+# Folder scans a reader repeats while it is attached (a resumed Codex starting a new rollout, a
+# marked rollout appearing, a resumed AGY opening a new conversation) stay at about once a second.
+TRANSCRIPT_RESCAN_INTERVAL_SEC = 1.0
 # Q2: the hub session marker travels in the task text, i.e. near the beginning of the transcript.
 # Codex 0.167+ writes ~160 KB of tool schemas, skills, and AGENTS.md before the first user message,
 # so scan up to 512 KB to never miss the session_id marker.
@@ -2798,6 +2805,11 @@ class HubSessionManager:
         # A11: worker→parent messages kept per session, outside the global 2000-event ring, so the
         # archive thread is complete even for a long-running session.
         self._worker_message_logs: Dict[str, List[Dict[str, Any]]] = {}
+        # Change marks behind transcript_version: the newest event and the number of stored
+        # intermediate messages per session, both counted once the write is readable.
+        self._transcript_event_seq: Dict[str, int] = {}
+        self._transcript_message_marks: Dict[str, int] = {}
+        self._transcript_boot = uuid.uuid4().hex[:8]
         self.pending_questions: Dict[str, Dict[str, Any]] = {}
         self._event_waiters: Set[asyncio.Event] = set()
         self._shutting_down: bool = False
@@ -3024,7 +3036,8 @@ class HubSessionManager:
         """Q2: hub session ids named in the transcript's first chunk (the task carries session_id=<id>).
 
         Only the head of the file is read, because the session marker travels with the initial task; the
-        answer is cached until the file grows, so a steady-state scan costs one stat.
+        answer is cached until the file grows, so a steady-state scan costs one stat.  A record only
+        grows at its end, so once the cached read covered the whole head it stays valid.
         """
         try:
             size = Path(path).stat().st_size
@@ -3032,7 +3045,7 @@ class HubSessionManager:
             return set()
         key = self._transcript_key(path)
         cached = self._marker_scan_cache.get(key)
-        if cached and cached[0] == size:
+        if cached and (cached[0] == size or TRANSCRIPT_MARKER_SCAN_BYTES <= cached[0] <= size):
             return set(cached[1])
         try:
             with open(path, "rb") as fh:
@@ -5492,6 +5505,47 @@ class HubSessionManager:
                 logger.exception("Shutdown could not flush every accepted write")
         return archived
 
+    async def _add_transcript_message(self, session_id: str, *args: Any, **kwargs: Any) -> None:
+        """Store an intermediate message and mark the session's transcript as changed.
+
+        The mark is counted once the row is readable (when the enclosing write is accepted), so a
+        transcript poll never records a version whose content it could not read yet.
+        """
+        await self.db.add_intermediate_message(session_id, *args, **kwargs)
+
+        def mark() -> None:
+            self._transcript_message_marks[session_id] = self._transcript_message_marks.get(session_id, 0) + 1
+
+        if getattr(self.db, "in_unit", False):
+            self.db.on_accept(mark)
+        else:
+            mark()
+
+    def transcript_version(self, session_id: str, limit: int) -> Optional[str]:
+        """A token that changes whenever the session's transcript can change; None when unknown.
+
+        Built from in-memory state only, so a console poll that finds it unchanged costs neither a
+        database read nor a feed build.  It covers every input of get_transcript_view: events,
+        stored messages, the parent mailbox, the pending interaction and the session fields the
+        feed shows.  A session that is no longer in memory (archived) has no version.
+        """
+        sess = self.sessions.get(session_id)
+        if sess is None:
+            return None
+        box = self.parent_messages.get(session_id) or []
+        last = box[-1] if box and isinstance(box[-1], dict) else {}
+        pending = sess.pending_interaction if isinstance(sess.pending_interaction, dict) else {}
+        parts = (
+            self._transcript_boot, limit,
+            self._transcript_event_seq.get(session_id, 0),
+            self._transcript_message_marks.get(session_id, 0),
+            len(box), str(last.get("id") or ""),
+            str(sess.status or ""), bool(sess.final_response_from_previous_turn),
+            str(sess.final_response or ""), str(sess.last_task or ""),
+            str(pending.get("request_id") or ""), str(pending.get("prompt") or ""),
+        )
+        return hashlib.sha1(repr(parts).encode("utf-8", "replace")).hexdigest()[:16]
+
     async def record_reasoning_parts(self, session_id: str, source: str, thoughts: Iterable[Any]) -> None:
         """Thinking from a native record: a console-only reasoning entry, never an intermediate message.
 
@@ -5599,7 +5653,7 @@ class HubSessionManager:
 
         for msg in intermediate_list:
             if msg and str(msg).strip():
-                await self.db.add_intermediate_message(session_id, step_num, str(msg).strip(), source=source)
+                await self._add_transcript_message(session_id, step_num, str(msg).strip(), source=source)
 
         if (tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected")) or (
             hook_event == "PostToolUse" and (tool_name or tool_response is not None)
@@ -5685,7 +5739,7 @@ class HubSessionManager:
                 prefix = "Waiting for parent approval" if ev_type == "approval_request" else "Waiting for parent answer"
                 sess.current_activity = f"{prefix}: {content[:80]}"
             elif ev_type == "message" and content:
-                await self.db.add_intermediate_message(session_id, sess.step_count, content, source="native_message")
+                await self._add_transcript_message(session_id, sess.step_count, content, source="native_message")
             if ev_type == "turn_completed":
                 if sess.step_count == 0:
                     sess.step_count = 1
@@ -5736,6 +5790,7 @@ class HubSessionManager:
             await self.persist_session(sess)
         def publish():
             self.global_seq = max(self.global_seq, seq)
+            self._transcript_event_seq[session_id] = max(self._transcript_event_seq.get(session_id, 0), seq)
             self.worker_events.append(record)
             if len(self.worker_events) > 2000:
                 self.worker_events = self.worker_events[-2000:]
@@ -6487,7 +6542,7 @@ class HubSessionManager:
             return
         if sess.pending_interaction is not None:
             logger.warning("[%s] deny feedback not typed: a new interaction is pending", session_id)
-            await self.db.add_intermediate_message(
+            await self._add_transcript_message(
                 session_id, sess.step_count,
                 f"[Parent deny feedback NOT delivered: a new interaction was pending] {text}",
                 source="parent_approval_proxy",
@@ -6906,7 +6961,7 @@ class HubSessionManager:
             await self.clear_pending_interaction(sess, target_qid)
         sess.current_activity = ("Awaiting native approval confirmation" if response_state == "unconfirmed"
                                  else f"Parent responded ({chosen_label[:50]})")
-        await self.db.add_intermediate_message(
+        await self._add_transcript_message(
             session_id,
             sess.step_count,
             f"[Parent Delegated Response -> {chosen_label}] ({action_trace})",
@@ -7494,17 +7549,25 @@ class HubSessionManager:
             results.append(ev)
         return results
 
-    async def get_transcript_view(self, session_id: str, limit: int = FEED_DEFAULT_LIMIT) -> Dict[str, Any]:
+    async def get_transcript_view(
+        self, session_id: str, limit: int = FEED_DEFAULT_LIMIT, since: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Build the engine-neutral transcript the console shows by default (see transcript_feed).
 
         This deliberately does not invoke the CLI-specific transcript summarizer.  The console
-        polls this endpoint every second for visible panes, so it only gathers the normalized
-        worker events and small persisted tails; `transcript_feed` does the shaping.
+        polls this endpoint several times a second for visible panes, so it only gathers the
+        normalized worker events and small persisted tails; `transcript_feed` does the shaping.
+        `since` is the `version` of the caller's last full answer: while it still matches, the
+        answer is only `{"unchanged": true}` (see transcript_version).
         """
         try:
             limit = max(10, min(FEED_MAX_LIMIT, int(limit)))
         except (TypeError, ValueError):
             limit = FEED_DEFAULT_LIMIT
+        # Taken before anything is read: a change that lands during the build gets a new version.
+        version = self.transcript_version(session_id, limit)
+        if since and version and since == version:
+            return {"session_id": session_id, "unchanged": True, "version": version}
         sess = self.sessions.get(session_id)
         if sess is not None:
             meta = sess.to_dict()
@@ -7528,7 +7591,7 @@ class HubSessionManager:
         parent_messages = self.parent_messages.get(session_id)
         if parent_messages is None:
             parent_messages = meta.get("parent_messages") or []
-        return build_transcript_feed(
+        feed = build_transcript_feed(
             session_id=session_id,
             meta=meta,
             events=events,
@@ -7538,6 +7601,8 @@ class HubSessionManager:
             limit=limit,
             window_saturated=len(persisted_events) >= window,
         )
+        feed["version"] = version
+        return feed
 
     async def get_pending_interactions(self, session_id: str = "all") -> List[Dict[str, Any]]:
         """Returns active unresolved pending interactions (`waiting_parent`) for the target session(s)."""
@@ -7624,19 +7689,23 @@ class HubSessionManager:
             return
 
         turn_has_step = False
+        rescan_at = 0.0
         while self._transcript_watch_alive(session):
-            if session.resume_attach:
-                # A resumed codex may start a new rollout for the same session id; accept it when it
-                # appears and tail it from the beginning (everything in it is new).
-                switched = await self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
-                if switched is not None:
-                    target_file = switched
-                    offset = 0
-            elif session.session_id not in self._transcript_marker_ids(target_file):
-                upgraded = await self._codex_upgrade_to_marked_rollout(session, codex_root, target_file, scan_start)
-                if upgraded is not None:
-                    target_file = upgraded
-                    offset = 0
+            # The record is read every tick; the folder checks below at most once a second.
+            if time.monotonic() >= rescan_at:
+                rescan_at = time.monotonic() + TRANSCRIPT_RESCAN_INTERVAL_SEC
+                if session.resume_attach:
+                    # A resumed codex may start a new rollout for the same session id; accept it when
+                    # it appears and tail it from the beginning (everything in it is new).
+                    switched = await self._codex_resume_new_rollout(session, codex_root, target_file, scan_start)
+                    if switched is not None:
+                        target_file = switched
+                        offset = 0
+                elif session.session_id not in self._transcript_marker_ids(target_file):
+                    upgraded = await self._codex_upgrade_to_marked_rollout(session, codex_root, target_file, scan_start)
+                    if upgraded is not None:
+                        target_file = upgraded
+                        offset = 0
             try:
                 lines, offset = read_complete_lines(target_file, offset)
                 for line in lines:
@@ -7845,7 +7914,7 @@ class HubSessionManager:
                 raise
             except Exception:
                 pass
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
         if session.resume_attach and session.status in ("exited", "crashed"):
             # Research: an archived codex session refuses to resume; surface its own instruction.
@@ -8151,7 +8220,7 @@ class HubSessionManager:
                 raise
             except Exception:
                 pass
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
     @staticmethod
     def _kimi_resolved_interaction_ids(lines: List[str]) -> Set[str]:
@@ -8486,7 +8555,7 @@ class HubSessionManager:
                 raise
             except Exception:
                 pass
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
     async def _watch_agy_transcript(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails AGY CLI's transcript.jsonl.
@@ -8572,6 +8641,7 @@ class HubSessionManager:
         resume_confirmed = not session.resume_attach
         # A3: the stray scan is bounded to the first 30 s after the resume spawn; past that it stops.
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
+        stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
         while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
@@ -8580,7 +8650,9 @@ class HubSessionManager:
                         resume_confirmed = True
                 except OSError:
                     pass
-                if not resume_confirmed and time.time() <= verify_deadline:
+                if (not resume_confirmed and time.time() <= verify_deadline
+                        and time.monotonic() >= stray_scan_at):
+                    stray_scan_at = time.monotonic() + TRANSCRIPT_RESCAN_INTERVAL_SEC
                     stray = self._agy_new_conversation_dir(session, brain_root)
                     if stray is not None:
                         await self._mark_agy_resume_failed(session)
@@ -8736,7 +8808,7 @@ class HubSessionManager:
                 raise
             except Exception:
                 pass
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
     @staticmethod
     def _agy_conversation_is_durable(brain_dir: Path) -> bool:
@@ -8982,7 +9054,7 @@ class HubSessionManager:
                             q_txt = str(obj["content"]).strip()
                             if q_txt:
                                 session.note_transcript_user_message(q_txt)
-                                await self.db.add_intermediate_message(
+                                await self._add_transcript_message(
                                     session.session_id,
                                     max(1, session.step_count),
                                     f"[Steer queued mid-turn] {q_txt[:240]}",
@@ -8996,7 +9068,7 @@ class HubSessionManager:
                             turn_last_text = None
                             turn_completed_emitted = False
                             turn_has_step = False
-                            await self.db.add_intermediate_message(
+                            await self._add_transcript_message(
                                 session.session_id,
                                 max(1, session.step_count),
                                 "[Steer dequeued] Processing queued parent instruction",
@@ -9010,7 +9082,7 @@ class HubSessionManager:
                         ai_title = str(obj["aiTitle"]).strip()
                         if ai_title and ai_title not in seen_topics:
                             seen_topics.add(ai_title)
-                            await self.db.add_intermediate_message(
+                            await self._add_transcript_message(
                                 session.session_id,
                                 max(1, session.step_count),
                                 f"[Topic] {ai_title}",
@@ -9221,7 +9293,7 @@ class HubSessionManager:
                 raise
             except Exception:
                 pass
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
     @classmethod
     def _tui_input_line(cls, screen_text: str, engine: str = "") -> Optional[str]:
@@ -10880,7 +10952,7 @@ class HubSessionManager:
                                         f"\r\n\x1b[1;34m📨 [DSH Worker Message to Parent]: {mtext}\x1b[0m\r\n"
                                     )
                                     if mtext.lstrip().startswith("[approval granted without asking"):
-                                        await self.db.add_intermediate_message(
+                                        await self._add_transcript_message(
                                             session.session_id,
                                             session.step_count,
                                             mtext.strip(),

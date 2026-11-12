@@ -1050,10 +1050,15 @@ async def api_session_transcript_summary(session_id: str):
 
 
 @app.get("/api/sessions/{session_id}/transcript")
-async def api_session_transcript(session_id: str, limit: int = Query(80, ge=10, le=400)):
-    """Lightweight engine-neutral transcript feed for the console's default view."""
+async def api_session_transcript(session_id: str, limit: int = Query(80, ge=10, le=400),
+                                 since: str = Query("", max_length=64)):
+    """Lightweight engine-neutral transcript feed for the console's default view.
+
+    `since` is the `version` of the caller's last full answer; while nothing changed the answer
+    is just `{"unchanged": true, "version": ...}`.
+    """
     try:
-        return await hub.get_transcript_view(session_id, limit=limit)
+        return await hub.get_transcript_view(session_id, limit=limit, since=since or None)
     except ValueError as e:
         return not_found(f"找不到会话 {session_id}")
 
@@ -1349,6 +1354,26 @@ async def api_hub_shutdown(req: Request):
 # Mount Parent MCP (/mcp)
 for route in mcp_parent_app.routes:
     app.router.routes.append(route)
+
+
+class TranscriptPollLogFilter(logging.Filter):
+    """Leaves the console's transcript polls (several a second per visible pane) out of the access log.
+
+    uvicorn logs each request as (client, method, path with query, HTTP version, status); failed
+    polls are still logged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 5:
+            method, path, status = args[1], str(args[2]), args[4]
+            if method == "GET" and "/transcript?" in path and isinstance(status, int) and status < 400:
+                return False
+        return True
+
+
+# uvicorn's logging setup keeps filters already on its loggers.
+logging.getLogger("uvicorn.access").addFilter(TranscriptPollLogFilter())
 
 
 if __name__ == "__main__":
