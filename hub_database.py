@@ -208,6 +208,8 @@ class HubDatabase:
                 "ALTER TABLE sessions ADD COLUMN resume_block_reason TEXT",
                 "ALTER TABLE sessions ADD COLUMN turn_id TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN wait_handle TEXT DEFAULT ''",
+                # Transcript feed: structured tool fields (tool, call id, input, output, ok) of an event.
+                "ALTER TABLE worker_events ADD COLUMN data_json TEXT",
             ):
                 try:
                     conn.execute(ddl)
@@ -385,8 +387,8 @@ class HubDatabase:
         with self._conn() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO worker_events (seq, session_id, timestamp, type, category, content, status, files_changed_json, request_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO worker_events (seq, session_id, timestamp, type, category, content, status, files_changed_json, request_id, data_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec["seq"],
@@ -398,6 +400,7 @@ class HubDatabase:
                     rec["status"],
                     json.dumps(rec.get("files_changed", []), ensure_ascii=False),
                     rec.get("request_id"),
+                    json.dumps(rec["data"], ensure_ascii=False) if rec.get("data") else None,
                 ),
             )
             return int(cur.lastrowid)
@@ -454,7 +457,7 @@ class HubDatabase:
             rows = conn.execute(
                 """
                 SELECT seq, session_id, timestamp, type, category, content, status,
-                       files_changed_json, request_id
+                       files_changed_json, request_id, data_json
                 FROM worker_events
                 WHERE session_id=?
                 ORDER BY seq DESC LIMIT ?
@@ -465,6 +468,7 @@ class HubDatabase:
             for row in reversed(rows):
                 item = dict(row)
                 item["files_changed"] = self._decode_json_column(item.pop("files_changed_json", None), [])
+                item["data"] = self._decode_json_column(item.pop("data_json", None), None)
                 item["interaction"] = None
                 result.append(item)
             return result

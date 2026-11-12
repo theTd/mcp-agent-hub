@@ -1049,7 +1049,7 @@ async def api_session_transcript_summary(session_id: str):
 
 
 @app.get("/api/sessions/{session_id}/transcript")
-async def api_session_transcript(session_id: str, limit: int = Query(80, ge=10, le=200)):
+async def api_session_transcript(session_id: str, limit: int = Query(80, ge=10, le=400)):
     """Lightweight engine-neutral transcript feed for the console's default view."""
     try:
         return await hub.get_transcript_view(session_id, limit=limit)

@@ -38,16 +38,20 @@ class TranscriptViewTests(unittest.IsolatedAsyncioTestCase):
         })
         feed = await self.hub.get_transcript_view("view")
         self.assertEqual(feed["session_id"], "view")
-        self.assertEqual(feed["entries"][0]["kind"], "user")
-        self.assertTrue(any(item["kind"] == "tool" for item in feed["entries"]))
-        self.assertTrue(any(item["text"] == "正在读取文件" for item in feed["entries"]))
+        self.assertEqual(feed["entries"][0]["kind"], "task")
+        tool = next(item["tool"] for item in feed["entries"] if item["kind"] == "tool")
+        self.assertEqual((tool["name"], tool["input"]), ("read_file", "README.md"))
+        self.assertTrue(any(item.get("text") == "正在读取文件" for item in feed["entries"]))
         self.assertNotIn("codex", {item.get("engine") for item in feed["entries"]})
 
         # The persisted tail keeps the view readable after a Hub restart or archive transition.
         await self.hub.db.flush()
         self.hub.sessions.pop("view")
         restored = await self.hub.get_transcript_view("view")
-        self.assertTrue(any(item["text"] == "正在读取文件" for item in restored["entries"]))
+        self.assertTrue(any(item.get("text") == "正在读取文件" for item in restored["entries"]))
+        # Tool details live in the event's structured data, which is persisted with it.
+        restored_tool = next(item["tool"] for item in restored["entries"] if item["kind"] == "tool")
+        self.assertEqual(restored_tool["input"], "README.md")
 
     async def test_unknown_session_is_rejected(self):
         with self.assertRaises(ValueError):

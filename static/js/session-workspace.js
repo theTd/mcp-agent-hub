@@ -3,9 +3,10 @@ import { hubApi } from './hub-api.js';
 import { state, on, emit, setActiveSession, removeSession, upsertSession } from './console-state.js';
 import {
   $, $$, escapeHtml, icon, formatDuration, shortPath, toast, confirmDialog, setBusy,
-  openModal, closeModal, registerModal, copyText, firstLine, formatWhen, formatClock,
+  openModal, closeModal, registerModal, copyText, firstLine, formatWhen,
 } from './ui-kit.js';
 import { statusLabel, statusTone, activityLabel, endReasonLabel } from './session-status-text.js';
+import { createTranscriptView, createTranscriptUiState } from './transcript-view.js';
 
 const HISTORY_MODAL = 'historyModal';
 const ARCHIVE_PAGE_SIZE = 50;
@@ -101,7 +102,10 @@ const archiveRows = new Map(); // session_id -> { el, sig } for the 归档 list 
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
 const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
 const streams = new Map(); // session_id -> { stopped, timer }
-const transcriptViews = new Map(); // session_id -> { mode, data, loading, scrollMode }
+const transcriptViews = new Map(); // session_id -> { mode, data, loading, limit, ui, controller }
+const TRANSCRIPT_PAGE = 80;
+const TRANSCRIPT_PAGE_STEP = 120;
+const TRANSCRIPT_MAX = 400;
 
 let sessionsMode = 'live'; // 'live' | 'history'
 let historyRecordId = null;
@@ -122,7 +126,6 @@ export function initSessionWorkspace() {
   $('#sessionList').addEventListener('click', onSessionListClick);
   $('#sessionList').addEventListener('keydown', onSessionListKeydown);
   $('#gridContainer').addEventListener('click', onWorkspaceClick);
-  $('#gridContainer').addEventListener('keydown', onWorkspaceKeydown);
   $('#gridContainer').addEventListener('dblclick', onWorkspaceDblClick);
   $$('[data-session-tab]').forEach((tab) => tab.addEventListener('click', () => setSessionsMode(tab.dataset.sessionTab)));
   $('#historyModal').addEventListener('click', onHistoryModalClick);
@@ -212,9 +215,10 @@ function renderAll() {
 // ---------------------------------------------------------- session shapes
 const isLive = (s) => (typeof s.process_alive === 'boolean' ? s.process_alive : LIVE_STATUSES.has(s.status));
 const engineKey = (s) => (s.kind === 'desktop_gui' ? 'desktop' : s.engine || s.kind || 'tui');
-// DSH is driven through the Harness job/message API. The backend's `tui` kind is retained for
-// launch and interaction compatibility, while the console offers Transcript + native DSH UI.
-const isDshSession = (s) => String(s?.engine || '').toLowerCase() === 'dsh';
+// A DSH session started through the Harness job/message API has no terminal of its own: the Hub
+// reads its native session record, so the console shows the transcript only. (A legacy `web_gui`
+// DSH profile runs `dsh headless` in a real terminal and keeps the 记录 / TUI switch.)
+const isTranscriptOnly = (s) => String(s?.engine || '').toLowerCase() === 'dsh' && s?.kind !== 'web_gui';
 const profileLabel = (s) => s.profile_name || s.profile_id || '会话';
 
 const LEGACY_TITLE_ID_SUFFIX_RE = /\s*\([a-z0-9_-]+-[0-9a-f]{6,}\)\s*$/i;
@@ -669,8 +673,11 @@ function renderWorkspace() {
       pane = createPane(s);
       panes.set(s.session_id, pane);
     }
+    const wasHidden = pane.el.hidden;
     pane.el.hidden = !isVisible;
     updatePane(pane, s);
+    // A hidden pane loses its scroll offset; put the transcript back where the reader left it.
+    if (isVisible && wasHidden && pane.mounted) transcriptViews.get(s.session_id)?.controller?.reveal();
     if (!pane.el.isConnected) insertPaneInOrder(grid, pane.el, s.session_id);
     if (isVisible && !pane.mounted) {
       mountPaneBody(pane, s);
@@ -731,8 +738,7 @@ function paneHeadHtml(s) {
   const live = isLive(s);
   const wsOpen = !!terminals.get(s.session_id)?.wsOpen;
   const isDesktop = s.kind === 'desktop_gui';
-  const isDsh = isDshSession(s);
-  const nativeUrl = isDsh ? safeGuiUrl(s.gui_url) : '';
+  const transcriptOnly = isTranscriptOnly(s);
   const view = transcriptViews.get(s.session_id)?.mode || 'transcript';
   const keys = Object.entries(QUICK_KEYS).map(([key, k]) => {
     const enabled = live && wsOpen;
@@ -750,16 +756,12 @@ function paneHeadHtml(s) {
       ${pillsHtml(s)}
     </div>
     <div class="pane-actions">
-      ${isDesktop ? tuckButton : isDsh && !nativeUrl ? '<span class="pane-view-note">Transcript</span>' : isDsh ? `
+      ${isDesktop ? tuckButton : transcriptOnly ? '' : `
         <div class="view-switch" role="group" aria-label="会话视图">
-          <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化 transcript（默认）">Transcript</button>
-          <button type="button" data-action="view" data-view="native" aria-pressed="${view === 'native'}" title="DeepSeek Harness 原生界面">DSH</button>
-        </div>` : `
-        <div class="view-switch" role="group" aria-label="会话视图">
-          <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化 transcript（默认）">Transcript</button>
+          <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化记录：消息、工具调用与审批（默认）">记录</button>
           <button type="button" data-action="view" data-view="tui" aria-pressed="${view === 'tui'}" title="原始 TUI 终端画面">TUI</button>
         </div>
-        <div class="key-group" role="group" aria-label="快捷按键">${keys}</div>`}
+        ${view === 'tui' ? `<div class="key-group" role="group" aria-label="快捷按键">${keys}</div>` : ''}`}
       ${state.layoutMode === 'matrix'
         ? `<button type="button" class="icon-btn sm" data-action="focus-single" title="在单窗口视图中打开（或双击标题栏）" aria-label="在单窗口视图中打开">${icon('maximize')}</button>`
         : ''}
@@ -815,7 +817,9 @@ function pendingQuestionText(s) {
 }
 
 function updateWaitingBanner(pane, s) {
-  const waiting = s.status === 'waiting_parent';
+  // In the transcript view the question sits in the transcript's own reply dock.
+  const transcriptShown = s.kind !== 'desktop_gui' && (transcriptViews.get(s.session_id)?.mode || 'transcript') === 'transcript';
+  const waiting = s.status === 'waiting_parent' && !transcriptShown;
   let banner = pane.el.querySelector('.pane-banner');
   if (!waiting) {
     banner?.remove();
@@ -838,8 +842,10 @@ function updateWaitingBanner(pane, s) {
 function transcriptState(sessionId) {
   let view = transcriptViews.get(sessionId);
   if (!view) {
-    // The first render follows the latest transcript. Later polls preserve the user's position.
-    view = { mode: 'transcript', data: null, loading: false, scrollMode: 'initial' };
+    view = {
+      mode: 'transcript', data: null, loading: false, queued: false, limit: TRANSCRIPT_PAGE,
+      ui: createTranscriptUiState(), controller: null,
+    };
     transcriptViews.set(sessionId, view);
   }
   return view;
@@ -848,8 +854,7 @@ function transcriptState(sessionId) {
 function setPaneView(sessionId, mode) {
   const view = transcriptState(sessionId);
   const session = state.sessions.find((item) => item.session_id === sessionId);
-  const alternate = isDshSession(session) ? 'native' : 'tui';
-  view.mode = mode === alternate ? alternate : 'transcript';
+  view.mode = mode === 'tui' && !isTranscriptOnly(session) ? 'tui' : 'transcript';
   const pane = panes.get(sessionId);
   if (pane) {
     pane.headSig = '';
@@ -860,13 +865,14 @@ function setPaneView(sessionId, mode) {
 }
 
 function applyPaneView(pane, sessionId) {
-  const mode = transcriptState(sessionId).mode;
+  const view = transcriptState(sessionId);
   const transcript = pane.body.querySelector('[data-ref="transcript"]');
   const alternate = pane.body.querySelector('[data-ref="alternate"]');
-  if (!transcript || !alternate) return;
-  transcript.hidden = mode !== 'transcript';
-  alternate.hidden = mode === 'transcript';
-  if (mode === 'tui') scheduleFit(sessionId);
+  if (!transcript) return;
+  transcript.hidden = view.mode !== 'transcript';
+  if (alternate) alternate.hidden = view.mode === 'transcript';
+  if (view.mode === 'tui') scheduleFit(sessionId);
+  else view.controller?.reveal();
 }
 
 function refreshVisibleTranscripts() {
@@ -879,162 +885,83 @@ function refreshVisibleTranscripts() {
   }
 }
 
-async function ensureTranscript(sessionId, force = false) {
-  transcriptState(sessionId);
-  await refreshTranscript(sessionId, force);
+function mountTranscript(pane, s) {
+  const view = transcriptState(s.session_id);
+  const host = pane.body.querySelector('[data-ref="transcript"]');
+  view.controller?.dispose();
+  view.controller = createTranscriptView(host, view.ui, {
+    onRespond: (body, trigger) => respondFromTranscript(s.session_id, body, trigger),
+    onLoadMore: () => {
+      view.limit = Math.min(TRANSCRIPT_MAX, view.limit + TRANSCRIPT_PAGE_STEP);
+      refreshTranscript(s.session_id, true);
+    },
+    onRetry: () => refreshTranscript(s.session_id, true),
+  });
+  if (view.data) view.controller.update(view.data);
+  refreshTranscript(s.session_id, true);
 }
 
 async function refreshTranscript(sessionId, force = false) {
   const view = transcriptState(sessionId);
-  if (view.loading || (view.mode !== 'transcript' && !force)) return;
+  if (view.mode !== 'transcript' && !force) return;
+  if (view.loading) {
+    // A forced refresh (load earlier, a reply, a view switch) must not be lost to a poll in flight.
+    if (force) view.queued = true;
+    return;
+  }
   view.loading = true;
   try {
-    const data = await hubApi.transcript(sessionId);
-    const previous = view.data;
-    const firstRender = !previous;
-    view.data = data || { entries: [] };
-    view.scrollMode = firstRender ? 'bottom' : null;
-    renderTranscript(sessionId);
+    view.data = (await hubApi.transcript(sessionId, view.limit)) || { entries: [] };
   } catch (err) {
-    // A session can disappear between the session poll and this lightweight request. Keep the
-    // last readable transcript and show the error only when there is no content yet.
-    if (!view.data || !(view.data.entries || []).length) {
-      view.data = { entries: [{ id: 'error', kind: 'system', label: '加载失败', text: err.message || String(err) }] };
-      renderTranscript(sessionId);
-    }
+    // A session can disappear between the session poll and this request: keep the last readable
+    // transcript and say that the refresh failed.
+    view.data = { ...(view.data || { entries: [] }), error: err.message || String(err) };
   } finally {
     view.loading = false;
   }
-}
-
-function transcriptEntryHtml(entry) {
-  const kind = ['user', 'assistant', 'tool', 'thinking', 'interaction', 'system'].includes(entry.kind) ? entry.kind : 'assistant';
-  const roles = { user: '主 Agent', assistant: 'Agent', tool: '工具调用', thinking: '思考链', interaction: '需要处理', system: 'Hub' };
-  const step = entry.step ? `<span class="transcript-step">第 ${escapeHtml(entry.step)} 步</span>` : '';
-  const time = entry.timestamp ? `<time>${escapeHtml(formatClock(entry.timestamp))}</time>` : '';
-  const source = entry.source ? `<span class="transcript-source">${escapeHtml(entry.source)}</span>` : '';
-  let body = String(entry.text || '');
-  const interaction = entry.interaction;
-  if (interaction && typeof interaction === 'object') {
-    const details = [];
-    if (interaction.title) details.push(`标题：${interaction.title}`);
-    if (interaction.prompt || interaction.question) details.push(`详情：${interaction.prompt || interaction.question}`);
-    if (Array.isArray(interaction.options) && interaction.options.length) {
-      details.push(`选项：${interaction.options.map((option, index) => `${index + 1}) ${option}`).join('  ')}`);
-    }
-    if (details.length && !details.some((line) => body.includes(line.split('：').slice(1).join('：')))) body = [body, ...details].filter(Boolean).join('\n');
+  view.controller?.update(view.data);
+  if (view.queued && transcriptViews.get(sessionId) === view) {
+    view.queued = false;
+    refreshTranscript(sessionId, true);
   }
-  const finalClass = entry.final ? ' is-final' : '';
-  const status = entry.status && !['running', 'info'].includes(entry.status)
-    ? `<span class="transcript-status" data-status="${escapeHtml(entry.status)}">${escapeHtml(entry.status)}</span>` : '';
-  const compact = kind === 'tool' || kind === 'thinking';
-  const preview = firstLine(body || '（无文本）').slice(0, 180);
-  const content = compact
-    ? `<details class="transcript-details"><summary><span class="transcript-summary-text">${escapeHtml(preview || '展开详情')}</span><span class="transcript-expand-hint">展开</span></summary><pre class="transcript-text">${escapeHtml(body || '（无文本）')}</pre></details>`
-    : `<pre class="transcript-text">${escapeHtml(body || '（无文本）')}</pre>`;
-  const meta = [
-    kind === 'user' ? roles.user : '',
-    entry.label || '',
-    step ? `第 ${escapeHtml(entry.step)} 步` : '',
-    source,
-    status,
-    time,
-  ].filter(Boolean).join('<span class="transcript-meta-sep">·</span>');
-  return `<article class="transcript-entry${finalClass}" data-kind="${kind}">
-    <div class="transcript-entry-card">
-      <div class="transcript-entry-head">${meta}</div>
-      ${content}
-    </div>
-  </article>`;
 }
 
-function transcriptInteractionHtml(interaction) {
-  if (!interaction || typeof interaction !== 'object') return '';
-  const options = Array.isArray(interaction.options) ? interaction.options.filter(Boolean) : [];
-  const title = interaction.title || (interaction.kind === 'approval_request' ? '需要审批' : '需要输入');
-  const prompt = interaction.prompt || interaction.question || interaction.text || '';
-  const requestId = interaction.request_id || interaction.id || '';
-  const buttons = options.map((option, index) => `<button type="button" class="transcript-choice" data-action="transcript-option" data-option-index="${index + 1}">${escapeHtml(option)}</button>`).join('');
-  return `<section class="transcript-pending" data-request-id="${escapeHtml(requestId)}">
-    <div class="transcript-pending-head"><span class="transcript-pending-dot"></span><strong>${escapeHtml(title)}</strong><span class="transcript-pending-label">${interaction.kind === 'approval_request' ? '审批' : 'Ask'}</span></div>
-    ${prompt ? `<p class="transcript-pending-prompt">${escapeHtml(prompt)}</p>` : ''}
-    ${buttons ? `<div class="transcript-choice-row">${buttons}</div>` : ''}
-    <div class="transcript-input-row"><input class="transcript-input" type="text" placeholder="输入回复…" data-ref="transcript-input" /><button type="button" class="btn btn-sm btn-primary" data-action="transcript-submit">发送</button></div>
-  </section>`;
-}
-
-function renderTranscript(sessionId) {
-  const pane = panes.get(sessionId);
-  const view = transcriptViews.get(sessionId);
-  const host = pane?.body.querySelector('[data-ref="transcript"]');
-  if (!host || !view) return;
-  const oldScroll = host.scrollTop;
-  const nearBottom = host.scrollHeight - host.clientHeight - oldScroll < 48;
-  const entries = view.data?.entries || [];
-  const pending = view.data?.pending_interaction;
-  const interaction = pending && typeof pending === 'object' ? transcriptInteractionHtml(pending) : '';
-  host.innerHTML = entries.length || interaction
-    ? `<div class="transcript-list">${entries.map(transcriptEntryHtml).join('')}${interaction}</div>`
-    : '<div class="transcript-empty">等待 Agent 产生可读事件…</div>';
-  if (view.scrollMode === 'top') {
-    host.scrollTop = 0;
-  } else if (view.scrollMode === 'bottom' || nearBottom) {
-    host.scrollTop = host.scrollHeight;
-  } else {
-    // Re-rendering replaces the children. Restore the user's non-tail position instead of
-    // treating every poll as permission to jump to the newest event.
-    host.scrollTop = oldScroll;
-  }
-  view.scrollMode = null;
-}
-
-function safeGuiUrl(url) {
-  if (!url) return '';
+async function respondFromTranscript(id, body, trigger) {
+  setBusy(trigger, true);
   try {
-    const parsed = new URL(url, location.href);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : '';
-  } catch {
-    return '';
+    await hubApi.respondInteraction(id, body);
+    toast('已发送回复', 'success', 1800);
+    emit('sessions:refresh-request');
+    await refreshTranscript(id, true);
+    return true;
+  } catch (err) {
+    toast(`发送失败：${err.message}`, 'error', 5000);
+    return false;
+  } finally {
+    setBusy(trigger, false);
   }
 }
 
 function mountPaneBody(pane, s) {
-  if (isDshSession(s)) {
-    const nativeUrl = safeGuiUrl(s.gui_url);
-    pane.body.innerHTML = nativeUrl
-      ? `<div class="transcript-slot" data-ref="transcript"></div>
-         <div class="dsh-native-slot" data-ref="alternate"><iframe src="${escapeHtml(nativeUrl)}" title="${escapeHtml(sessionTitle(s))} DeepSeek Harness"></iframe></div>`
-      : '<div class="transcript-slot" data-ref="transcript"></div>';
-    ensureTranscript(s.session_id, true);
-    applyPaneView(pane, s.session_id);
-    return;
-  }
-  const guiUrl = s.kind === 'web_gui' ? safeGuiUrl(s.gui_url) : '';
-  if (guiUrl) {
-    pane.body.innerHTML = `
-      <div class="transcript-slot" data-ref="transcript"></div>
-      <div class="web-gui-split" data-ref="alternate">
-        <iframe src="${escapeHtml(guiUrl)}" title="${escapeHtml(sessionTitle(s))} Web GUI"></iframe>
-        <div class="web-gui-term"></div>
-      </div>`;
-    attachTerminal(s.session_id, pane.body.querySelector('.web-gui-term'));
-    ensureTranscript(s.session_id, true);
-    applyPaneView(pane, s.session_id);
-  } else if (s.kind === 'desktop_gui') {
+  if (s.kind === 'desktop_gui') {
     pane.body.innerHTML = `
       <div class="desktop-stream">
         <img alt="${escapeHtml(sessionTitle(s))} 窗口画面" draggable="false" hidden />
         <div class="stream-overlay"><span class="spinner"></span>正在获取窗口画面…</div>
       </div>`;
     pane.body.querySelector('img').addEventListener('click', (ev) => onDesktopClick(ev, s.session_id));
+    return;
+  }
+  if (isTranscriptOnly(s)) {
+    pane.body.innerHTML = '<div class="transcript-slot" data-ref="transcript"></div>';
   } else {
     pane.body.innerHTML = `
       <div class="transcript-slot" data-ref="transcript"></div>
       <div class="term-slot" data-ref="alternate"></div>`;
     attachTerminal(s.session_id, pane.body.querySelector('[data-ref="alternate"]'));
-    ensureTranscript(s.session_id, true);
-    applyPaneView(pane, s.session_id);
   }
+  mountTranscript(pane, s);
+  applyPaneView(pane, s.session_id);
 }
 
 function disposeGoneSessions() {
@@ -1055,7 +982,11 @@ function disposeGoneSessions() {
     panes.delete(id);
   }
   for (const id of [...streams.keys()]) if (!alive.has(id)) stopStream(id);
-  for (const id of [...transcriptViews.keys()]) if (!alive.has(id)) transcriptViews.delete(id);
+  for (const [id, view] of [...transcriptViews]) {
+    if (alive.has(id)) continue;
+    view.controller?.dispose();
+    transcriptViews.delete(id);
+  }
   for (const [id, card] of cards) {
     if (alive.has(id)) continue;
     card.el.remove();
@@ -1338,55 +1269,8 @@ async function onWorkspaceClick(ev) {
       if (question) copyText(question, '已复制问题');
       break;
     }
-    case 'transcript-option':
-      await submitTranscriptInteraction(id, action, Number(action.dataset.optionIndex));
-      break;
-    case 'transcript-submit':
-      await submitTranscriptInteraction(id, action, null);
-      break;
     default:
       break;
-  }
-}
-
-function onWorkspaceKeydown(ev) {
-  if (ev.key !== 'Enter' || ev.shiftKey || !ev.target.matches('[data-ref="transcript-input"]')) return;
-  ev.preventDefault();
-  const pane = ev.target.closest('.pane');
-  const button = pane?.querySelector('[data-action="transcript-submit"]');
-  if (pane && button) submitTranscriptInteraction(pane.dataset.id, button, null);
-}
-
-async function submitTranscriptInteraction(id, trigger, optionIndex) {
-  const pane = panes.get(id)?.el;
-  const pending = pane?.querySelector('.transcript-pending');
-  if (!pending) return;
-  const view = transcriptState(id);
-  const interaction = view.data?.pending_interaction;
-  const requestId = pending.dataset.requestId || interaction?.request_id;
-  const input = pending.querySelector('[data-ref="transcript-input"]');
-  const customInput = input?.value?.trim() || '';
-  const body = { request_id: requestId || undefined };
-  if (optionIndex) body.option_index = optionIndex;
-  else if (customInput) body.custom_input = customInput;
-  else {
-    toast('请输入回复或选择一个选项', 'info', 2200);
-    input?.focus();
-    return;
-  }
-  setBusy(trigger, true);
-  pending.querySelectorAll('button').forEach((button) => { button.disabled = true; });
-  try {
-    await hubApi.respondInteraction(id, body);
-    toast('已发送回复', 'success', 1800);
-    if (input) input.value = '';
-    emit('sessions:refresh-request');
-    await refreshTranscript(id, true);
-  } catch (err) {
-    toast(`发送失败：${err.message}`, 'error', 5000);
-    pending.querySelectorAll('button').forEach((button) => { button.disabled = false; });
-  } finally {
-    setBusy(trigger, false);
   }
 }
 
