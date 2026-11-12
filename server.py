@@ -30,6 +30,7 @@ from session_manager import (
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
 from agent_guidance import SERVER_INSTRUCTIONS
+import windows_accept_guard
 
 BASE_DIR = Path(__file__).parent.resolve()
 PROFILES_PATH = default_profiles_path(BASE_DIR)
@@ -738,6 +739,16 @@ async def reject_work_during_shutdown(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def hold_requests_during_restart_resume(request: Request, call_next):
+    # After a deliberate restart (resume_on_start.json) the hub resumes the interrupted sessions
+    # once its port is open. Until that is done (at most 30 s) callers wait here instead of
+    # seeing those sessions interrupted or racing the resume; the desktop app's probes do not.
+    if not hub.restart_resume_gate.is_open and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
+        await hub.restart_resume_gate.wait()
+    return await call_next(request)
+
+
 # ============================================================================
 # 3. Durable parent wait URL and independent console telemetry API
 # ============================================================================
@@ -1377,6 +1388,9 @@ logging.getLogger("uvicorn.access").addFilter(TranscriptPollLogFilter())
 
 
 if __name__ == "__main__":
+    # One client dropping its connection mid-accept must not take the hub off the network
+    # (asyncio's Windows loop would close the listening socket); see windows_accept_guard.
+    windows_accept_guard.install()
     port = hub_port()
     # B11: startup discovery runs in a thread, so the first /api/sessions poll answers at once.
     uvicorn.run(
