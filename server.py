@@ -15,7 +15,9 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+import fastmcp
 from fastmcp import Context, FastMCP
+from fastmcp.utilities.logging import configure_logging as configure_fastmcp_logging
 import uvicorn
 
 from session_manager import (
@@ -1385,6 +1387,13 @@ class TranscriptPollLogFilter(logging.Filter):
 
 # uvicorn's logging setup keeps filters already on its loggers.
 logging.getLogger("uvicorn.access").addFilter(TranscriptPollLogFilter())
+
+# fastmcp logs each failed tool call through rich: a boxed traceback with syntax-highlighted
+# source, rendered synchronously on the event loop. In the live hub on 2026-11-12 one failed
+# set_subagent_approval_rules call held the loop for 1.75 s that way (pygments lexing, regex
+# compiles, imports). Plain logging writes the same traceback in milliseconds.
+fastmcp.settings.enable_rich_logging = False
+configure_fastmcp_logging(level=fastmcp.settings.log_level)
 
 
 if __name__ == "__main__":

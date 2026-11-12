@@ -2,6 +2,16 @@
 
 Design decisions confirmed by the owner. Change a line here before changing the behaviour it records.
 
+## Event-loop stalls (2026-11-12, owner: batch decision page, all defaults)
+
+| id | decision |
+|---|---|
+| fastmcp-log | fastmcp logs through its plain handler, not rich: a rich traceback held the loop 1.6-1.75 s per failed tool call. fastmcp lines in hub.log are `ERROR: ...` plus a standard traceback. |
+| dsh-tls | Every hub call to the DSH host passes `verify=dsh_tls_context()`, one shared TLS context built off the loop at start. The five synchronous `httpx.post` calls to DSH stay synchronous: awaiting them could start two continues for one session without a per-session lock. |
+| record-drain | The DSH session-record drain yields after each payload and still stores the session per payload, which keeps a stop mid-batch from recording a payload twice. |
+| sniffio | The portable runtime ships `sniffio`: httpcore imports it at every lock setup and connection close, and a missing package meant a disk search each time (0.2-0.85 s stalls). |
+| release | Merge and build at once; restart the live hub only on the owner's word, through `resume_on_start.json`. |
+
 ## Parent waiting protocol (2026-11-10, owner: systematic optimization)
 
 | id | decision |
