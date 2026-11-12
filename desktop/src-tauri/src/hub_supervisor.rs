@@ -24,6 +24,8 @@ use crate::windows_process;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const EXTERNAL_MISSES_BEFORE_ERROR: u32 = 3;
+/// Checks in a row an owned hub may run without listening on its port before the error view.
+const NOT_LISTENING_BEFORE_ERROR: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubMode {
@@ -325,6 +327,12 @@ impl HubShell {
 
     async fn start_locked(self: &Arc<Self>, app: &AppHandle) {
         self.cancel_start.store(false, Ordering::SeqCst);
+        // An owned hub can still be running here (the error view for a hub that stopped listening
+        // keeps it, and its sessions, until 重试). Stop it first: a second hub would take the free
+        // port and share its database.
+        if self.st().owned.is_some() {
+            self.stop_owned_locked(app).await;
+        }
         self.set_starting(app, "正在启动 Hub…", "");
         #[cfg(not(feature = "portable"))]
         let config_result = hub_config::load();
@@ -572,10 +580,12 @@ impl HubShell {
         self.start_locked(app).await;
     }
 
-    /// Every 5 s: session counts for the tray, a crashed owned hub → error view, an external hub
-    /// that stopped answering → error view (重试 then starts an owned one).
+    /// Every 5 s: session counts for the tray, a crashed owned hub → error view, an owned hub that
+    /// runs but no longer listens on its port → error view (its sessions keep running until 重试),
+    /// an external hub that stopped answering → error view (重试 then starts an owned one).
     pub async fn watch(self: Arc<Self>, app: AppHandle) {
         let mut external_misses = 0u32;
+        let mut not_listening = 0u32;
         loop {
             tokio::time::sleep(STATUS_INTERVAL).await;
             match self.mode() {
@@ -583,12 +593,33 @@ impl HubShell {
                     external_misses = 0;
                     if let Ok(_guard) = self.ops.try_lock() {
                         if let Some(code) = self.owned_exit() {
+                            not_listening = 0;
                             if let Some(owned) = self.st().owned.take() {
                                 owned.terminate();
                             }
                             self.fail(
                                 &app,
                                 &format!("Hub 进程意外退出了（退出码 {code}）。"),
+                                true,
+                            );
+                            continue;
+                        }
+                        // Connections that were already open keep working, so session counts
+                        // alone would not notice; the port itself says whether new ones can come in.
+                        let port = self.st().config.as_ref().map(|c| c.port).unwrap_or(0);
+                        if port != 0 && windows_process::listening_pid(port).is_none() {
+                            not_listening += 1;
+                        } else {
+                            not_listening = 0;
+                        }
+                        if not_listening >= NOT_LISTENING_BEFORE_ERROR {
+                            not_listening = 0;
+                            self.fail(
+                                &app,
+                                &format!(
+                                    "Hub 进程仍在运行，但已不再接受新连接（端口 {port} 没有在监听）。\
+                                     点「重试」会重启 Hub：运行中的会话会中断，之后可在「归档」里恢复。"
+                                ),
                                 true,
                             );
                             continue;

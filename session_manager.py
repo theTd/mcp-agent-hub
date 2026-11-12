@@ -39,6 +39,7 @@ from transcript_feed import (
 from dsh_session_record import (
     DshSessionRecordReader, RecordDecodeError, locate_dsh_session_record, native_events_to_telemetry,
 )
+from dsh_mailbox_replay import DshMailboxReplay
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
@@ -1904,6 +1905,28 @@ def _keep_dsh_record_seq(old_ref: Optional[Dict[str, Any]], new_ref: Dict[str, A
         if value is not None:
             new_ref[key] = value
     return new_ref
+
+
+# The hub records a DSH turn's end a moment after the job's `endedAt` (it polls the job status).
+DSH_END_RECORD_SLACK_SEC = 5.0
+
+
+def _dsh_end_unrecorded(job: Dict[str, Any], last_turn_completed_at: Optional[float]) -> bool:
+    """True when the hub has no turn end recorded since this ended DSH job ended.
+
+    That happens when the job ended while the hub was stopped or killed. Without a readable
+    `endedAt` it cannot be told, and the job is treated as already recorded (the old behaviour).
+    """
+    ended = str((job or {}).get("endedAt") or "")
+    if not ended:
+        return False
+    try:
+        ended_at = datetime.datetime.fromisoformat(ended.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    if last_turn_completed_at is None:
+        return True
+    return float(last_turn_completed_at) < ended_at - DSH_END_RECORD_SLACK_SEC
 
 
 class AgentSession:
@@ -4991,6 +5014,7 @@ class HubSessionManager:
         new_job = ""
         cjob: Dict[str, Any] = {}
         jstatus: Optional[str] = None
+        jview: Dict[str, Any] = {}
         dsh_send_mode = "attach"
 
         preparation = await self._prepare_dsh_workspace(
@@ -5067,6 +5091,20 @@ class HubSessionManager:
                     DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=f"任务状态为 {jstatus or '未知'}")
                 )
 
+        # Watching the same job again replays its whole mailbox; the hub's records say which
+        # messages and questions it already handled before it stopped (dsh_mailbox_replay).
+        replay: Optional[DshMailboxReplay] = None
+        history: Dict[str, Any] = {}
+        if not clean or dsh_send_mode == "message":
+            history = await self.db.read("get_mailbox_history", session_id) or {}
+            pending = record.get("pending_interaction")
+            replay = DshMailboxReplay.from_history(
+                history, self._interaction_ids(pending) if isinstance(pending, dict) else ()
+            )
+        # A job that ended while the hub was stopped has steps and a result nobody has read yet.
+        catch_up = (not clean and jstatus in DSH_ENDED_JOB_STATUSES
+                    and _dsh_end_unrecorded(jview, history.get("last_turn_completed_at")))
+
         sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
         sess.sandbox_preparation = preparation
         sess.profile_snapshot["sandbox_preparation"] = preparation
@@ -5119,6 +5157,10 @@ class HubSessionManager:
             sess.dsh_token = old_token or ""
             sess.status = "completed"
             sess.current_activity = f"Re-attached ended DSH job {job_id} ({jstatus})"
+            if catch_up:
+                # The watcher reads the rest and ends the turn itself (status, result, parent wake).
+                sess.status = "running"
+                sess.current_activity = f"Reading the end of DSH job {job_id} ({jstatus} while the hub was stopped)"
             if old_token:
                 sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
         await self.persist_session(sess)
@@ -5132,11 +5174,16 @@ class HubSessionManager:
             },
         )
         if clean:
+            # A message to the still-running job watches that job again: same rules as re-attaching.
+            same_job = dsh_send_mode == "message"
             self._schedule(self._watch_dsh_hub_job(
-                sess, new_job, sess.dsh_token or token
+                sess, new_job, sess.dsh_token or token,
+                reattach=same_job, replay=replay if same_job else None,
             ))
-        elif jstatus in ("running", "needs_input"):
-            self._schedule(self._watch_dsh_hub_job(sess, job_id, sess.dsh_token or token, reattach=True))
+        elif jstatus in ("running", "needs_input") or catch_up:
+            self._schedule(self._watch_dsh_hub_job(
+                sess, job_id, sess.dsh_token or token, reattach=True, replay=replay
+            ))
         injection = "dsh_continue" if clean else "dsh_attach"
         delivery = {
             "delivered": bool(clean),
@@ -10769,10 +10816,14 @@ class HubSessionManager:
                 return
 
     async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str, *,
-                                 log_path: Optional[Path] = None, reattach: bool = False):
+                                 log_path: Optional[Path] = None, reattach: bool = False,
+                                 replay: Optional[DshMailboxReplay] = None):
         """
         Tails ~/.config/dsh-crew/logs/<job_id>.log for real-time steps/tools/thoughts AND
         polls /_dsh/dsh-crew/jobs/<job_id>/messages for bidirectional worker->parent messages & questions!
+
+        `replay` (a job watched again after a hub restart): the first mailbox batch is the job's
+        whole mailbox, and entries the hub already handled before it stopped are skipped.
         """
         if session.terminated_by_user:
             # Q4: never attach, persist or emit for a session the user already terminated.
@@ -10910,6 +10961,10 @@ class HubSessionManager:
                             mkind = m.get("kind")
                             mtext = m.get("text", "")
                             mid = m.get("message_id") or f"dsh-msg-{seq}"
+                            if (replay is not None and mkind == "message"
+                                    and replay.already_handled(mid, mtext, bool(m.get("expects_reply")))):
+                                msg_cursor = max(msg_cursor, seq)
+                                continue
                             if mkind == "message":
                                 if m.get("expects_reply"):
                                     # Parse options from DSH worker-question handoff format: `Options: A | B | C`
@@ -10969,6 +11024,8 @@ class HubSessionManager:
                                             },
                                         )
                             msg_cursor = max(msg_cursor, seq)
+                        # Only the first batch read after re-attaching is the replay.
+                        replay = None
                 except PersistenceUnavailable:
                     raise
                 except Exception:

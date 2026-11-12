@@ -473,6 +473,33 @@ class HubDatabase:
                 result.append(item)
             return result
 
+    def get_mailbox_history(self, session_id: str) -> Dict[str, Any]:
+        """What the hub already did with a session's worker mailbox (see dsh_mailbox_replay).
+
+        `requests`: request ids of the questions and approvals it registered; `texts`: worker
+        messages it passed on (and auto-approval notices it stored); `last_turn_completed_at`: when
+        it last recorded the end of a turn, or None.
+        """
+        with self._conn() as conn:
+            requests = [row[0] for row in conn.execute(
+                "SELECT DISTINCT request_id FROM worker_events WHERE session_id=? "
+                "AND type IN ('approval_request', 'question') AND request_id IS NOT NULL AND request_id != ''",
+                (session_id,),
+            )]
+            texts = [row[0] for row in conn.execute(
+                "SELECT content FROM worker_events WHERE session_id=? AND type='message_to_parent'",
+                (session_id,),
+            )]
+            texts += [row[0] for row in conn.execute(
+                "SELECT content FROM intermediate_messages WHERE session_id=? AND source='dsh_auto_approval_notice'",
+                (session_id,),
+            )]
+            last = conn.execute(
+                "SELECT MAX(timestamp) FROM worker_events WHERE session_id=? AND type='turn_completed'",
+                (session_id,),
+            ).fetchone()[0]
+        return {"requests": requests, "texts": texts, "last_turn_completed_at": last}
+
     def list_persisted_sessions(self, limit: int = 30, include_archived: bool = True) -> List[Dict[str, Any]]:
         """Session summary rows; `include_archived=False` is "live + ended-in-memory" (spec §6)."""
         where = "" if include_archived else "WHERE archived_at IS NULL"
