@@ -57,6 +57,13 @@ class DshTlsContextTests(unittest.TestCase):
         self.assertEqual(missing, [], "session_manager.py: httpx calls without verify=dsh_tls_context()")
 
 
+class PortableDependencyTests(unittest.TestCase):
+    def test_the_portable_lock_ships_sniffio(self):
+        # Without it httpcore's import attempt searches sys.path on disk at every lock and close.
+        lock = (HUB_DIR / "desktop" / "portable" / "requirements.lock").read_text(encoding="utf-8")
+        self.assertRegex(lock, r"(?m)^sniffio==")
+
+
 class WorkerEventsIndexTests(unittest.TestCase):
     def test_session_reads_use_the_index(self):
         with tempfile.TemporaryDirectory(prefix="hub-index-", ignore_cleanup_errors=True) as root:
