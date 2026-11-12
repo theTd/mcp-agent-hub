@@ -78,6 +78,7 @@ def main():
     check(not (runtime / "downloads").exists(), "cached EXE startup makes zero Python downloads")
     check(not (source / "hub_worker.py").exists() and not (source / "worker_bridge_mcp.py").exists(), "retired worker bridge is absent")
     check((source / "native_session_launch.py").is_file(), "native launch configuration helper is packaged")
+    check((source / "compaction_threshold.py").is_file(), "per-session compaction threshold helper is packaged")
     check((source / "agent_guidance.py").is_file(), "English agent guidance is packaged")
     check((source / "parent_waiting.py").is_file(), "bounded parent waiting contract is packaged")
     check((source / "dsh_workspace_permissions.py").is_file()

@@ -42,6 +42,10 @@ from dsh_session_record import (
 from dsh_mailbox_replay import DshMailboxReplay
 from restart_resume_request import RestartResumeGate, RestartResumeRequest, wait_for_port
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
+from compaction_threshold import (
+    CLAUDE_PCT_ENV, CODEX_TOKEN_LIMIT_KEY, check_compaction_conflicts, check_compaction_support,
+    format_compaction_threshold, normalize_compaction_threshold, write_omp_compaction_overlay,
+)
 from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
     build_mcp_args, merge_claude_settings, replace_claude_settings,
@@ -11809,6 +11813,7 @@ class HubSessionManager:
         disabled_mcp_servers: Optional[List[str]] = None,
         strict_mcp_config: bool = False,
         approval_mode: Optional[str] = None,
+        compaction_threshold: Any = None,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
@@ -11840,6 +11845,10 @@ class HubSessionManager:
         profile_env = normalize_env_map(prof.get('env'), field_label='Profile 环境变量（env）')
         caller_env = normalize_env_map(env, field_label='启动环境变量（env）')
         resolved_env: Dict[str, str] = dict(profile_env)
+        compaction = normalize_compaction_threshold(compaction_threshold)
+        if compaction:
+            check_compaction_support(eng, kind, name, compaction)
+            check_compaction_conflicts(eng, base_args, caller_env)
 
         # The desktop app can run the Hub under a restricted Windows token.  Several CLIs write
         # their first-run state before rendering a prompt and otherwise exit immediately when the
@@ -12041,6 +12050,8 @@ class HubSessionManager:
                 injected.extend(['-m', resolved_model])
             if resolved_level:
                 injected.extend(['-c', f'model_reasoning_effort="{resolved_level}"'])
+            if compaction:
+                injected.extend(['-c', f'{CODEX_TOKEN_LIMIT_KEY}={compaction["value"]}'])
             args = injected + args
         elif eng == 'claude':
             if command:
@@ -12061,6 +12072,18 @@ class HubSessionManager:
         # Caller-supplied env vars override both profile defaults and engine-computed defaults.
         if caller_env:
             resolved_env.update(caller_env)
+        if compaction:
+            if eng == 'claude':
+                # The session's own value beats a profile default; a caller env copy was rejected above.
+                resolved_env[CLAUDE_PCT_ENV] = str(compaction['value'])
+            notes.append(
+                f"自动压缩阈值 {format_compaction_threshold(compaction)}："
+                + {
+                    'omp': '启动时为本会话生成 OMP 配置覆盖文件（--config）',
+                    'claude': f'通过 {CLAUDE_PCT_ENV} 传入；Claude 只会因此提前压缩，不会晚于其默认阈值',
+                    'codex': f'通过 -c {CODEX_TOKEN_LIMIT_KEY} 传入',
+                }[eng]
+            )
         if eng == 'claude' and resolved_env.get('CLAUDE_CONFIG_DIR'):
             resolved_env['CLAUDE_CONFIG_DIR'] = os.path.abspath(
                 os.path.expandvars(os.path.expanduser(str(resolved_env['CLAUDE_CONFIG_DIR']).strip()))
@@ -12151,6 +12174,7 @@ class HubSessionManager:
             'thinking_source': thinking_source,
             'cli_model': cli_model,
             'dsh_spec': dsh_spec,
+            'compaction_threshold': compaction,
             'bypass_approvals': bypass,
             **policy,
             'high_risk_approval': high_risk_approval,
@@ -12175,6 +12199,7 @@ class HubSessionManager:
         strict_mcp_config: bool = False,
         auto_approval_rules: Any = None,
         approval_mode: Optional[str] = None,
+        compaction_threshold: Any = None,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
@@ -12188,6 +12213,8 @@ class HubSessionManager:
             validate_mcp_engine("desktop_gui", "desktop_gui", mcp_config)
         if extra_args and profile_id == "desktop-gui":
             raise ValueError("桌面 GUI 会话不支持 extra_args")
+        if profile_id == "desktop-gui" and normalize_compaction_threshold(compaction_threshold):
+            raise ValueError("桌面 GUI 会话不支持自动压缩阈值（compaction_threshold）")
         loop = asyncio.get_running_loop()
 
         if profile_id == "desktop-gui" and hwnd:
@@ -12226,7 +12253,8 @@ class HubSessionManager:
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
                                      bypass_approvals=bypass_approvals, approval_mode=approval_mode,
-                                     extra_args=extra_args, **mcp_config)
+                                     extra_args=extra_args, compaction_threshold=compaction_threshold,
+                                     **mcp_config)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -12242,6 +12270,11 @@ class HubSessionManager:
 
         # Q12: 8 hex characters, wide enough that a reused profile prefix never collides.
         session_id = f'{profile_id}-{uuid.uuid4().hex[:8]}'
+        compaction = launch.get('compaction_threshold')
+        if compaction and engine == 'omp':
+            # Before the snapshot copy below, so a resume passes the same overlay again.
+            overlay = write_omp_compaction_overlay(self.runtime_configs_dir, session_id, compaction)
+            args.append(f'--config={overlay}')
         # Archive spec §3: the resolved launch, as it will really run. The task itself is added below
         # by the task mode and is deliberately NOT part of the snapshot (a resume adds its own message).
         launch_args = list(args)
@@ -12324,6 +12357,7 @@ class HubSessionManager:
             "startup_delay_sec": startup_delay,
             "submit_key": submit_key,
             "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
+            "compaction_threshold": compaction,
             "auto_approval_rules": auto_approval_rules,
             # Round 2: whether this launch had the profile's approval off switch on (a resume
             # re-reads the profile's current value and overwrites this).
