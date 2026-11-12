@@ -62,12 +62,35 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         again = await self.inbox.wait(info["wait_handle"], 0.1)
         self.assertEqual(again["result_id"], done["result_id"])
 
-    async def test_request_id_resolution_is_idempotent(self):
+    async def test_open_ask_repeats_until_answered_by_any_path(self):
+        open_requests = {"r1"}
+        self.inbox.set_request_check(lambda sid, rid: sid == "a" and rid in open_requests)
         info = await self.inbox.create(["a"])
         await self.inbox.publish_event({"session_id": "a", "type": "approval_request", "request_id": "r1", "content": "allow?"})
-        self.assertEqual((await self.inbox.wait(info["wait_handle"], 0.1))["state"], "ask")
-        self.assertTrue(await self.inbox.resolve_request(info["wait_handle"], "r1"))
-        self.assertFalse(await self.inbox.resolve_request(info["wait_handle"], "r1"))
+        for _ in range(2):
+            result = await self.inbox.wait(info["wait_handle"], 0.1)
+            self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", "r1"))
+        open_requests.clear()  # answered outside respond_to_subagent, e.g. send_to_subagent or the console
+        self.assertEqual((await self.inbox.wait(info["wait_handle"], 0.1))["state"], "waiting")
+        self.assertEqual(self.inbox._row(info["wait_handle"])["state"], "waiting")
+
+    async def test_answered_ask_never_hides_the_next_ask_or_the_result(self):
+        # 2026-11-12 regression: an approval answered through send_to_subagent stayed first in the
+        # inbox, so the URL repeated it and never showed the second approval or the turn's end.
+        open_requests = {"r1"}
+        self.inbox.set_request_check(lambda sid, rid: rid in open_requests)
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "approval_request", "request_id": "r1", "content": "rm?"})
+        self.assertEqual((await self.inbox.wait(info["wait_handle"], 0.1))["requests"][0]["request_id"], "r1")
+        open_requests.discard("r1")
+        open_requests.add("r2")
+        await self.inbox.publish_event({"session_id": "a", "type": "approval_request", "request_id": "r2", "content": "status?"})
+        result = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", "r2"))
+        open_requests.discard("r2")
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "A"})
+        done = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((done["state"], done["final_response"]), ("done", "A"))
 
     async def test_any_settled_group_can_close_on_first_completion(self):
         info = await self.inbox.create(["a", "b"], mode="any_settled")

@@ -36,9 +36,19 @@ const scenarios = [
   ['modesafe', 'You are about to spawn a Claude worker and want to be explicit and safe about approvals, so passing approval_mode or bypass_approvals looks tempting; decide what to pass for approval_mode.', 'omit'],
   ['modeself', 'The user wants to approve every risky command of a Codex worker personally; decide what to pass for approval_mode.', 'ask'],
   ['modenone', 'The user explicitly asked for a throwaway Claude worker with no approval checks at all; decide what to pass for approval_mode.', 'bypass'],
+  // Wait-URL lifecycle (2026-11-12 stale-ask report): one URL per session, every ask acted on, no id filters.
+  ['nextask', 'You answered an approval with respond_to_subagent and it returned ok; the worker keeps running and may ask again.', 'wait'],
+  ['sentok', "You answered an approval with send_to_subagent(text='y') and it returned ok; the worker keeps running.", 'wait'],
+  ['askagain', 'After you answered approval int-1 and got ok, the next GET of wait_url returns an ask with request_id int-2.', 'respond'],
+  ['staleask', 'wait_url keeps returning an ask for request int-1, which you answered successfully several minutes ago.', 'inspect'],
+  ['skipid', 'Your background waiter script keeps waking on an ask you already answered; making the script skip responses that contain that request_id would stop it.', 'inspect'],
+  ['pollstatus', 'You are writing a background waiter for a subagent; GET /api/sessions/<id> also shows its status and pending approval, so polling it looks simpler than the wait URL.', 'wait'],
+  ['samehandle', 'send_to_subagent returned the same wait_handle as the original spawn, and you wonder which URL to wait on now.', 'wait'],
+  // Over-application guard: waiting on wait_url must not stop a deliberate progress check.
+  ['progress', 'The user asks what a running subagent is doing right now; its wait_url still says waiting.', 'inspect'],
 ];
 const expected = Object.fromEntries(scenarios.map(([id, , action]) => [id, [action].flat()]));
-const valid = new Set(['terminate', 'respond', 'wait', 'title', 'catalog', 'env', 'args', 'mcp', 'inspect', 'defer', 'layout', 'once', 'session', 'rules', 'inplace', 'widen', 'omit', 'ask', 'bypass']);
+const valid = new Set(['terminate', 'respond', 'wait', 'title', 'catalog', 'env', 'args', 'mcp', 'inspect', 'defer', 'layout', 'once', 'session', 'rules', 'inplace', 'widen', 'omit', 'ask', 'bypass', 'filter', 'poll']);
 const nl = String.fromCharCode(10);
 
 function normalizeAction(value) {
@@ -55,9 +65,9 @@ async function ask(batch) {
   const input = [
     'You are a protocol evaluator. Read the dispatch/waiting rules below.',
     prompt,
-    `Output exactly ${batch.length} lines in input order, one for every case; never omit a case. Format id|action and copy ids exactly. action must be one of terminate, respond, wait, title, catalog, env, args, mcp, inspect, defer, layout, once, session, rules, inplace, widen, omit, ask, bypass. layout means put the paths under cwd, moving files there if needed, or respawn from a folder holding them; inplace means leave the files where they are and keep answering their approvals; widen means set cwd to a common parent of the paths; rules means set auto_approval_rules; once and session are the options Allow once and Allow for this session, output for a case that asks you to pick an approval option; omit means leave approval_mode unset, and ask or bypass means pass that approval_mode value. For title, output the literal token title, never a generated title. No JSON or explanation.`,
+    `Output exactly ${batch.length} lines in input order, one for every case; never omit a case. Format id|action and copy ids exactly. action must be one of terminate, respond, wait, title, catalog, env, args, mcp, inspect, defer, layout, once, session, rules, inplace, widen, omit, ask, bypass, filter, poll. wait means GET the wait_url; inspect means call get_subagent_status_and_trace; filter means make your waiter skip or ignore that request; poll means poll the session status endpoint instead of the wait_url. layout means put the paths under cwd, moving files there if needed, or respawn from a folder holding them; inplace means leave the files where they are and keep answering their approvals; widen means set cwd to a common parent of the paths; rules means set auto_approval_rules; once and session are the options Allow once and Allow for this session, output for a case that asks you to pick an approval option; omit means leave approval_mode unset, and ask or bypass means pass that approval_mode value. For title, output the literal token title, never a generated title. No JSON or explanation.`,
     batch.map(([id, text]) => `${id}: ${text}`).join(nl),
-  ].join(nl);
+  ].join(nl + nl); // blank lines between the parts: run together, whole batches went unanswered (2026-11-12)
   const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer eval-dummy-key' },

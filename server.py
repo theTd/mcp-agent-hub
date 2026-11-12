@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 import fastmcp
 from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from fastmcp.utilities.logging import configure_logging as configure_fastmcp_logging
 import uvicorn
 
@@ -216,6 +218,42 @@ mcp = FastMCP(
     version=HUB_VERSION,
     instructions=SERVER_INSTRUCTIONS,
 )
+
+
+# A parent connected before a hub update may still hold a tool list with these names; its call
+# reaches the server and would otherwise get a bare "Unknown tool".
+RETIRED_TOOL_HINTS = {
+    "respond_to_subagent_approval_or_choice": (
+        "respond_to_subagent",
+        "Until then, answer the pending request with send_to_subagent(session_id, text='approve' / "
+        "'deny' / an option number); it resolves the same request.",
+    ),
+    "reply_to_subagent": (
+        "send_to_subagent or respond_to_subagent",
+        "Until then, send_to_subagent(session_id, text) delivers a reply.",
+    ),
+    "wait_subagent_events": (
+        "the wait_url that every spawn/send/respond result returns",
+        "Until then, GET that wait_url; it needs no other tool.",
+    ),
+}
+
+
+class RetiredToolMiddleware(Middleware):
+    """Turn a call to a renamed tool into a hint instead of a bare unknown-tool error."""
+
+    async def on_call_tool(self, context, call_next):
+        hint = RETIRED_TOOL_HINTS.get(context.message.name)
+        if hint is None:
+            return await call_next(context)
+        replacement, fallback = hint
+        raise ToolError(
+            f"{context.message.name} is retired; use {replacement} instead. Your client's tool list predates "
+            f"a hub update, so reconnect the agent-hub MCP server to refresh it. {fallback}"
+        )
+
+
+mcp.add_middleware(RetiredToolMiddleware())
 
 
 @mcp.tool()
@@ -571,8 +609,6 @@ async def respond_to_subagent(
             custom_input=custom_input if custom_input is not None else answer,
             request_id=request_id,
         )
-        if request_id and session.wait_handle:
-            await hub.wait_inbox.resolve_request(session.wait_handle, request_id)
     if not session.wait_handle:
         wait = await _wait_contract([session_id], turn_ids={session_id: session.turn_id})
         session.wait_handle = wait["wait_handle"]

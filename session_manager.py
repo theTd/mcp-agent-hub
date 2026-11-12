@@ -2941,6 +2941,7 @@ class HubSessionManager:
         self._event_waiters: Set[asyncio.Event] = set()
         self._shutting_down: bool = False
         self.wait_inbox.set_state_provider(self._wait_state_snapshot)
+        self.wait_inbox.set_request_check(self._request_awaits_parent)
 
         # B11: the constructor must never shell out to five CLIs. It loads the profile file at once
         # (using whatever discovery already has) and finishes discovery on a background thread, so
@@ -3016,6 +3017,21 @@ class HubSessionManager:
                         sum(1 for r in results.values() if r.get("ok")),
                         sum(1 for r in results.values() if not r.get("ok")))
 
+    def _request_awaits_parent(self, session_id: str, request_id: str) -> bool:
+        """True while ``request_id`` is a live request that nobody has answered yet.
+
+        A response that is sent but not yet natively confirmed counts as answered:
+        respond_to_interaction refuses to answer it again, so the parent must not see it again.
+        """
+        sess = self.sessions.get(session_id)
+        if sess is None or not request_id:
+            return False
+        inter = sess.pending_interaction
+        if inter and request_id in self._interaction_ids(inter):
+            return (inter.get("metadata") or {}).get("response_state") not in ("sent", "unconfirmed")
+        entry = self.pending_questions.get(request_id)
+        return bool(entry and not entry.get("answered") and sess.pending_question_id == request_id)
+
     async def _wait_state_snapshot(self, session_ids: List[str]) -> Dict[str, Any]:
         """Compact state provider used by WaitInbox after a restart or a quiet turn."""
         pending = []
@@ -3023,8 +3039,9 @@ class HubSessionManager:
         for sid in session_ids:
             sess = self.sessions.get(sid)
             if sess is not None:
-                if sess.pending_interaction:
-                    pending.append(dict(sess.pending_interaction))
+                inter = sess.pending_interaction
+                if inter and self._request_awaits_parent(sid, str(inter.get("request_id") or "")):
+                    pending.append(dict(inter))
                 states.append({
                     "session_id": sid,
                     "status": sess.status,

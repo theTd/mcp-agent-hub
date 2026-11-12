@@ -138,3 +138,40 @@ Owner 要求：引擎有原生自动审批时默认使用，主 Agent 只有刻�
 | 定稿：refactor 行写明 companion kimi max | 3 | 0 | 0 | 已上线 |
 
 对照：未改的线上路由配旧场景 2 轮无错误，因此 refactor companion 的漏判归因于本次改动或新场景改变了分批，定稿在路由表行内直接写明 companion 后消除。所有版本（含 master 基线）都会偶发评测器格式噪声：id 后带冒号或整行缺失（基线一轮缺 9 行），不计入路由错误。线上路由从 3,831 字节增至 4,083 字节（+6.6%）；评测输入每次调用约 1,474 tokens，线上原版约 1,391（+6.0%）。
+
+## 等待 URL 生命周期（2026-11-12，过期 ask 报告）
+
+起因：会话 `codex-97e45358` 的第一个审批用 `send_to_subagent(text="y")` 回答后，wait URL 一直返回这条已回答的请求。它挡住了第二个审批（Worker 空等 27 分钟），回合结束后也不返回 done。Hub 侧原因：wait inbox 只在 `respond_to_subagent` 带 request_id 时才清除 ask。修复后，inbox 交出 ask 前先向会话确认该请求仍待回答，任何回答路径都生效。调用方侧的偏差有两处：等待脚本按 request_id 跳过重复的 ask，因此连新请求一起藏住；之后又改为轮询 `/api/sessions`。基线提示词下评测器复现了这两种做法（`skipid` 0/10 判 filter，`pollstatus` 0/10 判 poll）。
+
+改动：`WAIT_HANDLE_HINT` 改写为一条完整的 Waiting 规则：
+- 一个会话或派发组在所有回合共用同一个 wait_url；
+- 每个 ask 立即用 request_id 回答，回答后、任务未完成时都再 GET；
+- 已回答的请求不会再出现，若重复出现，调用 `get_subagent_status_and_trace` 并报告 Hub 故障；
+- 等待脚本不得按 request_id 跳过、过滤或去重；
+- 只在 wait_url 上等待，不轮询会话状态。
+
+开头一段和最后一条里与它重复的等待说明删去，unconfirmed 规则并入这一条。
+
+`tools/dispatch-prompt-stress.mjs` 新增 8 个场景，并新增动作 `filter`（让等待脚本跳过该请求）和 `poll`（轮询会话状态端点代替 wait_url）：
+- `nextask`、`sentok`：回答后继续等，期望 wait；
+- `askagain`：新 request_id 的 ask，期望 respond；
+- `staleask`、`skipid`：已回答的请求重复出现，期望 inspect；
+- `pollstatus`：想用 `/api/sessions` 代替 wait_url，期望 wait；
+- `samehandle`：send 返回与 spawn 相同的 handle，期望 wait；
+- `progress`：防过度执行，主动查看进度，期望 inspect。
+
+请求的四个部分之间改为空行分隔，与压测 skill 的布局一致。
+
+压测（本机 8789 评测器，skill 的 `stress.mjs` 加转换后的 `hub-dispatch.json`，33 个场景、5 次重复、每批 25 个输入，每版 2 轮）：
+
+| 版本 | 结果 | staleask | skipid | pollstatus | nextask | askagain | unfinished | 字节 |
+|---|---|---|---|---|---|---|---|---|
+| 基线（master） | `283/330`（另缺 3 行） | 1/10 | 0/10 | 0/10 | 10/10 | 10/10 | 6/10 | 3,925 |
+| v1：压缩合并 | `311/330` | 10/10 | 4/10 | 8/10 | 8/10 | 7/10 | 7/10 | 4,000 |
+| v2：拆开回答与再 GET，恢复 unfinished（定稿） | `317/330` | 10/10 | 4/10 | 7/10 | 10/10 | 9/10 | 10/10 | 4,093 |
+| v3：禁止过滤并入故障句，点名 `/api/sessions` | `315/330` | 10/10 | 4/10 | 5/10 | 10/10 | 10/10 | 10/10 | 4,111 |
+| v4：改写为正向表述（脚本原样交回每个结果） | `308/330` | 10/10 | 0/10 | 7/10 | 9/10 | 9/10 | 10/10 | 4,127 |
+
+v1 压缩时漏掉了旧规则里的“任务未完成时 GET wait_url”，`unfinished` 因此出现 defer。“GET again for the next ask” 又让 `askagain` 判成 wait。v2 把两件事拆开，并恢复 unfinished 子句。`skipid` 在各版本都停在 4/10，正向表述（v4）反而降到 0/10。所以这个场景主要靠 Hub 修复兜底：已回答的请求不再重复出现，就没有需要过滤的东西。定稿比基线多 168 字节（+4.3%），每次请求的输入约 1,756 tokens（基线 1,711）。
+
+另有一项改动：调用已改名的工具（`respond_to_subagent_approval_or_choice`、`reply_to_subagent`、`wait_subagent_events`）时，Hub 返回替代工具名、“重连 agent-hub MCP 刷新工具列表”的提示和一个当下可用的替代做法，不再只返回 Unknown tool。起因：上报会话从 11-10 起一直连着，客户端工具列表没有随 Hub 更新刷新。

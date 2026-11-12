@@ -21,6 +21,7 @@ WAKE_EVENT_TYPES = frozenset({
     "approval_request", "question", "delivery_failed", "turn_completed",
     "session_exited", "exited", "crashed", "hub_shutdown",
 })
+ASK_EVENT_TYPES = frozenset({"approval_request", "question"})
 TERMINAL_FAILURE_TYPES = frozenset({"delivery_failed", "crashed", "session_exited", "exited"})
 
 
@@ -46,10 +47,20 @@ class WaitInbox:
         self._lock = asyncio.Lock()
         self._waiters: Dict[str, tuple[str, asyncio.Future]] = {}
         self._state_provider: Optional[Callable[[List[str]], Awaitable[Dict[str, Any]]]] = None
+        self._request_check: Optional[Callable[[str, str], bool]] = None
         self._init_db()
 
     def set_state_provider(self, provider: Callable[[List[str]], Awaitable[Dict[str, Any]]]) -> None:
         self._state_provider = provider
+
+    def set_request_check(self, check: Callable[[str, str], bool]) -> None:
+        """``check(session_id, request_id)`` is True while that request still awaits the parent.
+
+        The inbox asks it before it hands out an ask, so a request answered by any path
+        (respond_to_subagent, send_to_subagent, the console, an automatic rule, the native
+        TUI) or gone with its session leaves the wait URL at once.
+        """
+        self._request_check = check
 
     def _connect(self):
         conn = sqlite3.connect(str(self.db_path), timeout=2.0, factory=_ClosingConnection)
@@ -224,19 +235,10 @@ class WaitInbox:
     async def publish_shutdown(self) -> None:
         await self.publish_event({"type": "hub_shutdown", "session_id": "", "content": "Hub shutdown"})
 
-    async def resolve_request(self, handle: str, request_id: str) -> bool:
-        if not request_id:
-            return False
-        with self._connect() as conn:
-            row = conn.execute("SELECT 1 FROM wait_handles WHERE handle=?", (handle,)).fetchone()
-            if not row:
-                raise WaitHandleError("unknown wait handle")
-            cur = conn.execute(
-                "UPDATE wait_inbox_events SET consumed=1 WHERE handle=? AND request_id=? AND consumed=0",
-                (handle, request_id),
-            )
-            conn.execute("UPDATE wait_handles SET state='waiting',updated_at=? WHERE handle=? AND state='ask'", (time.time(), handle))
-            return cur.rowcount > 0
+    def _request_open(self, event: Dict[str, Any], request_id: Optional[str]) -> bool:
+        if self._request_check is None:
+            return True
+        return bool(self._request_check(str(event.get("session_id") or ""), str(request_id or event.get("request_id") or "")))
 
     async def update_turn(self, handle: str, session_id: str, turn_id: str) -> None:
         with self._connect() as conn:
@@ -249,18 +251,28 @@ class WaitInbox:
 
     async def _next_event(self, handle: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM wait_inbox_events WHERE handle=? AND consumed=0 ORDER BY id LIMIT 1", (handle,)
-            ).fetchone()
-            if not row:
-                return None
-            item = self._load(row["payload_json"], {})
-            item["result_id"] = row["result_id"] or item.get("result_id")
-            # At-least-once delivery uses the stable result/request id.  Marking here is safe for
-            # retries because a disconnect can replay the persisted result through the handle row.
-            if row["event_type"] not in ("approval_request", "question"):
+            rows = conn.execute(
+                "SELECT * FROM wait_inbox_events WHERE handle=? AND consumed=0 ORDER BY id", (handle,)
+            ).fetchall()
+            for row in rows:
+                item = self._load(row["payload_json"], {})
+                item["result_id"] = row["result_id"] or item.get("result_id")
+                if row["event_type"] in ASK_EVENT_TYPES:
+                    # An ask is repeated until it is answered, then never again: the inbox
+                    # checks the live request instead of trusting one answer path to clear it.
+                    if self._request_open(item, row["request_id"]):
+                        return item
+                    conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (row["id"],))
+                    conn.execute(
+                        "UPDATE wait_handles SET state='waiting',updated_at=? WHERE handle=? AND state='ask'",
+                        (time.time(), handle),
+                    )
+                    continue
+                # At-least-once delivery uses the stable result/request id.  Marking here is safe for
+                # retries because a disconnect can replay the persisted result through the handle row.
                 conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (row["id"],))
-            return item
+                return item
+            return None
 
     async def _snapshot(self, handle: str) -> Dict[str, Any]:
         row = self._row(handle)
