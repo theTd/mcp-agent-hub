@@ -15,6 +15,19 @@ Planned design: `docs/rust-terminal-core.md`. Nothing in it is implemented yet.
 | terminal-core-batching | The core's per-session coalescing is the only PTY output batching; the separate Python-side output batching unit is dropped and never lands. |
 | terminal-core-conpty | The core uses the system ConPTY through the `windows` crate (`CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`), not the bundled `conpty.dll` / `OpenConsole.exe` pywinpty ships. Existing captures came from the bundled implementation, so parser fixtures are re-recorded against the system version. |
 
+## Rust terminal core, implementation (2026-11-13, decided by the orchestrator, pending owner review)
+
+Medium decisions taken while building steps 0 and 1. Each is easy to reverse; the last column says how.
+
+| id | decision | alternative not taken | how to reverse |
+|---|---|---|---|
+| oracle-bugs | Today's Python is the oracle, bugs included. The W9 "newest banner" block restores only the banner's leading `\r\n`, and a cut inside the banner line drops the banner; both are frozen in the goldens (doc §8, §10). | Fix the hub rule first, then render the goldens. | Change the rule in the Rust ring later; one golden update. |
+| replay-shape | The console replay is what `attach_ws_queue` sends today: the joined raw ring (≤ 512 KiB + 64 KiB slack), then one more OSC colour-query strip over the whole text (doc §6.4). | Replay the 512 KiB `_scrollback_blob` trim. | One golden and one call in the core. |
+| write-contract | `write` queues all or nothing: it returns the bytes queued, 0 for empty text, and raises `TimeoutError` when the queue is still full at the deadline (doc §5.2). | Partial writes that return a count. | Contract change in §5.2 and in step 3's caller. |
+| kill-all-parallel | `kill_all` terminates every session in parallel inside one 2 s budget. | Serial, with a per-session cap. | Local to the core. |
+| scrub-uuids | The corpus scrub replaces every UUID-shaped token and `session_<hex>` with a placeholder. | Engine-specific rules only. | Narrow the rule and re-render. |
+| tests-fail-without-pyd | `test_terminal_core_client.py` fails, not skips, when the extension is missing: after the cut-over the hub cannot run without it. | Skip with a warning. | One decorator. |
+
 ## Event-loop stalls (2026-11-12, owner: batch decision page, all defaults)
 
 | id | decision |
