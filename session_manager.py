@@ -1986,7 +1986,28 @@ class HubTerminalStream(pyte.Stream):
     pyte resets its parser when a handler raises but re-raises, and Stream.feed then abandons every
     byte after it (the raw scrollback kept them, the screen model did not). Here the failed
     character is dropped and the next one is parsed by the fresh parser.
+
+    Also drops the CSIs pyte ends early (``_split_marker_csi``): a kitty-keyboard marker such as
+    kimi's ``ESC[<u`` used to reach the screen as the text ``u``.
     """
+
+    def __init__(self, screen: Optional[pyte.Screen] = None, strict: bool = True) -> None:
+        super().__init__(screen, strict)
+        self._marker_csi_carry = ""
+
+    def feed(self, data: str) -> None:
+        if not self._marker_csi_carry and "\x1b" not in data and "\x9b" not in data:
+            # No escape byte and nothing held over: the filter could not change this text, and the
+            # per-call cost matters because virtual sessions feed one character at a time.
+            super().feed(data)
+            return
+        # A PTY chunk can split any sequence; the kept tail goes in front of the next chunk, so the
+        # filter always sees whole sequences.
+        text = self._marker_csi_carry + data
+        self._marker_csi_carry = ""
+        filtered, self._marker_csi_carry = _split_marker_csi(text)
+        if filtered:
+            super().feed(filtered)
 
     def _send_to_parser(self, data: str) -> Optional[bool]:
         try:
@@ -1994,6 +2015,83 @@ class HubTerminalStream(pyte.Stream):
         except Exception:
             # pyte's own handler already re-initialised the parser; report its plain-text state.
             return self._taking_plain_text
+
+
+# pyte 0.8.2 ends a CSI at the first byte that is not a digit, ';', '?', a space or '>', and
+# dispatches that byte as the final character. ECMA-48, and the vte parser of the coming Rust core,
+# read 0x30-0x3F as parameter bytes instead. The three bytes where the two readings differ are the
+# ones the CLIs send: ':' (SGR subparameters) and the '<' '=' private markers of the kitty keyboard
+# protocol (kimi and omp send ESC[<u, agy ESC[=5;1u and ESC[<1u).
+_CSI_MARKER_CHARS = ":<="
+# pyte's two CSI starts: ESC [ and the 8-bit CSI, which pyte accepts as one.
+_CSI_START_RE = re.compile("\x1b\\[|\x9b")
+# A real CSI is a few dozen bytes. A longer unterminated run can only be junk, and pyte holds such a
+# run in its own parser anyway, so the filter stops carrying it rather than buffering without bound.
+_CSI_CARRY_MAX = 512
+
+
+def _split_marker_csi(text: str) -> Tuple[str, str]:
+    """Splits PTY text into ``(what pyte must parse, a trailing partial CSI for the next chunk)``.
+
+    A CSI whose parameter bytes include ':' '<' or '=' is removed whole: vte reads the same bytes as
+    one sequence and draws nothing for it, while pyte would draw the rest of the sequence as text.
+    Every sequence pyte parses today is handed over unchanged - '?' private modes, '>' secondary
+    parameters, '$', and CAN/SUB cancelling a sequence (the CAN/SUB itself stays in the text, so
+    pyte's own cancel path still runs).
+    """
+    kept: List[str] = []
+    pos = 0
+    length = len(text)
+    while True:
+        match = _CSI_START_RE.search(text, pos)
+        if match is None:
+            tail = text[pos:]
+            if tail.endswith("\x1b"):
+                # An ESC at the very end: the next chunk decides what it starts, and pyte holds it
+                # in its own parser meanwhile, so nothing is drawn either way.
+                kept.append(tail[:-1])
+                return "".join(kept), "\x1b"
+            kept.append(tail)
+            return "".join(kept), ""
+        start = match.start()
+        kept.append(text[pos:start])
+        i = match.end()
+        marker = False
+        final_end = -1  # just past the final byte: where pyte itself ends the sequence
+        cancel_at = -1  # the CAN/SUB that cancels the sequence
+        while i < length:
+            char = text[i]
+            if "@" <= char <= "~":      # final byte: the CSI is complete
+                final_end = i + 1
+                break
+            if " " <= char <= "?":      # parameter and intermediate bytes
+                if char in _CSI_MARKER_CHARS:
+                    marker = True
+                i += 1
+            elif char == "\x7f":
+                i += 1                  # DEL is transparent inside a sequence
+            elif char in "\x18\x1a":
+                cancel_at = i
+                break
+            else:
+                break                   # not a byte ECMA-48 allows inside a CSI
+        if final_end < 0 and cancel_at < 0:
+            if i == length:
+                tail = text[start:]
+                if len(tail) <= _CSI_CARRY_MAX:
+                    return "".join(kept), tail
+                kept.append(tail)       # runaway sequence: pyte holds it in its own parser
+                return "".join(kept), ""
+            # A byte pyte reads in its own way; keep the bytes and look for the next start behind it.
+            kept.append(text[start:i])
+            pos = i
+            continue
+        end = final_end if final_end >= 0 else cancel_at
+        if marker:
+            pos = end                   # consumed whole and drawing nothing, as vte does
+        else:
+            kept.append(text[start:end])
+            pos = end
 
 
 # OSC 10/11/12/4 color queries emitted by TUI apps (e.g. Codex CLI) at startup, and the OSC
