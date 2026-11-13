@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from native_session_launch import strip_legacy_worker_bridge_args
 from session_manager import AgentSession, HubSessionManager, approval_launch_flags
+from transcript_summarizer import KimiTranscriptSummarizer
 from transcript_tail import read_complete_lines
 
 
@@ -366,6 +367,77 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    def kimi_wire(self, suffix):
+        sess = self.session("kimi", suffix)
+        work = self.root / f"kimi{suffix}"
+        path = work / "agents/main/wire.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_dir": str(work)}
+        return sess, path
+
+    @staticmethod
+    def kimi_step(text):
+        part = {"type": "content.part", "part": {"type": "text", "text": text}}
+        return [{"type": "context.append_loop_event", "event": {"type": "step.begin"}},
+                {"type": "context.append_loop_event", "event": part},
+                {"type": "context.append_loop_event", "event": {"type": "step.end", "finishReason": "end_turn"}}]
+
+    @staticmethod
+    def kimi_turn_ended(turn_id):
+        return {"type": "turn.ended", "agentId": "main", "turnId": turn_id, "reason": "completed"}
+
+    async def test_kimi_turn_ended_alone_completes_the_turn(self):
+        # kimi-ed1ee650 (2026-11-13): current Kimi writes only turn.ended, and the session stayed
+        # "running" after its answer because the watcher waited for agent.turn.ended.
+        sess, path = self.kimi_wire("-turn-ended")
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            self.append(path, *self.kimi_step("审计已写好。"), self.kimi_turn_ended(0),
+                        {"type": "prompt.completed", "agentId": "main", "reason": "completed"})
+            await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "审计已写好。")
+            self.assertTrue(sess.completion_reported)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_kimi_late_legacy_turn_end_does_not_end_the_next_turn(self):
+        # Older builds wrote agent.turn.ended in the end-of-turn batch, often after the next prompt.
+        sess, path = self.kimi_wire("-legacy-late")
+        prompt = {"type": "turn.prompt", "origin": {"kind": "user"}, "input": [{"type": "text", "text": "再查一遍"}]}
+        legacy_batch = [{"kind": "event", "type": "agent.message.appended", "message": {"message": {
+                            "role": "assistant", "content": [{"type": "text", "text": "第一轮结论。"}]}}},
+                        {"kind": "event", "type": "agent.turn.ended", "turnId": 0, "outcome": "done"}]
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            self.append(path, *self.kimi_step("第一轮结论。"), self.kimi_turn_ended(0))
+            await self.until(lambda: sess.status == "completed")
+            self.append(path, prompt, *legacy_batch)
+            await self.until(lambda: sess.final_response_from_previous_turn)
+            await asyncio.sleep(0.6)  # more than two watcher ticks, so the late legacy row is read
+            self.assertEqual(sess.status, "running")
+            self.append(path, *self.kimi_step("第二轮结论。"), self.kimi_turn_ended(1))
+            await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "第二轮结论。")
+            ends = [e for e in self.hub.worker_events
+                    if e["session_id"] == sess.session_id and e["type"] == "turn_completed"]
+            self.assertEqual([e["content"] for e in ends], ["第一轮结论。", "第二轮结论。"])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_kimi_summary_counts_turns_once_in_either_format(self):
+        current = self.root / "kimi-summary-current.jsonl"
+        both = self.root / "kimi-summary-both.jsonl"
+        legacy = self.root / "kimi-summary-legacy.jsonl"
+        self.append(current, *self.kimi_step("a"), self.kimi_turn_ended(0), *self.kimi_step("b"), self.kimi_turn_ended(1))
+        self.append(both, self.kimi_turn_ended(0), {"kind": "event", "type": "agent.turn.ended", "turnId": 0})
+        self.append(legacy, {"kind": "event", "type": "agent.turn.ended"})
+        summarize = lambda path: KimiTranscriptSummarizer().summarize(path, {}, [], [])["turns_completed"]
+        self.assertEqual([summarize(current), summarize(both), summarize(legacy)], [2, 1, 1])
 
     async def test_text_the_engine_writes_as_the_user_is_not_a_typed_prompt(self):
         for engine in ("codex", "claude"):

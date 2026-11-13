@@ -8720,7 +8720,7 @@ class HubSessionManager:
         return session.pending_interaction
 
     async def _watch_kimi_session(self, session: AgentSession, root: Optional[Path] = None):
-        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended.
+        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and turn ends.
 
         `root` points the watcher at a synthetic copy of the layout for tests; production uses
         ~/.kimi-code/sessions/<session>/agents/main/wire.jsonl.
@@ -8787,6 +8787,12 @@ class HubSessionManager:
         # turn).  Once the stream is seen, the messages are a second copy of the same step.
         streamed_steps = False
         step_texts: List[str] = []  # streamed text parts of the current step
+        # Kimi ends a turn with `turn.ended` (reason completed / cancelled / failed). Builds before
+        # 2026-11-13 also wrote a legacy `agent.turn.ended` event in the end-of-turn batch, often
+        # after the next prompt; current builds write only `turn.ended` (kimi-ed1ee650 stayed
+        # "running" when the watcher waited for the legacy event). Once `turn.ended` is seen, the
+        # legacy event is a late copy and must not end the next turn.
+        turn_ended_rows = False
         while self._transcript_watch_alive(session):
             try:
                 await self._drain_kimi_wire_interactions_once(session)
@@ -8818,7 +8824,14 @@ class HubSessionManager:
                             self.begin_new_turn(session, status="running")
                         continue
 
-                    if obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
+                    turn_end = obj.get("type") == "turn.ended" and obj.get("agentId", "main") == "main"
+                    if turn_end:
+                        turn_ended_rows = True
+                    elif obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
+                        if turn_ended_rows:
+                            continue
+                        turn_end = True
+                    if turn_end:
                         if latest_assistant_text:
                             if not turn_has_step:
                                 turn_has_step = True
