@@ -1331,8 +1331,12 @@ APPROVAL_SESSION_DECISIONS = (
 APPROVAL_DENY_DECISIONS = ("deny", "reject", "no", "n", "cancel")
 # omp ignores keys for 500 ms after its prompt opens (research 2026-11-07); the hub waits longer.
 OMP_PROMPT_KEY_GUARD_SEC = 0.6
-# agy: after a deny the turn ends; the feedback is typed as the next message once the composer is back.
+# agy, claude and codex: a deny ends the turn; the feedback is typed as the next message once the
+# composer is back.
 AGY_DENY_FEEDBACK_DELAY_SEC = 1.2
+# codex: the abort of a deny with feedback is held this long for that message (its checked submit
+# included); if none arrives, the abort ends the turn as a plain deny does.
+CODEX_DENY_FEEDBACK_HOLD_SEC = 30.0
 # A machine record (kimi wire) of a prompt the screen detector already registered and the parent
 # already answered is the same prompt if it arrives this soon after the screen registration.
 SCREEN_ADOPT_WINDOW_SEC = 20.0
@@ -6870,14 +6874,17 @@ class HubSessionManager:
         return trace, note, downgraded
 
     async def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
-        """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
+        """D7 (agy, claude, codex): the feedback of a deny, typed as the next message once the prompt
+        has closed.
 
         A new interaction pending by then would take the text as its own answer (a deny), so the
-        feedback is dropped instead, and the drop is recorded."""
+        feedback is dropped instead, and the drop is recorded. A dropped codex feedback also ends the
+        hold on its abort, so the turn ends now instead of after CODEX_DENY_FEEDBACK_HOLD_SEC."""
         sess = self.sessions.get(session_id)
         if sess is None or not sess.is_process_alive():
             return
         if sess.pending_interaction is not None:
+            sess._codex_abort_hold_until = 0.0
             logger.warning("[%s] deny feedback not typed: a new interaction is pending", session_id)
             await self._add_transcript_message(
                 session_id, sess.step_count,
@@ -7166,12 +7173,15 @@ class HubSessionManager:
                     if feedback:
                         notes.append("MCP Cancel 不支持拒绝反馈输入；未向终端追加反馈")
                 elif approval_action in ("deny", "deny_feedback"):
-                    steps = [(0.0, "n")]
+                    # `n` aborts the codex turn. The feedback goes in afterwards as the next message
+                    # through the checked submit (below): typed raw with Enter 0.25 s after `n`, it
+                    # stayed in the composer unsent (2026-11-12, codex-5eaf74c6 / codex-aeb2403d).
                     if approval_action == "deny_feedback":
-                        steps.append((0.25, feedback + "\r"))
-                    self._write_keys_scheduled(sess, loop, steps)
+                        # The rollout watcher holds the abort for that message instead of ending the turn.
+                        sess._codex_abort_hold_until = time.monotonic() + CODEX_DENY_FEEDBACK_HOLD_SEC
+                    self._write_keys_scheduled(sess, loop, [(0.0, "n")])
                     action_trace = "Codex approval key 'n' (Reject)" + (
-                        f" + feedback {feedback!r}" if approval_action == "deny_feedback" else ""
+                        f" + feedback as next message {feedback!r}" if approval_action == "deny_feedback" else ""
                     )
                 elif approval_action == "approve_session" and meta.get("codex_session_key") == "p":
                     # Round 2 (owner): a command prompt's "don't ask again" is p, read from the
@@ -7319,9 +7329,9 @@ class HubSessionManager:
         )
         await self.persist_session(sess, final=True)
 
-        if eng in ("agy", "claude") and approval_action == "deny_feedback" and (custom_input or "").strip():
-            # D7: agy and claude end the turn on a deny; the feedback goes in as the next message once
-            # the composer is back (after the interaction above is cleared, never into the prompt).
+        if eng in ("agy", "claude", "codex") and approval_action == "deny_feedback" and (custom_input or "").strip():
+            # D7: agy, claude and codex end the turn on a deny; the feedback goes in as the next message
+            # once the composer is back (after the interaction above is cleared, never into the prompt).
             feedback_text = (custom_input or "").strip()
             if loop is not None:
                 loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, lambda: self._schedule(self._deliver_deny_feedback(session_id, feedback_text)))
@@ -7995,6 +8005,33 @@ class HubSessionManager:
             session.ended_at = time.time()
         return time.time() < session.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC
 
+    async def _end_aborted_codex_turn(
+        self, session: AgentSession, reason: str, feedback_missing: bool = False
+    ) -> None:
+        """An aborted codex turn is over: Codex is idle at its prompt with no answer for this turn.
+
+        It ends the way task_complete does (turn_completed, so the parent's wait URL returns done),
+        with data.outcome "aborted" and a final response that says so, not an answer.
+        """
+        missing = "the deny's feedback never reached Codex; " if feedback_missing else ""
+        if session.status == "waiting_parent" and session.pending_interaction is None:
+            session.status = "running"  # so the turn end below can mark it completed
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": (
+                    f"Codex turn aborted ({reason}): {missing}the turn ended without a final answer "
+                    f"and Codex is idle at its prompt."
+                ),
+                "data": {"outcome": "aborted", "abort_reason": reason, "feedback_missing": feedback_missing},
+            },
+        )
+        session.current_activity = f"Turn aborted ({reason}) — idle at prompt"
+        await self.persist_session(session)
+
     async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails the Codex rollout jsonl files for a spawned Codex session.
 
@@ -8051,6 +8088,9 @@ class HubSessionManager:
 
         turn_has_step = False
         rescan_at = 0.0
+        # The reason of an abort held for a deny's feedback (see respond_to_interaction): the next
+        # user message continues the turn; none by session._codex_abort_hold_until ends it.
+        held_abort: Optional[str] = None
         while self._transcript_watch_alive(session):
             # The record is read every tick; the folder checks below at most once a second.
             if time.monotonic() >= rescan_at:
@@ -8166,6 +8206,10 @@ class HubSessionManager:
                                 if session.pending_interaction:
                                     await self.clear_pending_interaction(session)
                                 turn_has_step = False
+                                # The deny's feedback (or any message) arrived: the held abort was not
+                                # the end of this turn.
+                                held_abort = None
+                                session._codex_abort_hold_until = 0.0
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
                         elif ptype == "message" and payload.get("role") == "assistant":
@@ -8253,25 +8297,39 @@ class HubSessionManager:
                             },
                         )
                     elif otype == "event_msg" and ptype == "turn_aborted":
+                        # A deny (`n`), Esc in the console or a replaced task. Codex then sits idle at
+                        # its prompt, so the abort ends the turn and wakes the parent like
+                        # task_complete; before 2026-11-13 it only set "waiting_parent" with nothing
+                        # pending, and the parent's wait URL stayed "waiting" for good.
                         abort_reason = str(payload.get("reason") or "interrupted")
                         if session.pending_interaction:
                             await self.clear_pending_interaction(session)
                         await self.db.complete_latest_tool_call(
                             session.session_id, None, f"Turn aborted ({abort_reason})"
                         )
-                        if session.status == "running":
-                            session.status = "waiting_parent"
-                        session.current_activity = f"Turn aborted ({abort_reason}) — idle at prompt"
-                        await self.persist_session(session)
+                        held = time.monotonic() < getattr(session, "_codex_abort_hold_until", 0.0)
+                        # The console's "turn interrupted" row.
                         await self.record_worker_event(
                             session.session_id,
                             {
                                 "type": "turn_aborted",
                                 "category": "turn_completed",
-                                "status": "waiting_parent",
+                                "status": "running" if held else "turn_idle",
                                 "content": f"Codex turn aborted ({abort_reason})",
                             },
                         )
+                        if held:
+                            held_abort = abort_reason
+                            session.current_activity = (
+                                f"Turn aborted ({abort_reason}) by a deny; its feedback follows as the next message"
+                            )
+                            await self.persist_session(session)
+                        else:
+                            await self._end_aborted_codex_turn(session, abort_reason)
+                if held_abort is not None and time.monotonic() >= getattr(session, "_codex_abort_hold_until", 0.0):
+                    # The deny's feedback never reached Codex (dropped, or its submit failed).
+                    await self._end_aborted_codex_turn(session, held_abort, feedback_missing=True)
+                    held_abort = None
             except PersistenceUnavailable:
                 raise
             except Exception:

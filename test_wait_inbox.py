@@ -106,6 +106,18 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         await self.inbox.update_turn(info["wait_handle"], "a", "tb")
         self.assertEqual((await self.inbox.wait(info["wait_handle"], 0.1))["state"], "waiting")
 
+    async def test_rearming_drops_only_this_sessions_uncollected_earlier_result(self):
+        # A parent that denies a codex approval and sends new instructions at once never reads the
+        # abort's turn end; the new message must not be answered with it.
+        handle = (await self.inbox.create(["a", "b"], mode="any_settled"))["wait_handle"]
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "aborted"})
+        await self.inbox.publish_event({"session_id": "b", "type": "turn_completed", "turn_id": "tb", "content": "B"})
+        await self.inbox.update_turn(handle, "a", "ta2")
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta2", "content": "new"})
+        await self.inbox.update_turn(handle, "a", "ta2")  # a steer within the same turn keeps its result
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["final_response"], "B")  # another member's: kept
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["final_response"], "new")
+
     async def test_new_waiter_supersedes_old_connection(self):
         info = await self.inbox.create(["a"])
         old = asyncio.create_task(self.inbox.wait(info["wait_handle"], 2))
