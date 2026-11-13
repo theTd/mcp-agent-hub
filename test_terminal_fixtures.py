@@ -31,6 +31,18 @@ from tools import render_terminal_fixtures as renderer
 FIXTURES_ROOT = Path(__file__).resolve().parent / "tools" / "fixtures" / "terminal"
 LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-kimi", "live-omp")
 EDGE_CASES = (
+    "edge-screen-combining",
+    "edge-screen-csi-cancel",
+    "edge-screen-csi-marker",
+    "edge-screen-decom",
+    "edge-screen-decom-region",
+    "edge-screen-decstbm",
+    "edge-screen-decstbm-oneparam",
+    "edge-screen-decstbm-partial",
+    "edge-screen-save-restore",
+    "edge-screen-save-restore-origin",
+    "edge-screen-zero-width",
+    "edge-screen-zero-width-split",
     "edge-osc-color-query",
     "edge-osc-color-query-split",
     "edge-osc-reply",
