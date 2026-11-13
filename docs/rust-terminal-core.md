@@ -114,10 +114,9 @@ ticket issuing and the console-facing HTTP API.
 
 Every current reader of the pyte screen or the raw history, what it needs, and its new call.
 
-The anchors are line numbers at `b3d0614`, the commit this design was written against. Master has moved
-since (the fixes in §8.1 added screen readers and shifted every line), so step 3 re-derives this table on
-its branch head: every read of `session.screen` (`display`, `cursor`, `history`, `buffer`), every
-`get_clean_screen_text`, `get_scrollback_text` and `raw_history` use, by name, not by line.
+The anchors are line numbers at `b3d0614`, the commit this design was written against; the table keeps
+them for its core-call column only. Step 3a re-derived the consumers by function name and routed every
+one through `AgentSession`'s seam methods, one per core call: §4.1 is that map and the one to work from.
 
 | consumer | anchor | needs | new call |
 |---|---|---|---|
@@ -145,6 +144,136 @@ its branch head: every read of `session.screen` (`display`, `cursor`, `history`,
 | `write_input`, live message injection | `:2463`, call sites `:6718-10759` | ordered keystrokes | `write` |
 | DSH virtual session | `:2188`, `:2213` | screen fed from text, no PTY | `attach_text` + `feed` |
 | archived screen / scrollback reads | `server.py:669`, `server.py:1032` | the DB row only | unchanged; its input is `raw`/`screen` at persist time |
+
+### 4.1 After step 3a: the seam and its callers, by name
+
+Every place in `session_manager.py`, `server.py` and `tools/*.py` that read or wrote terminal state, by the
+function that holds it, with what it needs and the seam call it now makes. Line numbers are gone on purpose:
+they were stale at `b3d0614` and will be stale again. The table above maps consumers to core calls; this
+one, split by what each caller actually touched, maps them to the seam methods whose bodies step 3b swaps.
+
+The seam (design §5.2) lives on `AgentSession`:
+
+| seam call | reply | replaces |
+|---|---|---|
+| `read_screen(max_lines=80) -> ScreenRead(text, cursor_x, cursor_y, cols, rows, rev)` | text + cursor + geometry + revision | `get_clean_screen_text`, `sess.screen.display`, `.cursor`, `.columns`, `.lines` |
+| `read_scrollback(max_lines=300) -> ScrollbackRead(text, rev)` | visible screen + history rows | `get_full_scrollback_text` |
+| `read_raw() -> RawRead(text, bytes, rev)` | the joined ring, already inside the cap | `"".join(sess.raw_history)`, `raw_history` text access |
+| `read_raw_tail(max_chars=SUBMIT_DIAGNOSTIC_TAIL_CHARS) -> str` | newest characters, cut on a character boundary | `"".join(raw_history)[-65536:]` |
+| `raw_revision -> int` (property) | the rev without the join | `raw_history_rev` at the blob's change gate |
+| `seed_history(text)` | one ring entry, rev 1, ESC[3J carry cleared | `sess.raw_history = [seed]` + the two counters |
+| `write_input(text)` | bytes queued / virtual echo | `pty.write`, unchanged name |
+| `resize(cols, rows) -> (cols, rows)` | applied geometry after the 20/5 clamp | `pty.setwinsize` + `screen.resize` |
+| `kill(grace_ms=KILL_GRACE_MS) -> Optional[int]` | exit code if known | `taskkill /T /F` + `pty.terminate(force=True)` |
+| `is_process_alive() -> bool` | alive, by PTY, never by status | unchanged name (kept for tests) |
+| `has_process -> bool` (property) | holds a PTY object | `sess.pty is not None` truthiness |
+| `pid -> Optional[int]` (property) | the spawn reply's pid | `getattr(sess.pty, "pid", None)` |
+| `last_output_time() -> float` | unix seconds of the last byte | `sess.last_output_at` reads |
+
+#### `server.py` (4 sites)
+
+| consumer | needs | now calls |
+|---|---|---|
+| `read_subagent_screen` (MCP tool) | exact screen, `max_lines` (default 80), plus the composer line and K1 banner state from the same text | `read_screen(max_lines).text` |
+| `ws_pty_endpoint` (console `/ws/pty`) | ordered keystrokes from the browser, OSC replies stripped | `live.write_input(...)` (2 sites: `input` frame, bare text frame) |
+| `_session_can_receive` | live process, else a warm DSH job | `is_process_alive()` |
+
+Resize frames from the browser go through `hub.resize_session_from_client` → `resize`.
+
+#### `session_manager.py`, inside `AgentSession` (the seam's own bodies, not consumers)
+
+`read_screen`, `read_scrollback`, `read_raw`, `read_raw_tail`, `raw_revision`, `seed_history`, `write_input`,
+`resize`, `kill`, `is_process_alive`, `has_process`, `pid`, `last_output_time` hold the only field access that
+is left apart from the producers. `terminate` reads the session it ends (`read_scrollback(80)`,
+`is_process_alive()`, `kill`); `to_dict` reads `liveness`/`has_process`/`pid`/`last_output_time`;
+`_finish_read` reads `read_scrollback(80)` for the final-response snapshot.
+
+Allowed direct readers/writers, unchanged (3b deletes or keeps them by design):
+
+- `_read_loop`, `_on_pty_output` — the producers: `pty.read`, `stream.feed`, the ring append/trim, the
+  `last_output_at` bump, fan-out under `_lock`.
+- `start_pty` — the spawn path (`PtyProcess.spawn`, the `ws_prefix` frame, the reader thread).
+- `attach_ws_queue`/`detach_ws_queue`/`adopt_ws_frontends`/`push_ws_frame` — the replay snapshot and the
+  console fan-out; step 4 moves them to the core's own sockets.
+- `emit_virtual_ansi` — DSH virtual sessions feed text through `_on_pty_output`.
+- `_pid_alive` (module level) — `os.kill(pid, 0)` on a *pid number*, not on `AgentSession.pty`.
+
+#### `session_manager.py`, `HubSessionManager` (the reads, liveness checks and writes below)
+
+Screen readers (24 sites in the manager, all `read_screen(...).text` unless noted):
+
+| consumer | needs | argument kept |
+|---|---|---|
+| `_last_screen_text` | screen → last 20 non-empty lines for the record | 80 |
+| `summarize_transcript` | screen as the raw-TUI fallback | 30 |
+| `_capture_submit_diagnostic` | screen geometry (`cols`, `rows`) only | default read |
+| `_tui_composer_located`, `_clear_tui_draft` (2), `_submit_codex_text`, `_submit_text_to_tui`, `_submit_queued_live_text`, `_await_typed_text_settled`, `_confirm_tui_submit` (2), `_watch_tui_startup_and_type` (2), `deliver_parent_message` | composer line, submit marks, settle loop | 40 |
+| `_codex_composer_empty` | `cursor_x` only (placeholder painted after column 3) | default read |
+| `_watch_claude_session`, `_watch_kimi_session` | banner / spinner lines | 35 |
+| `_watch_codex_rollout` | "is archived" detection | 40 |
+| `respond_to_interaction` | Codex MCP modal parse | `max(38, sess.rows)` |
+| `_refresh_codex_mcp_response` | modal parse after answering | `max(38, session.rows)` |
+| `_register_omp_event_approval`, `poll_tui_screen_interactions_once` | OMP box rows | `max_rows` = `max(38, rows)` |
+| `wait_for_output_settle` | screen handed to `progress_cb` | 15 |
+
+Scrollback readers (2 sites in the manager, plus the seam's own `terminate`/`_finish_read`): `persist_session`
+(250 lines, the record) and the two 80-line exit snapshots, `_tui_banner_visible` (K1 banner may have scrolled, `TUI_READY_BANNER_HISTORY_ROWS`).
+
+Raw readers (4 sites): `_scrollback_blob` — `read_raw()` for the text and `raw_revision` for the two change
+gates; `_capture_submit_diagnostic` — `read_raw_tail(SUBMIT_DIAGNOSTIC_TAIL_CHARS)`.
+
+Spawn/exit plumbing: `_make_resumed_session` → `seed_history(seed)`; `_resume_process_session` →
+`has_process` + `kill(KILL_GRACE_MS)` on a failed spawn; `_shutdown` → `has_process`, then
+`_terminate_pty_tree` → `kill(grace_ms)`; `_record_tui_injection` → `has_process`.
+
+Liveness, 16 `is_process_alive()` at manager level plus the seam's own `terminate`/`to_dict`: `compute_resumable`
+(2), `_claim_conversation`, `_resume_locked`, `_resume_check_context`, `_close_session`, `_shutdown`,
+`_scrollback_flush_loop`, `_submit_queued_live_text` (2), `_deliver_deny_feedback`, `_clear_tui_draft` (2),
+`_transcript_watch_alive`, `_agy_new_conversation_dir`, `deliver_parent_message`,
+`get_subagent_status_and_trace`, `resize_session_from_client`.
+
+Process presence, 3 `has_process`: `_shutdown` (replace `pty is not None`), `_resume_process_session`,
+`_record_tui_injection`; `to_dict` reads it too.
+
+Write side: `write_input` at 61 sites (39 of them in `respond_to_interaction`), `resize` in
+`resize_session_from_client` (2: the target, then the background panes), `last_output_time()` in
+`to_dict` (2) and `wait_for_output_settle` (1), `kill` in `_terminate_pty_tree` and `_resume_process_session`.
+
+#### `tools/render_terminal_fixtures.py` (9 sites)
+
+Counts are call sites: `resize` three times inside `feed_session`, `read_raw_tail` twice (`render_session`,
+`render_trigger`).
+
+`screen_text` → `read_screen(80).text`; `joined_raw` → `read_raw().text`; `render_session` →
+`read_scrollback(250).text`, `read_raw_tail(RAW_TAIL_CHARS)`; `render_trigger` → `read_raw_tail`; `new_session`
+→ `seed_history(seed)`; `feed_session` → `resize` (3). `RAW_TAIL_CHARS` is now the imported
+`SUBMIT_DIAGNOSTIC_TAIL_CHARS`, and the two former "mirrored expressions" (the 65536 tail, the resume seed) are
+seam calls, so `test_terminal_fixtures` pins them by name instead of by source text.
+
+`render_trigger` still reads `len(session.raw_history)` and `raw_history_bytes` directly: it is the oracle for
+the W9 in-loop collapse and `trigger.json` pins the entry count before/after. Those are ring internals, not
+terminal text; the core's ring has no entry count to report. `tools/record_terminal_corpus.py` touches only
+its own recorder PTY, never `AgentSession`.
+
+#### What did not fit the seam, and why
+
+- **`_scrollback_blob`'s change gate** uses `raw_revision` (the counter, no join) rather than `read_raw().rev`.
+  Joining 512 KB per persist only to compare two integers would be a real regression; the counter is the same
+  revision the `raw` reply carries, and 3b's drain supplies it.
+- **`session.cols` / `session.rows`** stay plain fields: they are the hub's chosen geometry, not a screen
+  read, and the 20/5 clamp is applied by the hub (§6.4). The **screen's** `columns`/`lines` had no seam accessor
+  before; they now come from `read_screen().cols/rows`.
+- **`_capture_submit_diagnostic`'s evidence JSON** keeps its two screen-geometry fields by asking
+  `read_screen()` for them; today `screen.columns`/`screen.lines` track `session.cols`/`rows` exactly.
+- **`write_input` and `is_process_alive` keep their names** (the brief's exception): `write_input` is patched by
+  `test_session_approvals` (3 targets) and `test_tui_delivery` (2), and `is_process_alive` by
+  `test_transcript_view` (2); 61 and 16 internal sites plus `server.py` call them. The bodies are the core's `write`
+  and `alive`.
+- **`_terminate_pty_tree`** stays as the manager's `asyncio.to_thread` wrapper for shutdown; its body is one
+  `kill(grace_ms)` call, because `budget` is seconds and the seam's unit is `grace_ms`.
+- **`kill` returns `None` for a live process today**: `pty.terminate(force=True)` does not wait, so `exitstatus`
+  is usually not there yet. That matches §5.2's "None when the process outlived the budget"; 3b's reply carries
+  the code the core read before `TerminateJobObject`.
 
 ## 5. Interface between the core and Python
 
@@ -690,7 +819,7 @@ imported by the hub after step 3, and it is deleted with its `requirements.in` e
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
 | 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs` | `cargo test` in `terminal-core/`: `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach | branch only | M, 5-7 d |
-| 3. PTY ownership in Python | `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
+| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
 | 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
 | 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
 | 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; delete `tools/fixtures`'s pyte oracle and the `pyte` dependency entry | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |

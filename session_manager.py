@@ -21,7 +21,7 @@ import unicodedata
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 import httpx
 import pyte
@@ -684,6 +684,41 @@ HISTORY_BANNER_LINE_MAX_BYTES = 128
 # R7: an agy resume whose archived transcript is still locked by another watcher gets this long
 # to become claimable, then the watcher stops instead of spinning for the session's lifetime.
 AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
+# The terminal seam's own bounds (design §5.2). The submit diagnostic keeps the newest
+# SUBMIT_DIAGNOSTIC_TAIL_CHARS characters of the raw stream, as the `raw_tail` call's max_chars;
+# a user terminate gives a kill KILL_GRACE_MS to report an exit code (shutdown passes its budget).
+SUBMIT_DIAGNOSTIC_TAIL_CHARS = 65536
+KILL_GRACE_MS = 1500
+
+
+class ScreenRead(NamedTuple):
+    """What one screen read returns (design §5.2 `screen`): the visible text and where the cursor is.
+
+    The cursor is what tells a native placeholder from a typed draft (Codex's "Ask Codex to do
+    anything" is painted after a cursor at column 3), so it travels with the text it belongs to.
+    """
+
+    text: str
+    cursor_x: int
+    cursor_y: int
+    cols: int
+    rows: int
+    rev: int
+
+
+class ScrollbackRead(NamedTuple):
+    """What one scrollback read returns (design §5.2 `scrollback`): visible screen + history rows."""
+
+    text: str
+    rev: int
+
+
+class RawRead(NamedTuple):
+    """The whole raw stream, already trimmed to the archive cap (design §5.2 `raw`)."""
+
+    text: str
+    bytes: int
+    rev: int
 
 
 def resume_banner(resume_count: int) -> str:
@@ -2612,7 +2647,7 @@ class AgentSession:
         self.exit_code = exit_code
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
         try:
-            scrollback = self.get_full_scrollback_text(max_lines=80)
+            scrollback = self.read_scrollback(max_lines=80).text
             clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
             if clean_lines and not self.final_response_from_previous_turn:
                 self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
@@ -2792,7 +2827,12 @@ class AgentSession:
             return True
         return False
 
-    def resize(self, cols: int, rows: int):
+    def resize(self, cols: int, rows: int) -> Tuple[int, int]:
+        """`resize`: applies the 20/5 clamp, then the PTY's own size; returns the applied cols/rows.
+
+        The clamp stays here because it is hub policy (design §6.4): the core reports the request
+        and the hub decides what a pane gets.
+        """
         with self._lock:
             self.cols = max(20, int(cols))
             self.rows = max(5, int(rows))
@@ -2805,8 +2845,15 @@ class AgentSession:
                     self.pty.setwinsize(self.rows, self.cols)
                 except Exception:
                     pass
+            return self.cols, self.rows
 
-    def get_clean_screen_text(self, max_lines: int = 80) -> str:
+    # ---- The terminal seam (design §5.2) ------------------------------------------------
+    # Every read and write of terminal state in the hub goes through these. Step 3b swaps what is
+    # behind each body for a core call; the names and reply shapes are the core's, so no caller
+    # changes then. The bodies below read today's pyte screen and raw_history.
+
+    def read_screen(self, max_lines: int = 80) -> ScreenRead:
+        """`screen`: the visible text, the cursor, the grid size and the revision of this read."""
         with self._lock:
             try:
                 lines = [line.rstrip() for line in self.screen.display]
@@ -2816,15 +2863,15 @@ class AgentSession:
                 lines.pop()
             if max_lines and len(lines) > max_lines:
                 lines = lines[-max_lines:]
-            return "\n".join(lines)
+            try:
+                cursor_x, cursor_y = int(self.screen.cursor.x), int(self.screen.cursor.y)
+            except Exception:
+                cursor_x, cursor_y = 0, 0
+            return ScreenRead("\n".join(lines), cursor_x, cursor_y,
+                              int(self.screen.columns), int(self.screen.lines), self.raw_history_rev)
 
-    def note_transcript_user_message(self, text: str) -> None:
-        """K3 (fix 9): the transcript watcher read a user message; a typed submit may cite it."""
-        self.transcript_user_seq += 1
-        self.transcript_user_text = str(text or "")
-
-    def get_full_scrollback_text(self, max_lines: int = 300) -> str:
-        """Returns combined scrollback history + active screen lines from pyte.HistoryScreen."""
+    def read_scrollback(self, max_lines: int = 300) -> ScrollbackRead:
+        """`scrollback`: the visible screen followed by the newest history rows above it."""
         with self._lock:
             try:
                 curr_lines = [line.rstrip() for line in self.screen.display]
@@ -2848,7 +2895,97 @@ class AgentSession:
             all_lines = list(reversed(newest_history)) + all_lines
             if max_lines:
                 all_lines = all_lines[-max_lines:]
-            return "\n".join(all_lines)
+            return ScrollbackRead("\n".join(all_lines), self.raw_history_rev)
+
+    def read_raw(self) -> RawRead:
+        """`raw`: the whole raw stream as it stands, already inside the archive cap (W9).
+
+        The ring trims itself in `_on_pty_output` once it passes cap + slack, so what this returns
+        is the same text `_scrollback_blob` trims for archiving — only the blob's own cut differs.
+        """
+        with self._lock:
+            # raw_history_bytes is kept beside every ring write, so no second encode under the lock.
+            return RawRead("".join(self.raw_history), self.raw_history_bytes, self.raw_history_rev)
+
+    def read_raw_tail(self, max_chars: int = SUBMIT_DIAGNOSTIC_TAIL_CHARS) -> str:
+        """`raw_tail`: the newest max_chars characters, cut on a character boundary."""
+        with self._lock:
+            text = "".join(self.raw_history)
+        if max_chars <= 0:
+            return ""
+        return text[-max_chars:]
+
+    @property
+    def raw_revision(self) -> int:
+        """`raw`'s rev without the join: the change gate `_scrollback_blob` runs before reading.
+
+        Today it is the counter `_on_pty_output` bumps per chunk; after step 3b it is the rev the
+        core's drain record carries, so the 60 s scrollback write keeps its "changed?" gate.
+        """
+        return self.raw_history_rev
+
+    def seed_history(self, text: str) -> None:
+        """`spawn.seed_history`: the archived scrollback a resumed pane replays before its first byte.
+
+        One ring entry and rev 1, the state `_make_resumed_session` used to write by hand; the
+        ESC[3J carry is cleared because no sequence is half-seen across the boundary.
+        """
+        with self._lock:
+            self.raw_history = [text]
+            self.raw_history_bytes = len(text.encode("utf-8", "replace"))
+            self.raw_history_rev = 1
+        self._esc3j_carry = ""
+
+    def last_output_time(self) -> float:
+        """`drain`'s last_output_at: unix seconds of the last byte, for idle and quiet waits."""
+        return self.last_output_at
+
+    @property
+    def has_process(self) -> bool:
+        """Whether this session still holds a live PTY object (never a status guess)."""
+        return self.pty is not None
+
+    @property
+    def pid(self) -> Optional[int]:
+        """`spawn`'s reply pid, while the PTY object is still there."""
+        pty = self.pty
+        if pty is None:
+            return None
+        return getattr(pty, "pid", None)
+
+    def kill(self, grace_ms: int = KILL_GRACE_MS) -> Optional[int]:
+        """`kill`: taskkill the session's process tree on a real winpty process, then terminate.
+
+        Returns the exit code when it is already known; today `pty.terminate(force=True)` does not
+        wait for the process, so a live session reports None (design §5.2: None when the process
+        outlived the budget). The core's reply will carry the code it learned before terminating.
+        """
+        pty = self.pty
+        if pty is None:
+            return None
+        pid = getattr(pty, "pid", None)
+        if pid and isinstance(pty, REAL_PTY_PROCESS):
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=max(0.2, min(2.0, grace_ms / 1000.0)),
+                )
+            except Exception:
+                pass
+        try:
+            pty.terminate(force=True)
+        except Exception:
+            return None
+        try:
+            return pty.exitstatus
+        except Exception:
+            return None
+
+    def note_transcript_user_message(self, text: str) -> None:
+        """K3 (fix 9): the transcript watcher read a user message; a typed submit may cite it."""
+        self.transcript_user_seq += 1
+        self.transcript_user_text = str(text or "")
 
     def classify_end_reason(self, exit_code: Optional[int]) -> str:
         """Spec §1.4/§2: name an abnormal end instead of calling everything "exited".
@@ -2886,7 +3023,7 @@ class AgentSession:
         was_alive = self.is_process_alive()
         self.ended_at = time.time()
         try:
-            scrollback = self.get_full_scrollback_text(max_lines=80)
+            scrollback = self.read_scrollback(max_lines=80).text
             clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
             if clean_lines and not self.final_response_from_previous_turn:
                 self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
@@ -2899,21 +3036,8 @@ class AgentSession:
             self.status = "terminated"
             self.end_reason = "terminated"
             self.current_activity = "Terminated by parent/user"
-        if self.pty and was_alive:
-            pid = getattr(self.pty, "pid", None)
-            if pid and isinstance(self.pty, REAL_PTY_PROCESS):
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/T", "/F"],
-                        capture_output=True,
-                        timeout=1.5,
-                    )
-                except Exception:
-                    pass
-            try:
-                self.pty.terminate(force=True)
-            except Exception:
-                pass
+        if was_alive and self.pty:
+            self.kill(KILL_GRACE_MS)
         if self.dsh_job_id and was_alive:
             job_id = self.dsh_job_id
             threading.Thread(
@@ -2987,7 +3111,7 @@ class AgentSession:
 
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
-        if not alive and self.pty is not None and self.status not in (
+        if not alive and self.has_process and self.status not in (
             "completed", "exited", "crashed", "terminated", "interrupted"
         ):
             self.status = "exited"
@@ -3016,12 +3140,12 @@ class AgentSession:
             # D2: true while the answer above still belongs to the turn before the current one.
             "from_previous_turn": self.final_response_from_previous_turn,
             "files_changed": self.files_changed,
-            "pid": getattr(self.pty, "pid", None) if self.pty else None,
+            "pid": self.pid,
             "created_at": self.created_at,
             "ended_at": self.ended_at,
             "exit_code": self.exit_code,
-            "last_output_at": self.last_output_at,
-            "idle_seconds": round(time.time() - self.last_output_at, 1),
+            "last_output_at": self.last_output_time(),
+            "idle_seconds": round(time.time() - self.last_output_time(), 1),
             "last_task": self.last_task,
             "cols": self.cols,
             "rows": self.rows,
@@ -4676,7 +4800,7 @@ class HubSessionManager:
     ):
         """Writes the row. `final` marks the exit/archive write, the only one that rebuilds the
         mailbox thread (A11) instead of leaving the stored one alone."""
-        scrollback = session.get_full_scrollback_text(max_lines=250)
+        scrollback = session.read_scrollback(max_lines=250).text
         await self.db.upsert_session(
             session.to_dict(),
             scrollback_text=scrollback,
@@ -4689,7 +4813,7 @@ class HubSessionManager:
     def _last_screen_text(session: AgentSession) -> str:
         """The last 20 non-empty screen lines, as the final record keeps them (spec §3)."""
         try:
-            lines = [ln for ln in session.get_clean_screen_text(max_lines=80).splitlines() if ln.strip()]
+            lines = [ln for ln in session.read_screen(max_lines=80).text.splitlines() if ln.strip()]
         except Exception:
             lines = []
         return "\n".join(lines[-20:])
@@ -4754,15 +4878,15 @@ class HubSessionManager:
         if not force:
             if now - session._scrollback_written_at < RESUME_SCROLLBACK_INTERVAL_SEC:
                 return None
-            if session.raw_history_rev == session._scrollback_rev_written:
+            if session.raw_revision == session._scrollback_rev_written:
                 return None
-            if session.raw_history_rev == getattr(session, "_scrollback_pending_rev", -1):
+            if session.raw_revision == getattr(session, "_scrollback_pending_rev", -1):
                 return None
         # W9: cut at a line break and keep the newest resume banner (a raw byte slice can split an
         # escape sequence or drop the banner the pane is supposed to show above the new output).
-        with session._lock:
-            text = trim_history_text("".join(session.raw_history), RESUME_SCROLLBACK_MAX_BYTES)
-            revision = session.raw_history_rev
+        raw_read = session.read_raw()
+        text = trim_history_text(raw_read.text, RESUME_SCROLLBACK_MAX_BYTES)
+        revision = raw_read.rev
         raw = text.encode("utf-8", "replace")
         self.db.on_accept(lambda: setattr(session, "_scrollback_pending_rev", revision))
         def committed():
@@ -5171,9 +5295,7 @@ class HubSessionManager:
         # Spec §5.3: the pane starts with the archived output, then the resume separator.
         archived = await self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
-        sess.raw_history = [seed]
-        sess.raw_history_bytes = len(seed.encode("utf-8", "replace"))
-        sess.raw_history_rev = 1
+        sess.seed_history(seed)
         if engine == "dsh":
             sess.dsh_spec = dict(snapshot.get("dsh_spec") or {})
             sess.sandbox_preparation = snapshot.get("sandbox_preparation")
@@ -5391,11 +5513,8 @@ class HubSessionManager:
         except Exception as e:
             # R9: a spawn that raised after the PTY had already started must not leave that process
             # behind while the old (archived) object is put back in the live list.
-            if sess.pty is not None:
-                try:
-                    sess.pty.terminate(force=True)
-                except Exception:
-                    pass
+            if sess.has_process:
+                sess.kill(KILL_GRACE_MS)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -5980,25 +6099,9 @@ class HubSessionManager:
 
         A Windows PTY's children (MCP servers, shells) survive a plain terminate of the root; a
         surviving kimi keeps its per-session lock, which makes the archived row refuse to resume.
-        The taskkill is only used for a real winpty process, never in tests with a fake PID.
+        The seam's `kill` owns both steps; `budget` is in seconds (the design's `grace_ms`).
         """
-        pty = sess.pty
-        if pty is None:
-            return
-        pid = getattr(pty, "pid", None)
-        if pid and isinstance(pty, REAL_PTY_PROCESS):
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=max(0.2, min(2.0, float(budget))),
-                )
-            except Exception:
-                pass
-        try:
-            pty.terminate(force=True)
-        except Exception:
-            pass
+        sess.kill(int(max(0.2 * 1000, min(2.0, float(budget)) * 1000)))
 
     async def archive_all_sessions_on_shutdown(self) -> int:
         """Share one shutdown operation between the HTTP stop and lifespan exit."""
@@ -6028,7 +6131,7 @@ class HubSessionManager:
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
                 if sess.dsh_job_id:
                     stops.append(asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=2.0))
-                elif sess.pty is not None:
+                elif sess.has_process:
                     stops.append(asyncio.to_thread(self._terminate_pty_tree, sess, budget=2.0))
             else:
                 reasons[sess.session_id] = sess.end_reason or sess.classify_end_reason(sess.exit_code)
@@ -6431,7 +6534,7 @@ class HubSessionManager:
         if sess:
             meta = sess.to_dict()
             t_path = sess.transcript_path
-            raw_fallback = sess.get_clean_screen_text(max_lines=30)
+            raw_fallback = sess.read_screen(max_lines=30).text
         else:
             persisted = await self.db.get_session_record(session_id)
             if not persisted:
@@ -7432,7 +7535,7 @@ class HubSessionManager:
             if kind == "approval_request":
                 feedback = _one_line(custom_input)
                 if meta.get("codex_prompt") == "mcp":
-                    parsed = parse_codex_approval_prompt(sess.get_clean_screen_text(max_lines=max(38, sess.rows)))
+                    parsed = parse_codex_approval_prompt(sess.read_screen(max_lines=max(38, sess.rows)).text)
                     if not parsed or self._codex_mcp_identity(parsed) != tuple(meta.get("prompt_identity") or ()):
                         raise ValueError("Codex MCP 审批弹窗已变化或关闭；未发送按键")
                     wanted = "deny" if approval_action in ("deny", "deny_feedback") else "approve_once"
@@ -7694,7 +7797,7 @@ class HubSessionManager:
         engine = str(getattr(session, "engine", "") or "").strip().lower()
         if engine not in TUI_COMPOSER_SHAPES:
             return False
-        screen = session.get_clean_screen_text(max_lines=40)
+        screen = session.read_screen(max_lines=40).text
         return self._tui_input_line(screen, session.engine) is not None
 
     def _live_submit_checked(self, session: AgentSession) -> bool:
@@ -7829,7 +7932,7 @@ class HubSessionManager:
                 probe = clean[:30].strip()
                 tail = clean[-30:].strip()
                 eng = str(getattr(sess, "engine", "") or "").strip().lower()
-                marks = self._tui_submit_marks(sess, sess.get_clean_screen_text(max_lines=40), eng, probe)
+                marks = self._tui_submit_marks(sess, sess.read_screen(max_lines=40).text, eng, probe)
                 marks["expected_text"] = clean
                 await asyncio.sleep(TUI_UNCHECKED_ENTER_DELAY_SEC)
                 sess.write_input(submit_key or "\r")
@@ -8104,7 +8207,7 @@ class HubSessionManager:
                         await claim.wait_turn()
                         if getattr(sess, "_tui_draft_pending", None) or sess.pending_interaction:
                             raise ValueError("Input is pending; inspect or clear the draft before writing")
-                        line = self._tui_input_line(sess.get_clean_screen_text(max_lines=40), "codex")
+                        line = self._tui_input_line(sess.read_screen(max_lines=40).text, "codex")
                         if not self._codex_composer_empty(sess, line):
                             raise ValueError("Cannot write into a nonempty or unavailable composer")
                         pty_written = sess.write_input(clean_txt)
@@ -8636,7 +8739,7 @@ class HubSessionManager:
 
         if session.resume_attach and session.status in ("exited", "crashed"):
             # Research: an archived codex session refuses to resume; surface its own instruction.
-            screen = session.get_clean_screen_text(max_lines=40).lower()
+            screen = session.read_screen(max_lines=40).text.lower()
             if "is archived" in screen or "unarchive" in screen:
                 await self._mark_codex_archived(session)
 
@@ -9123,7 +9226,7 @@ class HubSessionManager:
             if not self._transcript_watch_alive(session):
                 break
             # First try exact match via Kimi TUI banner: Session: session_<uuid>
-            scr_txt = session.get_clean_screen_text(max_lines=35)
+            scr_txt = session.read_screen(max_lines=35).text
             m = re.search(r"(session_[0-9a-f\-]{20,})", scr_txt)
             if m:
                 # The TUI banner names the exact conversation, so this path needs no time heuristic;
@@ -10106,7 +10209,7 @@ class HubSessionManager:
                     and (now_ts - last_screen_probe_at) >= 2.4
                 ):
                     last_screen_probe_at = now_ts
-                    scr_txt = session.get_clean_screen_text(max_lines=35)
+                    scr_txt = session.read_screen(max_lines=35).text
                     if scr_txt:
                         sp_match = spinner_stat_re.search(scr_txt)
                         clean_lines = [
@@ -10631,11 +10734,11 @@ class HubSessionManager:
         try:
             target = self.data_dir / "diagnostics" / f"submit-{uuid.uuid4().hex}.json"
             target.parent.mkdir(parents=True, exist_ok=True)
-            with session._lock:
-                evidence = {"session_id": session.session_id, "reason": reason, "at": time.time(),
-                            "cols": session.cols, "rows": session.rows,
-                            "screen_cols": session.screen.columns, "screen_rows": session.screen.lines,
-                            "raw_ansi_tail": "".join(session.raw_history)[-65536:]}
+            screen = session.read_screen()
+            evidence = {"session_id": session.session_id, "reason": reason, "at": time.time(),
+                        "cols": session.cols, "rows": session.rows,
+                        "screen_cols": screen.cols, "screen_rows": screen.rows,
+                        "raw_ansi_tail": session.read_raw_tail(SUBMIT_DIAGNOSTIC_TAIL_CHARS)}
             target.write_text(json.dumps(evidence, ensure_ascii=False), encoding="utf-8")
             return str(target)
         except OSError:
@@ -10673,7 +10776,7 @@ class HubSessionManager:
             return True
         # The native placeholder is painted after a cursor at column 3. A typed copy of
         # the same words has its cursor after the text, so must still count as a draft.
-        return line.strip() == "Ask Codex to do anything" and session.screen.cursor.x == 2
+        return line.strip() == "Ask Codex to do anything" and session.read_screen().cursor_x == 2
 
     async def _clear_tui_draft(self, session: Optional[AgentSession]) -> Dict[str, Any]:
         if session is None or session.engine != "codex" or not session.is_process_alive():
@@ -10684,7 +10787,7 @@ class HubSessionManager:
             await self.poll_tui_screen_interactions_once(session)
             if session.pending_interaction or session.status not in ("completed", "idle"):
                 raise ValueError("Cannot clear input during an approval or active turn")
-            screen = session.get_clean_screen_text(max_lines=40)
+            screen = session.read_screen(max_lines=40).text
             line = self._tui_input_line(screen, "codex")
             if line is None or self._tui_blocking_dialog(screen, session):
                 raise ValueError("Cannot locate a safe Codex composer to clear")
@@ -10700,7 +10803,7 @@ class HubSessionManager:
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 await asyncio.sleep(.1)
-                line = self._tui_input_line(session.get_clean_screen_text(max_lines=40), "codex")
+                line = self._tui_input_line(session.read_screen(max_lines=40).text, "codex")
                 if self._codex_composer_empty(session, line) and session.is_process_alive():
                     blank_since = blank_since or time.monotonic()
                     if time.monotonic() - blank_since >= .5:
@@ -10724,7 +10827,7 @@ class HubSessionManager:
         clean = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
         if not clean:
             return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
-        screen = session.get_clean_screen_text(max_lines=40)
+        screen = session.read_screen(max_lines=40).text
         line = self._tui_input_line(screen, "codex")
         if session.pending_interaction or self._tui_blocking_dialog(screen, session) or line is None:
             return {"ok": False, "reason": "composer_unavailable", "attempts": 0, "label": "失败"}
@@ -10854,7 +10957,7 @@ class HubSessionManager:
         last_line: Optional[str] = None
         while time.time() < limit:
             await asyncio.sleep(TUI_SUBMIT_CONFIRM_POLL_SEC)
-            screen = session.get_clean_screen_text(max_lines=40)
+            screen = session.read_screen(max_lines=40).text
             marks["screen"] = screen
             last_line = self._tui_input_line(screen, engine)
             if self._tui_reject_count(screen, rules) > int(marks.get("rejects") or 0):
@@ -10878,7 +10981,7 @@ class HubSessionManager:
                 # was seen before the Enter gets the W3 window first, as it always had.
                 return "unsubmitted", "still_in_input_line"
         if last_line is None:
-            screen = session.get_clean_screen_text(max_lines=40)
+            screen = session.read_screen(max_lines=40).text
             marks["screen"] = screen
             last_line = self._tui_input_line(screen, engine)
         if self._composer_holds_typed(last_line, probe, tail, engine, typed_len):
@@ -10928,7 +11031,7 @@ class HubSessionManager:
         quiet_since = started
         while True:
             await asyncio.sleep(TUI_TYPE_SETTLE_POLL_SEC)
-            screen = session.get_clean_screen_text(max_lines=40)
+            screen = session.read_screen(max_lines=40).text
             lines = [ln.rstrip() for ln in str(screen or "").splitlines()]
             span = self._tui_composer_span(lines, engine)
             line = span[0] if span is not None else None
@@ -11056,7 +11159,7 @@ class HubSessionManager:
                 # D3: nothing proved either way. Press Enter once more and watch a short window --
                 # but never while a known trust/update dialog is on screen, because that Enter
                 # would answer the dialog instead of submitting the task.
-                marks["screen"] = session.get_clean_screen_text(max_lines=40)
+                marks["screen"] = session.read_screen(max_lines=40).text
                 dialog = self._tui_blocking_dialog(marks["screen"], session)
                 if extra_press or attempts >= TUI_SUBMIT_MAX_TRIES or dialog:
                     result = {"ok": None, "reason": "unconfirmed", "attempts": attempts,
@@ -11095,11 +11198,8 @@ class HubSessionManager:
         """K1 (fix 9): the banner is on screen or in the recent scrollback (it may scroll off fast)."""
         if banner in str(screen_text or ""):
             return True
-        scrollback = getattr(session, "get_full_scrollback_text", None)
-        if scrollback is None:
-            return False
         try:
-            return banner in scrollback(max_lines=TUI_READY_BANNER_HISTORY_ROWS)
+            return banner in session.read_scrollback(max_lines=TUI_READY_BANNER_HISTORY_ROWS).text
         except Exception:
             return False
 
@@ -11121,7 +11221,7 @@ class HubSessionManager:
             "content": str(result.get("reason") or result.get("label") or delivery_status),
             "request_id": result.get("submit_id"),
         })
-        if session.engine == "codex" and session.pty and result.get("ok") is not True:
+        if session.engine == "codex" and session.has_process and result.get("ok") is not True:
             # Native TUIs redraw differences against their own screen. Hub-added ANSI moves
             # the emulator's cursor without moving that native screen and can introduce drift.
             logger.warning("[%s] %s: %s", session.session_id, what, result.get("reason"))
@@ -11209,7 +11309,7 @@ class HubSessionManager:
             if session.status not in ("starting", "running"):
                 return
             now = time.time()
-            screen_txt = session.get_clean_screen_text(max_lines=40)
+            screen_txt = session.read_screen(max_lines=40).text
             if any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES):
                 # R1/W4: answer it wherever it appears in the window; never type behind it.
                 if TUI_TRUST_NO_FOCUSED_RE.search(screen_txt):
@@ -11223,7 +11323,7 @@ class HubSessionManager:
                     await asyncio.sleep(0.25)
                     if session.status not in ("starting", "running"):
                         return
-                    screen_txt = session.get_clean_screen_text(max_lines=40)
+                    screen_txt = session.read_screen(max_lines=40).text
                 if (
                     any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES)
                     and not TUI_TRUST_NO_FOCUSED_RE.search(screen_txt)
@@ -12248,7 +12348,7 @@ class HubSessionManager:
         deadline = time.monotonic() + OMP_EVENT_BOX_WAIT_SEC
         while True:
             call = session._open_transcript_tools.get(call_id)
-            parsed = parse_omp_approval_prompt(session.get_clean_screen_text(max_lines=max_rows))
+            parsed = parse_omp_approval_prompt(session.read_screen(max_lines=max_rows).text)
             if parsed is not None and not self._omp_box_shows_call(parsed, tool, call):
                 parsed = None
             if (parsed is not None and call is not None) or time.monotonic() >= deadline:
@@ -12469,7 +12569,7 @@ class HubSessionManager:
         meta = (inter or {}).get("metadata") or {}
         if meta.get("codex_prompt") != "mcp":
             return
-        screen = session.get_clean_screen_text(max_lines=max(38, session.rows))
+        screen = session.read_screen(max_lines=max(38, session.rows)).text
         if not screen.strip():
             return
         parsed = parse_codex_approval_prompt(screen)
@@ -12504,7 +12604,7 @@ class HubSessionManager:
         if time.time() < float(getattr(session, "_prompt_quiet_until", 0.0) or 0.0):
             return None
         max_rows = max(38, int(getattr(session, "rows", 38) or 38))
-        scr = session.get_clean_screen_text(max_lines=max_rows)
+        scr = session.read_screen(max_lines=max_rows).text
         if not scr.strip():
             return None
 
@@ -13326,7 +13426,7 @@ class HubSessionManager:
         progress_cb: Optional[Callable[[float, str], Any]] = None,
     ) -> Dict[str, Any]:
         start = time.time()
-        initial_output_at = session.last_output_at
+        initial_output_at = session.last_output_time()
         has_seen_new_output = False
 
         while (time.time() - start) < timeout_sec:
@@ -13334,12 +13434,12 @@ class HubSessionManager:
             now = time.time()
             elapsed = now - start
 
-            if session.last_output_at > initial_output_at:
+            if session.last_output_time() > initial_output_at:
                 has_seen_new_output = True
 
             if progress_cb and int(elapsed * 2) % 6 == 0:
                 try:
-                    res = progress_cb(elapsed, session.get_clean_screen_text(max_lines=15))
+                    res = progress_cb(elapsed, session.read_screen(max_lines=15).text)
                     if asyncio.iscoroutine(res):
                         await res
                 except PersistenceUnavailable:
@@ -13356,7 +13456,7 @@ class HubSessionManager:
                 return {"settled": True, "reason": f"status_{session.status}", "elapsed_sec": round(elapsed, 1)}
 
             if (has_seen_new_output and not submitting
-                    and (now - session.last_output_at) >= quiet_window_sec and elapsed >= 3.0):
+                    and (now - session.last_output_time()) >= quiet_window_sec and elapsed >= 3.0):
                 try:
                     await self.summarize_transcript(session.session_id)
                 except PersistenceUnavailable:

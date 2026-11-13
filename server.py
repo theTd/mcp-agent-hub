@@ -641,7 +641,7 @@ async def read_subagent_screen(
     transcript_summary = await hub.summarize_transcript(session_id=session_id)
     session = hub.sessions.get(session_id)
     if session:
-        raw_txt = session.get_clean_screen_text(max_lines=max_lines)
+        raw_txt = session.read_screen(max_lines=max_lines).text
         res: Dict[str, Any] = {
             "session_id": session.session_id,
             "profile_id": session.profile_id,

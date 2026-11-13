@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import httpx
 from fastmcp import Client
-from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES,
+from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES, ScreenRead,
                              parse_codex_approval_prompt, resolve_session_approval,
                              bypass_launch_flags, normalize_auto_approval_rules,
                              apply_approval_flags, resolve_session_approval_fields,
@@ -138,7 +138,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.sess.status = "running"
         self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
-        self.sess.get_clean_screen_text = lambda **kw: self.screen
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
 
     async def asyncTearDown(self):
@@ -472,7 +472,7 @@ class _OmpSessionCase(unittest.IsolatedAsyncioTestCase):
         self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
         self.screen = omp_box("Command: cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.p…")
-        self.sess.get_clean_screen_text = lambda **kw: self.screen
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
 
     async def asyncTearDown(self):
