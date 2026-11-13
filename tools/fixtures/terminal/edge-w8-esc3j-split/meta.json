@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 60,
+  "rows": 12,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "erase-saved-lines arrives as 'ESC[3' + 'J': the carry must drop it whole",
+  "resume_count": 1
+}

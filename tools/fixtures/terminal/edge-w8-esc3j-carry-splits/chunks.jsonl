@@ -1,0 +1,6 @@
+{"delay_ms": 10, "chunk": "archived line\r\n"}
+{"delay_ms": 10, "chunk": "before\u001b[2J\u001b"}
+{"delay_ms": 10, "chunk": "[3Jafter\r\n"}
+{"delay_ms": 10, "chunk": "second\u001b[2J\u001b["}
+{"delay_ms": 10, "chunk": "3Jthird\r\n"}
+{"delay_ms": 10, "chunk": "tail\r\n"}

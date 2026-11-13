@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "the raw cut lands exactly at the banner's leading CRLF: the block moves the cut back to the banner start, which restores those two bytes and nothing else",
+  "max_bytes": 130
+}

@@ -1,0 +1,4 @@
+[90m[较早的输出已截断][0m
+old output line 0000 xxxxxxxxxxxxxxxxxxxx
+old output line 0001 xxxxxxxxxxxxxxxxxxxx
+old output line 0002 xxxxxxxxxxxxxxxxxxxx

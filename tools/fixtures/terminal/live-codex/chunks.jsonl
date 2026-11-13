@@ -1,0 +1,1766 @@
+{"delay_ms": 135, "chunk": "\u001b[1t"}
+{"delay_ms": 1, "chunk": "\u001b[c\u001b[?1004h\u001b[?9001h"}
+{"delay_ms": 148, "chunk": "\u001b[?2004h"}
+{"delay_ms": 1, "chunk": "\u001b[?1004l\u001b[?1004h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[?1049h"}
+{"delay_ms": 2, "chunk": "\u001b[?1007l"}
+{"delay_ms": 2, "chunk": "\u001b[?1003;1006h\u001b[?1006h"}
+{"delay_ms": 2, "chunk": "\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[1;1H"}
+{"delay_ms": 2, "chunk": "\u001b[J"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[1;2H\u001b[0m\u001b[K\u001b[2;29H\u001b[0m\u001b[K\u001b[3;13H\u001b[0m\u001b[K\u001b[4;2H\u001b[0m\u001b[K\u001b[5;2H\u001b[0m\u001b[K\u001b[6;2H\u001b[0m\u001b[K\u001b[7;2H\u001b[0m\u001b[K\u001b[8;2H\u001b[0m\u001b[K\u001b[9;2H\u001b[0m\u001b[K\u001b[10;62H\u001b[0m\u001b[K\u001b[11;71H\u001b[0m\u001b[K\u001b[12;73H\u001b[0m\u001b[K\u001b[13;74H\u001b[0m\u001b[K\u001b[14;75H\u001b[0m\u001b[K\u001b[15;75H\u001b[0m\u001b[K\u001b[16;76H\u001b[0m\u001b[K\u001b[17;77H\u001b[0m\u001b[K\u001b[18;77H\u001b[0m\u001b[K\u001b[19;78H\u001b[0m\u001b[K\u001b[20;77H\u001b[0m\u001b[K\u001b[21;77H\u001b[0m\u001b[K\u001b[22;76H\u001b[0m\u001b[K\u001b[23;74H\u001b[0m\u001b[K\u001b[24;71H\u001b[0m\u001b[K\u001b[25;70H\u001b[0m\u001b[K\u001b[26;68H\u001b[0m\u001b[K\u001b[27;2H\u001b[0m\u001b[K\u001b[28;2H\u001b[0m\u001b[K\u001b[29;2H\u001b[0m\u001b[K\u001b[30;2H\u001b[0m\u001b[K\u001b[31;2H\u001b[0m\u001b[K\u001b[32;2H\u001b[0m\u001b[K\u001b[33;27H\u001b[0m\u001b[K\u001b[34;2H\u001b[0m\u001b[K\u001b[35;2H\u001b[0m\u001b[K\u001b[36;18H\u001b[0m\u001b[K\u001b[1;1H \u001b[2;1H  >_ \u001b[1mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.167.0)\u001b[3;1H\u001b[22m     \u001b[2mloading\u001b[4;1H\u001b[22m \u001b[5;1H \u001b[6;1H \u001b[7;1H \u001b[8;1H \u001b[9;1H \u001b[10;1H                                                       \u001b[2m⣀⣤⣤⣤⣀⣀\u001b[11;1H\u001b[22m                                                    \u001b[2m⣠⣶⣿⣿⣿⣿⣿⣿⣿⣿⣦⣤⣤⣤⣤⣤⣤⡀\u001b[12;1H\u001b[22m                                                  \u001b[2m⢀⣾⣿⣿⠿⠋⠉⠉⢉⣭⣿⣿⣿⣿⣿⠿⣿⣿⣿⣿⣷⣄\u001b[13;1H\u001b[22m                          "}
+{"delay_ms": 4, "chunk": "                       \u001b[2m⣀⣾⣿⣿⠃\u001b[22m \u001b[2m⣀⣴⣾⣿⣿⡿⠟⠋\u001b[22m \u001b[2m⣀⡀\u001b[22m \u001b[2m⠈⠙⢿⣿⣿⣧\u001b[14;1H\u001b[22m                                              \u001b[2m⣀⣶⣿⣿⣿⣿⡇\u001b[22m \u001b[2m⢸⣿⣿⡿⠛⠉⢀⣠⣴⣿⣿⣿⣷⣦⣀⠈⢻⣿⣿⡇\u001b[15;1H\u001b[22m                                             \u001b[2m⣰⣿⣿⡿⢿⣿⣿⡇\u001b[22m \u001b[2m⢸⣿⣿⢀⣤⣶⣿⣿⣿⠟⠛⠻⣿⣿⣿⣿⣮⣿⣿⡷\u001b[16;1H\u001b[22m                                            \u001b[2m⢰⣿⣿⡟⠁⢸⣿⣿⡇\u001b[22m \u001b[2m⢸⣿⣿⣿⣿⠿⠿⣿⣿⣿⣦⣄⡀⠈⠛⠿⣿⣿⣿⣧⡀\u001b[17;1H\u001b[22m                                            \u001b[2m⣾⣿⣿⠃\u001b[22m \u001b[2m⢸⣿⣿⡇\u001b[22m \u001b[2m⢸⣿⣿⠋⠁\u001b[22m  \u001b[2m⠈⠙⢻⣿⣿⣿⣶⣤⡀\u001b[22m \u001b[2m⠹⢿⣿⣷⡄\u001b[18;1H\u001b[22m                                            \u001b[2m⢸⣿⣿⣇\u001b[22m \u001b[2m⠸⣿⣿⣷⣦⣼⣿⣿\u001b[22m      \u001b[2m⢸⣿⣿⠻⢿⣿⣿⡇\u001b[22m \u001b[2m⠘⣿⣿⣿\u001b[19;1H\u001b[22m                                            \u001b[2m⠈⢿⣿⣿⣦⡀⠈⠛⠿"}
+{"delay_ms": 5, "chunk": "⣿⣿⣿⣿⣄⡀\u001b[22m  \u001b[2m⢀⣠⣼⣿⣿\u001b[22m  \u001b[2m⣿⣿⡇\u001b[22m  \u001b[2m⣿⣿⣿⠇\u001b[20;1H\u001b[22m                                              \u001b[2m⢻⣿⣿⣿⣷⣦⣀⠈⠙⠻⣿⣿⣿⣶⣶⣿⣿⣿⣿⣿\u001b[22m  \u001b[2m⣿⣿⡇\u001b[22m \u001b[2m⣠⣿⣿⣿\u001b[21;1H\u001b[22m                                              \u001b[2m⢸⣿⣿⡿⢿⣿⣿⣿⣦⣠⣴⣿⣿⣿⡿⠟⠋⢸⣿⣿\u001b[22m  \u001b[2m⣿⣿⣷⣴⣿⣿⣿⠃\u001b[22;1H\u001b[22m                                              \u001b[2m⠘⣿⣿⣷\u001b[22m \u001b[2m⠈⠛⢿⣿⣿⣿⠿⠋⠉\u001b[22m \u001b[2m⣠⣴⣿⣿⣿\u001b[22m  \u001b[2m⣿⣿⣿⣿⣿⠟⠁\u001b[23;1H\u001b[22m                                               \u001b[2m⠻⣿⣿⣿⣤⣀\u001b[22m \u001b[2m⠈⠉\u001b[22m \u001b[2m⢀⣤⣶⣿⣿⣿⠿⠟⠁\u001b[22m \u001b[2m⣰⣿⣿⡟⠋⠁\u001b[24;1H\u001b[22m                                                \u001b[2m⠈⠿⣿⣿⣿⣿⣶⣾⣿⣿⣿⣿⠟⠋⠁\u001b[22m  \u001b[2m⣠⣼⣿⣿⡟\u001b[25;1H\u001b[22m                                                   \u001b[2m⠙⠛⠛⠛⠻⠛⢿⣿⣿⣿⣿⣷⣾⣿⣿⣿⡿⠏\u001b[26;1H\u001b[22m                  "}
+{"delay_ms": 5, "chunk": "                                        \u001b[2m⠈⠙⠛⠿⠿⠿⠿⠛⠉\u001b[27;1H\u001b[22m \u001b[28;1H \u001b[29;1H \u001b[30;1H \u001b[31;1H \u001b[32;1H \u001b[33;1H\u001b[1m›\u001b[22m \u001b[2mAsk Codex to do anything\u001b[34;1H\u001b[22m \u001b[35;1H \u001b[36;1H  \u001b[1m?\u001b[22m for shortcuts\u001b[0m\u001b[1;1H"}
+{"delay_ms": 3, "chunk": "\u001b[0 q\u001b[1;1H \u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 12, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[3;6H\u001b[2m<SCRATCH>\\task-files\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 4, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 9, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 199, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 5, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 144, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 14, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 11, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 6, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 14, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 11, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 24, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 49, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 258, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 23, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b]0;task-files\u0007"}
+{"delay_ms": 17, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 4, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 1, "chunk": "\u001b]10;?\u001b\\\u001b]11;?\u001b\\"}
+{"delay_ms": 263, "chunk": "\u001b]7501;state=idle:app=codex\u001b\\"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[10;2H\u001b[0m\u001b[K\u001b[11;2H\u001b[0m\u001b[K\u001b[12;2H\u001b[0m\u001b[K\u001b[13;2H\u001b[0m\u001b[K\u001b[14;2H\u001b[0m\u001b[K\u001b[15;2H\u001b[0m\u001b[K\u001b[16;2H\u001b[0m\u001b[K\u001b[17;2H\u001b[0m\u001b[K\u001b[18;2H\u001b[0m\u001b[K\u001b[19;2H\u001b[0m\u001b[K\u001b[20;2H\u001b[0m\u001b[K\u001b[21;2H\u001b[0m\u001b[K\u001b[22;2H\u001b[0m\u001b[K\u001b[23;2H\u001b[0m\u001b[K\u001b[24;2H\u001b[0m\u001b[K\u001b[25;2H\u001b[0m\u001b[K\u001b[26;2H\u001b[0m\u001b[K\u001b[35;3HGPT-6.1-Sol\u001b[35;15Hdefault\u001b[35;23H·\u001b[35;25H<SCRATCH>\\task-files\u001b[36;3H\u001b[1m←\u001b[36;9H\u001b[22magen\u001b[36;14Hs · \u001b[1m?\u001b[36;20H\u001b[22mfor\u001b[36;24Hshortcuts\u001b[36;96H⚠\u001b[36;98H1\u001b[36;100Hwarning\u001b[36;108H·\u001b[36;110H\u001b[1mf2\u001b[36;113H\u001b[22mto\u001b[36;116Hview\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 7, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 6, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 87, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 295, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b]7501;state=working:app=codex\u001b\\"}
+{"delay_ms": 2, "chunk": "\u001b[6n"}
+{"delay_ms": 505, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[13;2H\u001b[0m\u001b[K\u001b[14;119H\u001b[0m\u001b[K\u001b[15;10H\u001b[0m\u001b[K\u001b[16;2H\u001b[0m\u001b[K\u001b[5;1H\u001b[2m  To get started, describe a task or try one of these commands:\u001b[7;3H\u001b[22m/init\u001b[2m - create an AGENTS.md file with instructions for Codex\u001b[8;3H\u001b[22m/status\u001b[2m - show current session configuration\u001b[9;3H\u001b[22m/permissions\u001b[2m - choose what Codex is allowed to do\u001b[10;3H\u001b[22m/model\u001b[2m - choose what model and reasoning effort to use\u001b[11;3H\u001b[22m/review\u001b[2m - review any changes and find issues\u001b[13;1H\u001b[22m \u001b[14;1H\u001b[1m\u001b[2m› \u001b[22m\u001b[22m[Hub Session: session_id=rtc-corpus-codex-1df64f69] list the files in this folder and say how many there are; change\u001b[15;1H  nothing\u001b[16;1H \u001b[35;15Hminimal\u001b[0m\u001b[33;3H"}
+{"delay_ms": 4, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 237, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 12, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[30;3H\u001b[2mStarting MCP servers (8/9): mc163market\u001b[30;43H(0s • \u001b[22m\u001b[1mesc\u001b[22m\u001b[2m\u001b[2m to interrupt)\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 37, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;44H\u001b[2m1\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 30, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 37, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 32, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 35, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 35, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;44H\u001b[2m2\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[30;44H3\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 47, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 49, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 49, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;44H\u001b[2m4\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;44H\u001b[2m5\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 4, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[30;44H\u001b[2m6\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 54, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;44H\u001b[2m7\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 37, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 4, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;2H\u001b[0m\u001b[K\u001b[18;1H\u001b[2m• \u001b[22mI\u001b[30;1H \u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 98, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 31, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;4H’ll\u001b[18;8Hinspect\u001b[18;16Hthe\u001b[18;20Hcurrent\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 30, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[18;28Hfolder\u001b[18;35Hcontents\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 10, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 104, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 30, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;44Hread\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 127, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 4, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;48H-only\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 13, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;54Hand\u001b[18;58Hcount\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 58, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;64Hthe\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 83, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[18;68Hfiles.\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 100, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠹ task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠸ task-files\u0007"}
+{"delay_ms": 18, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[30;3H\u001b[2mStarting MCP servers (8/9): mc163market\u001b[30;43H(8s • \u001b[22m\u001b[1mesc\u001b[22m\u001b[2m\u001b[2m to interrupt)\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b]0;⠼ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠴ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[30;44H9\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 32, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠦ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 35, "chunk": "\u001b]0;⠇ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠏ task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠋ task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 21, "chunk": "\u001b]0;⠙ task-files\u0007"}
+{"delay_ms": 23, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[35;89H·\u001b[35;91HList\u001b[35;96Hfolder\u001b[35;103Hfiles\u001b[35;109Hand\u001b[35;113Hcount\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 7, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 30, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;44H\u001b[2m10s • \u001b[22m\u001b[1mesc\u001b[22m\u001b[2m\u001b[2m to inte\u001b[30;62Hrupt)\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 37, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 33, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 35, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 35, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;45H\u001b[2m1\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 47, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 6, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 32, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 52, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 32, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[30;45H\u001b[2m2\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;45H\u001b[2m3\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 3, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;45H\u001b[2m4\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 51, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 4, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 11, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;67H\u001b[2m · 1 background terminal running · /ps to view · /sto…\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 64, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 34, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 23, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 3, "chunk": "\u001b[30;67H\u001b[0m\u001b[K\u001b[20;1H\u001b[1m•\u001b[20;3HRan\u001b[20;7H\u001b[22mGet-ChildItem -File | Select-Object -ExpandProperty Name\u001b[21;1H\u001b[2m  └ alpha.txt\u001b[22;1H    beta.txt\u001b[23;1H    gamma.md\u001b[30;1H◦\u001b[30;45H5\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 6, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 2, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 24, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;45H\u001b[2m6\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 46, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 45, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;45H\u001b[2m7\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 30, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 38, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 39, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;1H•\u001b[30;45H\u001b[2m8\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;45H\u001b[2m9\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H•\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 40, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;1H\u001b[2m◦\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 44, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[30;44H\u001b[2m20\u001b[0m\u001b[33;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 42, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 43, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 41, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;2H\u001b[0m\u001b[K\u001b[25;1H\u001b[2m• \u001b[22mFiles\u001b[30;1H \u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 56, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[25;2H\u001b[0m\u001b[K\u001b[25;1H \u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 10, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[25;1H\u001b[2m• \u001b[22mFiles\u001b[25;9Hin\u001b[25;12Hthe\u001b[25;16Hfolder:\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 89, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[26;3H•\u001b[26;5H`alpha\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 8, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[26;11H.txt\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 97, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 7, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[26;10H\u001b[0m\u001b[K\u001b[26;6Hbeta\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 9, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[26;2H\u001b[0m\u001b[K\u001b[27;3H•\u001b[27;5H`beta\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 28, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[27;5Halpha.txt\u001b[28;3H•\u001b[28;5H`beta\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 1, "chunk": "\u001b[?2026l"}
+{"delay_ms": 51, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[28;6H\u001b[0m\u001b[K\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 13, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 12, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[28;5Hbeta.txt\u001b[29;3H•\u001b[29;5H`\u001b[0m\u001b[33;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 78, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[29;6Hgamma.md\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 20, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 1, "chunk": "\u001b[29;13H\u001b[0m\u001b[K\u001b[29;5Hgamma.md\u001b[30;3HTotal\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 86, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[30;8H:\u001b[30;10H\u001b[1m3 files\u001b[22m.\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 85, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[3;2H\u001b[0m\u001b[K\u001b[5;2H\u001b[0m\u001b[K\u001b[7;47H\u001b[0m\u001b[K\u001b[10;47H\u001b[0m\u001b[K\u001b[11;2H\u001b[0m\u001b[K\u001b[12;2H\u001b[0m\u001b[K\u001b[14;10H\u001b[0m\u001b[K\u001b[15;2H\u001b[0m\u001b[K\u001b[16;2H\u001b[0m\u001b[K\u001b[18;2H\u001b[0m\u001b[K\u001b[20;14H\u001b[0m\u001b[K\u001b[21;13H\u001b[0m\u001b[K\u001b[23;2H\u001b[0m\u001b[K\u001b[25;2H\u001b[0m\u001b[K\u001b[27;13H\u001b[0m\u001b[K\u001b[29;2H\u001b[0m\u001b[K\u001b[1;3H>_\u001b[1;6H\u001b[1mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.167.0)\u001b[2;3H\u001b[22m  \u001b[2;6H\u001b[2m<SCRATCH>\\task-files\u001b[4;1H  To get started, describe a task or try one of these commands:\u001b[5;1H\u001b[22m \u001b[6;3H/init\u001b[2m - create an AGENTS.md file with instructions for Codex\u001b[7;4H\u001b[22msta\u001b[7;8Hus\u001b[7;11H\u001b[2m- show\u001b[7;18Hcurrent session configuration\u001b[8;4H\u001b[22mpermi\u001b[8;10Hsions\u001b[2m -\u001b[8;19Hhoose what C\u001b[8;32Hdex is allowed to do\u001b[9;4H\u001b[22mmodel\u001b[2m - choose what model\u001b[9;30Han\u001b[9;33H rea\u001b[9;38Honing \u001b[9;45Hffort to use\u001b[10;4H\u001b[22mreview\u001b[2m - revi\u001b[10;18Hw any\u001b[10;24Hchanges and find issues\u001b[12;1H\u001b[22m \u001b[13;1H\u001b[1m\u001b[2m› \u001b[22m\u001b[22m[Hub\u001b[13;8HSession:\u001b[13;17Hsession_id=rtc-corpus-codex-1df64f69]\u001b[13;55Hlist\u001b[13;60Hthe\u001b[13;64Hfiles\u001b[13;70Hin\u001b[13;73Hthis\u001b[13;78Hfolder\u001b[13;85H"}
+{"delay_ms": 6, "chunk": "and\u001b[13;89Hsay\u001b[13;93Hhow\u001b[13;97Hmany\u001b[13;102Hthere\u001b[13;108Hare;\u001b[13;113Hchange\u001b[14;1H  nothing\u001b[16;1H \u001b[17;1H\u001b[2m• \u001b[22mI’ll\u001b[17;8Hinspect\u001b[17;16Hthe\u001b[17;20Hcurrent\u001b[17;28Hfolder\u001b[17;35Hcontents\u001b[17;44Hread-only\u001b[17;54Hand\u001b[17;58Hcount\u001b[17;64Hthe\u001b[17;68Hfiles.\u001b[18;1H \u001b[19;1H\u001b[1m•\u001b[19;3HRan\u001b[19;7H\u001b[22mGet-ChildItem -File | Select-Object -ExpandProperty Name\u001b[20;1H\u001b[2m  └ alpha.txt\u001b[21;3H \u001b[21;5Hbeta.txt\u001b[22;5Hgamma.md\u001b[23;1H\u001b[22m \u001b[24;1H\u001b[2m• \u001b[22mFiles\u001b[24;9Hin\u001b[24;12Hthe\u001b[24;16Hfolder:\u001b[25;1H \u001b[26;3H•\u001b[26;5Halpha.txt\u001b[27;5Hbeta.txt\u001b[28;5Hgamma.md\u001b[0m\u001b[33;3H"}
+{"delay_ms": 4, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 93, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 102, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 30, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[1;2H\u001b[0m\u001b[K\u001b[2;64H\u001b[0m\u001b[K\u001b[4;63H\u001b[0m\u001b[K\u001b[6;52H\u001b[0m\u001b[K\u001b[8;47H\u001b[0m\u001b[K\u001b[9;2H\u001b[0m\u001b[K\u001b[10;2H\u001b[0m\u001b[K\u001b[11;119H\u001b[0m\u001b[K\u001b[13;2H\u001b[0m\u001b[K\u001b[14;2H\u001b[0m\u001b[K\u001b[15;74H\u001b[0m\u001b[K\u001b[17;63H\u001b[0m\u001b[K\u001b[19;13H\u001b[0m\u001b[K\u001b[20;13H\u001b[0m\u001b[K\u001b[21;2H\u001b[0m\u001b[K\u001b[24;14H\u001b[0m\u001b[K\u001b[26;13H\u001b[0m\u001b[K\u001b[27;2H\u001b[0m\u001b[K\u001b[2;1H\u001b[2m  To get started, describe a task or t\u001b[2;40Hy one of these commands:\u001b[4;1H\u001b[22m  /init\u001b[2m - create an AGENTS.md file wi\u001b[4;39Hh instruction\u001b[4;53H for Codex\u001b[5;3H\u001b[22m/status\u001b[2m - show current session configuration\u001b[6;4H\u001b[22mpermissions\u001b[2m -\u001b[6;18Hchoose what Codex\u001b[6;36His allowed to do\u001b[7;4H\u001b[22mmodel\u001b[2m - cho\u001b[7;16Hse what mod\u001b[7;28Hl and\u001b[7;34Hreasoning effort to use\u001b[8;4H\u001b[22mr\u001b[8;6Hview\u001b[2m - review any changes and\u001b[8;36Hfind issues\u001b[10;1H\u001b[22m \u001b[11;1H\u001b[1m\u001b[2m› \u001b[22m\u001b[22m[Hub Session: session_id=rtc-corpus-codex-1df64f69] list the files in this folder and say how many there are; change\u001b[12;3Hnothing\u001b[13;1H \u001b[14;1H \u001b[15;1H\u001b[2m• \u001b[22mI’ll inspect the current folder contents read-only and count the files.\u001b[17;1H\u001b[1m•\u001b[22m \u001b[1mRan"}
+{"delay_ms": 7, "chunk": "\u001b[22m Get-ChildItem -File | Select-Object -ExpandProperty Name\u001b[18;1H\u001b[2m  └ alpha.txt\u001b[19;1H    beta.txt\u001b[20;3H \u001b[20;5Hgamm\u001b[20;11Hmd\u001b[21;1H\u001b[22m \u001b[22;1H\u001b[2m•\u001b[22;3H\u001b[22mFiles in the\u001b[22;16Hfolder:\u001b[24;1H  • alpha.txt\u001b[25;3H•\u001b[25;5Hbeta.txt\u001b[26;5Hgamm\u001b[26;11Hmd\u001b[28;3HTotal: \u001b[1m3 files\u001b[22m.\u001b[30;1H\u001b[2m  Worked for 21s • 15:54                                                                                                \u001b[0m\u001b[33;3H"}
+{"delay_ms": 3, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 93, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 121, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 111, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 121, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 110, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠴ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 105, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 106, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠼ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠦ List folder files and count | task-files\u0007"}
+{"delay_ms": 107, "chunk": "\u001b]0;⠧ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠇ List folder files and count | task-files\u0007"}
+{"delay_ms": 109, "chunk": "\u001b]0;⠏ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠋ List folder files and count | task-files\u0007"}
+{"delay_ms": 108, "chunk": "\u001b]0;⠙ List folder files and count | task-files\u0007"}
+{"delay_ms": 110, "chunk": "\u001b]0;⠹ List folder files and count | task-files\u0007"}
+{"delay_ms": 65, "chunk": "\u001b]0;⠸ List folder files and count | task-files\u0007"}
+{"delay_ms": 1, "chunk": "\u001b]0;List folder files and count | task-files\u0007"}
+{"delay_ms": 11, "chunk": "\u001b]7501;state=done:app=codex\u001b\\"}
+{"delay_ms": 1, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[36;95H⚠ 2 warnings\u001b[0m\u001b[33;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 4069, "chunk": "\u001b[6n"}
+{"delay_ms": 510, "chunk": "\u001b[?2026h\u001b[1;1H"}
+{"delay_ms": 1, "chunk": "\u001b[J"}
+{"delay_ms": 3, "chunk": "\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[1;2H\u001b[0m\u001b[K\u001b[2;29H\u001b[0m\u001b[K\u001b[3;69H\u001b[0m\u001b[K\u001b[4;2H\u001b[0m\u001b[K\u001b[5;64H\u001b[0m\u001b[K\u001b[6;2H\u001b[0m\u001b[K\u001b[7;63H\u001b[0m\u001b[K\u001b[8;47H\u001b[0m\u001b[K\u001b[9;52H\u001b[0m\u001b[K\u001b[10;57H\u001b[0m\u001b[K\u001b[11;47H\u001b[0m\u001b[K\u001b[12;2H\u001b[0m\u001b[K\u001b[13;2H\u001b[0m\u001b[K\u001b[14;127H\u001b[0m\u001b[K\u001b[15;2H\u001b[0m\u001b[K\u001b[16;2H\u001b[0m\u001b[K\u001b[17;74H\u001b[0m\u001b[K\u001b[18;2H\u001b[0m\u001b[K\u001b[19;63H\u001b[0m\u001b[K\u001b[20;14H\u001b[0m\u001b[K\u001b[21;13H\u001b[0m\u001b[K\u001b[22;13H\u001b[0m\u001b[K\u001b[23;2H\u001b[0m\u001b[K\u001b[24;23H\u001b[0m\u001b[K\u001b[25;2H\u001b[0m\u001b[K\u001b[26;14H\u001b[0m\u001b[K\u001b[27;13H\u001b[0m\u001b[K\u001b[28;13H\u001b[0m\u001b[K\u001b[29;2H\u001b[0m\u001b[K\u001b[30;18H\u001b[0m\u001b[K\u001b[31;2H\u001b[0m\u001b[K\u001b[1;1H \u001b[2;1H  >_ \u001b[1mOpenAI Codex\u001b[22m\u001b[2m\u001b[2m (v0.167.0)\u001b[3;1H\u001b[22m     \u001b[2m<SCRATCH>\\task-files\u001b[4;1H\u001b[22m \u001b[5;1H\u001b[2m  To get started, describe a task or try one of these commands:\u001b[6;1H\u001b[22m \u001b[7;1H  /init\u001b[2m - create an AGENTS.md file with instructions for Codex\u001b[8;1H\u001b[22m  /status\u001b[2m - show current session configuration\u001b[9;1H\u001b[22m  /permissions\u001b[2m - choose what Codex is allowed to do\u001b[10;1H\u001b[22m  /model\u001b[2m - choose what model and reasoning effort to use\u001b[11;1H\u001b[22m  /review\u001b[2m - review any changes and find issues\u001b[12;1H"}
+{"delay_ms": 6, "chunk": "\u001b[22m \u001b[13;1H \u001b[14;1H\u001b[1m\u001b[2m› \u001b[22m\u001b[22m[Hub Session: session_id=rtc-corpus-codex-1df64f69] list the files in this folder and say how many there are; change nothing\u001b[15;1H \u001b[16;1H \u001b[17;1H\u001b[2m• \u001b[22mI’ll inspect the current folder contents read-only and count the files.\u001b[18;1H \u001b[19;1H\u001b[1m•\u001b[22m \u001b[1mRan\u001b[22m Get-ChildItem -File | Select-Object -ExpandProperty Name\u001b[20;1H\u001b[2m  └ alpha.txt\u001b[21;1H    beta.txt\u001b[22;1H    gamma.md\u001b[23;1H\u001b[22m \u001b[24;1H\u001b[2m• \u001b[22mFiles in the folder:\u001b[25;1H \u001b[26;1H  • alpha.txt\u001b[27;1H  • beta.txt\u001b[28;1H  • gamma.md\u001b[29;1H \u001b[30;1H  Total: \u001b[1m3 files\u001b[22m.\u001b[31;1H \u001b[32;1H\u001b[2m  Worked for 21s • 15:54                                                                                                                    \u001b[41;1H\u001b[22m\u001b[1m›\u001b[41;3H\u001b[22m\u001b[2m\u001b[2mAsk Codex to do anything\u001b[43;3H\u001b[22mGPT-6.1-Sol\u001b[43;15Hminimal\u001b[43;23H·\u001b[43;25H<SCRATCH>\\task-files\u001b[43;89H·\u001b[43;91HList\u001b[43;96Hfolder\u001b[43;103Hfiles\u001b[43;109Hand\u001b[43;113Hcount\u001b["}
+{"delay_ms": 5, "chunk": "44;3H\u001b[1m←\u001b[44;5H\u001b[22mfor\u001b[44;9Hagents\u001b[44;16H·\u001b[44;18H\u001b[1m?\u001b[44;20H\u001b[22mfor\u001b[44;24Hshortcuts\u001b[44;115H⚠\u001b[44;117H2\u001b[44;119Hwarnings\u001b[44;128H·\u001b[44;130H\u001b[1mf2\u001b[44;133H\u001b[22mto\u001b[44;136Hview\u001b[0m\u001b[1;1H"}
+{"delay_ms": 2, "chunk": "\u001b[0 q\u001b[1;1H \u001b[0m\u001b[41;3H\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 56, "chunk": "\u001b[?2026h\u001b[0m\u001b[41;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}
+{"delay_ms": 20023, "chunk": "\u001b[?2026h\u001b[0m\u001b[41;3H"}
+{"delay_ms": 1, "chunk": "\u001b[?25h\u001b[?2026l"}
+{"delay_ms": 83, "chunk": "\u001b]7501;state=idle:app=codex\u001b\\"}
+{"delay_ms": 2, "chunk": "\u001b[?2026h\u001b[?25l"}
+{"delay_ms": 2, "chunk": "\u001b[41;2H\u001b[0m\u001b[K\u001b[40;1H\u001b[1m›\u001b[40;3H\u001b[22m/exit\u001b[41;1H \u001b[44;3H \u001b[44;5H   \u001b[44;9H      \u001b[44;16H \u001b[44;18H \u001b[44;20H   \u001b[44;24H         \u001b[0m\u001b[41;3H"}
+{"delay_ms": 2, "chunk": "\u001b[?25h"}
+{"delay_ms": 2, "chunk": "\u001b[?2026l"}

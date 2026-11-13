@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "max_bytes is smaller than the truncation prefix, so budget <= 0 and the result is the prefix alone",
+  "max_bytes": 20
+}

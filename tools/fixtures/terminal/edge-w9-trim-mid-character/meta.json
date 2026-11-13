@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "budget cuts inside a 3-byte character on a line with no break: decode(..., 'replace')",
+  "max_bytes": 300
+}

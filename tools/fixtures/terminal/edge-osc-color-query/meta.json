@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "codex",
+  "cols": 60,
+  "rows": 12,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "every colour query in one chunk: OSC_COLOR_QUERY_RE removes them before the screen and the raw history",
+  "resume_count": 1
+}

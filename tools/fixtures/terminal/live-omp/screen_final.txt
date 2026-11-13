@@ -1,0 +1,39 @@
+
+                                                      ████████████
+                                                         ██  ██       ▄▀▀▄ █▀▄▀▄ █▀▀▄
+                                                         ██  ██       ▀▄▄▀ █ █ █ █▄▄▀
+                                                         ▒▒  ██                  █
+                                                             ██       v18.20.0
+
+                                           Tip: Press ⇧⇥ to cycle through reasoning effort levels
+
+
+
+ [Hub Session: session_id=rtc-corpus-omp-d07fe9b0] list the files in this folder and say how many there are; change nothing
+
+
+ Top-level of task-files: 3 files + 1 directory = 4 entries.
+
+ ┌───────────┬──────┬──────┐
+ │ Entry     │ Type │ Size │
+ ├───────────┼──────┼──────┤
+ │ alpha.txt │ file │ 9 B  │
+ ├───────────┼──────┼──────┤
+ │ beta.txt  │ file │ 8 B  │
+ ├───────────┼──────┼──────┤
+ │ gamma.md  │ file │ 14 B │
+ ├───────────┼──────┼──────┤
+ │ data/     │ dir  │ —    │
+ └───────────┴──────┴──────┘
+
+ Inside data/: one file, small.csv (19 B). Total files including that: 4. Nothing changed.
+
+ Closing session…
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                               ⇧⇥ to change thinking effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ π · ⦸ DeepSeek Flash (clay) · 📁 <SCRATCH>\task-files · ◫ 0.8%/1M ⟲ · $0.00 ↑
+TPS — tok/s · TTFT 7.1s
+u

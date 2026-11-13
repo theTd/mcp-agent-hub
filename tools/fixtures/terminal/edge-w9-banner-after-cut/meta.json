@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "the cut lands in the old output and the newest banner sits entirely after it: the banner survives by position (banner_start >= start, so the banner block does not fire)",
+  "max_bytes": 400
+}

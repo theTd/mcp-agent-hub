@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 60,
+  "rows": 12,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "resume_count": 1,
+  "note": "erase-saved-lines split as 'ESC' + '[3J' and 'ESC[' + '3J': on a resumed session the carry must drop both whole; the fresh session keeps them"
+}

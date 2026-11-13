@@ -1,0 +1,9 @@
+[90m[较早的输出已截断][0m
+old output line 0012 xxxxxxxxxxxxxxxxxxxx
+old output line 0013 xxxxxxxxxxxxxxxxxxxx
+old output line 0014 xxxxxxxxxxxxxxxxxxxx
+old output line 0015 xxxxxxxxxxxxxxxxxxxx
+old output line 0016 xxxxxxxxxxxxxxxxxxxx
+old output line 0017 xxxxxxxxxxxxxxxxxxxx
+old output line 0018 xxxxxxxxxxxxxxxxxxxx
+old output line 0019 xxxxxxxxxxxxxxxxxxxx

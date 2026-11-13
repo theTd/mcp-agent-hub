@@ -1,0 +1,7 @@
+{
+  "kind": "input",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "the OSC 52 (clipboard) and 1[01]\\d (110/119) branches of OSC_TERMINAL_REPLY_RE, next to a colour reply, all in one browser message"
+}
