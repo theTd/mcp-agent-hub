@@ -204,6 +204,8 @@ class AgentModelDiscovery:
         self._cache_at: float = 0.0
         self._cache_ttl: float = 120.0
         self._lock = threading.Lock()
+        self._claude_binary_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._claude_cache_lock = threading.Lock()
 
     def peek_cache(self) -> Optional[Dict[str, Any]]:
         """Returns whatever has already been discovered, without ever running a CLI (never blocks)."""
@@ -670,6 +672,299 @@ class AgentModelDiscovery:
             },
         }
 
+    @staticmethod
+    def _canonicalize_claude_catalog_id(model_id: str) -> str:
+        return re.sub(r"^(claude-[a-z0-9.\-]+)-\d{8}$", r"\1", (model_id or "").strip())
+
+    @staticmethod
+    def _format_claude_display_name(raw_name: Optional[str], model_id: str) -> str:
+        name = (raw_name or "").strip()
+        if name:
+            if name.startswith(("Fable ", "Opus ", "Sonnet ", "Haiku ")):
+                return f"Claude {name}"
+            return name
+        return model_id
+
+    def _resolve_reclaude_config_dir(self) -> Optional[Path]:
+        current_file = self.home / ".rec" / "claude" / "current"
+        try:
+            if not current_file.is_file():
+                return None
+            acct = current_file.read_text(encoding="utf-8", errors="replace").strip()
+            if not acct or "/" in acct or "\\" in acct or acct in (".", ".."):
+                return None
+            cand = self.home / ".rec" / "claude" / "accounts" / acct / "config"
+            if cand.is_dir():
+                return cand
+        except OSError:
+            pass
+        return None
+
+    def _read_claude_cached_catalog(self, claude_cfg_dir: Path) -> Optional[Dict[str, Any]]:
+        catalog_dir = claude_cfg_dir / "cache" / "model-catalog"
+        if not catalog_dir.is_dir():
+            return None
+        best_score = None
+        best_doc: Optional[Dict[str, Any]] = None
+        for json_path in catalog_dir.glob("*.json"):
+            try:
+                st = json_path.stat()
+                doc = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            catalog = doc.get("catalog")
+            if not isinstance(catalog, dict):
+                continue
+            config = catalog.get("config")
+            if not isinstance(config, dict):
+                continue
+            if catalog.get("surface") != "cc" and config.get("id") != "cc":
+                continue
+            raw_models = config.get("models")
+            if not isinstance(raw_models, list) or not raw_models:
+                continue
+            try:
+                fetched_at = int(doc.get("fetchedAt") or 0)
+            except (TypeError, ValueError):
+                fetched_at = 0
+            score = (fetched_at, st.st_mtime_ns)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_doc = doc
+        if best_doc is None:
+            return None
+
+        catalog = best_doc["catalog"]
+        config = catalog["config"]
+        thinking_by_model: Dict[str, str] = {}
+        state = catalog.get("state")
+        if isinstance(state, dict) and isinstance(state.get("thinking_by_model"), list):
+            for item in state["thinking_by_model"]:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "").strip()
+                effort = str(((item.get("thinking") or {}).get("effort")) or "").strip().lower()
+                if item_id and effort:
+                    thinking_by_model[item_id] = effort
+                    thinking_by_model[self._canonicalize_claude_catalog_id(item_id)] = effort
+
+        parsed_models: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for entry in config["models"]:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("disabled") is True or entry.get("section") == "deprecated":
+                continue
+            raw_id = str(entry.get("id") or "").strip()
+            if not raw_id:
+                continue
+            cid = self._canonicalize_claude_catalog_id(raw_id)
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            display_name = self._format_claude_display_name(entry.get("name"), cid)
+            section = "overflow" if entry.get("section") == "overflow" else "main"
+            runtime = entry.get("runtime") if isinstance(entry.get("runtime"), dict) else {}
+            thinking = entry.get("thinking") if isinstance(entry.get("thinking"), dict) else {}
+
+            if isinstance(runtime.get("effort_levels"), list):
+                levels: Optional[List[str]] = [
+                    str(x).strip().lower() for x in runtime["effort_levels"] if str(x).strip()
+                ]
+            elif thinking.get("type") == "none":
+                levels = []
+            elif isinstance(thinking.get("effort_options"), list):
+                levels = [
+                    str(o.get("id")).strip().lower()
+                    for o in thinking["effort_options"]
+                    if isinstance(o, dict) and str(o.get("id") or "").strip()
+                ]
+            else:
+                levels = None
+
+            if levels == []:
+                default_effort = None
+            else:
+                default_effort = str(runtime.get("default_effort") or "").strip().lower() or None
+                if default_effort is None and levels:
+                    cand_effort = thinking_by_model.get(raw_id) or thinking_by_model.get(cid)
+                    if cand_effort and cand_effort in levels:
+                        default_effort = cand_effort
+
+            parsed_models.append(
+                {
+                    "id": cid,
+                    "display_name": display_name,
+                    "section": section,
+                    "levels": levels,
+                    "default_effort": default_effort,
+                }
+            )
+
+        alias_targets: Dict[str, str] = {}
+        pat = config.get("provider_alias_targets")
+        if isinstance(pat, dict):
+            for alias, target_info in pat.items():
+                if isinstance(target_info, dict) and isinstance(target_info.get("default"), str):
+                    target = target_info["default"].strip()
+                    if target:
+                        alias_targets[str(alias).strip().lower()] = self._canonicalize_claude_catalog_id(target)
+
+        return {"models": parsed_models, "alias_targets": alias_targets} if parsed_models else None
+
+    def _extract_claude_binary_catalog(self, claude_bin: Path) -> Optional[Dict[str, Any]]:
+        script_suffixes = {".cmd", ".bat", ".ps1", ".sh"}
+        seen_paths = set()
+
+        def _parse_candidate(cand: Path) -> Optional[Dict[str, Any]]:
+            if not cand or cand.suffix.lower() in script_suffixes:
+                return None
+            try:
+                if not cand.is_file():
+                    return None
+                resolved = cand.resolve()
+                norm = os.path.normcase(str(resolved))
+                if norm in seen_paths:
+                    return None
+                seen_paths.add(norm)
+                st = resolved.stat()
+                cache_key = (norm, st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+            with self._claude_cache_lock:
+                cached = self._claude_binary_cache.get(cache_key)
+            if cached is None:
+                parsed_models: List[Dict[str, Any]] = []
+                seen_ids = set()
+                alias_targets: Dict[str, str] = {}
+                try:
+                    raw_bytes = resolved.read_bytes()
+
+                    # 1. Embedded surfaces.cc model-catalog seed (UE)
+                    m_cc = raw_bytes.find(b'model_selector_config:[{id:"cc",models:[')
+                    if m_cc != -1:
+                        m_pat = raw_bytes.find(b"provider_alias_targets:", m_cc, m_cc + 40_000)
+                        end_idx = (m_pat + 1500) if m_pat != -1 else (m_cc + 40_000)
+                        cc_snip = raw_bytes[m_cc:end_idx].decode("utf-8", errors="replace")
+                        matches = list(re.finditer(r'\{id:"(claude-[a-z0-9.\-]+)",name:"([^"]+)"', cc_snip))
+                        pat_pos = cc_snip.find("provider_alias_targets:")
+                        for idx, m in enumerate(matches):
+                            start = m.start()
+                            nxt = (
+                                matches[idx + 1].start()
+                                if idx + 1 < len(matches)
+                                else (pat_pos if pat_pos > start else len(cc_snip))
+                            )
+                            entry = cc_snip[start:nxt]
+                            if "disabled:!0" in entry or 'section:"deprecated"' in entry:
+                                continue
+                            cid = self._canonicalize_claude_catalog_id(m.group(1))
+                            if cid in seen_ids:
+                                continue
+                            seen_ids.add(cid)
+                            display_name = self._format_claude_display_name(m.group(2), cid)
+                            section = "overflow" if 'section:"overflow"' in entry else "main"
+                            eff_m = re.search(r"effort_levels:\[([^\]]*)\]", entry)
+                            if eff_m:
+                                levels: Optional[List[str]] = [
+                                    x.strip().strip('"').strip("'").lower()
+                                    for x in eff_m.group(1).split(",")
+                                    if x.strip().strip('"').strip("'")
+                                ]
+                            elif 'thinking:{type:"none"}' in entry:
+                                levels = []
+                            else:
+                                levels = None
+                            def_m = re.search(r'default_effort:"([^"]+)"', entry)
+                            default_effort = def_m.group(1).strip().lower() if def_m else None
+                            if levels == []:
+                                default_effort = None
+                            parsed_models.append(
+                                {
+                                    "id": cid,
+                                    "display_name": display_name,
+                                    "section": section,
+                                    "levels": levels,
+                                    "default_effort": default_effort,
+                                }
+                            )
+                        if pat_pos != -1:
+                            pat_snip = cc_snip[pat_pos:]
+                            for a_m in re.finditer(
+                                r'\b(fable|opus|sonnet|haiku):\{default:"(claude-[a-z0-9.\-]+)"',
+                                pat_snip,
+                            ):
+                                alias_targets[a_m.group(1).lower()] = self._canonicalize_claude_catalog_id(a_m.group(2))
+
+                    # 2. Embedded canonical model constants (Em)
+                    em_marker = raw_bytes.find(b'FABLE_ID:"')
+                    if em_marker == -1:
+                        em_marker = raw_bytes.find(b'OPUS_ID:"')
+                    if em_marker != -1:
+                        brace_start = raw_bytes.rfind(b"{", max(0, em_marker - 2048), em_marker + 10)
+                        brace_end = raw_bytes.find(b"}", em_marker, em_marker + 2048)
+                        if brace_start != -1 and brace_end != -1:
+                            em_snip = raw_bytes[brace_start : brace_end + 1].decode("ascii", errors="ignore")
+                            pairs = re.findall(
+                                r'([A-Z0-9_]+)_ID:"(claude-(?:fable|opus|sonnet|haiku)-[a-z0-9.\-]+)",\1_NAME:"([^"]+)"',
+                                em_snip,
+                            )
+                            for prefix, raw_id, raw_label in pairs:
+                                cid = self._canonicalize_claude_catalog_id(raw_id)
+                                if cid in seen_ids:
+                                    continue
+                                seen_ids.add(cid)
+                                parsed_models.append(
+                                    {
+                                        "id": cid,
+                                        "display_name": self._format_claude_display_name(raw_label, cid),
+                                        "section": "overflow" if prefix.startswith("PREV_") else "main",
+                                        "levels": None,
+                                        "default_effort": None,
+                                    }
+                                )
+                except Exception:
+                    pass
+
+                cached = {"models": parsed_models, "alias_targets": alias_targets}
+                with self._claude_cache_lock:
+                    self._claude_binary_cache[cache_key] = cached
+
+            return cached if cached.get("models") else None
+
+        hit = _parse_candidate(claude_bin)
+        if hit:
+            return hit
+
+        fallback_candidates: List[Path] = [self.home / ".local" / "bin" / "claude.exe"]
+        versions_dir = self.home / ".local" / "share" / "claude" / "versions"
+        if versions_dir.is_dir():
+            try:
+                fallback_candidates.extend(
+                    sorted(
+                        (p for p in versions_dir.iterdir() if p.is_file()),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except OSError:
+                pass
+        for cand in fallback_candidates:
+            hit = _parse_candidate(cand)
+            if hit:
+                return hit
+
+        for which_name in ("claude.exe", "claude"):
+            found = shutil.which(which_name)
+            if found:
+                hit = _parse_candidate(Path(found))
+                if hit:
+                    return hit
+        return None
+
     def _discover_claude(
         self,
         binary_override: Optional[str] = None,
@@ -678,6 +973,7 @@ class AgentModelDiscovery:
         raw_bin = (binary_override or os.environ.get("CLAUDE_BIN") or "").strip()
         fallback_exe = self.home / ".local" / "bin" / "claude.exe"
         fallback_cmd = self.home / "AppData" / "Roaming" / "npm" / "claude.cmd"
+        fallback_reclaude = self.home / "AppData" / "Local" / "Programs" / "reclaude" / "bin" / "reclaude.exe"
         if raw_bin:
             expanded_bin = os.path.expandvars(os.path.expanduser(raw_bin))
             candidate_bin = Path(expanded_bin)
@@ -699,33 +995,29 @@ class AgentModelDiscovery:
             elif fallback_cmd.exists():
                 claude_bin = fallback_cmd
             else:
-                claude_bin = fallback_exe
+                reclaude_str = shutil.which("reclaude.exe") or shutil.which("reclaude")
+                if reclaude_str:
+                    claude_bin = Path(reclaude_str)
+                elif fallback_reclaude.exists():
+                    claude_bin = fallback_reclaude
+                else:
+                    claude_bin = fallback_exe
 
         raw_cfg_dir = (config_dir_override or os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
         if raw_cfg_dir:
             claude_cfg_dir = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(raw_cfg_dir))))
+        elif claude_bin.stem.lower() == "reclaude":
+            claude_cfg_dir = self._resolve_reclaude_config_dir() or (self.home / ".claude")
         else:
             claude_cfg_dir = self.home / ".claude"
 
         thinking_levels: List[str] = ["low", "medium", "high", "xhigh", "max"]
         default_model = "sonnet"
         default_effort = "high"
-        discovered_models: List[str] = []
-        models: List[Dict[str, Any]] = []
-
-        def _add_model(m_id: str, display_name: Optional[str] = None) -> None:
-            m_id = (m_id or "").strip()
-            if not m_id or m_id in discovered_models:
-                return
-            discovered_models.append(m_id)
-            models.append(
-                {
-                    "id": m_id,
-                    "display_name": display_name or m_id,
-                    "default_thinking_level": default_effort,
-                    "supported_thinking_levels": thinking_levels,
-                }
-            )
+        global_effort_override: Optional[str] = None
+        model_effort_overrides: Dict[str, str] = {}
+        explicit_env_models: List[tuple] = []
+        avail_cfg_models: List[str] = []
 
         settings_path = claude_cfg_dir / "settings.json"
         if settings_path.exists():
@@ -735,6 +1027,7 @@ class AgentModelDiscovery:
                 cfg_model = (
                     cfg.get("model")
                     or env_cfg.get("ANTHROPIC_MODEL")
+                    or env_cfg.get("ANTHROPIC_DEFAULT_MODEL")
                     or env_cfg.get("CLAUDE_MODEL")
                 )
                 if isinstance(cfg_model, str) and cfg_model.strip():
@@ -743,71 +1036,213 @@ class AgentModelDiscovery:
                     cfg.get("effortLevel")
                     or env_cfg.get("CLAUDE_CODE_EFFORT_LEVEL")
                 )
-                if isinstance(cfg_effort, str) and cfg_effort.strip() in thinking_levels:
-                    default_effort = cfg_effort.strip()
-                for env_key in (
-                    "ANTHROPIC_MODEL",
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                if isinstance(cfg_effort, str) and cfg_effort.strip().lower() in thinking_levels:
+                    global_effort_override = cfg_effort.strip().lower()
+                    default_effort = global_effort_override
+
+                raw_model_settings = cfg.get("modelSettings")
+                if isinstance(raw_model_settings, dict):
+                    for m_key, m_cfg in raw_model_settings.items():
+                        if not isinstance(m_key, str) or not m_key.strip() or not isinstance(m_cfg, dict):
+                            continue
+                        raw_lvl = m_cfg.get("effortLevel")
+                        if isinstance(raw_lvl, str) and raw_lvl.strip().lower() in thinking_levels:
+                            lvl_clean = raw_lvl.strip().lower()
+                            model_effort_overrides[m_key.strip()] = lvl_clean
+                            model_effort_overrides[self._canonicalize_claude_catalog_id(m_key)] = lvl_clean
+
+                for env_key, name_key in (
+                    ("ANTHROPIC_MODEL", None),
+                    ("ANTHROPIC_DEFAULT_MODEL", None),
+                    ("ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"),
+                    ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"),
+                    ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"),
+                    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"),
+                    ("ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"),
                 ):
                     val = env_cfg.get(env_key)
                     if isinstance(val, str) and val.strip():
-                        _add_model(val.strip())
+                        name_val = env_cfg.get(name_key) if name_key else None
+                        label = name_val.strip() if isinstance(name_val, str) and name_val.strip() else None
+                        explicit_env_models.append((val.strip(), label, env_key))
+
                 avail = cfg.get("availableModels")
                 if isinstance(avail, list):
                     for item in avail:
                         if isinstance(item, str) and item.strip():
-                            _add_model(item.strip())
+                            avail_cfg_models.append(item.strip())
             except Exception:
                 pass
 
-        # Extract embedded canonical model constants from claude.exe if present
-        if claude_bin.exists() and claude_bin.suffix.lower() == ".exe":
-            try:
-                raw_bytes = claude_bin.read_bytes()
-                marker = raw_bytes.find(b"OPUS_ID:")
-                if marker != -1:
-                    snippet = raw_bytes[max(0, marker - 240) : marker + 480].decode("ascii", errors="ignore")
-                    pairs = re.findall(
-                        r'([A-Z_]+)_ID:"(claude-(?:opus|sonnet|haiku)-[a-z0-9.\-]+)",\1_NAME:"([^"]+)"',
-                        snippet,
-                    )
-                    for _prefix, m_id, m_label in pairs:
-                        _add_model(m_id, m_label)
-            except Exception:
-                pass
+        cached_cat = self._read_claude_cached_catalog(claude_cfg_dir)
+        bin_cat = self._extract_claude_binary_catalog(claude_bin)
 
+        catalog_entries: List[Dict[str, Any]] = []
+        catalog_by_id: Dict[str, Dict[str, Any]] = {}
+        if cached_cat:
+            for entry in cached_cat["models"]:
+                catalog_entries.append(entry)
+                catalog_by_id[entry["id"]] = entry
+            if bin_cat:
+                for entry in bin_cat["models"]:
+                    if entry.get("section") == "main" and entry["id"] not in catalog_by_id:
+                        catalog_entries.append(entry)
+                        catalog_by_id[entry["id"]] = entry
+        elif bin_cat:
+            for entry in bin_cat["models"]:
+                catalog_entries.append(entry)
+                catalog_by_id[entry["id"]] = entry
+
+        alias_targets: Dict[str, str] = {
+            "fable": "claude-fable-5-2",
+            "opus": "claude-opus-5-5",
+            "sonnet": "claude-sonnet-5-5",
+            "haiku": "claude-haiku-5-5",
+        }
+        if bin_cat and bin_cat.get("alias_targets"):
+            alias_targets.update(bin_cat["alias_targets"])
+        if cached_cat and cached_cat.get("alias_targets"):
+            alias_targets.update(cached_cat["alias_targets"])
+        for fam, env_key in (
+            ("fable", "ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            ("opus", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            ("haiku", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        ):
+            for _val, _lbl, ek in explicit_env_models:
+                if ek == env_key:
+                    alias_targets[fam] = _val
+
+        alias_family_map = {
+            "fable": "fable",
+            "fable[1m]": "fable",
+            "opus": "opus",
+            "opus[1m]": "opus",
+            "opusplan": "opus",
+            "sonnet": "sonnet",
+            "sonnet[1m]": "sonnet",
+            "haiku": "haiku",
+        }
+
+        fallback_levels_by_id: Dict[str, List[str]] = {
+            "claude-opus-4-6": ["low", "medium", "high", "max"],
+            "claude-sonnet-4-6": ["low", "medium", "high", "max"],
+            "claude-haiku-4-5": [],
+        }
+
+        discovered_models: List[str] = []
+        models: List[Dict[str, Any]] = []
+
+        def _resolve_model_thinking(m_id: str) -> tuple:
+            target_id = alias_targets.get(alias_family_map.get(m_id.lower(), ""))
+            cat = catalog_by_id.get(m_id) or (catalog_by_id.get(target_id) if target_id else None)
+            if cat and isinstance(cat.get("levels"), list):
+                supported = list(cat["levels"])
+            elif m_id in fallback_levels_by_id:
+                supported = list(fallback_levels_by_id[m_id])
+            else:
+                supported = list(thinking_levels)
+
+            if not supported:
+                return [], None
+
+            override_lvl = model_effort_overrides.get(m_id) or (
+                model_effort_overrides.get(target_id) if target_id else None
+            )
+            cat_def = cat.get("default_effort") if cat else None
+            chosen_default = override_lvl or global_effort_override or cat_def or default_effort
+            if chosen_default not in supported:
+                chosen_default = supported[len(supported) // 2]
+            return supported, chosen_default
+
+        def _add_model(m_id: str, display_name: Optional[str] = None) -> None:
+            m_id = (m_id or "").strip()
+            if not m_id or m_id in discovered_models:
+                return
+            supported, model_def = _resolve_model_thinking(m_id)
+            discovered_models.append(m_id)
+            models.append(
+                {
+                    "id": m_id,
+                    "display_name": display_name or m_id,
+                    "default_thinking_level": model_def,
+                    "supported_thinking_levels": supported,
+                }
+            )
+
+        # 1. Explicit env models and availableModels from settings.json
+        for m_val, m_lbl, _env_key in explicit_env_models:
+            _add_model(m_val, m_lbl)
+        for m_val in avail_cfg_models:
+            _add_model(m_val)
+
+        # 2. Discovered main-section catalog models
+        for entry in catalog_entries:
+            if entry.get("section") == "main":
+                _add_model(entry["id"], entry.get("display_name"))
+
+        # 3. Standard aliases
         for m_id, label in [
-            ("sonnet", "Claude Sonnet (Latest Alias)"),
+            ("fable", "Claude Fable (Latest Alias)"),
             ("opus", "Claude Opus (Latest Alias)"),
+            ("sonnet", "Claude Sonnet (Latest Alias)"),
             ("haiku", "Claude Haiku (Latest Alias)"),
             ("opusplan", "Claude Opus Plan + Sonnet Execution"),
-            ("sonnet[1m]", "Claude Sonnet (1M Context)"),
+            ("fable[1m]", "Claude Fable (1M Context)"),
             ("opus[1m]", "Claude Opus (1M Context)"),
-            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            ("sonnet[1m]", "Claude Sonnet (1M Context)"),
+        ]:
+            _add_model(m_id, label)
+
+        # 4. Discovered overflow-section catalog models
+        for entry in catalog_entries:
+            if entry.get("section") == "overflow":
+                _add_model(entry["id"], entry.get("display_name"))
+
+        # 5. Static baseline fallback models
+        for m_id, label in [
+            ("claude-fable-5-2", "Claude Fable 5.2"),
             ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
             ("claude-haiku-5-5", "Claude Haiku 5.5"),
+            ("claude-fable-5-1", "Claude Fable 5.1"),
             ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
             ("claude-opus-4-6", "Claude Opus 4.6"),
             ("claude-haiku-4-5", "Claude Haiku 4.5"),
         ]:
             _add_model(m_id, label)
 
+        # 6. Any modelSettings keys not yet in discovered_models
+        for m_key in model_effort_overrides:
+            if self._canonicalize_claude_catalog_id(m_key) not in discovered_models:
+                _add_model(m_key)
+
+        # 7. Ensure default_model is first in both discovered_models and models
         if default_model and default_model not in discovered_models:
+            supported, model_def = _resolve_model_thinking(default_model)
             discovered_models.insert(0, default_model)
             models.insert(
                 0,
                 {
                     "id": default_model,
                     "display_name": default_model,
-                    "default_thinking_level": default_effort,
-                    "supported_thinking_levels": thinking_levels,
+                    "default_thinking_level": model_def,
+                    "supported_thinking_levels": supported,
                 },
             )
         elif default_model in discovered_models:
-            discovered_models.remove(default_model)
-            discovered_models.insert(0, default_model)
+            idx = discovered_models.index(default_model)
+            if idx > 0:
+                discovered_models.pop(idx)
+                discovered_models.insert(0, default_model)
+                m_entry = models.pop(idx)
+                models.insert(0, m_entry)
+
+        engine_default_thinking = (
+            (models[0].get("default_thinking_level") if models else None)
+            or global_effort_override
+            or default_effort
+        )
 
         return {
             "engine": "claude",
@@ -816,7 +1251,7 @@ class AgentModelDiscovery:
             "config_dir": str(claude_cfg_dir),
             "installed": claude_bin.exists(),
             "default_model": default_model,
-            "default_thinking_level": default_effort,
+            "default_thinking_level": engine_default_thinking,
             "available_models": discovered_models,
             "model_details": models,
             "available_thinking_levels": thinking_levels,
