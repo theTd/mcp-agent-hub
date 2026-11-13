@@ -53,7 +53,7 @@ from session_mcp_config import (
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
-from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
+from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
 from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 
 from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
@@ -143,6 +143,52 @@ def _clip_detail(text: str) -> str:
     if len(text) <= TOOL_DETAIL_LIMIT:
         return text
     return f"{text[:TOOL_DETAIL_LIMIT]}\n…（已截断，原文 {len(text)} 字符）"
+
+
+def _stored_telemetry(data: Dict[str, Any]) -> Dict[str, Any]:
+    """`data` for record_telemetry with the tool input/output reduced to the forms that get stored.
+
+    The write is sized from its arguments before it runs (logical_write: 1 MB + 8 x their pickle).
+    A raw tool output of ~4 MB (a Codex `view_image` result is several MB of base64) sized past the
+    32 MB queue, the write raised, and the transcript watcher that made it ended for good: the
+    session stayed "running" and its later turn ends were never seen (codex-732d4e3a and five
+    more, 2026-11-10..13). Only the summaries, the clipped details and the title below are kept,
+    so they are made here, from the full values, and the raw ones never reach the write.
+    """
+    tool_input = data.get("tool_input")
+    tool_response = data.get("tool_response")
+    hook_event = data.get("hook_event", "")
+    if isinstance(tool_input, (dict, list)):
+        input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
+        input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+    else:
+        input_str = "" if tool_input is None else str(tool_input)[:600]
+        input_detail = "" if tool_input is None else str(tool_input)
+    if isinstance(tool_response, (dict, list)):
+        resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
+    else:
+        resp_str = "" if tool_response is None else str(tool_response)[:600]
+    full_title = ""
+    if (hook_event not in ("PostToolUse", "ReportStep") and not data.get("tool_title")
+            and len(input_detail) > TOOL_DETAIL_LIMIT):
+        # The stored arguments are clipped and may lose the describing one (a long Bash command
+        # ahead of its description): name the call from the whole text now.
+        full_title = tool_title(str(data.get("tool_name") or ""), input_detail)[:300]
+    stored = {key: value for key, value in data.items() if key not in ("tool_input", "tool_response")}
+    stored["_tool"] = {
+        "has_response": tool_response is not None,
+        "input_str": input_str,
+        "resp_str": resp_str,
+        "input_detail": _clip_detail(input_detail),
+        "output_detail": (
+            _clip_detail(tool_output_text(tool_response)) if hook_event == "PostToolUse" and tool_response is not None
+            else ""
+        ),
+        "full_title": full_title,
+    }
+    if data.get("reasoning") is not None:
+        stored["reasoning"] = _clip_detail(str(data["reasoning"]).strip())
+    return stored
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
@@ -6007,58 +6053,45 @@ class HubSessionManager:
                 "content": _clip_detail(text),
             })
 
-    @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser."""
+        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser.
+
+        The raw tool input/output is reduced first (`_stored_telemetry`), outside the sized write.
+        """
+        return await self._record_stored_telemetry(session_id, _stored_telemetry(data))
+
+    @logical_write
+    async def _record_stored_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
         if sess and data.get("transcript_path"):
             sess.transcript_path = Path(str(data["transcript_path"]))
         hook_event = data.get("hook_event", "")
         source = data.get("source", "telemetry")
         tool_name = data.get("tool_name")
-        tool_input = data.get("tool_input")
-        tool_response = data.get("tool_response")
+        tool_fields = data["_tool"]  # see _stored_telemetry
         step_title = data.get("step_title")
         intermediate_list = data.get("intermediate_messages") or []
         final_text = data.get("final_assistant_text")
 
-        input_str = ""
-        if isinstance(tool_input, (dict, list)):
-            input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
-        elif tool_input is not None:
-            input_str = str(tool_input)[:600]
+        # 600-character summaries for status/trace consumers.
+        input_str = tool_fields["input_str"]
+        resp_str = tool_fields["resp_str"]
 
-        resp_str = ""
-        if isinstance(tool_response, (dict, list)):
-            resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
-        elif tool_response is not None:
-            resp_str = str(tool_response)[:600]
-
-        # The transcript feed shows a tool's arguments and output; the 600-character summaries
-        # above stay as they were for status/trace consumers.
+        # The transcript feed shows a tool's arguments and output (clipped details).
         call_id = str(data.get("call_id") or "").strip()
-        if isinstance(tool_input, (dict, list)):
-            input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
-        else:
-            input_detail = "" if tool_input is None else str(tool_input)
-        output_detail = tool_output_text(tool_response) if tool_response is not None else ""
         tool_data: Dict[str, Any] = {"tool": tool_name or "", "call_id": call_id}
         if hook_event == "PostToolUse":
-            tool_data["output"] = _clip_detail(output_detail)
+            tool_data["output"] = tool_fields["output_detail"]
             if isinstance(data.get("tool_ok"), bool):
                 tool_data["ok"] = data["tool_ok"]
         else:
-            tool_data["input"] = _clip_detail(input_detail)
+            tool_data["input"] = tool_fields["input_detail"]
             if hook_event == "ReportStep":
                 tool_data["step_marker"] = True  # a step counter (`llm_inference`), not a real tool
             if data.get("tool_title"):
                 tool_data["title"] = str(data["tool_title"])[:300]
-            elif len(input_detail) > TOOL_DETAIL_LIMIT and hook_event != "ReportStep":
-                # The stored arguments are clipped and may lose the describing one (a long Bash
-                # command ahead of its description): name the call from the whole text now.
-                full_title = tool_title(str(tool_name or ""), input_detail)
-                if full_title:
-                    tool_data["title"] = full_title[:300]
+            elif tool_fields["full_title"]:
+                tool_data["title"] = tool_fields["full_title"]
 
         step_num = sess.step_count if sess else 0
 
@@ -6094,7 +6127,7 @@ class HubSessionManager:
                 await self._add_transcript_message(session_id, step_num, str(msg).strip(), source=source)
 
         if (tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected")) or (
-            hook_event == "PostToolUse" and (tool_name or tool_response is not None)
+            hook_event == "PostToolUse" and (tool_name or tool_fields["has_response"])
         ):
             # A result without a tool name (Claude, Kimi, AGY records) still closes its call in the
             # transcript; the feed pairs it by call id or call order.
@@ -6113,7 +6146,7 @@ class HubSessionManager:
                 "type": "reasoning",
                 "category": "progress",
                 "status": "running",
-                "content": _clip_detail(str(data["reasoning"]).strip()),
+                "content": data["reasoning"],  # clipped by _stored_telemetry
             })
         elif hook_event == "AssistantMessage" and intermediate_list:
             await self.record_worker_event(session_id, {
@@ -8106,6 +8139,17 @@ class HubSessionManager:
             session.ended_at = time.time()
         return time.time() < session.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC
 
+    @staticmethod
+    def _skip_unstorable_record(session: AgentSession, reader: str, error: Exception) -> None:
+        """A native record that can never be stored is skipped; its reader keeps following.
+
+        Re-raising it (as for storage that is down or closing) ended the reader for good, and the
+        session stayed "running" through every later turn end. The rest of the batch it was read
+        with is lost with it; record_telemetry already reduces tool input/output, so only an
+        unforeseen huge record lands here.
+        """
+        logger.warning("%s skipped a record too large to store (%s): %s", reader, session.session_id, error)
+
     async def _end_aborted_codex_turn(
         self, session: AgentSession, reason: str, feedback_missing: bool = False
     ) -> None:
@@ -8431,6 +8475,8 @@ class HubSessionManager:
                     # The deny's feedback never reached Codex (dropped, or its submit failed).
                     await self._end_aborted_codex_turn(session, held_abort, feedback_missing=True)
                     held_abort = None
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Codex rollout watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -8788,6 +8834,8 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "OMP session watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9137,6 +9185,8 @@ class HubSessionManager:
                                 "tool_response": content,
                             },
                         )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Kimi wire watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9411,6 +9461,8 @@ class HubSessionManager:
                     err_txt = error_tail[0]
                     error_tail = None
                     await self._end_agy_error_turn(session, err_txt)
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "AGY transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9923,6 +9975,8 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Streaming response — {latest_line[:70]}"
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Claude transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -11647,6 +11701,8 @@ class HubSessionManager:
                             msg_cursor = max(msg_cursor, seq)
                         # Only the first batch read after re-attaching is the replay.
                         replay = None
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH record reader", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:
@@ -11756,6 +11812,8 @@ class HubSessionManager:
                                     },
                                 )
                             break
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH job watcher", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:

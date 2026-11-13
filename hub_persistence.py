@@ -24,6 +24,14 @@ class PersistenceUnavailable(RuntimeError):
     """A bounded admission/barrier failed, or storage needs operator attention."""
 
 
+class PersistenceRecordTooLarge(PersistenceUnavailable):
+    """This one write can never fit (larger than the queue, or than its own reservation).
+
+    Retrying the same write cannot help, but storage itself is fine: a reader that hits it skips
+    the record and keeps going instead of ending (see the transcript watchers).
+    """
+
+
 @dataclass
 class _Unit:
     owner: object
@@ -169,7 +177,7 @@ class HubPersistence:
 
     async def _reserve(self, size):
         if size > self.max_bytes:
-            raise PersistenceUnavailable("单次持久化数据超过队列容量")
+            raise PersistenceRecordTooLarge("单次持久化数据超过队列容量")
         async def wait_capacity():
             async with self._condition:
                 while True:
@@ -198,7 +206,7 @@ class HubPersistence:
             yield unit
             actual = sum(len(operation) for operation in unit.operations)
             if actual > reserve_bytes:
-                raise PersistenceUnavailable("持久化快照超过预留容量，拒绝不完整写入")
+                raise PersistenceRecordTooLarge("持久化快照超过预留容量，拒绝不完整写入")
             if unit.operations:
                 async with self._condition:
                     self._check_open()
