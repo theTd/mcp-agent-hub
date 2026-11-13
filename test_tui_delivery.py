@@ -145,6 +145,81 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             update.cancel()
 
+    LONG = ("One follow-up, no game and no code change. The record says a call returned state, "
+            "but no file holds that call or its answer. Write the raw file with each command and "
+            "its full return, then add one line under the table. Report in under 5 lines.")
+
+    def test_scrolled_composer_showing_the_end_counts_as_whole(self):
+        # 80x24 shape: the top rows scrolled out of the composer, an arrow marks them.
+        visible = self.LONG[self.LONG.index("but no file"):]
+        line = visible[:60] + "   ↑ " + visible[60:]
+        self.assertTrue(self.hub._codex_composer_shows_whole(line, self.LONG))
+        self.assertTrue(self.hub._codex_composer_shows_whole(self.LONG, self.LONG))
+        # A scrolled view whose end is not the text's end (still growing) never counts.
+        middle = self.LONG[self.LONG.index("but no file"):self.LONG.index("then add")]
+        self.assertFalse(self.hub._codex_composer_shows_whole(middle[:40] + " ↑ " + middle[40:], self.LONG))
+        # Without the arrow a bare suffix is a partial draft, not a scrolled one.
+        self.assertFalse(self.hub._codex_composer_shows_whole(visible, self.LONG))
+        # Too little visible text is not trusted.
+        self.assertFalse(self.hub._codex_composer_shows_whole("↑ " + self.LONG[-20:], self.LONG))
+
+    async def test_scrolled_composer_settles(self):
+        visible = self.LONG[self.LONG.index("but no file"):]
+        self.screen = "› " + visible[:60] + "   ↑\n  " + visible[60:] + "\n\n  ? for shortcuts"
+        with patch("session_manager.TUI_TYPE_SETTLE_SEC", .02), patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .01):
+            result = await self.hub._await_typed_text_settled(self.sess, "codex", self.LONG[:30], self.LONG[-30:],
+                                                           typed_len=len(self.LONG), expected_text=self.LONG)
+        self.assertTrue(result[2])
+
+    async def test_text_still_growing_at_the_cap_keeps_waiting(self):
+        # Send #2 shape: Codex takes the paste in a few words per frame, past the cap.
+        loop = asyncio.get_running_loop()
+        words = self.LONG.split(" ")
+        state = {"n": 1}
+        def grow():
+            state["n"] += 1
+            self.screen = "› " + " ".join(words[:state["n"]]) + "\n\n  ? for shortcuts"
+            if state["n"] < len(words):
+                handles.append(loop.call_later(.01, grow))
+        handles = [loop.call_later(.01, grow)]
+        try:
+            with patch("session_manager.TUI_TYPE_SETTLE_SEC", .05), patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .005), \
+                 patch("session_manager.TUI_TYPE_SETTLE_CAP_SEC", .05), patch("session_manager.TUI_TYPE_STALL_SEC", .2):
+                result = await self.hub._await_typed_text_settled(self.sess, "codex", self.LONG[:30], self.LONG[-30:],
+                                                               typed_len=len(self.LONG), expected_text=self.LONG)
+        finally:
+            for h in handles: h.cancel()
+        self.assertTrue(result[2])
+        self.assertGreater(result[3], .05)
+
+    async def test_stalled_partial_text_gives_up_after_the_stall(self):
+        # typed_len=1 keeps the codex length floor (typed_len * .01 s) under the patched cap.
+        self.screen = "› " + self.LONG[:80] + "\n\n  ? for shortcuts"
+        with patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .005), patch("session_manager.TUI_TYPE_SETTLE_CAP_SEC", .05), \
+             patch("session_manager.TUI_TYPE_STALL_SEC", .1), patch("session_manager.TUI_TYPE_SETTLE_HARD_CAP_SEC", 5):
+            result = await self.hub._await_typed_text_settled(self.sess, "codex", self.LONG[:30], self.LONG[-30:],
+                                                           typed_len=1, expected_text=self.LONG)
+        self.assertFalse(result[2])
+        self.assertLess(result[3], 1)
+
+    async def test_growth_stops_at_the_hard_cap(self):
+        loop = asyncio.get_running_loop()
+        state = {"n": 0}
+        def churn():
+            state["n"] += 1
+            self.screen = "› partial " + "x" * (state["n"] % 7) + "\n\n  ? for shortcuts"
+            handles.append(loop.call_later(.01, churn))
+        handles = [loop.call_later(.01, churn)]
+        try:
+            with patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .005), patch("session_manager.TUI_TYPE_SETTLE_CAP_SEC", .05), \
+                 patch("session_manager.TUI_TYPE_STALL_SEC", 1), patch("session_manager.TUI_TYPE_SETTLE_HARD_CAP_SEC", .3):
+                result = await self.hub._await_typed_text_settled(self.sess, "codex", self.LONG[:30], self.LONG[-30:],
+                                                               typed_len=1, expected_text=self.LONG)
+        finally:
+            for h in handles: h.cancel()
+        self.assertFalse(result[2])
+        self.assertLess(result[3], 1)
+
     def test_placeholder_is_empty_only_with_native_cursor_at_start(self):
         self.sess.screen.cursor.x = 2
         self.assertTrue(self.hub._codex_composer_empty(self.sess, "Ask Codex to do anything"))
