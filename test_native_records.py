@@ -597,6 +597,104 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    def watched_codex(self, name):
+        sess = self.session("codex", f"-{name}")
+        path = self.root / f"codex-{name}.jsonl"
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"rollout_path": str(path)}
+        return sess, path, self.hub._schedule(self.hub._watch_codex_rollout(sess, self.root))
+
+    async def wait_handle(self, sess):
+        info = await self.hub.wait_inbox.ensure_for_sessions([sess.session_id], {sess.session_id: sess.turn_id})
+        sess.wait_handle = info["wait_handle"]
+        return info["wait_handle"]
+
+    @staticmethod
+    def codex_message(role, text):
+        return {"type": "response_item", "payload": {"type": "message", "role": role,
+                                                     "content": [{"type": "input_text", "text": text}]}}
+
+    async def deny_codex_approval(self, sess, path, feedback=None):
+        """The parent denies a codex command approval; Codex aborts the turn for the `n`."""
+        self.append(path, {"type": "event_msg", "payload": {"type": "exec_approval_request", "call_id": "c1",
+                                                            "command": ["rm", "-r", "out"]}})
+        await self.until(lambda: sess.pending_interaction is not None)
+        await self.hub.respond_to_interaction(sess.session_id, decision="deny", custom_input=feedback)
+        await self.until(lambda: "n" in sess.pty.inputs)
+        # Real order (rollout of codex-1146485d): the developer marker, then the abort event.
+        self.append(path, self.codex_message("developer", "<turn_aborted>\nThe previous turn was interrupted on purpose.</turn_aborted>"),
+                    {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}})
+
+    async def test_codex_abort_ends_the_turn_and_wakes_the_parent(self):
+        # 2026-11-13: an abort (here the parent's deny) only set "waiting_parent" with nothing
+        # pending, so the parent's wait URL stayed "waiting" until the parent gave up.
+        sess, path, task = self.watched_codex("abort")
+        try:
+            handle = await self.wait_handle(sess)
+            await self.deny_codex_approval(sess, path)
+            self.assertEqual(sess.pty.inputs, ["n"])
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual(done["state"], "done")
+            self.assertTrue(done["final_response"].startswith("Codex turn aborted (interrupted): the turn ended"))
+            self.assertEqual(done["results"][0]["data"]["outcome"], "aborted")
+            self.assertEqual(sess.status, "completed")
+            events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual((events.count("turn_aborted"), events.count("turn_completed")), (1, 1))
+            # Whatever is typed next starts a new turn.
+            self.append(path, self.codex_message("user", "Rename it instead."))
+            await self.until(lambda: sess.status == "running")
+            self.assertTrue(sess.final_response_from_previous_turn)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_codex_deny_feedback_is_the_next_message_and_holds_the_abort(self):
+        # 2026-11-12 (codex-5eaf74c6, codex-aeb2403d): the feedback, typed raw with Enter 0.25 s
+        # after `n`, stayed in the composer unsent. It now goes in through the checked submit as the
+        # next message, and the abort waits for it instead of ending the turn.
+        sess, path, task = self.watched_codex("feedback")
+        sent = []
+        async def deliver(session_id, text, **kwargs):
+            sent.append((session_id, text))
+            return {"delivered": True}
+        try:
+            handle = await self.wait_handle(sess)
+            with patch.object(self.hub, "deliver_parent_message", deliver), \
+                    patch("session_manager.AGY_DENY_FEEDBACK_DELAY_SEC", 0.01):
+                await self.deny_codex_approval(sess, path, feedback="Rename it instead.")
+                await self.until(lambda: bool(sent))
+            self.assertEqual(sent, [(sess.session_id, "Rename it instead.")])
+            self.assertEqual(sess.pty.inputs, ["n"])
+            self.assertEqual((await self.hub.wait_inbox.wait(handle, 0.6))["state"], "waiting")
+            self.assertEqual(sess.status, "running")
+            self.append(path, self.codex_message("user", "Rename it instead."),
+                        {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Renamed it."}})
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual((done["state"], done["final_response"]), ("done", "Renamed it."))
+            events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual(events.count("turn_completed"), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_codex_abort_held_for_feedback_ends_the_turn_when_none_arrives(self):
+        # The real checked submit fails here (the fixture draws no composer), so nothing reaches Codex.
+        sess, path, task = self.watched_codex("lost-feedback")
+        try:
+            handle = await self.wait_handle(sess)
+            with patch("session_manager.AGY_DENY_FEEDBACK_DELAY_SEC", 0.01), \
+                    patch("session_manager.CODEX_DENY_FEEDBACK_HOLD_SEC", 1.0):
+                await self.deny_codex_approval(sess, path, feedback="Rename it instead.")
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual(done["state"], "done")
+            self.assertIn("the deny's feedback never reached Codex", done["final_response"])
+            self.assertTrue(done["results"][0]["data"]["feedback_missing"])
+            self.assertEqual(sess.status, "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_omp_prose_requires_native_stop_reason(self):
         sess = self.session("omp")
         path = self.root / "omp-stop.jsonl"
