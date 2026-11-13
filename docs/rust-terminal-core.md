@@ -215,7 +215,10 @@ arrives while the first is still queued gets `TimeoutError`.
 `raw_slack_bytes` (64 KiB). `seed_history` sets the raw ring before the first byte of the new process
 (today `sess.raw_history = [seed]`, `:4864`) and clears the `ESC[3J` carry. `ws_prefix` is written to
 every socket already subscribed to that id before the reader thread starts, which is where A1's "between
-spawn and first output" ordering stops depending on Python's timing.
+spawn and first output" ordering stops depending on Python's timing. The sinks are the **id's**, not the
+new `Session`'s: `Session::start` takes the predecessor's fan-out over, so the prefix goes to the sockets
+that were attached before the resume, in stream order after the predecessor's last flushed batch and its
+`superseded` mark (`take_over`, §5.4). `attach_text` does the same with its `seed`.
 
 `subscribe`/`unsubscribe` are gone: no Python object holds a terminal queue any more. The console
 attaches straight to the core's socket (§6.4), and `close_sockets` is the only fan-out call the hub
@@ -282,12 +285,28 @@ byte. That caps a session at 50 frames/s per socket while a busy session (≈72 
 delivers every byte in order, and it is the only batching in the system (owner decision 7: the
 Python-side batching unit does not land).
 
-Frames reach one socket in stream order: a per-session delivery lock is held from the moment a batch is
-taken to the moment every attached sink has it, so the reader's 32 KiB trigger and the ticker's 5 ms flush
-cannot hand frame *n+1* over before frame *n*. `attach_sink` holds the same lock across its replay snapshot
-and its registration, which is the whole of Q11's atomicity. Lock order is one-directional (delivery, then
-the text lock; the sink list only under delivery); `FrameSink::deliver` must not block, so a slow socket
-costs the reader its queue push and never its read.
+**Delivery state belongs to the session id.** The delivery lock, the sink list and the handle counter
+are one structure carried across a resume (`SinkFanout`, `session.rs`'s `fanout` field): a socket that
+attached before a resume keeps its registration, its handle and its replay stream, and `detach_sink(id,
+handle)` works whichever incarnation registered the handle (§6.4 A1). Every frame and every registration
+happens under that lock, so frame order and Q11's atomic attach are one rule rather than two: a frame is
+taken from the batch and handed to the sinks inside it, and `attach_sink` takes its replay snapshot,
+registers the sink and hands back the batch it took in one gap between two deliveries. Lock order is
+one-directional: the id's delivery lock, then a session's text lock; the sink list only under delivery.
+
+`FrameSink::deliver` runs on the session's reader thread under that lock, so it may not block and may not
+write a socket itself: it pushes onto the socket's own bounded queue (`FrameQueue`), and the socket's own
+thread writes the replay and `replay_end` before the first queued frame (§6.4). One sink's panic costs
+that sink and nothing else: `deliver` is wrapped in `catch_unwind`, the panicking sink is detached and
+counted in `stats.panics` and logged once with its handle, the other sinks still get the frame, and the
+session keeps running. No lock in the delivery path skips its work on poison, so `attach_sink` can never
+return a handle it did not register.
+
+One frame bypasses the batch: the resume separator (`spawn`'s `ws_prefix`, `attach_text`'s seed), which
+must land between the predecessor's last bytes and the new process's first. `Session::push_frame`'s
+precondition is therefore a state, not a caller's promise: the incarnation's reader has not started, no
+batch is pending, and the caller holds the id's delivery lock — all three asserted in debug builds, and
+only the handover (`take_over`) satisfies them (§6.4 A1).
 
 `output.text` is already W8-stripped, OSC-stripped and decoded before it enters a batch: the core owns a
 per-session UTF-8 decoder with up to 3 carried bytes, so a multi-byte character split across two ConPTY
@@ -367,12 +386,15 @@ path to run. It also cannot survive the process dying, which is what §6.3 is ab
   of that workspace: it is its own workspace with its own release profile (§7.3).
 - A Rust panic that unwinds out of a `#[pymethods]` call becomes a Python `PanicException` (unverified,
   from memory of the PyO3 docs; the design only depends on the panic not corrupting the interpreter).
-- Every native thread's loop body and every `pymethod` body is wrapped in `catch_unwind`. A panic in a
-  reader thread ends **that session only**: the core drops the pseudoconsole, keeps the screen and
-  scrollback, sets `alive = false`, `exit_code = None` and `crashed = true`, and the hub archives it
-  through `classify_end_reason` (`:2312`) the way it archives a failed exit today. The console shows a
-  crashed pane, not a frozen one. A panic in the ticker thread is caught and logged and the thread
-  continues; a panic on the accept thread refuses that connection and keeps the listener.
+- The failing item costs its item, never the loop. A panic in a reader thread ends **that session only**:
+  the core drops the pseudoconsole, keeps the screen and scrollback, sets `alive = false`,
+  `exit_code = None` and `crashed = true`, and the hub archives it through `classify_end_reason`
+  (`:2312`) the way it archives a failed exit today. The console shows a crashed pane, not a frozen one.
+  A panic in the ticker thread is caught and logged and the thread continues; a panic on the accept thread
+  refuses that connection and keeps the listener. A panic from a `FrameSink::deliver` costs **that sink**:
+  each delivery is wrapped in `catch_unwind`, the sink is detached, counted in `stats.panics` and logged
+  once with the session id and its handle, the other sinks still get that frame and every later one, and
+  the session's reader, screen and scrollback are untouched (§5.4).
 - An error *returned* by one item is handled the same way as a panic: it costs that item, never the
   loop. A socket write that fails closes that socket; a frame a sink cannot take is dropped and counted;
   an accept that fails is logged and retried (§6.4). Only the reader's own end of pipe ends a reader, and
@@ -435,11 +457,23 @@ is minted, keeping the console's existing not-found path.
 - Q11 atomicity lives in the core: one session mutex covers "append to the raw ring + publish to
   subscribers" and "snapshot the replay + register this socket", so a chunk is either inside the replay
   or in the socket's queue, never both and never neither. There is no Python lock left to race.
+  Concretely, the id's delivery lock serialises every fan-out, and `attach_sink` holds it across the
+  replay snapshot, the registration and the hand-over of the batch it took; the replay it returns
+  therefore continues exactly where the frames it will receive begin. The sink must write the replay and
+  `replay_end` **before** draining its own queue (a direct write from `deliver` would put a frame on the
+  wire ahead of the replay), which is what §5.4's sink contract requires.
 - A1 (a resumed session keeps its sockets): sockets attach to the **session id**, not to a Python
   object, so a resume changes nothing for them — `adopt_ws_frontends` (`:2446`) and
-  `register_ws_closer` (`:2410`) disappear. The resume banner travels as `spawn(ws_prefix=…)` and is
-  written to every attached socket before the reader thread starts; the DSH virtual resume passes it as
-  `attach_text(seed=…)` (`:5317`).
+  `register_ws_closer` (`:2410`) disappear. The delivery lock, the sink list and the handle counter are
+  one `Arc`-shared structure that each new incarnation of an id takes over from its predecessor, so
+  attached sinks and their handles survive the swap and `detach_sink(id, handle)` still finds them. The
+  resume banner travels as `spawn(ws_prefix=…)` and is written to every attached socket before the reader
+  thread starts; the DSH virtual resume passes it as `attach_text(seed=…)` (`:5317`). The handover runs
+  under the delivery lock: the predecessor's pending batch is delivered to the sinks, the predecessor is
+  marked `superseded` (anything its reader still files is dropped and counted, never written after the
+  banner), the successor becomes the id's replay source, and then the banner goes out. A sink attached
+  during that swap is kept exactly once: it lands either fully before the handover (its replay includes
+  the old bytes and the banner) or fully after it.
 - W8 on resume: `spawn(strip_esc3j_on_output=true)` drops `ESC[3J` with the same 3-byte carry.
 - Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as today. OSC
   terminal replies are stripped in the core with `OSC_TERMINAL_REPLY_RE`'s pattern (`:1853`) before any
@@ -626,8 +660,9 @@ widths), `winpty-rs` and `portable-pty` (§7.1).
 
 | invariant | where it lives now | how the core keeps it |
 |---|---|---|
-| Q11: a new WebSocket sees every chunk exactly once (replay/register atomic) | `attach_ws_queue` `:2425` under `_lock` | the core's per-session mutex covers "append to the ring + publish" and "snapshot the replay + register the socket"; there is no Python lock left to race (§6.4) |
-| A1: a resumed session keeps its sockets, and the resume separator lands between spawn and first output | `adopt_ws_frontends` `:2447`, `push_ws_frame` `:2458`, `:2270` | sockets attach to the **session id** in the core, so a resume changes nothing for them; the separator arrives as `spawn(ws_prefix=…)` and is written before the reader thread starts |
+| Q11: a new WebSocket sees every chunk exactly once (replay/register atomic) | `attach_ws_queue` `:2425` under `_lock` | the id's delivery lock covers "append to the ring + publish" and "snapshot the replay + register the socket" (§5.4); there is no Python lock left to race (§6.4) |
+| A1: a resumed session keeps its sockets, and the resume separator lands between spawn and first output | `adopt_ws_frontends` `:2447`, `push_ws_frame` `:2458`, `:2270` | sockets attach to the **session id**: the delivery lock, sink list and handles are one structure a new incarnation takes over, so a resume changes nothing for them; the separator arrives as `spawn(ws_prefix=…)` written under that lock, before the reader thread starts, after the predecessor's batch |
+| A1: a superseded incarnation never writes after its successor's banner | `adopt_ws_frontends` re-points the queue; the old `_read_loop` keeps running until EOF | the handover marks the predecessor `superseded`; a frame it would still deliver is dropped and counted in its `dropped_bytes`, logged once |
 | A1: `raw_history` is seeded with the archived scrollback on resume | `:4864` | `spawn.seed_history` |
 | W8: `ESC[3J` (erase saved lines) is dropped on resumed sessions only, with a split-sequence carry | `_strip_saved_lines_erase` `:2390` | same algorithm in the core, `strip_esc3j_on_output` flag, per-session carry ≤3 bytes |
 | OSC 10/11/12/4 colour queries never reach the console or the history | `OSC_COLOR_QUERY_RE` `:1852` `:2334` `:2437` | same regex in the core, applied before append and before replay |
@@ -689,9 +724,9 @@ imported by the hub after step 3, and it is deleted with its `requirements.in` e
 |---|---|---|---|---|
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
-| 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs` | `cargo test` in `terminal-core/`: `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach | branch only | M, 5-7 d |
+| 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs`; step 2d makes the delivery state (lock, sinks, handles) belong to the session id, which step 4's sockets attach to | `cargo test` **and** `cargo test --features conpty_session/test-hooks` in `terminal-core/` (the delivery-order, resume-handover and panic-isolation cases need the hooks; neither the hooks nor their call sites exist in a release build): `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach, `sink_handover.rs` the resume handover, and both pass 20 runs in a row with the hooks on | branch only | M, 5-7 d |
 | 3. PTY ownership in Python | `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
-| 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
+| 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; the socket sink is a bounded `FrameQueue` drained by the socket's own thread, which writes the replay and `replay_end` before the first frame; per-socket `dropped_bytes` reported per handle in the drain record rather than summed per session, and `attach_sink`'s replay render measured under the delivery lock (≈1.5 ms at the 512 KiB cap) before deciding whether to move it out; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
 | 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
 | 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; delete `tools/fixtures`'s pyte oracle and the `pyte` dependency entry | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
 
@@ -802,13 +837,20 @@ Run only when the machine is idle; it is not part of the default suite.
 5. **Panic to abort.** Any dependency compiled with `panic = "abort"` (or an `abort()`/stack overflow/
    access violation) kills the whole hub. Mitigation: `cargo metadata` profile assertion in CI, and no
    `unsafe` outside the `windows` FFI wrappers, each with a `// SAFETY:` note in the existing style.
-6. **Control path on the event loop.** A wedged reader costs up to the deadline per call (50 ms for
+6. **Per-socket drop accounting and the replay render under the delivery lock.** Two step-4 items are
+   carried forward from step 2's delivery review rather than built now: `dropped_bytes` is summed per
+   session (`stats`/drain record), so with two sockets one client cannot learn its own loss, and
+   `attach_sink` holds the delivery lock across `replay_text()` (one ring join plus one strip pass, ≈1.5 ms
+   at the 512 KiB cap), which serialises the reader for that long. Step 4 owns both: the count moves onto
+   `SinkEntry` and is surfaced per handle, and the load test (§11) measures the render before anyone decides
+   whether to render under `text` alone and re-take it for the batch.
+7. **Control path on the event loop.** A wedged reader costs up to the deadline per call (50 ms for
    write/resize/screen/scrollback/raw/stats, 2 s for spawn/kill/kill_all). Mitigation: deadline,
    cached-snapshot fallback, `degraded` marking (itself a dirty flag, cleared by the next successful
    call), and readers that hold the session mutex only for one buffer append. `spawn`'s 2 s cannot be
    enforced — `CreateProcessW` is not interruptible — so it is a release gate measured by the selftest
    (20 spawns, p50/p99 printed) and logged when exceeded, not a timer.
-7. **ConPTY close/resize races.** Closing a pseudoconsole while a read is pending is a known source of
+8. **ConPTY close/resize races.** Closing a pseudoconsole while a read is pending is a known source of
    hangs (unverified specifics). Mitigation: the close happens exactly once, through a three-state slot,
    always on a helper thread with a deadline, never on the reader thread; `resize` holds that slot across
    `ResizePseudoConsole` (releasing it would let a close invalidate the HPCON), and every other acquirer
@@ -816,30 +858,30 @@ Run only when the machine is idle; it is not part of the default suite.
    thread — the death record, `kill` and `kill_all` still complete inside their budgets. A close helper
    that outlives its deadline keeps running; the slot stays `closing` until it returns, and callers
    publish on their own deadline (measured: a few seconds at most under load on a busy machine).
-8. **Nested job objects.** The hub already runs inside the app's kill-on-close job (`owned_hub.rs:142`) and
+9. **Nested job objects.** The hub already runs inside the app's kill-on-close job (`owned_hub.rs:142`) and
    the core creates one job per session. Nested jobs are supported on Windows 8+, but whether the outer
    job's limits let the inner handle behave needs the one-hour experiment before step 1 is called done.
    If `AssignProcessToJobObject` fails, the fallback is the app's existing tree kill: walk the children
    with `CreateToolhelp32Snapshot` (`Win32_System_Diagnostics_ToolHelp` is already linked) and terminate
    them, which is what `taskkill /T /F` does today (`:2597`, `:5680`).
-9. **Packaging.** The `.pyd` in the payload must survive the privacy gate (host paths, CodeView record) and
+10. **Packaging.** The `.pyd` in the payload must survive the privacy gate (host paths, CodeView record) and
    the `bootstrap.ps1` import check (`-I` implies `-P`). Both are step 5's gate, and failure there is a
    build-script fix, not a gate exemption.
-10. **Fixture provenance.** Today's captures came from the bundled `conpty.dll` (pywinpty 3.1.2), while the
+11. **Fixture provenance.** Today's captures came from the bundled `conpty.dll` (pywinpty 3.1.2), while the
     core uses the system ConPTY, so the byte stream can differ in repaint/erase details on day one. Step 0
     therefore froze the corpus, and step 2a re-recorded claude, codex, kimi and omp on the system ConPTY
     (exact read bytes, `chunk_encoding: utf8_bytes`); `live-agy` keeps its bundled recording
     (`agy-bundled-case`). Observed differences: conhost answers DA1, window-title and OSC 10/11 queries
     itself, so the live streams no longer carry them (the `edge-osc-*` cases still pin the strips), and
     reads are smaller.
-11. **No Python-side batching.** The parallel unit's Task 1 does not land (owner decision 7). The core's
+12. **No Python-side batching.** The parallel unit's Task 1 does not land (owner decision 7). The core's
     coalescing is the only batching, which means before the merge there is no batching at all and after it
     there is exactly one layer — never two, so there is no double-batching case to reason about.
-12. **Skipped here.** No code, no compiled module, no benchmark. Crate versions and APIs cited are file
+13. **Skipped here.** No code, no compiled module, no benchmark. Crate versions and APIs cited are file
     evidence where marked (the `windows` console/job exports, the lock contents, uvicorn's deflate
     default) and marked unverified otherwise (PyO3's panic conversion and abi3 range, `tungstenite`'s
     deflate support); pin them when step 1 opens.
-13. **Exit-code fidelity.** The reaper reads `GetExitCodeProcess` after the handle is signalled, and `kill`
+14. **Exit-code fidelity.** The reaper reads `GetExitCodeProcess` after the handle is signalled, and `kill`
     reads it *before* `TerminateJobObject` — a process that has exited but is still terminating can have
     its code replaced by the job's termination code, so the pre-read is what keeps `cmd /c "exit 3"`
     reporting 3 when the hub kills it in that window. A failed query logs and leaves `exit_code = None`

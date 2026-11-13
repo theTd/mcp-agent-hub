@@ -87,7 +87,15 @@ impl Coalescer {
     }
 }
 
-/// One console socket. `deliver` returns the bytes it had to drop to accept the frame.
+/// One console socket's queue. `deliver` hands the frame over and returns the bytes it had to drop to
+/// accept it.
+///
+/// `deliver` runs on the session's reader thread (or on `feed`'s caller) while the session's delivery
+/// lock and sink list are held, in stream order, one frame at a time. It must therefore not block and
+/// must not write a socket itself: it pushes onto the sink's own bounded queue (`FrameQueue`), and the
+/// socket's own thread writes the replay and the `replay_end` marker before the first queued frame
+/// (§6.4). A panic from `deliver` costs that sink alone: the core catches it, detaches the sink and
+/// reports it, and the other sinks still get the frame (§6.3).
 pub trait FrameSink: Send + Sync {
     fn deliver(&self, session_id: &str, frame: &[u8]) -> u64;
 }

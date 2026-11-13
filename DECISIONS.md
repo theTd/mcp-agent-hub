@@ -16,11 +16,17 @@ skeleton) and step 2a (corpus re-recorded on the system ConPTY). The hub does no
 | terminal-core-batching | The core's per-session coalescing is the only PTY output batching; the separate Python-side output batching unit is dropped and never lands. |
 | terminal-core-conpty | The core uses the system ConPTY through the `windows` crate (`CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`), not the bundled `conpty.dll` / `OpenConsole.exe` pywinpty ships. Existing captures came from the bundled implementation, so parser fixtures are re-recorded against the system version. |
 
-## Rust terminal core, implementation (2026-11-13, decided by the orchestrator, reviewed by the owner)
+## Rust terminal core, implementation (2026-11-13, decided by the orchestrator)
 
 Medium decisions taken while building steps 0 to 2. Each is easy to reverse; the last column says how.
-The owner reviewed them on the batch decision page `hub-rtc-review-1113` (2026-11-13): `oracle-bugs`
-changed as recorded in its row; every other row kept its default.
+The owner reviewed `oracle-bugs`, `replay-shape`, `write-contract`, `write-oversize`, `kill-all-parallel`,
+`tests-fail-without-pyd` and `agy-bundled-case` on the batch decision page `hub-rtc-review-1113`
+(2026-11-13): `oracle-bugs` changed as recorded in its row, the others kept their defaults.
+`parser-vte-own-screen`, `w9-banner-overshoot`, `ws-listening-health`, `live-capture-new-consumers`,
+`nfc-deferred` (as the crate question) and `csi-esc-restart` (as the master-merge question) are on the page
+`hub-rtc-step2-1114`, not answered yet; `csi-residue-fix`, `scrub-uuids`, `master-fixes-carry`,
+`zero-width-skip` and `edge-screen-corpus` were reported in an audit list; the four `rtc-sink-*` rows
+(step 2d) came after that page.
 
 | id | decision | alternative not taken | how to reverse |
 |---|---|---|---|
@@ -42,6 +48,10 @@ changed as recorded in its row; every other row kept its default.
 | nfc-deferred | The core stores combining marks unnormalised (pyte NFC-composes); exact NFC needs the `unicode-normalization` crate, not approved, so 8 exceptions-file rows cover exactly that difference. Owner question: approve the crate? | Add the crate now. | Approve the crate, compose in `screen.rs`, drop the 8 rows. |
 | edge-screen-corpus | Step 2c adds 12 synthetic `edge-screen-*` corpus cases (DECSTBM, DECOM, save/restore, zero-width, combining, CSI cut by CAN/SUB/ESC, `$p`, private markers) rendered by the Python oracle, since the review showed the live corpus never exercises them; a 13th, `edge-screen-csi-controls`, came with `csi-esc-restart`. | Rust-only unit tests. | Delete the folders and their `EDGE_CASES` names. |
 | csi-esc-restart | A third oracle bug found by step 2c's edge cases, fixed in Python first per `oracle-bugs` (`fix/pyte-csi-esc-restart`, `a3dce22`, not on master yet): inside a CSI an ESC now starts the next sequence (pyte drew the rest as text), and in the same pass a C0 control runs in front of the sequence and DEL is dropped, the two other bytes pyte took for a final byte. Only `edge-screen-csi-cancel` changed; its 4 exception rows are gone. | Fix the ESC case only. | Revert the branch and restore the 4 exception rows. |
+| rtc-sinks-per-id | Step 2d, review of step 2c: the delivery lock, the sink list and the handle counter are one `Arc<SinkFanout>` per session **id**, carried over by each new incarnation (`spawn`/`attach_text` of a dead id). The handover, under that lock: flush the predecessor's pending batch, mark it superseded, then send the resume separator, so an attached socket sees the old output, the banner, the new output, each once (doc §5.4, §6.4 A1). | Keep sinks per `Session` and re-attach sockets in Python on resume. | Give each incarnation its own `SinkFanout` and drop the handover. |
+| rtc-sink-superseded | A superseded incarnation never delivers again: a frame its reader still files is dropped, counted in its `dropped_bytes` and logged once, never written after its successor's banner. | Let the old reader deliver until its EOF, after the banner. | Drop the `superseded` check in `fan_out`. |
+| rtc-sink-panic | A panic in one `FrameSink::deliver` costs that sink: caught, detached, counted in `stats.panics`, logged once with its handle; no lock on the delivery path skips its work on poison (doc §6.3). | Let the panic end the session's reader. | Remove `catch_unwind` from `SinkFanout::fan_out`. |
+| rtc-sink-contract | `deliver` must not block and must not write a socket; the step 4 socket sink is a bounded `FrameQueue` whose own thread writes the replay and `replay_end` before the first queued frame. Per-socket drop counts and the cost of rendering the replay under the delivery lock (~1.5 ms at the cap) are step 4's. | A sink that writes the socket from `deliver` (a frame could precede the replay). | Change the step 4 sink and the trait doc. |
 
 Two owner answers on the same page that are not core decisions: `perf/session-cache-offloop-scans` and
 `perf/console-push-updates` are not merged into master; their need is re-assessed after the Rust core

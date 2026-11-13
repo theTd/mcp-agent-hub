@@ -11,6 +11,8 @@ pub mod handles;
 pub mod job;
 pub mod job_tree;
 pub mod session;
+/// The delivery state that belongs to a session id (§6.4 A1); internals of the core, not its surface.
+mod sink_fanout;
 
 /// Test-only knobs the integration tests need; never part of a release build.
 #[cfg(feature = "test-hooks")]
