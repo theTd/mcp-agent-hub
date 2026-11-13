@@ -16,6 +16,7 @@ test-hooks = ["conpty_session/test-hooks"]
 
 [dependencies]
 conpty_session = { path = "../conpty_session" }
+terminal_stream = { path = "../terminal_stream" }
 # Pinned: 0.30.1 is the first release that knows CPython 3.15, and `abi3-py311` builds one artifact for
 # the portable bootstrap's 3.11-3.14 range plus the dev 3.15 (verified by importing the same .pyd on
 # 3.14 and 3.15; §7.3's abi3 gate). Bumping it is a deliberate step, not a range drift.

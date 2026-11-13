@@ -300,6 +300,180 @@ class CoreClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.spawn()
 
+    def test_screen_scrollback_raw_and_replay_of_a_live_session(self):
+        self.spawn(cols=100, rows=30)
+        self.wait_for(">", timeout=15.0)
+        self.core.write(self.session, "echo hub-screen-ok\r\n")
+        self.wait_for("hub-screen-ok")
+
+        deadline = time.time() + 10.0
+        screen = None
+        while time.time() < deadline:
+            screen = self.core.screen(self.session, 80)
+            if "hub-screen-ok" in screen["text"]:
+                break
+            time.sleep(0.02)
+        self.assertIn("hub-screen-ok", screen["text"])
+        self.assertEqual((screen["cols"], screen["rows"]), (100, 30))
+        self.assertGreaterEqual(screen["rev"], 1)
+        self.assertGreaterEqual(screen["cursor_x"], 0)
+        self.assertGreaterEqual(screen["cursor_y"], 0)
+
+        scrollback = self.core.scrollback(self.session, 250)
+        self.assertIsInstance(scrollback["text"], str)
+        self.assertGreater(scrollback["rev"], 0)
+
+        raw = self.core.raw(self.session)
+        self.assertIn("hub-screen-ok", raw["text"])
+        self.assertGreaterEqual(raw["bytes"], len(raw["text"].encode("utf-8")))
+        self.assertGreater(raw["rev"], 0)
+        replay = self.core.replay(self.session)
+        self.assertIn("hub-screen-ok", replay)
+        self.assertNotIn("\x1b]11;?", replay)
+
+    def test_snapshot_all_reports_the_live_session(self):
+        self.spawn()
+        self.wait_for(">", timeout=15.0)
+        self.core.write(self.session, "echo snapshot-ok\r\n")
+        self.wait_for("snapshot-ok")
+        snapshots = self.core.snapshot_all(250, 512 * 1024)
+        mine = [snapshot for snapshot in snapshots if snapshot["session_id"] == self.session]
+        self.assertEqual(len(mine), 1, snapshots)
+        self.assertIn("snapshot-ok", mine[0]["screen_text"])
+        self.assertTrue(mine[0]["alive"])
+        self.assertGreater(mine[0]["raw_rev"], 0)
+
+
+    def test_seed_history_precedes_the_first_output(self):
+        self.core.spawn(
+            self.session,
+            ["cmd.exe"],
+            cols=80,
+            rows=24,
+            seed_history="RESUMED-SEED\r\n",
+        )
+        raw = self.core.raw(self.session)
+        self.assertTrue(raw["text"].startswith("RESUMED-SEED"), raw["text"][:120])
+        self.core.kill(self.session, 2000)
+
+    def test_spawn_flags_bound_the_ring_and_the_history(self):
+        self.core.spawn(
+            self.session,
+            ["cmd.exe"],
+            cols=80,
+            rows=24,
+            flags={"raw_cap_bytes": 64, "raw_slack_bytes": 0, "history_rows": 10},
+        )
+        self.wait_for(">", timeout=15.0)
+        line = "echo " + "0123456789" * 20 + "\r\n"
+        self.core.write(self.session, line)
+        deadline = time.time() + 10.0
+        raw = self.core.raw(self.session)
+        while time.time() < deadline and "较早的输出已截断" not in raw["text"]:
+            time.sleep(0.02)
+            raw = self.core.raw(self.session)
+        self.assertIn("较早的输出已截断", raw["text"])
+        # A trimmed ring may exceed its cap by less than the banner line (`HISTORY_BANNER_LINE_MAX_BYTES`).
+        self.assertLessEqual(raw["bytes"], 64 + 128, raw["bytes"])
+        self.assertLessEqual(len(self.core.scrollback(self.session, 250)["text"].splitlines()), 250)
+
+
+class TextSessionTests(unittest.TestCase):
+    """`attach_text` + `feed`: a screen without a process (§5.2), and the character-count tail."""
+
+    def setUp(self):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
+        self.notify_calls = []
+        self.core = Core(notify=lambda: self.notify_calls.append(time.monotonic()), log=lambda line: None)
+        self.session = "virtual"
+
+    def tearDown(self):
+        try:
+            self.core.kill_all(2000)
+        finally:
+            self.core.shutdown()
+
+    def test_feed_renders_and_the_tail_never_splits_a_character(self):
+        reply = self.core.attach_text(
+            self.session, cols=40, rows=6, seed_history="ARCHIVED\r\n"
+        )
+        self.assertEqual((reply["cols"], reply["rows"]), (40, 6))
+        first = self.core.feed(self.session, "hello 世界\r\nsecond line")
+        self.assertGreaterEqual(first, 1)
+        screen = self.core.screen(self.session, 10)
+        self.assertIn("hello 世界", screen["text"])
+        self.assertIn("second line", screen["text"])
+
+        self.assertTrue(
+            self.core.raw(self.session)["text"].startswith("ARCHIVED"),
+            "attach_text's seed_history is the ring's first entry",
+        )
+        second = self.core.feed(self.session, "\r\n第三行")
+        self.assertGreater(second, first)
+        self.assertIn("第三行", self.core.screen(self.session, 10)["text"])
+        # raw_tail is a character count, as the hub's "".join(raw_history)[-65536:] always was: the tail
+        # of a CJK string comes back whole instead of being cut inside a three-byte character.
+        self.assertEqual(self.core.raw_tail(self.session, 3), "第三行")
+        self.assertEqual(self.core.raw_tail(self.session, 1), "行")
+        self.assertIn("hello 世界", self.core.raw(self.session)["text"])
+        self.assertIn("hello 世界", self.core.replay(self.session))
+
+        record = self.drain_until(lambda entry: entry["session_id"] == self.session)
+        self.assertGreaterEqual(record["screen_rev"], second)
+        self.assertIsNone(record["screen_text"], "a session that is not watched carries no screen")
+        self.assertTrue(record["alive"])
+
+        self.core.watch_screen(self.session, 10, 0)
+        self.core.feed(self.session, "\r\nwatched")
+        watched = self.drain_until(
+            lambda entry: entry["session_id"] == self.session and entry["screen_text"]
+        )
+        self.assertIn("watched", watched["screen_text"])
+        self.core.unwatch(self.session)
+
+        # A text session ends without an exit code, and its state stays readable.
+        self.assertIsNone(self.core.kill(self.session, 100))
+        dead = self.drain_until(lambda entry: entry["session_id"] == self.session and not entry["alive"])
+        self.assertIsNone(dead["exit_code"])
+        self.assertIn("watched", self.core.screen(self.session, 10)["text"])
+
+    def test_unknown_text_session_raises_key_error(self):
+        for call in (
+            lambda: self.core.feed("no-such-session", "x"),
+            lambda: self.core.screen("no-such-session", 10),
+            lambda: self.core.scrollback("no-such-session", 10),
+            lambda: self.core.raw("no-such-session"),
+            lambda: self.core.replay("no-such-session"),
+            lambda: self.core.watch_screen("no-such-session", 10, 1),
+            lambda: self.core.unwatch("no-such-session"),
+        ):
+            with self.assertRaises(KeyError):
+                call()
+
+    def drain_until(self, predicate, timeout=5.0):
+        end = time.time() + timeout
+        seen = []
+        while time.time() < end:
+            for record in self.core.drain():
+                seen.append(record)
+                if predicate(record):
+                    return record
+            time.sleep(0.02)
+        self.fail(f"no drain record matched; records seen: {seen}")
+
+
+class ReplyStripTests(unittest.TestCase):
+    def test_strip_osc_terminal_replies_is_a_function(self):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
+        module = sys.modules["hub_terminal_core"]
+        self.assertEqual(module.strip_osc_terminal_replies("\x1b]11;rgb:1/1/1\x07hi"), "hi")
+        self.assertEqual(module.strip_osc_terminal_replies("\x1b]52;c;YWJj\x07"), "")
+        self.assertEqual(module.strip_osc_terminal_replies("\x1b]110;rgb:0/0/0\x1b\\x"), "x")
+        self.assertEqual(module.strip_osc_terminal_replies("plain"), "plain")
+        self.assertEqual(module.strip_osc_terminal_replies("\x1b]10;rgb:1/1"), "\x1b]10;rgb:1/1")
+
 
 # B2: `shutdown`/`Drop` must not wait for the GIL while they hold it. A regression hangs the process, so
 # each case runs in a child interpreter that the parent kills at a hard timeout.

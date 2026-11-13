@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use conpty_session::job_tree;
-use conpty_session::{Core, CoreOptions, SpawnRequest};
+use conpty_session::{Core, CoreOptions, SessionFlags, SpawnRequest};
 
 use windows::Win32::System::Threading::GetCurrentProcess;
 
@@ -67,7 +67,7 @@ fn wait_for_output(core: &Core, id: &str, needle: &str, deadline: Duration) -> R
         let tail = core
             .raw_tail(id, 64 * 1024, Duration::from_millis(50))
             .map_err(|error| error.to_string())?;
-        let text = String::from_utf8_lossy(&tail).to_string();
+        let text = tail.clone();
         last_len = text.len();
         if text.contains(needle) {
             return Ok(text);
@@ -122,7 +122,9 @@ fn run_selftest() -> u32 {
         env: environment(),
         cols: 100,
         rows: 30,
+        flags: SessionFlags::default(),
         seed_history: None,
+        ws_prefix: None,
     });
     let (pid, spawn_size) = match spawned {
         Ok(reply) => (reply.pid, (reply.cols, reply.rows)),
@@ -296,7 +298,9 @@ fn natural_exit_check() -> Result<(), String> {
         env: environment(),
         cols: 80,
         rows: 24,
+        flags: SessionFlags::default(),
         seed_history: None,
+        ws_prefix: None,
     })
     .map_err(|error| error.to_string())?;
     let end = Instant::now() + Duration::from_secs(1);
@@ -319,7 +323,7 @@ fn natural_exit_check() -> Result<(), String> {
     let tail = core
         .raw_tail(id, 64 * 1024, Duration::from_millis(50))
         .map_err(|error| error.to_string())?;
-    if !String::from_utf8_lossy(&tail).contains("natural-exit") {
+    if !tail.contains("natural-exit") {
         return Err("the last output was not in the raw tail".to_string());
     }
     core.spawn(SpawnRequest {
@@ -329,7 +333,9 @@ fn natural_exit_check() -> Result<(), String> {
         env: environment(),
         cols: 80,
         rows: 24,
+        flags: SessionFlags::default(),
         seed_history: None,
+        ws_prefix: None,
     })
     .map_err(|error| format!("the exited id could not be spawned again: {error}"))?;
     let end = Instant::now() + Duration::from_secs(1);
@@ -369,7 +375,9 @@ fn spawn_timing_check() -> Result<(), String> {
             env: environment(),
             cols: 80,
             rows: 24,
+            flags: SessionFlags::default(),
             seed_history: None,
+            ws_prefix: None,
         })
         .map_err(|error| error.to_string())?;
         let elapsed = started.elapsed();
@@ -449,7 +457,9 @@ fn nested_outer() -> i32 {
         env: environment(),
         cols: 100,
         rows: 30,
+        flags: SessionFlags::default(),
         seed_history: None,
+        ws_prefix: None,
     });
     let pid = match spawned {
         Ok(reply) => reply.pid,

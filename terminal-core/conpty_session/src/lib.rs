@@ -16,5 +16,9 @@ pub mod session;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
 
-pub use core::{Core, CoreError, CoreOptions, SpawnReply, SpawnRequest, Stats};
-pub use session::DrainRecord;
+pub use core::{
+    Core, CoreError, CoreOptions, SpawnReply, SpawnRequest, Stats, TextRequest,
+};
+pub use session::{
+    DrainRecord, RawReply, ScreenReply, SessionFlags, SessionSnapshot, TextReply,
+};

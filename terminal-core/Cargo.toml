@@ -1,7 +1,7 @@
 # The terminal core is its own workspace: desktop/src-tauri sets `panic = "abort"` for the app, and a
 # dependency compiled with abort would turn every caught panic back into a hub kill (docs §6.3, §7.3).
 [workspace]
-members = ["conpty_session", "hub_terminal_core"]
+members = ["terminal_stream", "conpty_session", "hub_terminal_core"]
 resolver = "2"
 
 [profile.release]
