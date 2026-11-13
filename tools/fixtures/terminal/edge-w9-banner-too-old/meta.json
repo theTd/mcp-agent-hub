@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "the newest banner is far older than the budget: its tail does not fit, so the block never fires and the cut follows the byte budget (the banner is gone)",
+  "max_bytes": 400
+}

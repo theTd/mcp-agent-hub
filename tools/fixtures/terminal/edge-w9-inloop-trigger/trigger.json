@@ -1,0 +1,11 @@
+{
+  "fired_at_chunk": 146,
+  "entries_before": 147,
+  "entries_after": 1,
+  "bytes_before": 589122,
+  "bytes_after": 524269,
+  "max_bytes": 524288,
+  "slack_bytes": 65536,
+  "final_entries": 12,
+  "final_bytes": 565165
+}

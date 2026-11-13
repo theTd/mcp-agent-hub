@@ -1,0 +1,8 @@
+{
+  "kind": "trim",
+  "engine": "generic",
+  "synthetic": true,
+  "chunk_encoding": "text",
+  "note": "the byte budget lands inside the newest banner line: banner_start < start, but the banner tail alone is larger than the budget, so the block is skipped and the banner is dropped (today's behaviour, frozen)",
+  "max_bytes": 196
+}

@@ -1,0 +1,50 @@
+{"delay_ms": 10, "chunk": "old output line 0000 xxxxxxxxxxxxxxxxxxxx\r\nold output"}
+{"delay_ms": 10, "chunk": " line 0001 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0002"}
+{"delay_ms": 10, "chunk": " xxxxxxxxxxxxxxxxxxxx\r\nold output line 0003 xxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxx\r\nold output line 0004 xxxxxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "x\r\nold output line 0005 xxxxxxxxxxxxxxxxxxxx\r\nold out"}
+{"delay_ms": 10, "chunk": "put line 0006 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0"}
+{"delay_ms": 10, "chunk": "007 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0008 xxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxx\r\nold output line 0009 xxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxx\r\nold output line 0010 xxxxxxxxxxxxxxxxxxxx\r\nold "}
+{"delay_ms": 10, "chunk": "output line 0011 xxxxxxxxxxxxxxxxxxxx\r\nold output lin"}
+{"delay_ms": 10, "chunk": "e 0012 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0013 xxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxxxx\r\nold output line 0014 xxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxx\r\nold output line 0015 xxxxxxxxxxxxxxxxxxxx\r\no"}
+{"delay_ms": 10, "chunk": "ld output line 0016 xxxxxxxxxxxxxxxxxxxx\r\nold output "}
+{"delay_ms": 10, "chunk": "line 0017 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0018 "}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxxxxxxx\r\nold output line 0019 xxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxx\r\nold output line 0020 xxxxxxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "\r\nold output line 0021 xxxxxxxxxxxxxxxxxxxx\r\nold outp"}
+{"delay_ms": 10, "chunk": "ut line 0022 xxxxxxxxxxxxxxxxxxxx\r\nold output line 00"}
+{"delay_ms": 10, "chunk": "23 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0024 xxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxx\r\nold output line 0025 xxxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxx\r\nold output line 0026 xxxxxxxxxxxxxxxxxxxx\r\nold o"}
+{"delay_ms": 10, "chunk": "utput line 0027 xxxxxxxxxxxxxxxxxxxx\r\nold output line"}
+{"delay_ms": 10, "chunk": " 0028 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0029 xxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxxx\r\nold output line 0030 xxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxx\r\nold output line 0031 xxxxxxxxxxxxxxxxxxxx\r\nol"}
+{"delay_ms": 10, "chunk": "d output line 0032 xxxxxxxxxxxxxxxxxxxx\r\nold output l"}
+{"delay_ms": 10, "chunk": "ine 0033 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0034 x"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxxxxxx\r\nold output line 0035 xxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxx\r\nold output line 0036 xxxxxxxxxxxxxxxxxxxx\r"}
+{"delay_ms": 10, "chunk": "\nold output line 0037 xxxxxxxxxxxxxxxxxxxx\r\nold outpu"}
+{"delay_ms": 10, "chunk": "t line 0038 xxxxxxxxxxxxxxxxxxxx\r\nold output line 003"}
+{"delay_ms": 10, "chunk": "9 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0040 xxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxx\r\nold output line 0041 xxxxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xx\r\nold output line 0042 xxxxxxxxxxxxxxxxxxxx\r\nold ou"}
+{"delay_ms": 10, "chunk": "tput line 0043 xxxxxxxxxxxxxxxxxxxx\r\nold output line "}
+{"delay_ms": 10, "chunk": "0044 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0045 xxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxx\r\nold output line 0046 xxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxx\r\nold output line 0047 xxxxxxxxxxxxxxxxxxxx\r\nold"}
+{"delay_ms": 10, "chunk": " output line 0048 xxxxxxxxxxxxxxxxxxxx\r\nold output li"}
+{"delay_ms": 10, "chunk": "ne 0049 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0050 xx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxxxxxxxxx\r\nold output line 0051 xxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxx\r\nold output line 0052 xxxxxxxxxxxxxxxxxxxx\r\n"}
+{"delay_ms": 10, "chunk": "old output line 0053 xxxxxxxxxxxxxxxxxxxx\r\nold output"}
+{"delay_ms": 10, "chunk": " line 0054 xxxxxxxxxxxxxxxxxxxx\r\nold output line 0055"}
+{"delay_ms": 10, "chunk": " xxxxxxxxxxxxxxxxxxxx\r\nold output line 0056 xxxxxxxxx"}
+{"delay_ms": 10, "chunk": "xxxxxxxxxxx\r\nold output line 0057 xxxxxxxxxxxxxxxxxxx"}
+{"delay_ms": 10, "chunk": "x\r\nold output line 0058 xxxxxxxxxxxxxxxxxxxx\r\nold out"}
+{"delay_ms": 10, "chunk": "put line 0059 xxxxxxxxxxxxxxxxxxxx\r\n\r\n\u001b[90m── 已恢复（第 2"}
+{"delay_ms": 10, "chunk": " 次）──\u001b[0m\r\nnew line 1\r\nnew line 2\r\n"}

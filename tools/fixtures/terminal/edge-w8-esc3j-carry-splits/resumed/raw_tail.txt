@@ -1,0 +1,10 @@
+archived line
+before[2J[3Jafter
+second[2J[3Jthird
+tail
+
+[90m── 已恢复（第 1 次）──[0m
+archived line
+before[2Jafter
+second[2Jthird
+tail

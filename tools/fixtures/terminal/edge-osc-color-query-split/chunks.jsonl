@@ -1,0 +1,5 @@
+{"delay_ms": 0, "chunk": "\u001b]1"}
+{"delay_ms": 10, "chunk": "1;?"}
+{"delay_ms": 10, "chunk": "\u0007prompt> \r\n"}
+{"delay_ms": 10, "chunk": "\u001b]4;0"}
+{"delay_ms": 10, "chunk": ";?\u0007done\r\n"}

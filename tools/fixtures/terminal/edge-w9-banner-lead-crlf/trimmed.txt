@@ -1,0 +1,4 @@
+[90m[较早的输出已截断][0m
+
+[90m── 已恢复（第 1 次）──[0m
+old output line 0000 xxxxxxxxxxxxxxxxxxxx

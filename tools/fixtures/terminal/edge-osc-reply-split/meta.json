@@ -1,0 +1,7 @@
+{
+  "kind": "input",
+  "engine": "generic",
+  "synthetic": true,
+  "note": "a reply split over two browser messages is not stripped (per-message strip)",
+  "chunk_encoding": "text"
+}

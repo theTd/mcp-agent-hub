@@ -1,0 +1,939 @@
+[1t[c[?1004h[?9001h[?2026$p[?2027$p]7501;?[?5W[?2004h[>4;2m[>5u[?u[0 q[J
+[6C▄▀▀▄        [1mAntigravity CLI 1.5.8[m
+[34D▀▀▀▀▀▀       <EMAIL>
+[35D▀▀▀▀▀▀▀▀      <SCRATCH><SCRATCH>
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts[2A[13D[?25h[?25l[5A		  Gemini 4 Argon (Low)[K
+[20D<SCRATCH><SCRATCH>
+
+
+
+
+
+[19C[2mGemini 4 Argon · low[m[2A[2C[?25h[?25lAuto mode: edits & safe commands auto-approved (shift+tab to cycle)
+
+[24Cauto[2m · [m[2A[98D[?25h[?25l[2A⣷  Generating...
+
+
+
+esc to cancel  [2A[13D[?25h[?25l[2A⣯  Gene
+
+[5D[?25h[?25l[2A Genera
+
+[7D[?25h[?25l[2A⣟ 
+
+[?25h[?25l[2A⡿  Generat
+
+[8D[?25h[?25l[2A⢿  Generatin
+
+[10D[?25h[?25l[2A⣻  Generating
+
+[11D[?25h[?25l[2A⣽  Generating.
+
+[12D[?25h[?25l[2A⣾  Generating..
+
+[13D[?25h[?25l[2A⣷  Generating...
+
+[14D[?25h[?25l[2A⣯  Generating
+
+[11D[?25h[?25l[2A⣟  Generating.
+
+[12D[?25h[?25l[2A⡿  Generating...
+
+[14D[?25h[?25l[2A⢿ 
+
+[?25h[?25l[2A⣻ 
+
+[?25h[?25l[2A⣽ 
+
+[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷ 
+
+[?25h[?25l[2A⣯  G
+
+[?25h[?25l[6A[37C (<PLAN>)
+
+
+
+[53Den
+└ Tip: Press ctrl+b to send a long task to the background.[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A[3Cne
+
+
+[5D[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A[K
+────────────────────────────────────────────────────────────
+[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change[m[K
+[1m  nothing[m[K
+⡿  Generating...[K
+└ Tip: Press ctrl+b to send a long task to the background.[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[3A⢿  Gener
+
+
+[6D[?25h[?25l[3A⣻  Genera
+
+
+[7D[?25h[?25l[3A⣽  Generat
+
+
+[8D[?25h[?25l[3A⣾  Generati
+
+
+[9D[?25h[?25l[3A[4Ceratin
+
+
+[10D[?25h[?25l[3A⣷  Generating.
+
+
+[12D[?25h[?25l[3A⣯  Generating..
+
+
+[13D[?25h[?25l[3A⣟  Generating...
+
+
+[14D[?25h[?25l[3A[9Cng
+[6DUse /btw to ask a question without breaking context.
+
+[57D[?25h[?25l[3A⡿  Generating
+
+
+[11D[?25h[?25l[3A⢿  Generating.
+
+
+[12D[?25h[?25l[3A⣽  Generating...
+
+
+[14D[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟  Ge
+
+
+[?25h[?25l[3A⡿  Gen
+
+
+[4D[?25h[?25l[3A⢿  Gene
+
+
+[5D[?25h[?25l[3A⣻  Gener
+
+
+[6D[?25h[?25l[3A Genera
+
+
+[7D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A⣾  Generati
+
+
+[9D[?25h[?25l[3A⣷  Generatin
+
+
+[10D[?25h[?25l[3A⣯  Generating.
+
+
+[12D[?25h[?25l[3A⣟  Generating..
+
+
+[13D[?25h[?25l[3A⡿  Generating...
+
+
+[14D[?25h[?25l[3A⢿  Generatin
+
+
+[10D[?25h[?25l[3A⣻  Generating.
+
+
+[12D[?25h[?25l[3A⣽  Generating..
+
+
+[13D[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A[13C.
+
+
+[14D[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A⢿ 
+
+
+[?25h[?25l[3A⣻  G
+
+
+[?25h[?25l[3A⣽  Ge
+
+
+[?25h[?25l[3A⣾  Gen
+
+
+[4D[?25h[?25l[3A⣷  Gene
+
+
+[5D[?25h[?25l[3A⣯  Genera
+
+
+[7D[?25h[?25l[3A⣟  Generat
+
+
+[8D[?25h[?25l[3A⡿  Generati
+
+
+[9D[?25h[?25l[3A⢿  Generatin
+
+
+[10D[?25h[?25l[3A⣻  Generating.
+
+
+[12D[?25h[?25l[3A⣽  Generating..
+
+
+[13D[?25h[?25l[3A⣾  Generating...
+
+
+[14D[?25h[?25l[3A⣷  Generating
+
+
+[11D[?25h[?25l[3A⣯  Generating.
+
+
+[12D[?25h[?25l[3A⣟  Generating..
+
+
+[13D[?25h[?25l[3A⡿  Generating...
+
+
+[14D[?25h[?25l[3A⢿ 
+
+
+[?25h[?25l[3A⣻ 
+
+
+[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷  G
+
+
+[?25h[?25l[3A⣯  Ge
+
+
+[?25h[?25l[3A⣟  Gene
+
+
+[5D[?25h[?25l[3A⡿  Gener
+
+
+[6D[?25h[?25l[3A⢿  Genera
+
+
+[7D[?25h[?25l[3A⣻  Generat
+
+
+[8D[?25h[?25l[3A[3Cnerati
+
+
+[9D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A⣾  Generatin
+
+
+[10D[?25h[?25l[3A⣷  Generating.
+
+
+[12D[?25h[?25l[3A⣯  Generating..
+
+
+[13D[?25h[?25l[3A⣟  Generating...
+
+
+[14D[?25h[?25l[3A⡿  Generatin
+
+
+[10D[?25h[?25l[3A⢿  Generating.
+
+
+[12D[?25h[?25l[3A⣻  Generating..
+
+
+[13D[?25h[?25l[3A⣽  Generating...
+
+
+[14D[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A[K
+● [1mRunning[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)
+⣟  Running command...[K
+└ Tip: Use /btw to ask a question without breaking context.[K
+
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A		nd
+
+
+[16D[?25h[?25l[3A⢿  Running command
+
+
+[16D[?25h[?25l[3A⣻  Running command.
+
+
+[17D[?25h[?25l[4A○ 
+[17C..
+
+
+[19D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A[18C.
+
+
+[19D[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A⢿  R
+
+
+[?25h[?25l[3A⣻  Ru
+
+
+[?25h[?25l[3A[3Cnn
+
+
+[5D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A⣾  Runn
+
+
+[5D[?25h[?25l[3A⣷  Runnin
+
+
+[7D[?25h[?25l[3A⣯  Running
+
+
+[8D[?25h[?25l[3A⣟  Running 
+
+
+[9D[?25h[?25l[3A⡿  Running c
+
+
+[10D[?25h[?25l[3A[5Cing co
+
+
+[11D[?25h[?25l[3A⢿  Running com
+
+
+[12D[?25h[?25l[3A⣻  Running comm
+
+
+[13D[?25h[?25l[3A⣽  Running comman
+
+
+[15D[?25h[?25l[3A⣾  Running command
+
+
+[16D[?25h[?25l[3A⣷  Running command.
+
+
+[17D[?25h[?25l[3A⣯  Running command...
+
+
+[19D[?25h[?25l[3A⣟  Running comman
+
+
+[15D[?25h[?25l[3A⡿  Running command.
+
+
+[17D[?25h[?25l[3A⢿  Running command..
+
+
+[18D[?25h[?25l[3A⣻  Running command...
+
+
+[19D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟  R
+
+
+[?25h[?25l[3A⡿  Ru
+
+
+[?25h[?25l[3A⢿  Run
+
+
+[4D[?25h[?25l[3A⣻  Runni
+
+
+[6D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A Runnin
+
+
+[7D[?25h[?25l[3A⣾  Running
+
+
+[8D[?25h[?25l[3A⣷  Running 
+
+
+[9D[?25h[?25l[3A⣯  Running co
+
+
+[11D[?25h[?25l[3A⣟  Running com
+
+
+[12D[?25h[?25l[3A⡿  Running comm
+
+
+[13D[?25h[?25l[3A⢿  Running comman
+
+
+[15D[?25h[?25l[3A⣻  Running command
+
+
+[16D[?25h[?25l[3A⣷  Running command...
+
+
+[19D[?25h[?25l[3A⣯  Running comman
+
+
+[15D[?25h[?25l[3A⣟  Running command.
+
+
+[17D[?25h[?25l[3A⡿  Running command..
+
+
+[18D[?25h[?25l[3A⢿  Running command...
+
+
+[19D[?25h[6n[?25l[3A⣻ 
+
+
+[?25h[?25l[3A⣷  Ru
+
+
+[?25h[?25l[3A⣯  Runn
+
+
+[5D[?25h[?25l[3A⣟  Runni
+
+
+[6D[?25h[?25l[3A⡿  Runnin
+
+
+[7D[?25h[?25l[3A⢿  Running
+
+
+[8D[?25h[?25l[3A⣻  Running c
+
+
+[10D[?25h[?25l[3A⣽  Running co
+
+
+[11D[?25h[?25l[3A⣾  Running com
+
+
+[12D[?25h[?25l[3A[7Cg comm
+
+
+[13D[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[4A● 
+[8C comman
+
+
+[15D[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[4A● [1mRan[m [4P
+
+
+
+[4D[?25h[?25l[3A⣟  Running command
+
+
+[16D[?25h[?25l[3A⡿  Running command.
+
+
+[17D[?25h[?25l[3A⢿  Running command..
+
+
+[18D[?25h[?25l[3A⣻  Running command...
+
+
+[19D[?25h[?25l[3A⣽  Running command
+
+
+[16D[?25h[?25l[3A⣾  Running command.
+
+
+[17D[?25h[?25l[3A⣷  Running command..
+
+
+[18D[?25h[?25l[3A⣯  Running command...
+
+
+[19D[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A⢿ 
+
+
+[?25h[?25l[3A⣻ 
+
+
+[?25h[?25l[3A⣽  R
+
+
+[?25h[?25l[3A⣾  Ru
+
+
+[?25h[?25l[3A⣷  Run
+
+
+[4D[?25h[?25l[3A⣯  Runni
+
+
+[6D[?25h[?25l[3A⣟  Runnin
+
+
+[7D[?25h[?25l[3A⡿  Running
+
+
+[8D[?25h[?25l[3A⢿  Running 
+
+
+[9D[?25h[?25l[3A⣻  Running co
+
+
+[11D[?25h[?25l[3A⣽  Running com
+
+
+[12D[?25h[?25l[3A⣾  Running comm
+
+
+[13D[?25h[?25l[3A⣷  Running comman
+
+
+[15D[?25h[?25l[3A⣯  Running command
+
+
+[16D[?25h[?25l[3A⣟  Running command.
+
+
+[17D[?25h[?25l[3A⡿  Running command..
+
+
+[18D[?25h[?25l[3A⢿  Running command...
+
+
+[19D[?25h[?25l[3A⣻  Running command
+
+
+[16D[?25h[?25l[3A⣽  Running command.
+
+
+[17D[?25h[?25l[3A⣾  Running command...
+
+
+[19D[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A⢿ 
+
+
+[?25h[?25l[3A⣻  R
+
+
+[?25h[?25l[3A⣽  Ru
+
+
+[?25h[?25l[3A⣾  Run
+
+
+[4D[?25h[?25l[3A⣷  Runni
+
+
+[6D[?25h[?25l[3A⣯  Runnin
+
+
+[7D[?25h[?25l[3A⣟  Running
+
+
+[8D[?25h[?25l[3A⡿  Running 
+
+
+[9D[?25h[?25l[3A⢿  Running c
+
+
+[10D[?25h[?25l[3A⣻  Running com
+
+
+[12D[?25h[?25l[3A⣽  Running comm
+
+
+[13D[?25h[?25l[3A⣾  Running comma
+
+
+[14D[?25h[?25l[3A⣷  Running comman
+
+
+[15D[?25h[?25l[3A⣯  Running command.
+
+
+[17D[?25h[?25l[3A⣟  Running command..
+
+
+[18D[?25h[?25l[3A⡿  Running command...
+
+
+[19D[?25h[?25l[3A⢿  Running comman
+
+
+[15D[?25h[?25l[3A[15Cd.
+
+
+[17D[?25h[?25l[3A⣻  Running command.
+
+
+[17D[?25h[?25l[3A⣽  Running command..
+
+
+[18D[?25h[?25l[3A⣾  Running command...
+
+
+[19D[?25h[?25l[3A⣷ 
+
+
+[?25h[?25l[3A⣯ 
+
+
+[?25h[?25l[3A⣟ 
+
+
+[?25h[?25l[3A⡿ 
+
+
+[?25h[?25l[3A⢿  R
+
+
+[?25h[?25l[3A⣻  Run
+
+
+[4D[?25h[?25l[3A⣽ 
+
+
+[?25h[?25l[3A[4Cni
+
+
+[6D[?25h[?25l[3A⣾ 
+
+
+[?25h[?25l[3A⣷  Runni
+
+
+[6D[?25h[?25l[3A⣯  Running
+
+
+[8D[?25h[?25l[3A⣟  Running 
+
+
+[9D[?25h[?25l[3A⡿  Running c
+
+
+[10D[?25h[?25l[3A⢿  Running co
+
+
+[11D[?25h[?25l[3A⣻  Running comm
+
+
+[13D[?25h[?25l[3A⣽  Running comma
+
+
+[14D[?25h[?25l[3A⣾  Running comman
+
+
+[15D[?25h[?25l[3A⣷  Running command
+
+
+[16D[?25h[?25l[3A⣯  Running command..
+
+
+[18D[?25h[?25l[3A[K
+  There are [1m3[m files in[K
+⣯  Running command...[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[3A[21Cthis folder
+⣟ 
+
+[?25h[?25l[3A[32C:
+[K
+  • [alpha.[K
+⣟  Running command...[K
+
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[3A[9Ctxt](file://
+
+
+[21D[?25h[?25l[3A[21C/D
+		nd
+
+[16D[?25h[?25l[2A⡿ 
+
+[?25h[?25l[3A			<SCRATCH>
+[20Dd.
+
+[17D[?25h[?25l[3A[35C<SCRATCH>
+⢿ 
+
+[?25h[?25l[3A[71C<SCRATCH>
+[67D..
+
+[18D[?25h[?25l[3A[83Ces
+
+
+[85D[?25h[?25l[2A⣻  Running command..
+
+[18D[?25h[?25l[3A[2C[4m]8;id=jk6007d81ed7159627;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;[K
+⣽  Running command...
+
+[19D[?25h[?25l[3A[2C[4m]8;id=jkfb50ff32529440d5;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+  • [beta.txt](file:///<SCRATCH_DRIVE>
+⣽  Running command...[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[4A[2C[4m]8;id=jkb09f55c37012f4eb;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+		<SCRATCH>
+
+
+[36D[?25h[?25l[4A[2C[4m]8;id=jk9c29087cbaf7c506;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[25C<SCRATCH>
+
+
+[47D[?25h[?25l[2A⣾ 
+
+[?25h[?25l[2A⣷ 
+
+[?25h[?25l[4A[2C[4m]8;id=jk2d604c538521ef18;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[36C<SCRATCH>
+
+
+[71D[?25h[?25l[4A[2C[4m]8;id=jke2ebfcad7425bd9b;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[60C<SCRATCH>
+
+
+[83D[?25h[?25l[4A[2C[4m]8;id=jkfb9734c5a23f9705;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[9D[4m]8;id=jk18eed8b7a0e744ca;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;[K
+  • [gamma[K
+⣷  Running command...[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)[K
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel[80X[80Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[2A⣯ 
+
+[?25h[?25l[5A[2C[4m]8;id=jkd3936bbc0f0be0a1;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[9D[4m]8;id=jk76bb737b0ab976e6;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+.md](file:///<SCRATCH>
+
+
+[44D[?25h[?25l[5A[2C[4m]8;id=jkebf20fe0bcfe6b8a;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[9D[4m]8;id=jkb7625ac66b135b;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+[34C<SCRATCH>
+
+
+[56D[?25h[?25l[5A[2C[4m]8;id=jkd97aeb59bc2f9ac8;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[9D[4m]8;id=jk9f9de96ef525fe3d;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+[46C<SCRATCH>
+
+
+[65D[?25h[?25l[2A⣟ 
+
+[?25h[?25l[5A[2C[4m]8;id=jkb8c0c17a6c8be295;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+[9D[4m]8;id=jk2b00f72ded6eb2ba;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+[8D[4m]8;id=jkc48a949e00cf00a5;file:///<SCRATCH><SCRATCH>/gamma.mdgamma.md[m]8;;[K
+⡿ 
+
+[?25h[?25l[2A Ru
+
+[?25h[?25l[2A[K
+
+
+
+? for shortcuts[2A[13D[?25h[6n[?25l[20A[J
+[6C▄▀▀▄        [1mAntigravity CLI 1.5.8[m
+[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)
+[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)
+   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change[m
+[1m  nothing[m
+
+● [1mRan[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)
+
+  There are [1m3[m files in this folder:
+
+  • [4m]8;id=jkb8c0c17a6c8be295;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+  • [4m]8;id=jk2b00f72ded6eb2ba;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+  • [4m]8;id=jkc48a949e00cf00a5;file:///<SCRATCH><SCRATCH>/gamma.mdgamma.md[m]8;;
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts[78X[78Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[0 q[19A[J[A? for shortcuts[98X[98Cauto[2m · Gemini 4 Argon · low[m[2J[3J[H[>4;2m[=5;1u[?u[0 q[J
+[6C▄▀▀▄        [1mAntigravity CLI 1.5.8[m
+[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)
+[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)
+   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing[m
+
+● [1mRan[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)
+
+  There are [1m3[m files in this folder:
+
+  • [4m]8;id=jk18e80d917be1b2f9;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+  • [4m]8;id=jkde34b3f528e3044e;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+  • [4m]8;id=jk3d4c0057c2b6bdf1;file:///<SCRATCH><SCRATCH>/gamma.mdgamma.md[m]8;;
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts[98X[98Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l/e[K
+
+> /effort[26X[26C  [2mSet the reasoning effort[m[K
+  /exit[30X[30C[2mExit the CLI[m
+  /clay-mc-engine-kb-first           [2mMUST use before asserting anything about Minecraft China (NetEase MC163 / ModSDK) engine-native beh...[m
+  /help[30X[30C[2mShow available commands and keybindings[m
+  /open[30X[30C[2mOpen a file or view opened/edited files[m
+[2m   ↓ 58 more[m
+
+  [1m↑/↓[m Navigate · [1menter[m Select · [1mtab[m Complete
+? for shortcuts[98X[98Cauto[2m · Gemini 4 Argon · low[m[10A[4C[?25h[?25l
+
+
+[J[3A[2C[K
+
+esc to cancel[100X[100Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[?25l[19A[K
+Resume with -c (or command below):[K
+agy --conversation=<UUID>[K
+[K
+[?5W[J
+[6C▄▀▀▄        [1mAntigravity CLI 1.5.8[m
+[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)
+[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)
+   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing[m
+
+● [1mRan[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)
+
+  There are [1m3[m files in this folder:
+
+  • [4m]8;id=jk18e80d917be1b2f9;file:///<SCRATCH><SCRATCH>/alpha.txtalpha.txt[m]8;;
+  • [4m]8;id=jkde34b3f528e3044e;file:///<SCRATCH><SCRATCH>/beta.txtbeta.txt[m]8;;
+  • [4m]8;id=jk3d4c0057c2b6bdf1;file:///<SCRATCH><SCRATCH>/gamma.mdgamma.md[m]8;;
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts[98X[98Cauto[2m · Gemini 4 Argon · low[m[2A[2C[?25h[>4m[<1u
+
+[J[?2004l[0 q
+Resume with -c (or command below):
+agy --conversation=<UUID>

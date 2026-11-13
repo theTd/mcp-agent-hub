@@ -1,0 +1,124 @@
+{
+  "kind": "session",
+  "engine": "agy",
+  "cols": 120,
+  "rows": 36,
+  "resize": {
+    "at_ms": 40042,
+    "chunk_index": 277,
+    "from": [
+      120,
+      36
+    ],
+    "to": [
+      140,
+      44
+    ]
+  },
+  "chunk_encoding": "text",
+  "launch": {
+    "command": "agy.EXE",
+    "args": [
+      "--effort",
+      "low",
+      "--mode",
+      "auto",
+      "-i",
+      "[Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing"
+    ],
+    "task_mode": "interactive_flag"
+  },
+  "flags": {
+    "ephemeral": true,
+    "isolated_hub_port": 4599,
+    "env_keys": []
+  },
+  "session_files": {
+    "engine_session_id": null
+  },
+  "task": "[Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing",
+  "recorder": {
+    "version": 1,
+    "recorded_at": "2026-11-13T15:58:40+0800",
+    "chunk_count": 287,
+    "bytes": 26849,
+    "max_chunk_bytes": 2224,
+    "events": [
+      {
+        "event": "spawn",
+        "at_ms": 0
+      },
+      {
+        "event": "answer_settled",
+        "at_ms": 40042
+      },
+      {
+        "event": "idle_reached",
+        "at_ms": 60799
+      },
+      {
+        "event": "keys",
+        "reason": "exit",
+        "at_ms": 60799,
+        "bytes": 6
+      }
+    ],
+    "exit": {
+      "stop_reason": "exited",
+      "exit_code": 0,
+      "duration_ms": 62169
+    }
+  },
+  "scrub": {
+    "rules": [
+      {
+        "label": "email",
+        "count": 4
+      },
+      {
+        "label": "extra_plan",
+        "count": 4
+      },
+      {
+        "label": "extra_scratch",
+        "count": 31
+      },
+      {
+        "label": "extra_scratch_drive",
+        "count": 1
+      },
+      {
+        "label": "uuid",
+        "count": 2
+      },
+      {
+        "label": "window_scratch",
+        "count": 41
+      }
+    ],
+    "replacements": 83,
+    "chunks": 287,
+    "chunk_encoding": "text",
+    "runs": 2,
+    "last_run": {
+      "rules": [
+        {
+          "label": "extra_scratch_drive",
+          "count": 1
+        },
+        {
+          "label": "uuid",
+          "count": 2
+        },
+        {
+          "label": "window_scratch",
+          "count": 41
+        }
+      ],
+      "replacements": 44,
+      "chars_before": 19190,
+      "chars_after": 19004
+    }
+  },
+  "resume_count": 1
+}
