@@ -383,6 +383,7 @@ class KimiTranscriptSummarizer(BaseTranscriptSummarizer):
         assistant_texts: List[str] = []
         tool_actions: List[str] = []
         turns_ended = 0
+        legacy_turns_ended = 0
         steps_count = 0
 
         if transcript_path and transcript_path.exists():
@@ -405,8 +406,11 @@ class KimiTranscriptSummarizer(BaseTranscriptSummarizer):
                                     prompts.append(_strip_bridge_hint(str(part["text"])))
                         elif isinstance(obj.get("data"), dict) and obj["data"].get("user_input"):
                             prompts.append(_strip_bridge_hint(str(obj["data"]["user_input"])))
-                    elif obj.get("kind") == "event" and otype == "agent.turn.ended":
+                    elif otype == "turn.ended" and obj.get("agentId", "main") == "main":
                         turns_ended += 1
+                    elif obj.get("kind") == "event" and otype == "agent.turn.ended":
+                        # Builds before 2026-11-13 wrote this legacy copy as well; newer ones only turn.ended.
+                        legacy_turns_ended += 1
                     elif otype == "context.append_loop_event":
                         ev = obj.get("event") or {}
                         ev_type = ev.get("type")
@@ -480,7 +484,7 @@ class KimiTranscriptSummarizer(BaseTranscriptSummarizer):
         return {
             "cli_type": "kimi",
             "transcript_file": str(transcript_path) if transcript_path else None,
-            "turns_completed": turns_ended,
+            "turns_completed": turns_ended or legacy_turns_ended,
             "step_count": step_count,
             "recent_actions": tool_actions[-10:],
             "key_thoughts": [_compact_str(t, 300) for t in thoughts[-5:]],
