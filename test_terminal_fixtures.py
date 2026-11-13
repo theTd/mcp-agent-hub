@@ -285,7 +285,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         # the hub's separator so the corpus' resume count (1 or 2) does not matter.
         banner = session_manager.resume_banner(1).split("第")[0]
         for name, banner_kept in (("edge-w9-banner-after-cut", True),
-                                  ("edge-w9-trim-banner-inside", False),
+                                  ("edge-w9-trim-banner-inside", True),
                                   ("edge-w9-banner-too-old", False),
                                   ("edge-w9-banner-lead-crlf", True)):
             meta = case_meta(name)
@@ -304,16 +304,23 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
             else:
                 self.assertLess(banner_start, start, name)
                 self.assertNotIn("已恢复", trimmed, name)
-            # Whether the block could fire at all.  Its guard is "the banner's tail fits the budget
-            # and the cut would have passed the banner"; ``raw_cut`` is the budget's own cut before
-            # the hub moves it to a line break, so no part of the trim is re-implemented here.
+            # The rule: the banner is kept whole when the budget's own cut (before the hub moves it
+            # to a line break) falls before the end of the newest banner line, and dropped when the
+            # cut is at or past that end.  Only the cut is computed here; the trim is the hub's.
             raw_cut = len(raw) - budget
-            fires = len(raw) - banner_start <= budget and banner_start <= raw_cut
-            if name == "edge-w9-banner-lead-crlf":
-                self.assertTrue(fires, name)
-                self.assertTrue(trimmed.startswith(prefix + "\r\n"), name)
+            marker_start = len(text[:found + 2].encode("utf-8"))
+            banner_end = raw.index(b"\n", marker_start) + 1
+            self.assertEqual(banner_kept, raw_cut < banner_end, name)
+            over = len(trimmed.encode("utf-8")) - meta["max_bytes"]
+            if name == "edge-w9-trim-banner-inside":
+                # The cut is inside the banner line, so keeping it goes over the cap by less than it.
+                self.assertGreater(raw_cut, banner_start, name)
+                self.assertGreater(over, 0, name)
+                self.assertLess(over, session_manager.HISTORY_BANNER_LINE_MAX_BYTES, name)
             else:
-                self.assertFalse(fires, name)
+                self.assertLessEqual(over, 0, name)
+            if name == "edge-w9-banner-lead-crlf":
+                self.assertTrue(trimmed.startswith(prefix + "\r\n"), name)
 
     def test_a_budget_below_the_prefix_returns_the_prefix(self):
         name = "edge-w9-trim-budget-zero"

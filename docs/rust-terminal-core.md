@@ -597,7 +597,7 @@ widths), `winpty-rs` and `portable-pty` (§7.1).
 | W8: `ESC[3J` (erase saved lines) is dropped on resumed sessions only, with a split-sequence carry | `_strip_saved_lines_erase` `:2390` | same algorithm in the core, `strip_esc3j_on_output` flag, per-session carry ≤3 bytes |
 | OSC 10/11/12/4 colour queries never reach the console or the history | `OSC_COLOR_QUERY_RE` `:1852` `:2334` `:2437` | same regex in the core, applied before append and before replay |
 | OSC replies from the browser never reach the PTY | `strip_osc_terminal_replies` `:1856`, used in `ws_pty_endpoint` | moves into the core: it owns the socket that receives the input, so it strips with the same pattern before `write` (§6.4) |
-| W9: the raw ring is trimmed to ≤ 512 KiB when it passes 512 KiB + 64 KiB of slack, and `_scrollback_blob` trims the same way on read: cut at a line break, `[较早的输出已截断]` prefix; the newest `── 已恢复（第 N 次）──` banner is protected only when the cut is at or before its start — the block then restores the banner's two leading bytes (`\r\n`) and nothing else, and a cut inside the banner line drops the banner | `trim_history_text` `:630`, `_on_pty_output` `:2358-2370`, `_scrollback_blob` `:4437` | byte-identical Rust implementation; the in-loop collapse, the prefix and all three banner outcomes are golden fixtures (§10) |
+| W9: the raw ring is trimmed to ≤ 512 KiB when it passes 512 KiB + 64 KiB of slack, and `_scrollback_blob` trims the same way on read: cut at a line break, `[较早的输出已截断]` prefix; the newest `── 已恢复（第 N 次）──` banner line is kept whole, with its leading `\r\n`, whenever the budget's own cut (before the move to a line break) falls before the end of that line; a cut inside the line therefore leaves the history over the cap by less than the line (`HISTORY_BANNER_LINE_MAX_BYTES` = 128 bounds what counts as the banner line), and a banner that ends before the cut is dropped. Fixed in Python before the port (`oracle-bugs`, owner, 2026-11-13); until then a cut inside the banner line dropped it | `trim_history_text` `:633`, `_on_pty_output` `:2358-2370`, `_scrollback_blob` `:4437` | byte-identical Rust implementation; the in-loop collapse, the prefix and all three banner outcomes are golden fixtures (§10) |
 | history sizes: screen `history=3000`, `snapshot_all`/`scrollback` caps | `:2157`, `:4369`, `:2516` | `spawn.flags.history_rows` |
 | K4: one unparseable sequence costs only itself | `HubTerminalStream` `:1832`, `HubTerminalScreen` `:1792` | `vte` cannot fail; `catch_unwind` around the feed so a handler bug costs one chunk, not the session |
 | B9: liveness is the process, never the status string | `is_process_alive` `:2562` | `alive` in the drain record, set false by the reader thread; no syscall and no round trip, and `to_dict["idle_seconds"]` reads the same record |
@@ -655,7 +655,8 @@ New tests, none run by this unit:
 - Rust, parser and history: the shim-unwrap table (same fixtures as `test_session_launch_args.py`) and
   the step-0 corpus (`tools/fixtures/terminal/`, rendered screen-for-screen against the frozen Python
   output): W9 trim goldens (UTF-8 split, `budget <= 0`, and the three banner outcomes — banner after the
-  cut, cut inside the banner line, banner older than the budget); the in-loop W9 trigger
+  cut, cut inside the banner line (banner kept, history over the cap by less than the line), banner
+  older than the budget); the in-loop W9 trigger
   (`edge-w9-inloop-trigger`: regenerate `chunks.jsonl` from its `generator` block, then the ring must
   collapse to one entry with the entry/byte counts `trigger.json` records, the trimmed text in
   `raw.txt`, and the 64 KiB tail unchanged); the W8 carry for all three splits; the per-chunk OSC query

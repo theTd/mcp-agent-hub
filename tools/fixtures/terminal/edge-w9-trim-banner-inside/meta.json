@@ -3,6 +3,6 @@
   "engine": "generic",
   "synthetic": true,
   "chunk_encoding": "text",
-  "note": "the byte budget lands inside the newest banner line: banner_start < start, but the banner tail alone is larger than the budget, so the block is skipped and the banner is dropped (today's behaviour, frozen)",
+  "note": "the byte budget lands inside the newest banner line: the hub keeps the whole banner line, its leading line break and everything after it, so the trimmed history is over max_bytes by less than that line (fixed in Python on the owner's oracle-bugs answer, 2026-11-13; frozen before that as dropping the banner)",
   "max_bytes": 196
 }

@@ -16,13 +16,16 @@ skeleton) and step 2a (corpus re-recorded on the system ConPTY). The hub does no
 | terminal-core-batching | The core's per-session coalescing is the only PTY output batching; the separate Python-side output batching unit is dropped and never lands. |
 | terminal-core-conpty | The core uses the system ConPTY through the `windows` crate (`CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`), not the bundled `conpty.dll` / `OpenConsole.exe` pywinpty ships. Existing captures came from the bundled implementation, so parser fixtures are re-recorded against the system version. |
 
-## Rust terminal core, implementation (2026-11-13, decided by the orchestrator, pending owner review)
+## Rust terminal core, implementation (2026-11-13, decided by the orchestrator, reviewed by the owner)
 
-Medium decisions taken while building steps 0 and 1. Each is easy to reverse; the last column says how.
+Medium decisions taken while building steps 0 to 2. Each is easy to reverse; the last column says how.
+The owner reviewed them on the batch decision page `hub-rtc-review-1113` (2026-11-13): `oracle-bugs`
+changed as recorded in its row; every other row kept its default.
 
 | id | decision | alternative not taken | how to reverse |
 |---|---|---|---|
-| oracle-bugs | Today's Python is the oracle, bugs included. The W9 "newest banner" block restores only the banner's leading `\r\n`, and a cut inside the banner line drops the banner; both are frozen in the goldens (doc §8, §10). | Fix the hub rule first, then render the goldens. | Change the rule in the Rust ring later; one golden update. |
+| oracle-bugs | Owner, 2026-11-13: fix the hub rule in Python first, then render the goldens, so the bug never enters the core. Branch `fix/w9-banner-trim`: a cut before the end of the newest banner line keeps that line whole with its leading `\r\n`; the trimmed history may then exceed the cap by less than the line (`HISTORY_BANNER_LINE_MAX_BYTES` = 128). One golden changed (`edge-w9-trim-banner-inside`). Today's Python stays the oracle for everything else. | Copy the old rule (a cut inside the banner line drops it) and fix it in Rust after the cut-over (the orchestrator's original default). | Revert `fix/w9-banner-trim` and re-render that golden. |
+| w9-banner-overshoot | Keeping the banner lets the history go up to 127 bytes over `max_bytes` instead of cutting into the output after the banner to stay under it. | Stay strictly under the cap: keep the banner and cut the output after it at a line break (a silent gap after the banner). | Change the rule in `trim_history_text` and the Rust ring; one golden. |
 | replay-shape | The console replay is what `attach_ws_queue` sends today: the joined raw ring (≤ 512 KiB + 64 KiB slack), then one more OSC colour-query strip over the whole text (doc §6.4). | Replay the 512 KiB `_scrollback_blob` trim. | One golden and one call in the core. |
 | write-contract | `write` queues all or nothing: it returns the bytes queued, 0 for empty text, and raises `TimeoutError` when the queue is still full at the deadline (doc §5.2). | Partial writes that return a count. | Contract change in §5.2 and in step 3's caller. |
 | kill-all-parallel | `kill_all` terminates every session in parallel inside one 2 s budget. | Serial, with a per-session cap. | Local to the core. |
@@ -30,6 +33,11 @@ Medium decisions taken while building steps 0 and 1. Each is easy to reverse; th
 | write-oversize | A `write` larger than the 1 MiB queue cap is accepted whole when the queue is empty, so a paste over 1 MiB works as it did under pywinpty; otherwise all-or-nothing with `TimeoutError` (doc §5.2). | Reject it up front with `ValueError` and have step 3 split pastes. | Swap the fit test; one test. |
 | agy-bundled-case | `live-agy` keeps its pywinpty (bundled ConPTY) recording: the owner's agy config enables the `agent-hub` MCP server on 4444 and agy has no session-scoped switch, so the recorder refuses. The conhost differences are engine-independent and the other four engines cover them. | Disable agy's hub MCP server for one recording (owner's call), or record with the live hub attached. | Re-run the recorder for agy once the server is disabled. |
 | tests-fail-without-pyd | `test_terminal_core_client.py` fails, not skips, when the extension is missing: after the cut-over the hub cannot run without it. | Skip with a warning. | One decorator. |
+
+Two owner answers on the same page that are not core decisions: `perf/session-cache-offloop-scans` and
+`perf/console-push-updates` are not merged into master; their need is re-assessed after the Rust core
+lands (the branches stay). `docs/omp-approval-prompts-handoff.md` stays an untracked file in the main
+checkout.
 
 ## Event-loop stalls (2026-11-12, owner: batch decision page, all defaults)
 
