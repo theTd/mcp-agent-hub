@@ -125,20 +125,28 @@ fn normcase(path: &str) -> String {
         .collect()
 }
 
-const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC";
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
 
-fn pathext(env: &HashMap<String, String>) -> Vec<String> {
-    let source = env
-        .get("PATHEXT")
+/// `shutil.which`'s `os.getenv("PATHEXT") or _WIN_DEFAULT_PATHEXT`: the **process** environment, not the
+/// session's. pywinpty passes only `PATH` to `which`, so a session that overrides `PATHEXT` does not
+/// change resolution (nit: the session env used to win here).
+fn pathext() -> Vec<String> {
+    let source = std::env::var("PATHEXT")
+        .ok()
         .filter(|value| !value.is_empty())
-        .cloned()
-        .or_else(|| std::env::var("PATHEXT").ok().filter(|value| !value.is_empty()))
         .unwrap_or_else(|| DEFAULT_PATHEXT.to_string());
     source
         .split(';')
         .filter(|ext| !ext.is_empty())
         .map(|ext| ext.trim_end_matches('.').to_string())
         .collect()
+}
+
+/// `os.defpath` on Windows, verified on the installed interpreter (`ntpath.defpath == '.;C:\\bin'`).
+/// `shutil.which(path=...)` replaces a falsy `path` with it, which is what `env.get('PATH',
+/// os.defpath)` hands it when the session env has no `PATH` at all.
+fn default_path() -> String {
+    ".;C:\\bin".to_string()
 }
 
 /// `shutil._access_check` with `F_OK | X_OK`: an existing regular file. On Windows `os.access(X_OK)`
@@ -157,18 +165,26 @@ fn needs_curdir(command: &str) -> bool {
     unsafe { NeedCurrentDirectoryForExePathW(PCWSTR(wide.as_ptr())).as_bool() }
 }
 
-/// `shutil.which(command, path=env["PATH"])`, the resolution pywinpty performs on `argv[0]`.
+/// `shutil.which(command, path=env.get("PATH", os.defpath))`, the resolution pywinpty performs on
+/// `argv[0]` (pywinpty builds `path = env.get('PATH', os.defpath)`). A session env without `PATH` uses
+/// `os.defpath`, not this process's `PATH` (nit); `PATHEXT` always comes from the process environment.
 pub fn resolve_application(command: &str, env: &HashMap<String, String>) -> Option<String> {
+    resolve_with(command, env.get("PATH").map(String::as_str), &pathext())
+}
+
+/// Resolution with its two inputs explicit, so the parity test can pin the rule against a captured
+/// layout without touching this process's environment.
+pub fn resolve_with(command: &str, session_path: Option<&str>, pathext: &[String]) -> Option<String> {
     let (dirname, name) = split_path(command);
     let mut dirs: Vec<String> = Vec::new();
     if !dirname.is_empty() {
         dirs.push(dirname.to_string());
     } else {
-        let path_env = env
-            .get("PATH")
-            .cloned()
-            .or_else(|| std::env::var("PATH").ok())
-            .unwrap_or_default();
+        // `shutil.which` returns immediately for a falsy `path`: an empty session `PATH` matches
+        // nothing, while a missing one falls back to `os.defpath`.
+        let path_env = session_path
+            .map(str::to_string)
+            .unwrap_or_else(default_path);
         if path_env.is_empty() {
             return None;
         }
@@ -178,18 +194,17 @@ pub fn resolve_application(command: &str, env: &HashMap<String, String>) -> Opti
         }
     }
 
-    let extensions = pathext(env);
     // `X_OK` is in the mode, so a direct match only comes first when the name already ends in one of
     // PATHEXT (shutil.which's cmd.exe simulation); otherwise each extension is tried as-is.
     let upper = name.to_uppercase();
-    let direct_match = extensions
+    let direct_match = pathext
         .iter()
         .any(|ext| upper.ends_with(&ext.to_uppercase()));
-    let mut files: Vec<String> = Vec::with_capacity(extensions.len() + 1);
+    let mut files: Vec<String> = Vec::with_capacity(pathext.len() + 1);
     if direct_match {
         files.push(name.to_string());
     }
-    for ext in &extensions {
+    for ext in pathext {
         files.push(format!("{name}{ext}"));
     }
 
@@ -316,6 +331,49 @@ mod tests {
             "The command was not found or was not executable: hub-terminal-core-no-such-command."
         );
         assert!(build_command_line(&[], &env).is_err());
+    }
+
+    #[test]
+    fn pathext_comes_from_the_process_environment() {
+        // `shutil.which` reads PATHEXT from the process env; a session override never reaches it.
+        let system32 = r"C:\Windows\System32";
+        let clean: HashMap<String, String> =
+            [("PATH".to_string(), system32.to_string())].into_iter().collect();
+        let with_bogus: HashMap<String, String> = [
+            ("PATH".to_string(), system32.to_string()),
+            ("PATHEXT".to_string(), ".ZZZ".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let expected = resolve_with("cmd.exe", Some(system32), &pathext());
+        assert!(expected.is_some(), "cmd.exe must resolve from System32");
+        assert_eq!(resolve_application("cmd.exe", &clean), expected);
+        assert_eq!(
+            resolve_application("cmd.exe", &with_bogus),
+            expected,
+            "the session env's PATHEXT must not change resolution"
+        );
+    }
+
+    #[test]
+    fn a_session_env_without_path_falls_back_to_os_defpath() {
+        // pywinpty passes `env.get('PATH', os.defpath)`; the fallback searches `.` and `C:\bin`, not
+        // this process's PATH, and an empty PATH entry matches nothing.
+        let no_path = HashMap::new();
+        assert_eq!(
+            resolve_application("hub-terminal-core-no-such-command", &no_path),
+            None
+        );
+        let empty_path: HashMap<String, String> =
+            [("PATH".to_string(), String::new())].into_iter().collect();
+        assert_eq!(
+            resolve_application("hub-terminal-core-no-such-command", &empty_path),
+            None,
+            "an empty PATH must not fall back to os.defpath"
+        );
+        // The fallback contains the current directory, so a file that exists there resolves even with
+        // no PATH at all: `.` is the first entry of `os.defpath`.
+        assert_eq!(default_path(), ".;C:\\bin");
     }
 
     #[test]

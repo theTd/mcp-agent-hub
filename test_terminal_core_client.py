@@ -1,11 +1,16 @@
 """The hub's client contract with the Rust terminal core, through ``terminal_core.py``.
 
 Covers docs/rust-terminal-core.md §5.2 (calls and deadlines), §5.3 (drain clears its flags, the 50 ms
-notify window) and §7.3 (the missing-module message). The live cases need the built extension beside
-this file (``hub_terminal_core.pyd``); without it they are skipped rather than failed.
+notify window, natural exits) and §7.3 (the missing-module message).
+
+The live cases need the built extension beside this file (``hub_terminal_core.pyd``). They **fail**, not
+skip, when it is missing or broken: a green suite on an unbuilt tree is a gate that cannot see a broken
+build (review nit).
 """
 import importlib.util
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 import unittest
@@ -18,12 +23,25 @@ EXTENSION = HERE / "hub_terminal_core.pyd"
 try:
     import terminal_core
     from terminal_core import Core
-except ImportError as _import_error:  # pragma: no cover - exercised only on an unbuilt tree
+except ImportError as _import_error:  # exercised only on an unbuilt tree, and then the live tests fail
     terminal_core = None
     Core = None
     IMPORT_ERROR = _import_error
 else:
     IMPORT_ERROR = None
+
+
+def live_core(test):
+    """Marks a test as needing the extension: a missing or broken build fails it instead of skipping."""
+
+    def wrapper(self, *args, **kwargs):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
+        return test(self, *args, **kwargs)
+
+    wrapper.__name__ = test.__name__
+    wrapper.__doc__ = test.__doc__
+    return wrapper
 
 
 class MissingModuleMessageTests(unittest.TestCase):
@@ -45,16 +63,17 @@ class MissingModuleMessageTests(unittest.TestCase):
 
 
 class WrapperSurfaceTests(unittest.TestCase):
-    @unittest.skipIf(Core is None, f"hub_terminal_core is not built: {IMPORT_ERROR}")
+    @live_core
     def test_wrapper_reexports_the_extension_identity(self):
         self.assertIs(terminal_core.Core, Core)
         self.assertEqual(terminal_core.ABI, "abi3-py311")
         self.assertTrue(terminal_core.__version__)
 
 
-@unittest.skipIf(Core is None, f"hub_terminal_core is not built: {IMPORT_ERROR}")
 class CoreClientTests(unittest.TestCase):
     def setUp(self):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
         self.notify_calls = []
         self.logs = []
         self.core = Core(notify=lambda: self.notify_calls.append(time.monotonic()), log=self.logs.append)
@@ -95,6 +114,7 @@ class CoreClientTests(unittest.TestCase):
         reply = self.spawn()
         self.assertGreater(reply["pid"], 0)
         self.assertEqual((reply["cols"], reply["rows"]), (100, 30))
+        self.assertGreater(reply["elapsed_ms"], 0)
         self.wait_for(">", timeout=15.0)
 
         payload = "echo hub-core-ok\r\n"
@@ -131,6 +151,26 @@ class CoreClientTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(self.core.drain(), [], "a second drain must return nothing new")
 
+    def test_natural_exit_is_reported_without_kill(self):
+        """B1: a child that exits by itself is reported, with its code, without `kill`."""
+        self.spawn(["cmd.exe", "/c", "echo natural-exit & exit 7"])
+        started = time.monotonic()
+        dead = self.drain_until(
+            lambda record: record["session_id"] == self.session and not record["alive"],
+            timeout=1.0,
+        )
+        self.assertLess(time.monotonic() - started, 1.0, "the death record took more than 1 s")
+        self.assertEqual(dead["exit_code"], 7, dead)
+        self.assertFalse(dead["crashed"], dead)
+        self.assertGreater(dead["bytes_total"], 0, dead)
+        # The reader published after its last bytes, so the output is already in the buffer.
+        self.assertIn("natural-exit", self.core.raw_tail(self.session, 4096))
+        # A naturally exited id is spawnable again, and the old session is released.
+        again = self.spawn(["cmd.exe", "/c", "exit", "0"])
+        self.assertGreater(again["pid"], 0)
+        dead = self.drain_until(lambda record: not record["alive"], timeout=1.0)
+        self.assertEqual(dead["exit_code"], 0, dead)
+
     def test_unknown_session_raises_key_error(self):
         with self.assertRaises(KeyError):
             self.core.raw_tail("no-such-session", 16)
@@ -148,7 +188,9 @@ class CoreClientTests(unittest.TestCase):
         payload = "x" * 64 * 1024
         blocked = False
         for _ in range(96):
-            if self.core.write(self.session, payload, 100) == 0:
+            try:
+                self.core.write(self.session, payload, 100)
+            except TimeoutError:
                 blocked = True
                 break
         self.assertTrue(blocked, "the writer queue never filled")
@@ -165,16 +207,29 @@ class CoreClientTests(unittest.TestCase):
         try:
             time.sleep(0.05)
             before = ticks[0]
-            started = time.perf_counter()
-            accepted = self.core.write(self.session, payload, 150)
-            elapsed = time.perf_counter() - started
+            # The console drains at most one chunk between attempts, so a retry loop is what makes this
+            # deterministic: the first call that has to wait for the deadline is the one measured.
+            caught = None
+            window = time.perf_counter() + 5.0
+            while time.perf_counter() < window:
+                started = time.perf_counter()
+                try:
+                    self.core.write(self.session, payload, 150)
+                except TimeoutError as error:
+                    caught = (error, time.perf_counter() - started)
+                    break
             after = ticks[0]
         finally:
             stop.set()
             thread.join(2)
-        self.assertEqual(accepted, 0)
+        self.assertIsNotNone(caught, "the writer queue never stayed full for a whole deadline")
+        error, elapsed = caught
+        # §5.2 (SF4): a full queue at the deadline is a TimeoutError with nothing queued, not a silent 0.
+        self.assertIn("nothing queued", str(error))
         self.assertGreaterEqual(elapsed, 0.10, "the call was expected to wait for its deadline")
         self.assertGreater(after, before, "another Python thread made no progress: the GIL was held")
+        # An empty write is not a timeout.
+        self.assertEqual(self.core.write(self.session, ""), 0)
 
     def test_notify_is_rate_limited_to_the_drain_interval(self):
         self.spawn()
@@ -214,6 +269,62 @@ class CoreClientTests(unittest.TestCase):
         self.assertNotEqual(first["pid"], second["pid"])
         with self.assertRaises(ValueError):
             self.spawn()
+
+
+# B2: `shutdown`/`Drop` must not wait for the GIL while they hold it. A regression hangs the process, so
+# each case runs in a child interpreter that the parent kills at a hard timeout.
+GIL_PROBE = textwrap.dedent(
+    """
+    import gc
+    import sys
+    import time
+
+    sys.path.insert(0, sys.argv[1])
+    import terminal_core
+
+    mode = sys.argv[2]
+    core = terminal_core.Core(notify=lambda: None, log=lambda line: None)
+    core.spawn(
+        "printing",
+        ["cmd.exe", "/c", "for /L %i in (1,1,1000000) do @echo 0123456789012345678901234567890123456789"],
+    )
+    time.sleep(0.5)  # a session is printing, so the ticker is calling back
+    sys.setswitchinterval(60)
+    # Hold the GIL with a busy loop, then make the call that used to join the ticker while holding it.
+    end = time.perf_counter() + 0.05
+    while time.perf_counter() < end:
+        pass
+    started = time.perf_counter()
+    if mode == "shutdown":
+        core.shutdown()
+    else:
+        del core
+        gc.collect()
+    print("elapsed=%.3f" % (time.perf_counter() - started))
+    """
+)
+
+
+class GilTeardownTests(unittest.TestCase):
+    def run_probe(self, mode):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", GIL_PROBE, str(HERE), mode],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        elapsed = float(result.stdout.strip().split("=")[1])
+        self.assertLess(elapsed, 3.0, f"{mode} took {elapsed:.3f} s while the GIL was held")
+        return elapsed
+
+    @live_core
+    def test_shutdown_returns_while_another_thread_holds_the_gil(self):
+        self.run_probe("shutdown")
+
+    @live_core
+    def test_dropping_the_last_reference_returns_while_the_gil_is_held(self):
+        self.run_probe("drop")
 
 
 if __name__ == "__main__":

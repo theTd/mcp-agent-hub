@@ -241,7 +241,7 @@ fn run_selftest() -> u32 {
         drain_settles(&core),
     );
 
-    let stats = core.stats();
+    let stats = core.stats(Duration::from_millis(5));
     failures += check(
         "stats",
         if stats.sessions >= 1 && stats.bytes_total > 0 && stats.notify_calls > 0 && stats.panics == 0 {
@@ -262,6 +262,12 @@ fn run_selftest() -> u32 {
         },
     );
 
+    // B1: a child that exits on its own, on a fresh core so nothing above can have killed it. The gates
+    // only ever reach `kill`; this is the path the hub takes every time an engine ends by itself.
+    failures += check("natural-exit", natural_exit_check());
+    // §5.2's spawn bound, measured rather than assumed: 20 headless `cmd.exe` spawns, p50 and p99.
+    failures += check("spawn-timing", spawn_timing_check());
+
     // §12.8: the hub runs inside the desktop app's kill-on-close job, so a per-session job is nested.
     // The child re-executes this binary with the outer job in place and reports its own checks.
     failures += check("nested-job", run_nested_child());
@@ -272,6 +278,118 @@ fn run_selftest() -> u32 {
         }
     }
     failures
+}
+
+/// B1: `cmd /c "echo natural-exit & exit 7"` with no `kill`: a dead record with code 7 inside 1 s, the
+/// last output present, and the id spawnable again.
+fn natural_exit_check() -> Result<(), String> {
+    let core = start_core(logs());
+    let id = "natural";
+    core.spawn(SpawnRequest {
+        session_id: id.to_string(),
+        argv: vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "echo natural-exit & exit 7".to_string(),
+        ],
+        cwd: None,
+        env: environment(),
+        cols: 80,
+        rows: 24,
+        seed_history: None,
+    })
+    .map_err(|error| error.to_string())?;
+    let end = Instant::now() + Duration::from_secs(1);
+    let mut record = None;
+    while Instant::now() < end {
+        if let Some(found) = core
+            .drain()
+            .into_iter()
+            .find(|record| record.session_id == id && !record.alive)
+        {
+            record = Some(found);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = record.ok_or_else(|| "no dead record within 1 s".to_string())?;
+    if record.exit_code != Some(7) {
+        return Err(format!("exit code {:?}, crashed {}", record.exit_code, record.crashed));
+    }
+    let tail = core
+        .raw_tail(id, 64 * 1024, Duration::from_millis(50))
+        .map_err(|error| error.to_string())?;
+    if !String::from_utf8_lossy(&tail).contains("natural-exit") {
+        return Err("the last output was not in the raw tail".to_string());
+    }
+    core.spawn(SpawnRequest {
+        session_id: id.to_string(),
+        argv: vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string(), "0".to_string()],
+        cwd: None,
+        env: environment(),
+        cols: 80,
+        rows: 24,
+        seed_history: None,
+    })
+    .map_err(|error| format!("the exited id could not be spawned again: {error}"))?;
+    let end = Instant::now() + Duration::from_secs(1);
+    let mut code = None;
+    while Instant::now() < end {
+        if let Some(found) = core
+            .drain()
+            .into_iter()
+            .find(|record| record.session_id == id && !record.alive)
+        {
+            code = found.exit_code;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = core.kill_all(Duration::from_millis(2000));
+    core.shutdown();
+    match code {
+        Some(0) => Ok(()),
+        other => Err(format!("the respawned session reported {other:?}, expected 0")),
+    }
+}
+
+/// §5.2's 2 s spawn bound, measured: 20 spawns of `cmd.exe`, p50 and p99 printed. Each session is killed
+/// right after its spawn so the measurement is of `spawn`, not of a loaded table.
+fn spawn_timing_check() -> Result<(), String> {
+    let core = start_core(logs());
+    let mut timings: Vec<Duration> = Vec::with_capacity(20);
+    let mut slowest = Duration::ZERO;
+    for index in 0..20 {
+        let id = format!("timing-{index}");
+        let started = Instant::now();
+        core.spawn(SpawnRequest {
+            session_id: id.clone(),
+            argv: vec!["cmd.exe".to_string()],
+            cwd: None,
+            env: environment(),
+            cols: 80,
+            rows: 24,
+            seed_history: None,
+        })
+        .map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed();
+        timings.push(elapsed);
+        slowest = slowest.max(elapsed);
+        let _ = core.kill(&id, Duration::from_millis(500));
+    }
+    let _ = core.kill_all(Duration::from_millis(2000));
+    core.shutdown();
+    timings.sort();
+    let p50 = timings[timings.len() / 2];
+    let p99 = *timings.last().unwrap_or(&Duration::ZERO);
+    println!(
+        "spawn-timing: 20 spawns of cmd.exe, p50 {:?}, p99 {:?}, max {:?} (bound 2 s)",
+        p50, p99, slowest
+    );
+    if slowest > Duration::from_secs(2) {
+        return Err(format!("the slowest spawn took {slowest:?}, over the 2 s bound"));
+    }
+    Ok(())
 }
 
 /// Re-executes this binary inside an outer kill-on-close job (the desktop app's shape) and checks that

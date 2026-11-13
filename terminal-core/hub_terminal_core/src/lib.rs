@@ -4,16 +4,20 @@
 //! * every call that can block releases the GIL (`Python::detach`) and passes its §5.2 deadline;
 //! * `notify` and `log` are the only callables the core holds, and the core calls them with no core
 //!   lock held (the plain crate guarantees that);
-//! * an unknown session id is a `KeyError`, a spawn failure a `RuntimeError` carrying the Win32 message;
+//! * an unknown session id is a `KeyError`, a spawn failure a `RuntimeError` carrying the Win32 message,
+//!   a refused `write` a `TimeoutError` with nothing queued, a refused size a `ValueError`;
 //! * a panic inside a call becomes a `RuntimeError`, never an abort (the workspace release profile
-//!   unwinds, and the `release_profile` test below pins that).
+//!   unwinds, and the `release_profile` test below pins that);
+//! * no core thread ever waits for the GIL while another thread holds it and waits on that thread (B2):
+//!   the callbacks `try_attach` and skip their call, `shutdown` detaches, and `Drop` skips the join
+//!   when it cannot attach.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
@@ -22,16 +26,19 @@ use conpty_session::{CoreError, CoreOptions, SpawnRequest};
 const DEFAULT_WRITE_DEADLINE_MS: u64 = 50;
 const DEFAULT_KILL_GRACE_MS: u64 = 2000;
 const DEFAULT_RAW_TAIL_BYTES: usize = 64 * 1024;
+/// §5.2's spawn bound: the whole call, process creation included.
+const SPAWN_DEADLINE: Duration = Duration::from_millis(2000);
+/// §5.2's `stats` bound; the table read it needs is contended only by a spawn insert.
+const STATS_DEADLINE: Duration = Duration::from_millis(5);
 
-/// `KeyError` for an unknown id, `ValueError` for a refused argument, `RuntimeError` for everything a
-/// spawn or a thread could fail with (§5.1).
+/// `KeyError` for an unknown id, `TimeoutError` for a deadline that left nothing done, `ValueError` for a
+/// refused argument, `RuntimeError` for everything a spawn or a thread could fail with (§5.1).
 fn core_error(error: CoreError) -> PyErr {
     match error {
         CoreError::UnknownSession(id) => PyKeyError::new_err(id),
         CoreError::Invalid(message) => PyValueError::new_err(message),
-        CoreError::Spawn(message)
-        | CoreError::Deadline(message)
-        | CoreError::Internal(message) => PyRuntimeError::new_err(message),
+        CoreError::Deadline(message) => PyTimeoutError::new_err(message),
+        CoreError::Spawn(message) | CoreError::Internal(message) => PyRuntimeError::new_err(message),
     }
 }
 
@@ -80,6 +87,9 @@ fn options_from_dict(opts: Option<HashMap<String, u64>>) -> CoreOptions {
 #[pyclass(module = "hub_terminal_core", name = "Core")]
 pub struct Core {
     inner: Arc<conpty_session::Core>,
+    /// The hub's `log`, kept on this side too: the spawn's log lines are queued while the GIL is
+    /// released and delivered here after it is back (§5.2, SF3).
+    log: Option<Arc<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -91,9 +101,12 @@ impl Core {
         log: Option<Py<PyAny>>,
         opts: Option<HashMap<String, u64>>,
     ) -> PyResult<Self> {
+        // `try_attach`, never `attach`: a Python thread that holds the GIL while calling into the core
+        // must not be able to make the ticker wait for it forever (B2). A skipped callback only means
+        // the hub sees the next dirty record on the following tick.
         let notify_fn: Box<dyn Fn() + Send + Sync> = match notify {
             Some(callback) => Box::new(move || {
-                Python::attach(|py| {
+                Python::try_attach(|py| {
                     if let Err(error) = callback.call0(py) {
                         error.write_unraisable(py, None);
                     }
@@ -101,10 +114,11 @@ impl Core {
             }),
             None => Box::new(|| {}),
         };
-        let log_fn: Box<dyn Fn(&str) + Send + Sync> = match log {
-            Some(callback) => Box::new(move |message: &str| {
-                Python::attach(|py| {
-                    if let Err(error) = callback.call1(py, (message,)) {
+        let log_shared = log.map(Arc::new);
+        let log_fn: Box<dyn Fn(&str) + Send + Sync> = match log_shared.clone() {
+            Some(shared) => Box::new(move |message: &str| {
+                Python::try_attach(|py| {
+                    if let Err(error) = shared.call1(py, (message,)) {
                         error.write_unraisable(py, None);
                     }
                 });
@@ -113,11 +127,16 @@ impl Core {
         };
         Ok(Self {
             inner: conpty_session::Core::new(notify_fn, log_fn, options_from_dict(opts)),
+            log: log_shared,
         })
     }
 
     /// Starts one console session. `flags`/`seed_history` are the §5.2 shape: `seed_history` seeds the
     /// raw buffer now; the strip flags arrive with the parser in step 2 and are accepted unused.
+    ///
+    /// The spawn is measured against §5.2's 2 s bound: `CreateProcessW`, the job assignment, the resume
+    /// and the three thread starts are all inside it, and a spawn that misses the bound is logged (the
+    /// session is kept, because killing a just-started console would be worse than a slow reply).
     #[pyo3(signature = (session_id, argv, cwd=None, env=None, cols=80, rows=24, flags=None, seed_history=None))]
     fn spawn<'py>(
         &self,
@@ -132,7 +151,7 @@ impl Core {
         seed_history: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let _ = flags;
-        guarded(|| {
+        let measured = guarded(|| {
             let request = SpawnRequest {
                 session_id,
                 argv,
@@ -142,21 +161,46 @@ impl Core {
                 rows,
                 seed_history: seed_history.map(|seed| seed.into_bytes()),
             };
-            // The spawn itself is bounded by the OS (CreateProcessW); the 2 s §5.2 deadline covers the
-            // session-table write that follows it.
+            // No Python callback inside the detached part: the spawn's log lines come back with the
+            // reply and are logged below, with the GIL back (§5.2, SF3).
+            let started = Instant::now();
             let reply = py
                 .detach(|| self.inner.spawn(request))
                 .map_err(core_error)?;
-            let dict = PyDict::new(py);
-            dict.set_item("pid", reply.pid)?;
-            dict.set_item("cols", reply.cols)?;
-            dict.set_item("rows", reply.rows)?;
-            Ok(dict)
-        })
+            Ok((reply, started.elapsed()))
+        })?;
+        let (reply, elapsed) = measured;
+        for line in &reply.log_lines {
+            if let Some(log) = &self.log {
+                if let Err(error) = log.call1(py, (line.as_str(),)) {
+                    error.write_unraisable(py, None);
+                }
+            }
+        }
+        if elapsed > SPAWN_DEADLINE {
+            if let Some(log) = &self.log {
+                if let Err(error) = log.call1(
+                    py,
+                    (format!(
+                        "terminal core: spawn of pid {} took {elapsed:?}, over the §5.2 bound",
+                        reply.pid
+                    ),),
+                ) {
+                    error.write_unraisable(py, None);
+                }
+            }
+        }
+        let dict = PyDict::new(py);
+        dict.set_item("pid", reply.pid)?;
+        dict.set_item("cols", reply.cols)?;
+        dict.set_item("rows", reply.rows)?;
+        dict.set_item("elapsed_ms", elapsed.as_secs_f64() * 1000.0)?;
+        Ok(dict)
     }
 
-    /// Enqueues one write as a whole: returns the bytes accepted, 0 when the deadline expired with the
-    /// session's writer queue full.
+    /// Enqueues one write as a whole or not at all: empty text returns 0 with nothing queued, and a queue
+    /// still full at the deadline raises `TimeoutError` with nothing queued, so the caller can retry the
+    /// same text without duplicating bytes (§5.2, SF4).
     #[pyo3(signature = (session_id, text, deadline_ms=None))]
     fn write(
         &self,
@@ -189,8 +233,8 @@ impl Core {
         })
     }
 
-    /// Terminates the session's tree and returns its exit code (`None` when it was still running after
-    /// the grace period).
+    /// Terminates the session's tree. `grace_ms` bounds the whole call: the wait for the exit and the
+    /// console close together (§5.2's 2 s).
     #[pyo3(signature = (session_id, grace_ms=None))]
     fn kill(&self, py: Python<'_>, session_id: String, grace_ms: Option<u64>) -> PyResult<Option<i32>> {
         guarded(|| {
@@ -200,6 +244,7 @@ impl Core {
         })
     }
 
+    /// Terminates every session in parallel inside one budget (§5.2).
     #[pyo3(signature = (grace_ms=None))]
     fn kill_all(&self, py: Python<'_>, grace_ms: Option<u64>) -> PyResult<()> {
         guarded(|| {
@@ -253,9 +298,10 @@ impl Core {
         })
     }
 
+    /// Diagnostics counters. The table read is bounded (§5.2: 5 ms), and the GIL is released for it.
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         guarded(|| {
-            let stats = self.inner.stats();
+            let stats = py.detach(|| self.inner.stats(STATS_DEADLINE));
             let dict = PyDict::new(py);
             dict.set_item("sessions", stats.sessions)?;
             dict.set_item("alive", stats.alive)?;
@@ -270,16 +316,21 @@ impl Core {
     }
 
     /// Stops the ticker. `kill_all` is the shutdown path that ends the sessions first (§6.6).
-    fn shutdown(&self) {
-        self.inner.shutdown();
+    ///
+    /// The join happens with the GIL released: the ticker may be inside `notify`, which needs the GIL
+    /// to return, so waiting for the ticker while holding it deadlocks (B2).
+    fn shutdown(&self, py: Python<'_>) {
+        py.detach(|| self.inner.shutdown());
     }
 }
 
 impl Drop for Core {
     fn drop(&mut self) {
         // The hub keeps one Core for its lifetime; a dropped one must not leave the ticker calling into
-        // a finalising interpreter.
-        self.inner.shutdown();
+        // a finalising interpreter. `try_attach` because this runs on the GC thread and, at interpreter
+        // teardown, may not attach at all; the join is skipped then, and the ticker exits by itself at
+        // its next tick (the process is going away, which is the `shutdown-ends-cli` path).
+        Python::try_attach(|py| py.detach(|| self.inner.shutdown()));
     }
 }
 

@@ -4,6 +4,11 @@
 //! Nothing here parses, renders or batches: step 1 owns the PTYs and the counters. What it does own is
 //! the two rules that make the rest of the design work: the core takes no lock while calling `notify`
 //! or `log`, and every blocking call has a deadline.
+//!
+//! No core thread ever blocks waiting for the GIL while another thread can hold the GIL and wait on that
+//! thread (review B2): `notify`/`log` are called through `Python::try_attach`, which skips the call
+//! instead of waiting when the interpreter is finalizing, and `shutdown` only joins the ticker from a
+//! caller that has released the GIL (the binding's `Drop` skips the join).
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -48,11 +53,14 @@ pub struct SpawnRequest {
     pub seed_history: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SpawnReply {
     pub pid: u32,
     pub cols: u16,
     pub rows: u16,
+    /// The spawn's log lines, queued rather than delivered: `spawn` runs with the GIL released, so the
+    /// binding logs them after it re-attaches (§5.2).
+    pub log_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -64,6 +72,7 @@ pub struct Stats {
     pub chunks_total: u64,
     pub dropped_bytes: u64,
     pub notify_calls: u64,
+    /// Every caught panic: reader, writer, reaper, ticker and close helper (should-fix 5).
     pub panics: u64,
 }
 
@@ -117,8 +126,10 @@ pub struct Core {
     wake: Condvar,
     stopping: AtomicBool,
     notify_calls: AtomicU64,
-    panics: AtomicU64,
+    panics: Arc<AtomicU64>,
     ticker: Mutex<Option<JoinHandle<()>>>,
+    /// The ticker's id: `shutdown` must not join the ticker from the ticker.
+    ticker_id: Mutex<Option<thread::ThreadId>>,
 }
 
 impl Core {
@@ -130,6 +141,7 @@ impl Core {
         opts: CoreOptions,
     ) -> Arc<Self> {
         let tick = Arc::new(TickFlags::default());
+        let panics = Arc::new(AtomicU64::new(0));
         let core = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             notify,
@@ -140,8 +152,9 @@ impl Core {
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
             notify_calls: AtomicU64::new(0),
-            panics: AtomicU64::new(0),
+            panics,
             ticker: Mutex::new(None),
+            ticker_id: Mutex::new(None),
         });
         let ticker_core = Arc::clone(&core);
         let handle = thread::Builder::new()
@@ -149,6 +162,9 @@ impl Core {
             .spawn(move || ticker_core.ticker_body())
             .expect("spawn ticker thread");
         if let Ok(mut slot) = core.ticker.lock() {
+            if let Ok(mut ticker_id) = core.ticker_id.lock() {
+                *ticker_id = Some(handle.thread().id());
+            }
             *slot = Some(handle);
         }
         core
@@ -169,6 +185,8 @@ impl Core {
             if self.stopping.load(Ordering::Acquire) {
                 return;
             }
+            // The whole iteration is guarded, its error path included: a panic in `notify` or in the
+            // `log` line that reports it must not take the ticker down (should-fix 5).
             let work = catch_unwind(AssertUnwindSafe(|| {
                 let urgent = self.tick.urgent.swap(false, Ordering::AcqRel);
                 let pending = self.tick.pending.swap(false, Ordering::AcqRel);
@@ -178,7 +196,8 @@ impl Core {
                 if urgent || (pending && due) {
                     last_notify = Some(Instant::now());
                     self.notify_calls.fetch_add(1, Ordering::Relaxed);
-                    // No core lock is held here: Python may hold one and call back in (§6.5).
+                    // No core lock is held here: Python may hold one and call back in (§6.5). The
+                    // callback itself skips its call when it cannot attach (no waiting for the GIL).
                     (self.notify)();
                 } else if pending {
                     self.tick.pending.store(true, Ordering::Release);
@@ -186,7 +205,9 @@ impl Core {
             }));
             if work.is_err() {
                 self.panics.fetch_add(1, Ordering::Relaxed);
-                (self.log)("terminal core: notify callback panicked; ticker continues");
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    (self.log)("terminal core: notify callback panicked; ticker continues");
+                }));
             }
         }
     }
@@ -213,6 +234,9 @@ impl Core {
             .ok()
             .and_then(|map| map.get(&session_id).cloned())
         {
+            // A session whose process has exited is replaceable even when its reader is still winding
+            // down: `alive` is the only "still running" signal, and the reaper publishes it as soon as
+            // the process is gone (B1).
             if existing.alive() {
                 return Err(CoreError::Invalid(format!(
                     "session {session_id} is already running in the core"
@@ -228,7 +252,7 @@ impl Core {
             rows,
         };
         let process = conpty::spawn(&spec).map_err(CoreError::Spawn)?;
-        let session = Session::start(
+        let (session, log_lines) = Session::start(
             session_id.clone(),
             process,
             cols,
@@ -238,6 +262,7 @@ impl Core {
                 write_queue_bytes: self.opts.write_queue_bytes,
             },
             Arc::clone(&self.tick),
+            Arc::clone(&self.panics),
             Arc::clone(&self.log),
             seed_history,
         );
@@ -245,9 +270,12 @@ impl Core {
             pid: session.pid,
             cols,
             rows,
+            log_lines,
         };
         // A dead session under the same id is replaced: resume spawns a new process for an id whose
-        // previous session has exited, and the hub's screens come from `seed_history` (§8 A1).
+        // previous session has exited, and the hub's screens come from `seed_history` (§8 A1). The old
+        // `Arc<Session>` is released here: its reader has hit EOF, so `Session::drop` closes the pipes and
+        // `Resources::drop` the console, leaving no HPCON, conhost or reader behind.
         let replaced = self
             .sessions
             .write()
@@ -269,7 +297,16 @@ impl Core {
         let session = self.session(id)?;
         session
             .write(text, deadline)
-            .map_err(|error| CoreError::Internal(error.to_string()))
+            // The deadline error carries nothing queued, which is what the binding turns into
+            // `TimeoutError`; a closed input pipe is an internal failure (§5.2, SF4).
+            .map_err(|error| match error {
+                crate::session::WriteError::Timeout => CoreError::Deadline(format!(
+                    "session {id}: write queue full, nothing queued"
+                )),
+                crate::session::WriteError::Closed => {
+                    CoreError::Internal(format!("session {id}: input is closed"))
+                }
+            })
     }
 
     pub fn resize(
@@ -288,14 +325,14 @@ impl Core {
         session.resize(cols, rows, deadline).map_err(CoreError::Internal)
     }
 
-    pub fn kill(&self, id: &str, grace: Duration) -> Result<Option<i32>, CoreError> {
+    pub fn kill(&self, id: &str, budget: Duration) -> Result<Option<i32>, CoreError> {
         let session = self.session(id)?;
-        session.kill(grace).map_err(CoreError::Internal)
+        session.kill(budget).map_err(CoreError::Internal)
     }
 
-    /// `TerminateJobObject` per session. Shutdown calls this after `snapshot_all` in step 5; here it is
-    /// also what makes the selftest's "no leftover process" check possible.
-    pub fn kill_all(&self, grace: Duration) -> Result<(), CoreError> {
+    /// `TerminateJobObject` for every session, in parallel, inside one `budget` (§5.2: 2 s for the whole
+    /// call, not per session). Used by the selftest and by shutdown in step 5.
+    pub fn kill_all(&self, budget: Duration) -> Result<(), CoreError> {
         let sessions: Vec<Arc<Session>> = self
             .sessions
             .read()
@@ -303,13 +340,28 @@ impl Core {
             .values()
             .cloned()
             .collect();
-        for session in sessions {
-            if let Err(error) = session.kill(grace) {
-                (self.log)(&format!(
-                    "terminal core: kill_all failed for {}: {error}",
-                    session.id
+        let end = Instant::now() + budget;
+        let failures: Vec<String> = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(sessions.len());
+            for session in &sessions {
+                let remaining = end.saturating_duration_since(Instant::now());
+                let session = Arc::clone(session);
+                handles.push((
+                    session.id.clone(),
+                    scope.spawn(move || session.kill(remaining)),
                 ));
             }
+            handles
+                .into_iter()
+                .filter_map(|(id, handle)| match handle.join() {
+                    Ok(Err(error)) => Some(format!("{id}: {error}")),
+                    Ok(Ok(_)) => None,
+                    Err(_) => Some(format!("{id}: kill panicked")),
+                })
+                .collect()
+        });
+        for failure in failures {
+            (self.log)(&format!("terminal core: kill_all failed for {failure}"));
         }
         Ok(())
     }
@@ -336,10 +388,18 @@ impl Core {
         Ok(session.raw_tail(max_bytes, deadline))
     }
 
-    pub fn stats(&self) -> Stats {
-        let sessions: Vec<Arc<Session>> = match self.sessions.read() {
-            Ok(map) => map.values().cloned().collect(),
-            Err(_) => Vec::new(),
+    /// Test-only: the session behind an id. The integration tests put a session into the state a thread
+    /// panic leaves it in (`crashed`, `alive = false`, process still running) without panicking a thread.
+    #[doc(hidden)]
+    pub fn session_for_test(&self, id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().ok()?.get(id).cloned()
+    }
+
+    pub fn stats(&self, deadline: Duration) -> Stats {
+        let sessions: Vec<Arc<Session>> = match read_deadline(&self.sessions, deadline) {
+            Some(map) => map.values().cloned().collect(),
+            // A busy spawn insert costs one bounded call: report what the atomic counters hold.
+            None => Vec::new(),
         };
         let mut stats = Stats {
             sessions: sessions.len(),
@@ -362,21 +422,25 @@ impl Core {
         stats
     }
 
-    pub fn session_ids(&self) -> Vec<String> {
-        self.sessions
-            .read()
-            .map(|map| map.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    /// Stops the ticker. Sessions keep their own threads; `kill_all` is the documented shutdown path
-    /// before this.
+    /// Stops the ticker and joins it. The caller must have released the GIL: the ticker may be inside a
+    /// Python callback, and joining it while holding the GIL is exactly the deadlock B2 is about. Called
+    /// from the ticker itself (a `notify` callback that drops the core), the join is skipped.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
         if let Ok(mut stop) = self.stop.lock() {
             *stop = true;
         }
         self.wake.notify_all();
+        let on_ticker = self
+            .ticker_id
+            .lock()
+            .ok()
+            .and_then(|id| *id)
+            .map(|id| id == thread::current().id())
+            .unwrap_or(false);
+        if on_ticker {
+            return;
+        }
         if let Ok(mut slot) = self.ticker.lock() {
             if let Some(handle) = slot.take() {
                 let _ = handle.join();

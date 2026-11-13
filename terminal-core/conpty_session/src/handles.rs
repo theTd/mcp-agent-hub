@@ -37,9 +37,10 @@ impl Drop for OwnedHandle {
 }
 
 /// An owned pseudoconsole. `ClosePseudoConsole` must never run on the session's reader thread (§12.7),
-/// so it is only ever taken out of the session and closed on a helper thread.
+/// so a live session only ever takes it out and closes it on a helper thread. Dropping this value
+/// closes it as well: that is the spawn-error path, where no read is pending yet (should-fix 1).
 #[derive(Debug)]
-pub struct OwnedPseudoConsole(HPCON);
+pub struct OwnedPseudoConsole(Option<HPCON>);
 
 // SAFETY: HPCON is an opaque kernel handle value; closing it from a helper thread is the documented
 // way to avoid the pending-read hang.
@@ -47,16 +48,31 @@ unsafe impl Send for OwnedPseudoConsole {}
 
 impl OwnedPseudoConsole {
     pub fn new(handle: HPCON) -> Self {
-        Self(handle)
+        Self(Some(handle))
     }
 
+    /// The raw handle. Panics only if called after `close`, which consumes the value.
     pub fn get(&self) -> HPCON {
-        self.0
+        self.0.expect("pseudoconsole handle used after close")
     }
 
     /// Closes the pseudoconsole. Consumes the value: a second close is impossible by type.
-    pub fn close(self) {
-        // SAFETY: owned, and the value is dropped here, so no other close can follow.
-        unsafe { ClosePseudoConsole(self.0) }
+    pub fn close(mut self) {
+        self.close_in_place();
+    }
+
+    fn close_in_place(&mut self) {
+        if let Some(handle) = self.0.take() {
+            // SAFETY: owned, and the handle is taken out here, so no other close can follow.
+            unsafe { ClosePseudoConsole(handle) }
+        }
+    }
+}
+
+impl Drop for OwnedPseudoConsole {
+    fn drop(&mut self) {
+        // A spawn that failed after `CreatePseudoConsole` never started a reader, so closing here cannot
+        // hit the pending-read hang; anywhere else the value is taken by `close` on a helper thread.
+        self.close_in_place();
     }
 }

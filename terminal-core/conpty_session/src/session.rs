@@ -1,11 +1,17 @@
-//! One console session: its pipes, its job, one reader thread and one writer thread.
+//! One console session: its pipes, its job, a reader thread, a writer thread and a reaper thread.
 //!
 //! Step 1 keeps the per-session work deliberately small: the reader appends the raw bytes to a bounded
 //! buffer, counts them and marks the session dirty. Parsing, the W9 ring, coalescing and the screen
 //! model arrive in step 2, so nothing here builds a `str` per chunk.
 //!
+//! Exit detection is the reaper's job. The reader's `ReadFile` cannot signal a natural exit: the write
+//! end of the output pipe belongs to conhost, which stays alive while we hold the HPCON, so the read
+//! never completes on its own (review B1). The reaper waits on the process handle instead, records the
+//! exit code and closes the console on a helper thread so the pending read returns; the death record is
+//! published only after that read has ended, so the last bytes are in the buffer before `alive = false`.
+//!
 //! A panic anywhere in a thread body ends **that** session (`crashed`, `alive = false`, buffer kept) and
-//! nothing else (§6.3).
+//! nothing else (§6.3), and it is counted in `panics`.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -18,22 +24,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 
 use crate::conpty::ConPtyProcess;
 use crate::handles::{OwnedHandle, OwnedPseudoConsole};
 use crate::job::JobObject;
 use crate::job_tree;
 
-/// How long `kill` waits for a helper thread to close the pseudoconsole (§12.7).
-const CONSOLE_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
-/// How long the reader waits for the process to be reaped once its output pipe ends.
-const EXIT_WAIT: Duration = Duration::from_secs(2);
+/// How long the exit/kill teardown waits for a helper thread to close the pseudoconsole (§12.7).
+pub const CONSOLE_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 /// `STILL_ACTIVE`: GetExitCodeProcess's "has not exited" value.
 const STILL_ACTIVE: i32 = 259;
 /// One ReadFile / WriteFile step. 8 KiB matches the hub's old `pty.read(4096)` order of magnitude
 /// while halving the number of syscalls for bulk output.
 const IO_CHUNK: usize = 8192;
+/// The reaper only blocks in `WaitForSingleObject` (and the close helper), so it needs no real stack.
+const REAPER_STACK: usize = 64 * 1024;
 
 /// Tunables a session needs from the core.
 #[derive(Clone, Copy, Debug)]
@@ -77,21 +83,125 @@ struct Resources {
 
 impl Drop for Resources {
     fn drop(&mut self) {
-        // The last owner closes a console that no `kill`/exit path took: the process is already gone
-        // (or the interpreter is tearing down), so there is no live read waiting on it.
+        // Never close synchronously on the dropping thread: `del core` drops sessions on the Python GC
+        // thread, and closing a console with a read pending is the §12.7 hang. The slot is empty when
+        // the exit/kill teardown already closed it, so this only runs for a session that was abandoned.
         if let Ok(mut slot) = self.console.lock() {
             if let Some(console) = slot.take() {
-                console.close();
+                close_console_off_thread(console, CONSOLE_CLOSE_DEADLINE);
             }
         }
     }
 }
 
+/// Why `write` refused to queue anything. Both variants mean "nothing was queued", so the caller can
+/// retry the whole text without duplicating bytes (§5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError {
+    /// The queue stayed full until the deadline.
+    Timeout,
+    /// The input pipe failed; the session's input is closed for good.
+    Closed,
+}
+
 #[derive(Debug, Default)]
-struct WriterQueue {
+struct WriterState {
     chunks: VecDeque<Vec<u8>>,
     pending: usize,
     closed: bool,
+}
+
+/// The per-session write queue: whole chunks in, whole chunks out, one writer thread consuming them so
+/// D7/D1 arrival order is the pipe's order.
+#[derive(Debug)]
+struct WriteQueue {
+    state: Mutex<WriterState>,
+    ready: Condvar,
+    cap: usize,
+}
+
+impl WriteQueue {
+    fn new(cap: usize) -> Self {
+        Self {
+            state: Mutex::new(WriterState::default()),
+            ready: Condvar::new(),
+            cap,
+        }
+    }
+
+    /// Queues `text` as one chunk or nothing at all: empty text queues nothing (and returns 0), a queue
+    /// that stays over its cap until `deadline` raises `Timeout` with nothing queued.
+    fn push(&self, text: &[u8], deadline: Duration) -> Result<usize, WriteError> {
+        if text.is_empty() {
+            return Ok(0);
+        }
+        let end = Instant::now() + deadline;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if state.closed {
+                return Err(WriteError::Closed);
+            }
+            if state.pending + text.len() <= self.cap {
+                state.pending += text.len();
+                state.chunks.push_back(text.to_vec());
+                self.ready.notify_all();
+                return Ok(text.len());
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(WriteError::Timeout);
+            }
+            let (guard, wait) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            state = guard;
+            if wait.timed_out() && state.pending + text.len() > self.cap {
+                return if state.closed {
+                    Err(WriteError::Closed)
+                } else {
+                    Err(WriteError::Timeout)
+                };
+            }
+        }
+    }
+
+    /// Next chunk, blocking until one arrives; `None` once the queue is closed and empty.
+    fn pop(&self) -> Option<Vec<u8>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(chunk) = state.chunks.pop_front() {
+                return Some(chunk);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The chunk is in the pipe: free its bytes for the next `push`.
+    fn complete(&self, len: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending = state.pending.saturating_sub(len);
+        self.ready.notify_all();
+    }
+
+    /// Closes the queue and returns the bytes that will never be written.
+    fn close(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        let dropped = state.pending;
+        state.chunks.clear();
+        state.pending = 0;
+        self.ready.notify_all();
+        dropped
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.state.lock().map(|state| state.pending).unwrap_or(0)
+    }
 }
 
 /// Polling deadline lock: a wedged holder costs one bounded wait, never an unbounded block (§5.2).
@@ -121,6 +231,23 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Closes a pseudoconsole on its own thread and waits at most `deadline`; `false` means the helper is
+/// still inside `ClosePseudoConsole` and will finish on its own (§12.7).
+fn close_console_off_thread(console: OwnedPseudoConsole, deadline: Duration) -> bool {
+    let (done, wait) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("core-close".to_string())
+        .stack_size(REAPER_STACK)
+        .spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| console.close()));
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => matches!(wait.recv_timeout(deadline), Ok(())),
+        Err(_) => false,
+    }
+}
+
 pub struct Session {
     pub id: String,
     pub pid: u32,
@@ -128,10 +255,12 @@ pub struct Session {
     buffer: Mutex<VecDeque<u8>>,
     /// The last `raw_tail` reply, handed back when the buffer lock misses its deadline (§5.2).
     last_tail: Mutex<Vec<u8>>,
-    writer: Mutex<WriterQueue>,
-    writer_ready: Condvar,
+    writer: WriteQueue,
     alive: AtomicBool,
     exit_code: AtomicI32,
+    /// Set once the output pipe stopped being read, so a later exit does not wait for a reader that is
+    /// already gone before publishing the death record.
+    output_ended: AtomicBool,
     bytes_total: AtomicU64,
     chunks_total: AtomicU64,
     dropped_bytes: AtomicU64,
@@ -143,11 +272,14 @@ pub struct Session {
     rows: AtomicU32,
     options: SessionOptions,
     tick: Arc<TickFlags>,
+    panics: Arc<AtomicU64>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Session {
-    /// Wraps a spawned process and starts its reader and writer threads.
+    /// Wraps a spawned process and starts its reader, writer and reaper threads. The returned lines are
+    /// the spawn's log lines: the caller logs them after it re-attaches, because this runs with the GIL
+    /// released (§5.2: no Python callback inside the detached spawn path).
     pub fn start(
         id: String,
         process: ConPtyProcess,
@@ -155,9 +287,10 @@ impl Session {
         rows: u16,
         options: SessionOptions,
         tick: Arc<TickFlags>,
+        panics: Arc<AtomicU64>,
         log: Arc<dyn Fn(&str) + Send + Sync>,
         seed_history: Option<Vec<u8>>,
-    ) -> Arc<Self> {
+    ) -> (Arc<Self>, Vec<String>) {
         let ConPtyProcess {
             pid,
             command_line,
@@ -169,12 +302,13 @@ impl Session {
             job_assigned,
             job_error,
         } = process;
+        let mut spawn_log = Vec::new();
         if let Some(error) = job_error {
-            log(&format!(
+            spawn_log.push(format!(
                 "session {id}: job assignment failed, kill will walk the tree with ToolHelp: {error}"
             ));
         }
-        log(&format!(
+        spawn_log.push(format!(
             "session {id}: spawned pid {pid} (job {}) cmdline {command_line}",
             if job_assigned { "assigned" } else { "not assigned" }
         ));
@@ -192,10 +326,10 @@ impl Session {
             }),
             buffer: Mutex::new(VecDeque::new()),
             last_tail: Mutex::new(Vec::new()),
-            writer: Mutex::new(WriterQueue::default()),
-            writer_ready: Condvar::new(),
+            writer: WriteQueue::new(options.write_queue_bytes),
             alive: AtomicBool::new(true),
             exit_code: AtomicI32::new(-1),
+            output_ended: AtomicBool::new(false),
             bytes_total: AtomicU64::new(0),
             chunks_total: AtomicU64::new(0),
             dropped_bytes: AtomicU64::new(0),
@@ -207,6 +341,7 @@ impl Session {
             rows: AtomicU32::new(rows as u32),
             options,
             tick,
+            panics,
             log,
         });
 
@@ -222,6 +357,7 @@ impl Session {
 
         let reader = Arc::clone(&session);
         let writer = Arc::clone(&session);
+        let reaper = Arc::clone(&session);
         thread::Builder::new()
             .name(format!("core-read-{}", session.id))
             .spawn(move || reader.reader_body())
@@ -230,8 +366,14 @@ impl Session {
             .name(format!("core-write-{}", session.id))
             .spawn(move || writer.writer_body())
             .expect("spawn writer thread");
+        // 64 KiB is enough: the body only waits on the process handle.
+        thread::Builder::new()
+            .name(format!("core-reap-{}", session.id))
+            .stack_size(REAPER_STACK)
+            .spawn(move || reaper.reaper_body())
+            .expect("spawn reaper thread");
 
-        session
+        (session, spawn_log)
     }
 
     /// One place that reaches the core's `log` callable, so every line goes through the same path.
@@ -239,7 +381,7 @@ impl Session {
         (self.log)(message);
     }
 
-    /// ReadFile until the console's output pipe closes; a panic here crashes only this session.
+    /// ReadFile until the console's output pipe stops producing; a panic here crashes only this session.
     fn reader_body(self: Arc<Self>) {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut chunk = [0u8; IO_CHUNK];
@@ -262,8 +404,13 @@ impl Session {
             }
         }));
         if result.is_err() {
+            self.note_panic();
+            self.output_ended.store(true, Ordering::Release);
             self.mark_crashed("reader thread panicked");
         } else {
+            // The read is over: any byte it returned is in the buffer, so a death record published from
+            // here cannot overtake the last output.
+            self.output_ended.store(true, Ordering::Release);
             self.on_output_closed();
         }
     }
@@ -272,17 +419,7 @@ impl Session {
     /// byte order intact.
     fn writer_body(self: Arc<Self>) {
         let result = catch_unwind(AssertUnwindSafe(|| loop {
-            let next = {
-                let mut queue = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-                while queue.chunks.is_empty() && !queue.closed {
-                    queue = self
-                        .writer_ready
-                        .wait(queue)
-                        .unwrap_or_else(|e| e.into_inner());
-                }
-                queue.chunks.pop_front()
-            };
-            let Some(mut chunk) = next else {
+            let Some(mut chunk) = self.writer.pop() else {
                 return;
             };
             let mut written_total = 0usize;
@@ -299,26 +436,72 @@ impl Session {
                     )
                 };
                 if status.is_err() || written == 0 {
-                    let mut queue = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-                    queue.pending = queue.pending.saturating_sub(chunk.len() - written_total);
-                    queue.closed = true;
-                    self.writer_ready.notify_all();
+                    let dropped = self.writer.close();
                     self.log(&format!(
                         "session {}: input pipe closed, {} queued bytes dropped",
-                        self.id,
-                        queue.pending
+                        self.id, dropped
                     ));
                     return;
                 }
                 written_total += written as usize;
             }
-            let mut queue = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-            queue.pending = queue.pending.saturating_sub(chunk.len());
-            self.writer_ready.notify_all();
+            self.writer.complete(chunk.len());
             chunk.clear();
         }));
         if result.is_err() {
+            self.note_panic();
             self.mark_crashed("writer thread panicked");
+        }
+    }
+
+    /// Waits on the process handle for the whole session's life: this is the only exit signal a natural
+    /// end of the child has, because the output pipe stays open while conhost lives (review B1).
+    fn reaper_body(self: Arc<Self>) {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: the process handle is owned by the session and open for waiting.
+            let waited = unsafe { WaitForSingleObject(self.resources.process.get(), INFINITE) };
+            if waited == WAIT_OBJECT_0 {
+                self.on_process_exit();
+            }
+        }));
+        if result.is_err() {
+            self.note_panic();
+            self.mark_crashed("reaper thread panicked");
+        }
+    }
+
+    /// The process is gone. Record its code, then run the same teardown `kill` runs after its
+    /// job-termination step: close the console on a helper thread so the pending read returns.
+    fn on_process_exit(&self) {
+        let mut code = 0u32;
+        // SAFETY: the process handle is owned by the session and open for query.
+        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+            Ok(()) if code as i32 != STILL_ACTIVE => {
+                self.set_exit_code(code as i32);
+                self.log(&format!(
+                    "session {}: exited with code {}",
+                    self.id, code as i32
+                ));
+            }
+            Ok(()) => return,
+            Err(error) => {
+                // Leave `exit_code` as None: a fake 0 would archive a crash as a clean exit.
+                self.log(&format!(
+                    "session {}: GetExitCodeProcess failed after the process exited: {}",
+                    self.id,
+                    error.message()
+                ));
+            }
+        }
+        if !self.close_console(CONSOLE_CLOSE_DEADLINE) {
+            // The close deadline passed: the hub learns of the death without waiting for the read.
+            self.publish_death();
+            return;
+        }
+        // The close returned, so the reader's read is ending; publish here only if it is already gone.
+        // Otherwise the reader publishes the record after its last bytes (the ordering §5.3 wants).
+        if self.output_ended.load(Ordering::Acquire) {
+            self.publish_death();
         }
     }
 
@@ -337,54 +520,72 @@ impl Session {
         self.tick.pending.store(true, Ordering::Release);
     }
 
-    /// The output pipe ended: reap the process (bounded) and report the exit.
+    /// The output pipe stopped producing. Either the exit/kill teardown closed the console (then the
+    /// exit code is already recorded) or the child closed its own side of the pipe.
     fn on_output_closed(&self) {
-        // SAFETY: the process handle is owned by the session.
-        let waited = unsafe { WaitForSingleObject(self.resources.process.get(), EXIT_WAIT.as_millis() as u32) };
-        let mut code = 0u32;
-        // SAFETY: the handle is owned and open for query.
-        let read_ok = unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) }.is_ok();
-        if waited == WAIT_OBJECT_0 && read_ok {
-            self.set_exit(code as i32);
-            self.log(&format!(
-                "session {}: exited with code {}",
-                self.id, code as i32
-            ));
-        } else if read_ok && code as i32 == STILL_ACTIVE {
-            self.log(&format!(
-                "session {}: output closed while pid {} is still running",
-                self.id, self.pid
-            ));
+        if self.exit_code().is_some() || self.crashed() {
+            self.publish_death();
             return;
-        } else {
-            self.set_exit(code as i32);
         }
-        self.close_console(CONSOLE_CLOSE_DEADLINE);
+        let mut code = 0u32;
+        // SAFETY: the process handle is owned by the session and open for query.
+        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+            Ok(()) if code as i32 != STILL_ACTIVE => {
+                self.set_exit_code(code as i32);
+                self.log(&format!(
+                    "session {}: exited with code {}",
+                    self.id, code as i32
+                ));
+                self.publish_death();
+            }
+            _ => {
+                // Console closed but the process is alive: the reaper reports the eventual exit. The
+                // session stays alive, which is what §5.3's `on_output_closed` case is for.
+                self.log(&format!(
+                    "session {}: output closed while pid {} is still running",
+                    self.id, self.pid
+                ));
+            }
+        }
     }
 
-    fn set_exit(&self, code: i32) {
-        // The exit is one event: `kill` and the reader thread can both observe it, but only the first
-        // caller sets the code, marks the session dirty and wakes the ticker, so `drain` reports one
-        // dead record and a second call returns nothing new (§5.3).
-        if self
+    /// Records the exit code; the first caller wins, so `kill`, the reaper and the reader all observe the
+    /// same code. The death record itself is published separately (see `publish_death`).
+    fn set_exit_code(&self, code: i32) {
+        let _ = self
             .exit_code
-            .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.alive.store(false, Ordering::Release);
+            .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// Publishes the death record: `alive = false`, one dirty record and an urgent wakeup (§5.3). Called
+    /// after the reader's last bytes (or when the console-close deadline passes), never before.
+    fn publish_death(&self) {
+        if self.alive.swap(false, Ordering::AcqRel) {
             self.dirty.store(true, Ordering::Release);
             self.tick.urgent.store(true, Ordering::Release);
-        } else {
-            self.alive.store(false, Ordering::Release);
+            // Nothing can reach a dead process: closing the queue ends its writer thread, so the
+            // session's last `Arc` is released instead of being held by a thread parked on a condvar
+            // (B1: the replaced session must release its handles, not leak a writer).
+            self.writer.close();
         }
     }
 
-    fn mark_crashed(&self, reason: &str) {
+    /// Counts a caught panic: `stats.panics` covers reader, writer, reaper, ticker and close helpers.
+    fn note_panic(&self) {
+        self.panics.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Marks the session crashed. The thread bodies call it when their own body panics; the tests call it
+    /// to reproduce "marked dead, tree still alive" without panicking a real thread (should-fix 2:
+    /// `kill` must still terminate the tree).
+    #[doc(hidden)]
+    pub fn mark_crashed(&self, reason: &str) {
         self.crashed.store(true, Ordering::Release);
-        self.alive.store(false, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         self.tick.urgent.store(true, Ordering::Release);
         self.log(&format!("session {}: crashed ({reason})", self.id));
+        // A crashed session has no reader to publish at EOF, so the death is published here.
+        self.publish_death();
         // The pseudoconsole is closed on a helper thread, never by the panicking thread's own read path.
         self.close_console(CONSOLE_CLOSE_DEADLINE);
     }
@@ -399,59 +600,20 @@ impl Session {
         let Some(console) = console else {
             return true;
         };
-        let (done, wait) = mpsc::channel();
-        thread::Builder::new()
-            .name(format!("core-close-{}", self.id))
-            .spawn(move || {
-                let _ = catch_unwind(AssertUnwindSafe(|| console.close()));
-                let _ = done.send(());
-            })
-            .expect("spawn pseudoconsole close thread");
-        match wait.recv_timeout(deadline) {
-            Ok(()) => true,
-            Err(_) => {
-                self.log(&format!(
-                    "session {}: pseudoconsole close still pending after {:?}",
-                    self.id, deadline
-                ));
-                false
-            }
+        let closed = close_console_off_thread(console, deadline);
+        if !closed {
+            self.log(&format!(
+                "session {}: pseudoconsole close still pending after {:?}",
+                self.id, deadline
+            ));
         }
+        closed
     }
 
-    /// Enqueues one write as a whole or not at all: a keystroke's bytes are never split across two
-    /// writes. Returns the bytes accepted (0 when the deadline expired with the queue full).
-    pub fn write(&self, text: &[u8], deadline: Duration) -> Result<usize, &'static str> {
-        if text.is_empty() {
-            return Ok(0);
-        }
-        let cap = self.options.write_queue_bytes;
-        let end = Instant::now() + deadline;
-        let mut queue = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if queue.closed {
-            return Err("session input is closed");
-        }
-        while queue.pending + text.len() > cap {
-            let remaining = end.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(0);
-            }
-            let (guard, timeout) = self
-                .writer_ready
-                .wait_timeout(queue, remaining)
-                .unwrap_or_else(|e| e.into_inner());
-            queue = guard;
-            if queue.closed {
-                return Err("session input is closed");
-            }
-            if timeout.timed_out() && queue.pending + text.len() > cap {
-                return Ok(0);
-            }
-        }
-        queue.pending += text.len();
-        queue.chunks.push_back(text.to_vec());
-        self.writer_ready.notify_all();
-        Ok(text.len())
+    /// Queues one write as a whole or not at all (SF4, §5.2): empty text returns 0 with nothing queued, a
+    /// full queue at the deadline is `Timeout` with nothing queued, so a retry cannot duplicate bytes.
+    pub fn write(&self, text: &[u8], deadline: Duration) -> Result<usize, WriteError> {
+        self.writer.push(text, deadline)
     }
 
     /// `ResizePseudoConsole`. The core never propagates a size (that is hub policy); it only applies it.
@@ -475,12 +637,13 @@ impl Session {
         Ok((cols, rows))
     }
 
-    /// Terminates the session's tree (job first, ToolHelp fallback), waits up to `grace` for the root
-    /// process and closes the pseudoconsole on a helper thread.
-    pub fn kill(&self, grace: Duration) -> Result<Option<i32>, String> {
-        if !self.alive.load(Ordering::Acquire) {
-            return Ok(self.exit_code());
-        }
+    /// Terminates the session's tree and waits up to `budget` for the exit and the console close. The
+    /// tree is always terminated, even when the session is already marked dead: a reader panic leaves the
+    /// CLI running (should-fix 2), and `TerminateJobObject` is idempotent. Only the wait is skipped when
+    /// the exit is already confirmed. `budget` bounds the whole call; a close helper that outlives it
+    /// keeps running on its own thread (should-fix 3).
+    pub fn kill(&self, budget: Duration) -> Result<Option<i32>, String> {
+        let end = Instant::now() + budget;
         let mut method = "TerminateJobObject";
         let result = if self.resources.job_assigned {
             self.resources.job.terminate(1)
@@ -496,34 +659,56 @@ impl Session {
             ));
             job_tree::terminate_tree(self.pid);
         }
-        // SAFETY: the process handle is owned by the session.
-        unsafe {
-            WaitForSingleObject(self.resources.process.get(), grace.as_millis() as u32);
+
+        if self.exit_code().is_none() {
+            // SAFETY: the process handle is owned by the session.
+            unsafe {
+                WaitForSingleObject(
+                    self.resources.process.get(),
+                    end.saturating_duration_since(Instant::now()).as_millis() as u32,
+                );
+            }
+            let mut code = 0u32;
+            // SAFETY: as above; a still-running process reports STILL_ACTIVE and has no code.
+            match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+                Ok(()) if code as i32 != STILL_ACTIVE => {
+                    self.set_exit_code(code as i32);
+                    self.log(&format!(
+                        "session {}: killed pid {} ({}), exit code {}",
+                        self.id,
+                        self.pid,
+                        method,
+                        code as i32
+                    ));
+                }
+                Ok(()) => {}
+                Err(error) => self.log(&format!(
+                    "session {}: GetExitCodeProcess failed after {}: {}",
+                    self.id,
+                    method,
+                    error.message()
+                )),
+            }
         }
-        let mut code = 0u32;
-        // SAFETY: as above; a still-running process reports STILL_ACTIVE and is treated as "not exited".
-        let read_ok = unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) }.is_ok();
-        if read_ok && code as i32 != STILL_ACTIVE {
-            self.set_exit(code as i32);
-            self.close_console(CONSOLE_CLOSE_DEADLINE);
+
+        let remaining = end.saturating_duration_since(Instant::now());
+        self.close_console(remaining.min(CONSOLE_CLOSE_DEADLINE));
+        if self.exit_code().is_some() {
+            // The exit is confirmed: the death record may go out, after the console was asked to close so
+            // the reader can file its last bytes (§5.3).
+            self.publish_death();
+        } else {
             self.log(&format!(
-                "session {}: killed pid {} ({}), exit code {}",
-                self.id,
-                self.pid,
-                method,
-                code as i32
+                "session {}: pid {} did not exit within {:?} after {}",
+                self.id, self.pid, budget, method
             ));
-            return Ok(Some(code as i32));
         }
-        self.log(&format!(
-            "session {}: pid {} did not exit within {:?} after {}",
-            self.id, self.pid, grace, method
-        ));
-        Ok(None)
+        Ok(self.exit_code())
     }
 
     /// Last `max_bytes` of the bounded raw buffer. On a missed deadline the previous reply is returned
-    /// and the session is marked `degraded`, so a wedged buffer cannot hold the hub's loop.
+    /// and the session is marked `degraded`, which is itself a dirty flag so the hub's next drain sees
+    /// it without waiting for more output.
     pub fn raw_tail(&self, max_bytes: usize, deadline: Duration) -> Vec<u8> {
         let taken = match lock_deadline(&self.buffer, deadline) {
             Some(buffer) => {
@@ -541,6 +726,8 @@ impl Session {
             Some(bytes) => bytes,
             None => {
                 self.degraded.store(true, Ordering::Release);
+                self.dirty.store(true, Ordering::Release);
+                self.tick.pending.store(true, Ordering::Release);
                 self.last_tail
                     .lock()
                     .map(|last| last.clone())
@@ -589,13 +776,6 @@ impl Session {
         }
     }
 
-    pub fn size(&self) -> (u16, u16) {
-        (
-            self.cols.load(Ordering::Relaxed) as u16,
-            self.rows.load(Ordering::Relaxed) as u16,
-        )
-    }
-
     /// `(bytes, chunks, dropped)` without touching the dirty flag, so `stats` cannot steal a record
     /// from the next `drain` (§5.3).
     pub fn counters(&self) -> (u64, u64, u64) {
@@ -609,11 +789,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Unblocks the writer thread and lets it drain or exit; the pipes close with `Resources`.
-        if let Ok(mut queue) = self.writer.lock() {
-            queue.closed = true;
-        }
-        self.writer_ready.notify_all();
+        // Unblocks the writer thread and lets it exit; the pipes close with `Resources`. No `log` call
+        // here: this can run on the Python GC thread during interpreter teardown.
+        self.writer.close();
     }
 }
 
@@ -629,5 +807,51 @@ fn trim_buffer(buffer: &mut VecDeque<u8>, cap: usize, dropped: &AtomicU64) {
         let excess = buffer.len() - cap;
         buffer.drain(..excess);
         dropped.fetch_add(excess as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_queues_the_whole_text_or_nothing() {
+        let queue = WriteQueue::new(16);
+        assert_eq!(queue.push(b"", Duration::from_millis(5)), Ok(0));
+        assert_eq!(queue.push(b"abc", Duration::from_millis(5)), Ok(3));
+        assert_eq!(queue.pending(), 3);
+        // A text bigger than the cap can never fit: it is refused as a whole, not split.
+        assert_eq!(
+            queue.push(&[b'x'; 32], Duration::from_millis(20)),
+            Err(WriteError::Timeout)
+        );
+        assert_eq!(queue.pending(), 3, "a refused write queues nothing");
+        // The writer takes the chunk out, so the same text now fits.
+        let popped = queue.pop().expect("one chunk");
+        assert_eq!(popped, b"abc");
+        queue.complete(popped.len());
+        assert_eq!(queue.push(&[b'y'; 16], Duration::from_millis(5)), Ok(16));
+    }
+
+    #[test]
+    fn write_to_a_full_queue_times_out_and_closed_refuses() {
+        let queue = WriteQueue::new(8);
+        assert_eq!(queue.push(b"12345678", Duration::from_millis(5)), Ok(8));
+        let started = Instant::now();
+        assert_eq!(
+            queue.push(b"x", Duration::from_millis(40)),
+            Err(WriteError::Timeout)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "the push returned before its deadline"
+        );
+        assert_eq!(queue.pending(), 8);
+        assert_eq!(queue.close(), 8);
+        assert_eq!(
+            queue.push(b"x", Duration::from_millis(5)),
+            Err(WriteError::Closed)
+        );
+        assert!(queue.pop().is_none());
     }
 }

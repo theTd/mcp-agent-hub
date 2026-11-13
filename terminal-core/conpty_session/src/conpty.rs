@@ -11,7 +11,7 @@ use windows::Win32::System::Console::{CreatePseudoConsole, HPCON, COORD};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
-    UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
@@ -43,6 +43,18 @@ pub struct ConPtyProcess {
     pub job_assigned: bool,
     /// Set when the assignment failed, for the spawn log line.
     pub job_error: Option<String>,
+}
+
+/// Terminates a child that `CreateProcessW` created suspended and that must not run: the spawn path
+/// failed after the process existed (should-fix 1). The caller's handle closes with `OwnedHandle`.
+fn terminate_suspended(process: &OwnedHandle, pid: u32) {
+    // SAFETY: the process handle is owned by the caller and has PROCESS_TERMINATE.
+    if unsafe { TerminateProcess(process.get(), 1) }.is_ok() {
+        return;
+    }
+    // The handle can lack PROCESS_TERMINATE if the security policy narrowed it; the tree walk with
+    // PROCESS_TERMINATE is the fallback `kill` uses as well.
+    crate::job_tree::terminate_tree(pid);
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -110,15 +122,34 @@ pub fn spawn(spec: &SpawnSpec<'_>) -> Result<ConPtyProcess, String> {
 
     let (process, thread, pid) = create_process(&app, &command_line, spec, console.get())?;
 
-    let job =
-        Arc::new(JobObject::new_kill_on_close().map_err(|e| format!("CreateJobObject: {e}"))?);
-    let (job_assigned, job_error) = match job.assign(process.get()) {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(error.to_string())),
+    // Everything from here to the return is an error scope: the child exists but has never run, so a
+    // failure must terminate it. Dropping its handle alone leaves a permanently suspended process, and
+    // `console` (an `OwnedPseudoConsole`) closes the HPCON on the same path (should-fix 1).
+    let started = (|| -> Result<(Arc<JobObject>, bool, Option<String>), String> {
+        let job =
+            Arc::new(JobObject::new_kill_on_close().map_err(|e| format!("CreateJobObject: {e}"))?);
+        let (job_assigned, job_error) = match job.assign(process.get()) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        // SAFETY: the thread was created suspended and is owned by `thread`. A failed resume returns
+        // `u32::MAX` (not an error code), so the return value is the only failure signal.
+        let resumed = unsafe { ResumeThread(thread.get()) };
+        if resumed == u32::MAX {
+            // SAFETY: GetLastError reads this thread's last error, set by the failed ResumeThread.
+            let last = unsafe { windows::Win32::Foundation::GetLastError() };
+            let error = windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(last.0));
+            return Err(format!("ResumeThread: {}", win32_message(&error)));
+        }
+        Ok((job, job_assigned, job_error))
+    })();
+    let (job, job_assigned, job_error) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            terminate_suspended(&process, pid);
+            return Err(error);
+        }
     };
-
-    // SAFETY: the thread was created suspended and is owned by `thread`.
-    unsafe { ResumeThread(thread.get()) };
     drop(thread);
 
     // Our copies of the console's ends are no longer needed once the child has the attribute.
@@ -146,6 +177,7 @@ fn create_process(
     spec: &SpawnSpec<'_>,
     console: HPCON,
 ) -> Result<(OwnedHandle, OwnedHandle, u32), String> {
+    let command_line_text = command_line;
     let mut command_line = wide(command_line);
     let cwd = spec.cwd.map(wide);
     let env_block = environment_block(spec.env);
@@ -221,7 +253,7 @@ fn create_process(
         }
         .map_err(|e| {
             format!(
-                "CreateProcessW({app}, {command_line:?}): {}",
+                "CreateProcessW({app}, {command_line_text:?}): {}",
                 win32_message(&e)
             )
         });

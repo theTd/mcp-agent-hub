@@ -7,8 +7,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessHandleCount, OpenProcess, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 use crate::handles::OwnedHandle;
@@ -62,6 +62,77 @@ pub fn tree_of(root: u32) -> Vec<u32> {
         }
     }
     tree
+}
+
+/// Running processes whose executable name matches `name` (case-insensitive). The leak tests count
+/// `conhost.exe` with it: a pseudoconsole that is never closed keeps its conhost alive.
+pub fn count_processes_named(name: &str) -> usize {
+    let wanted = name.to_ascii_lowercase();
+    process_snapshot_entries()
+        .into_iter()
+        .filter(|(_, _, exe)| exe.eq_ignore_ascii_case(&wanted))
+        .count()
+}
+
+/// Running processes named `name` whose parent is `parent`: `conhost.exe` is created by the process that
+/// opened the pseudoconsole, so this counts *our* consoles and ignores another app's (or another
+/// session's) console starting at the same moment.
+pub fn count_processes_named_by_parent(parent: u32, name: &str) -> usize {
+    let wanted = name.to_ascii_lowercase();
+    process_snapshot_entries()
+        .into_iter()
+        .filter(|(pid, parent_pid, exe)| {
+            *pid != 0 && *parent_pid == parent && exe.eq_ignore_ascii_case(&wanted)
+        })
+        .count()
+}
+
+/// `(pid, parent pid, executable name)` for every process in one snapshot.
+fn process_snapshot_entries() -> Vec<(u32, u32, String)> {
+    // SAFETY: a system-wide process snapshot; the handle is closed by the wrapper.
+    let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(handle) => OwnedHandle::new(handle),
+        Err(_) => return Vec::new(),
+    };
+    // SAFETY: PROCESSENTRY32W is a plain-old-data struct; dwSize must be set before the first call.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entries = Vec::new();
+    // SAFETY: `entry` is a valid out pointer with dwSize set.
+    if unsafe { Process32FirstW(snapshot.get(), &mut entry) }.is_err() {
+        return entries;
+    }
+    loop {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        entries.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..end]),
+        ));
+        // SAFETY: same struct, same size, as Process32FirstW requires.
+        if unsafe { Process32NextW(snapshot.get(), &mut entry) }.is_err() {
+            break;
+        }
+    }
+    entries
+}
+
+/// Open handles of this process. A failed spawn must not raise it: the error path closed the console,
+/// both pipe ends and the process handle it created (should-fix 1).
+pub fn current_handle_count() -> u32 {
+    let mut count = 0u32;
+    // SAFETY: GetCurrentProcess returns a borrowed pseudo handle (never closed) and `count` is a valid
+    // out pointer.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.is_ok();
+    if ok {
+        count
+    } else {
+        0
+    }
 }
 
 /// Opens a process with the rights a liveness check needs.
