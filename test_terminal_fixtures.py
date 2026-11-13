@@ -33,6 +33,7 @@ LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-kimi", "live-omp")
 EDGE_CASES = (
     "edge-screen-combining",
     "edge-screen-csi-cancel",
+    "edge-screen-csi-controls",
     "edge-screen-csi-marker",
     "edge-screen-decom",
     "edge-screen-decom-region",
