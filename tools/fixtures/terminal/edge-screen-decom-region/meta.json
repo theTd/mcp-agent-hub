@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "DECOM inside a region: with ESC[2;5r set, ESC[?6h puts ESC[H on row 1 and ESC[9;1H outside the region, where pyte ignores the move; ESC[?6l then homes to row 0",
+  "resume_count": 1
+}

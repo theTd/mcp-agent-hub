@@ -66,6 +66,9 @@ class WrapperSurfaceTests(unittest.TestCase):
     @live_core
     def test_wrapper_reexports_the_extension_identity(self):
         self.assertIs(terminal_core.Core, Core)
+        self.assertIs(terminal_core.strip_osc_terminal_replies,
+                      sys.modules["hub_terminal_core"].strip_osc_terminal_replies)
+        self.assertIn("strip_osc_terminal_replies", terminal_core.__all__)
         self.assertEqual(terminal_core.ABI, "abi3-py311")
         self.assertTrue(terminal_core.__version__)
 
@@ -467,12 +470,12 @@ class ReplyStripTests(unittest.TestCase):
     def test_strip_osc_terminal_replies_is_a_function(self):
         if Core is None:
             self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
-        module = sys.modules["hub_terminal_core"]
-        self.assertEqual(module.strip_osc_terminal_replies("\x1b]11;rgb:1/1/1\x07hi"), "hi")
-        self.assertEqual(module.strip_osc_terminal_replies("\x1b]52;c;YWJj\x07"), "")
-        self.assertEqual(module.strip_osc_terminal_replies("\x1b]110;rgb:0/0/0\x1b\\x"), "x")
-        self.assertEqual(module.strip_osc_terminal_replies("plain"), "plain")
-        self.assertEqual(module.strip_osc_terminal_replies("\x1b]10;rgb:1/1"), "\x1b]10;rgb:1/1")
+        strip = terminal_core.strip_osc_terminal_replies
+        self.assertEqual(strip("\x1b]11;rgb:1/1/1\x07hi"), "hi")
+        self.assertEqual(strip("\x1b]52;c;YWJj\x07"), "")
+        self.assertEqual(strip("\x1b]110;rgb:0/0/0\x1b\\x"), "x")
+        self.assertEqual(strip("plain"), "plain")
+        self.assertEqual(strip("\x1b]10;rgb:1/1"), "\x1b]10;rgb:1/1")
 
 
 # B2: `shutdown`/`Drop` must not wait for the GIL while they hold it. A regression hangs the process, so

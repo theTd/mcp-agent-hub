@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "DECSTBM partial: ESC[2;4r covers rows 1..3 and homes the cursor; scrolling twice moves only those rows, leaves 0 and 4..5 in place, and sends 'b' then 'c' to history",
+  "resume_count": 1
+}

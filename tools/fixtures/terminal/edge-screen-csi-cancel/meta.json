@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "a CSI cut by CAN (0x18), by SUB (0x1a) and by ESC: CAN/SUB cancel the sequence and draw the substitute, and the ESC starts a new sequence - pyte instead draws '[1m' as text after the ESC, which is its bug, and that row is the exception",
+  "resume_count": 1
+}

@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "CSI forms pyte mis-reads: ESC[?2026$p, the private markers '<' '=' ':' and an SGR with subparameters all draw nothing; one private marker arrives cut between two chunks, which the parser carries",
+  "resume_count": 1
+}

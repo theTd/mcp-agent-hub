@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "utf8_bytes",
+  "synthetic": true,
+  "note": "the same zero-width characters cut by a read boundary: ZWSP (3 bytes) and VS16 (3 bytes) each split over two reads, which the UTF-8 carry must join before the screen skips them",
+  "resume_count": 1
+}

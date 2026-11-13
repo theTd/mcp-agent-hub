@@ -8,6 +8,9 @@
 //! W8, W9, OSC and UTF-8 cases and `trigger.json`'s counts. The three rendered files (`screen_final.txt`,
 //! `screen_at_resize.txt`, `scrollback_250.txt`) are compared per row against `screen_exceptions.jsonl`:
 //! a difference not listed there fails the test, a listed difference that no longer occurs fails it too.
+//!
+//! A golden a case's kind and `meta.json` call for must exist: a missing one is a failure, not a skip
+//! (step 2c, review F10), so a dropped file cannot remove coverage silently.
 
 mod json;
 
@@ -287,8 +290,10 @@ fn session_goldens(
     exceptions: &mut [Exception],
 ) {
     let mut compare_file = |name: String, actual: String, failures: &mut Vec<String>| {
-        if let Some(expected) = golden(case, &format!("{prefix}{name}")) {
-            compare(&case.name, &format!("{prefix}{name}"), &expected, &actual, exceptions, failures);
+        let file = format!("{prefix}{name}");
+        match golden(case, &file) {
+            Some(expected) => compare(&case.name, &file, &expected, &actual, exceptions, failures),
+            None => failures.push(format!("{}/{}: golden missing", case.name, file)),
         }
     };
     compare_file(
@@ -337,7 +342,9 @@ fn run_session_case(case: &Case, failures: &mut Vec<String>, exceptions: &mut [E
 
     // A resumed pane replays the archived (trimmed) output, then the separator, and W8 is on from the
     // first byte. `render_case` renders `resumed/` from exactly these two inputs.
-    if golden(case, "resumed/raw.txt").is_some() {
+    // Every session case has its `resumed/` goldens (`render_case` renders them unconditionally) and a
+    // missing one is a failure, not a skip.
+    {
         let count = case.resume_count();
         let seed = format!("{}{}", stream.raw_text(), resume_banner(count));
         let mut resumed = case.stream(count, Some(&seed));
@@ -479,63 +486,67 @@ fn run_trigger_case(case: &Case, failures: &mut Vec<String>) {
     }
     finish(&mut stream);
     // The trigger case's `raw.txt` is the joined ring (already collapsed), not `_scrollback_blob`'s trim.
-    if let Some(expected) = golden(case, "raw.txt") {
-        compare(&case.name, "raw.txt", &expected, stream.raw_join(), &mut [], failures);
+    match golden(case, "raw.txt") {
+        Some(expected) => compare(&case.name, "raw.txt", &expected, stream.raw_join(), &mut [], failures),
+        None => failures.push(format!("{}/raw.txt: golden missing", case.name)),
     }
-    if let Some(expected) = golden(case, "raw_tail.txt") {
-        compare(
+    match golden(case, "raw_tail.txt") {
+        Some(expected) => compare(
             &case.name,
             "raw_tail.txt",
             &expected,
             &stream.raw_tail(RAW_TAIL_CHARS),
             &mut [],
             failures,
-        );
+        ),
+        None => failures.push(format!("{}/raw_tail.txt: golden missing", case.name)),
     }
-    if let Some(expected) = golden(case, "trigger.json") {
-        let expected = json::parse(&expected).expect("trigger.json parses");
-        let referred = [
-            "fired_at_chunk",
-            "entries_before",
-            "entries_after",
-            "bytes_before",
-            "bytes_after",
-            "max_bytes",
-            "slack_bytes",
-        ];
-        for key in referred {
-            let want = expected.get(key).and_then(|value| value.as_usize());
-            let got = record.get(key).and_then(|value| value.as_usize());
-            if want != got {
-                failures.push(format!(
-                    "{}/trigger.json: {key} expected {:?}, got {:?}",
-                    case.name, want, got
-                ));
-            }
-        }
-        let final_entries = expected
-            .get("final_entries")
-            .and_then(|value| value.as_usize());
-        if final_entries != Some(stream.raw_entries()) {
+    let Some(expected) = golden(case, "trigger.json") else {
+        failures.push(format!("{}/trigger.json: golden missing", case.name));
+        return;
+    };
+    let expected = json::parse(&expected).expect("trigger.json parses");
+    let referred = [
+        "fired_at_chunk",
+        "entries_before",
+        "entries_after",
+        "bytes_before",
+        "bytes_after",
+        "max_bytes",
+        "slack_bytes",
+    ];
+    for key in referred {
+        let want = expected.get(key).and_then(|value| value.as_usize());
+        let got = record.get(key).and_then(|value| value.as_usize());
+        if want != got {
             failures.push(format!(
-                "{}/trigger.json: final_entries expected {:?}, got {}",
-                case.name,
-                final_entries,
-                stream.raw_entries()
+                "{}/trigger.json: {key} expected {:?}, got {:?}",
+                case.name, want, got
             ));
         }
-        let final_bytes = expected.get("final_bytes").and_then(|value| value.as_usize());
-        if final_bytes != Some(stream.raw_bytes() as usize) {
-            failures.push(format!(
-                "{}/trigger.json: final_bytes expected {:?}, got {}",
-                case.name,
-                final_bytes,
-                stream.raw_bytes()
-            ));
-        }
-        if fired_at.is_none() {
-            failures.push(format!("{}/trigger.json: the ring never collapsed", case.name));
-        }
+    }
+    let final_entries = expected
+        .get("final_entries")
+        .and_then(|value| value.as_usize());
+    if final_entries != Some(stream.raw_entries()) {
+        failures.push(format!(
+            "{}/trigger.json: final_entries expected {:?}, got {}",
+            case.name,
+            final_entries,
+            stream.raw_entries()
+        ));
+    }
+    let final_bytes = expected.get("final_bytes").and_then(|value| value.as_usize());
+    if final_bytes != Some(stream.raw_bytes() as usize) {
+        failures.push(format!(
+            "{}/trigger.json: final_bytes expected {:?}, got {}",
+            case.name,
+            final_bytes,
+            stream.raw_bytes()
+        ));
+    }
+    if fired_at.is_none() {
+        failures.push(format!("{}/trigger.json: the ring never collapsed", case.name));
     }
 }
 
@@ -566,8 +577,11 @@ fn main_test() {
             "trim" => {
                 let max_bytes = case.number("max_bytes", 512 * 1024);
                 let actual = trim_history_text(&joined_text(&case), max_bytes);
-                if let Some(expected) = golden(&case, "trimmed.txt") {
-                    compare(&case.name, "trimmed.txt", &expected, &actual, &mut [], &mut failures);
+                match golden(&case, "trimmed.txt") {
+                    Some(expected) => {
+                        compare(&case.name, "trimmed.txt", &expected, &actual, &mut [], &mut failures)
+                    }
+                    None => failures.push(format!("{}/trimmed.txt: golden missing", case.name)),
                 }
             }
             "input" => {
@@ -579,8 +593,11 @@ fn main_test() {
                     };
                     actual.push_str(&strip_terminal_replies(text));
                 }
-                if let Some(expected) = golden(&case, "stripped.txt") {
-                    compare(&case.name, "stripped.txt", &expected, &actual, &mut [], &mut failures);
+                match golden(&case, "stripped.txt") {
+                    Some(expected) => {
+                        compare(&case.name, "stripped.txt", &expected, &actual, &mut [], &mut failures)
+                    }
+                    None => failures.push(format!("{}/stripped.txt: golden missing", case.name)),
                 }
             }
             other => failures.push(format!("{}/meta.json: unknown kind {other:?}", case.name)),

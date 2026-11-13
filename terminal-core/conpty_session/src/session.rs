@@ -557,6 +557,15 @@ pub struct Session {
     resources: Option<Arc<Resources>>,
     text: Mutex<TextState>,
     cached: Mutex<CachedText>,
+    /// Frames reach the sinks one at a time, in stream order.
+    ///
+    /// Lock order is one-directional: `delivery` before `text`, and `sinks` only under `delivery`.
+    /// Nothing takes `delivery` while holding `text`, `sinks` or `cached`. A frame is taken out of the
+    /// batch and fanned out inside this lock, so the reader (`ingest`) and the ticker (`flush_frames`)
+    /// cannot deliver frame n+1 before frame n, and `attach_sink`'s snapshot and registration sit in one
+    /// gap between deliveries. `FrameSink::deliver` must not block, so holding it costs the reader no
+    /// more than the sink's own queue lock would.
+    delivery: Mutex<()>,
     sinks: Mutex<Vec<SinkEntry>>,
     next_sink: AtomicU64,
     writer: WriteQueue,
@@ -622,6 +631,7 @@ impl Session {
                 frame: Vec::with_capacity(8192),
             }),
             cached: Mutex::new(CachedText::default()),
+            delivery: Mutex::new(()),
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             writer: WriteQueue::new(options.write_queue_bytes),
@@ -993,15 +1003,14 @@ impl Session {
         if !frame.is_empty() {
             batch.push(frame, now);
         }
-        // §5.4's first trigger is the batch's own size: a 32 KiB frame does not wait for the 5 ms tick.
-        let ready = if batch.due(now) { batch.take_all() } else { None };
         let rev = stream.screen_rev();
         let processed = frame.len() as u64;
         let ring_dropped = stream.ring_dropped_bytes();
         drop(guard);
-        if let Some(frame) = ready {
-            self.deliver(&frame);
-        }
+        // §5.4's first trigger is the batch's own size: a 32 KiB frame does not wait for the 5 ms tick.
+        // The frame is taken and fanned out inside `pump`, i.e. under the delivery lock: taking it here
+        // would let two readers hand frames to the sinks in the wrong order.
+        self.pump(Some(now));
         self.dropped_bytes.fetch_add(
             ring_dropped.saturating_sub(ring_before),
             Ordering::Relaxed,
@@ -1507,19 +1516,25 @@ impl Session {
 
     /// Registers a sink and hands back the replay that goes with the registration (Q11).
     ///
-    /// The pending batch is delivered to the sinks that existed before this one *first*, so a chunk is
-    /// never in both the replay and a frame; only then is the snapshot taken and the sink added, all
-    /// under the text lock.
+    /// Atomic against `pump`/`push_frame` for this session: the delivery lock is held from the pending
+    /// batch through the snapshot and the registration, so no frame can be taken and fanned out in
+    /// between (a chunk would otherwise be in neither the replay nor any frame). The pending batch is
+    /// fanned out to the sinks that existed before this one only, because the replay already carries
+    /// those bytes; the new sink gets them once, from the replay.
     pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, u64) {
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
         let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(frame) = text.batch.take_all() {
-            self.deliver(&frame);
-        }
+        let pending = text.batch.take_all();
         let replay = text.stream.replay_text();
-        let handle = self.next_sink.fetch_add(1, Ordering::Relaxed);
         drop(text);
+        let handle = self.next_sink.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::attach_delay();
         if let Ok(mut sinks) = self.sinks.lock() {
             sinks.push(SinkEntry { handle, sink });
+        }
+        if let Some(frame) = pending {
+            self.fan_out(&frame, Some(handle));
         }
         (replay, handle)
     }
@@ -1536,21 +1551,56 @@ impl Session {
     /// One frame straight to the attached sinks, not through the batch: `spawn(ws_prefix=…)` and
     /// `attach_text(seed=…)` (§5.2, A1). No sink is attached unless a socket already follows the id.
     pub fn push_frame(&self, frame: &str) {
-        if !frame.is_empty() {
-            self.deliver(frame.as_bytes());
+        if frame.is_empty() {
+            return;
+        }
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        self.fan_out(frame.as_bytes(), None);
+    }
+
+    /// Takes the frame that is due (or whatever the batch holds, for the final flush) and fans it out —
+    /// both inside the delivery lock, which is what keeps frame order.
+    ///
+    /// Lock order here is delivery → text: `ingest` releases the text lock before calling this, so the
+    /// reader never holds `text` while waiting for a delivery that another thread is making.
+    fn pump(&self, now: Option<Instant>) {
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = {
+            let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
+            match now {
+                Some(now) => text.batch.take_due(now),
+                None => text.batch.take_all(),
+            }
+        };
+        if let Some(frame) = frame {
+            self.fan_out(&frame, None);
         }
     }
 
-    /// Delivers one coalesced frame to every attached sink; the drops each one reports land in
-    /// `dropped_bytes` (§5.4).
-    fn deliver(&self, frame: &[u8]) {
-        let sinks: Vec<Arc<dyn FrameSink>> = match self.sinks.lock() {
-            Ok(sinks) => sinks.iter().map(|entry| Arc::clone(&entry.sink)).collect(),
-            Err(error) => error.into_inner().iter().map(|entry| Arc::clone(&entry.sink)).collect(),
-        };
+    /// Delivers one coalesced frame to every attached sink, skipping `skip` (the sink that is being
+    /// registered and already has these bytes in its replay); the drops each sink reports land in
+    /// `dropped_bytes` (§5.4). The caller holds the delivery lock, and `FrameSink::deliver` never blocks,
+    /// so a slow sink costs the reader its queue push, never its read.
+    fn fan_out(&self, frame: &[u8], skip: Option<u64>) {
         let mut dropped = 0u64;
-        for sink in sinks {
-            dropped += sink.deliver(&self.id, frame);
+        match self.sinks.lock() {
+            Ok(mut sinks) => {
+                for entry in sinks.iter_mut() {
+                    if Some(entry.handle) == skip {
+                        continue;
+                    }
+                    dropped += entry.sink.deliver(&self.id, frame);
+                }
+            }
+            Err(error) => {
+                let sinks = error.into_inner();
+                for entry in sinks.iter() {
+                    if Some(entry.handle) == skip {
+                        continue;
+                    }
+                    dropped += entry.sink.deliver(&self.id, frame);
+                }
+            }
         }
         if dropped > 0 {
             self.dropped_bytes.fetch_add(dropped, Ordering::Relaxed);
@@ -1559,24 +1609,12 @@ impl Session {
 
     /// The ticker's 5 ms pass: flush this session's batch when §5.4's window is over.
     pub fn flush_frames(&self, now: Instant) {
-        let frame = {
-            let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
-            text.batch.take_due(now)
-        };
-        if let Some(frame) = frame {
-            self.deliver(&frame);
-        }
+        self.pump(Some(now));
     }
 
     /// The session's last bytes before it dies: flush whatever the batch holds, due or not.
     fn flush_frames_all(&self) {
-        let frame = {
-            let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
-            text.batch.take_all()
-        };
-        if let Some(frame) = frame {
-            self.deliver(&frame);
-        }
+        self.pump(None);
     }
 
     /// `watch_screen`: at most one render per changed revision and per `interval`, carried by `drain`.

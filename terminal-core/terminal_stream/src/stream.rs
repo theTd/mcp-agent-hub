@@ -14,7 +14,6 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use vte::Parser;
 
-use crate::csi_marker::CsiMarkerQuirk;
 use crate::decoder::Utf8Carry;
 use crate::esc::{strip_color_queries, Esc3jStrip};
 use crate::history::HistoryRing;
@@ -52,7 +51,6 @@ pub struct TerminalStream {
     screen: Screen,
     ring: HistoryRing,
     esc3j: Esc3jStrip,
-    marker: CsiMarkerQuirk,
     decoder: Utf8Carry,
     /// The decode scratch, reused so a read does not allocate a `String` per chunk.
     scratch: String,
@@ -70,7 +68,6 @@ impl TerminalStream {
             screen: Screen::new(opts.cols, opts.rows, opts.history_rows),
             ring: HistoryRing::new(opts.raw_cap_bytes, opts.raw_slack_bytes),
             esc3j: Esc3jStrip::new(),
-            marker: CsiMarkerQuirk::new(),
             decoder: Utf8Carry::new(),
             scratch: String::new(),
             raw_cap_bytes: opts.raw_cap_bytes,
@@ -103,13 +100,6 @@ impl TerminalStream {
         if !text.is_empty() {
             self.feed_text(&text, out);
         }
-        let tail = self.marker.finish();
-        if !tail.is_empty() {
-            let Self {
-                parser, screen, ..
-            } = self;
-            let _ = catch_unwind(AssertUnwindSafe(|| parser.advance(screen, tail.as_bytes())));
-        }
         self.scratch = text;
     }
 
@@ -125,14 +115,15 @@ impl TerminalStream {
         }
         self.ring.append(&data);
         out.extend_from_slice(data.as_bytes());
-        // The parser sees pyte's private-marker rewrite; the ring and the socket frames keep the raw text.
-        let parsed = self.marker.rewrite(&data);
+        // vte reads a CSI whose parameters include `:` `<` `=` as one sequence and draws nothing for it,
+        // which is what the oracle's `_split_marker_csi` filter makes pyte do (step 2c). The ring and the
+        // socket frames keep the raw text either way.
         let Self {
             parser, screen, ..
         } = self;
         // K4: vte cannot fail on bad input, so this only fires on a bug in the model itself; the chunk
         // costs itself (the ring already has it) and the parser restarts, as `HubTerminalStream` does.
-        if catch_unwind(AssertUnwindSafe(|| parser.advance(screen, parsed.as_bytes()))).is_err() {
+        if catch_unwind(AssertUnwindSafe(|| parser.advance(screen, data.as_bytes()))).is_err() {
             self.parser = Parser::new();
             self.parser_panics += 1;
         }

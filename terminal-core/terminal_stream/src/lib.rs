@@ -5,7 +5,6 @@
 //! its reader thread, `hub_terminal_core` binds the results.
 
 pub mod coalesce;
-pub mod csi_marker;
 pub mod decoder;
 pub mod esc;
 pub mod history;

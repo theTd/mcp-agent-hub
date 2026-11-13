@@ -94,9 +94,6 @@ pub struct Screen {
     tabstops: BTreeSet<usize>,
     /// Combining marks folded into a cell, addressed by `Cell::marks`.
     marks: Vec<Box<str>>,
-    /// pyte's `draw` abandons the rest of the text run on an unprintable character (`break`); the flag
-    /// carries that decision to the following `print` calls until any other action ends the run.
-    print_suspended: bool,
 }
 
 impl Screen {
@@ -118,7 +115,6 @@ impl Screen {
             savepoints: Vec::new(),
             tabstops: BTreeSet::new(),
             marks: Vec::new(),
-            print_suspended: false,
         };
         screen.reset();
         screen
@@ -448,15 +444,21 @@ impl Screen {
     fn restore_cursor(&mut self) {
         match self.savepoints.pop() {
             Some(savepoint) => {
-                self.origin = savepoint.origin;
-                self.wrap = savepoint.wrap;
+                // pyte's `restore_cursor` only *sets* the modes the savepoint had on; a mode turned on
+                // after the save survives the restore.
+                if savepoint.origin {
+                    self.set_mode(6, true);
+                }
+                if savepoint.wrap {
+                    self.set_mode(7, true);
+                }
                 self.x = savepoint.x;
                 self.y = savepoint.y;
                 self.ensure_hbounds();
                 self.ensure_vbounds(true);
             }
             None => {
-                self.origin = false;
+                self.reset_mode(6, true);
                 self.cursor_position(None, None);
             }
         }
@@ -571,22 +573,28 @@ impl Screen {
             self.margins = None;
             return;
         }
-        // pyte passes the CSI values through unshifted (its off-by-one, kept per `oracle-bugs`) and needs
-        // two parameters; one parameter raised a TypeError the hub then dropped (K4).
-        if let (Some(top), Some(bottom)) = (top, bottom) {
-            let top = top.min(self.rows.saturating_sub(1));
-            let bottom = bottom.min(self.rows.saturating_sub(1));
-            if bottom >= top + 1 {
-                self.margins = Some((top, bottom));
-                self.cursor_position(None, None);
-            }
+        // pyte's `set_margins`: the arguments are 1-based, so each is decremented and clamped into
+        // `[0, rows - 1]`; a missing argument keeps the current region's bound (so `ESC[3r` and
+        // `ESC[2;r` both count). A region of fewer than two lines is ignored, and changing it homes the
+        // cursor through `cursor_position`, which is origin-relative.
+        let last = self.rows.saturating_sub(1);
+        let (current_top, current_bottom) = self.margins.unwrap_or((0, last));
+        let top = top.map_or(current_top, |value| value.saturating_sub(1).min(last));
+        let bottom = bottom.map_or(current_bottom, |value| value.saturating_sub(1).min(last));
+        if bottom >= top + 1 {
+            self.margins = Some((top, bottom));
+            self.cursor_position(None, None);
         }
     }
 
     fn set_mode(&mut self, mode: u16, private: bool) {
         match (private, mode) {
             (true, 7) => self.wrap = true,
-            (true, 6) => self.origin = true,
+            (true, 6) => {
+                self.origin = true;
+                // pyte: "According to VT520 manual, DECOM should also home the cursor."
+                self.cursor_position(None, None);
+            }
             (true, 3) => {
                 self.saved_columns = Some(self.cols);
                 self.resize(132, self.rows);
@@ -602,7 +610,11 @@ impl Screen {
     fn reset_mode(&mut self, mode: u16, private: bool) {
         match (private, mode) {
             (true, 7) => self.wrap = false,
-            (true, 6) => self.origin = false,
+            (true, 6) => {
+                self.origin = false;
+                // Clearing DECOM homes the cursor too (`reset_mode` follows `set_mode`'s logic).
+                self.cursor_position(None, None);
+            }
             (true, 3) => {
                 if let Some(columns) = self.saved_columns.take() {
                     self.resize(columns, self.rows);
@@ -616,13 +628,14 @@ impl Screen {
         }
     }
 
-    /// pyte's `draw` for one character (`Stream` hands it a text run; per character is the same state
-    /// machine when `print` is the only action in between).
+    /// pyte's `draw` for one character, with the hub's fix: a zero-width character that is not
+    /// combining, or an unprintable one, is skipped — it takes no cell, does not trigger a pending wrap
+    /// and changes nothing — and the text after it is still drawn (`HubTerminalScreen.draw`).
     fn draw(&mut self, ch: char) {
-        if self.print_suspended {
+        let width = char_width(ch);
+        if width < 0 || (width == 0 && !is_combining(ch)) {
             return;
         }
-        let width = char_width(ch);
         if self.x == self.cols {
             if self.wrap {
                 self.carriage_return();
@@ -642,12 +655,8 @@ impl Screen {
                     self.set_cell(self.x + 1, self.y, STUB);
                 }
             }
-            0 if is_combining(ch) => self.combine(ch),
-            _ => {
-                // pyte abandons the rest of this text run (`draw`'s bare `break`).
-                self.print_suspended = true;
-                return;
-            }
+            // Zero width, and combining: the only other case left.
+            _ => self.combine(ch),
         }
         if width > 0 {
             self.x = (self.x + width as usize).min(self.cols);
@@ -655,6 +664,10 @@ impl Screen {
     }
 
     /// pyte folds a combining mark into the cell to the left, or the previous row's last cell.
+    ///
+    /// Only the marks are stored: the cell's own character is printed once by `push_cell_text`, and pyte
+    /// holds the base and the marks in one string. pyte additionally NFC-composes that string, which
+    /// needs `unicodedata.normalize`; the marks are kept unnormalised (`screen_exceptions.jsonl`).
     fn combine(&mut self, ch: char) {
         let (x, y) = if self.x > 0 {
             (self.x - 1, self.y)
@@ -670,11 +683,10 @@ impl Screen {
             return;
         };
         let mut text = String::new();
-        if cell.marks == 0 {
-            text.push(cell.ch);
-        } else if let Some(marks) = self.marks.get((cell.marks - 1) as usize) {
-            text.push(cell.ch);
-            text.push_str(marks);
+        if cell.marks != 0 {
+            if let Some(marks) = self.marks.get((cell.marks - 1) as usize) {
+                text.push_str(marks);
+            }
         }
         text.push(ch);
         self.marks.push(text.into_boxed_str());
@@ -700,14 +712,24 @@ fn param(params: &Params, index: usize) -> Option<usize> {
         .map(|value| value as usize)
 }
 
+/// pyte's `csi_dispatch` argument list: a parameter written empty (`,4` in `ESC[;4r`, `2;` in `ESC[2;r`)
+/// is a 0 to pyte, while a parameter that was not written at all is absent. `param` collapses those two,
+/// which is harmless for every handler but `set_margins` (`ESC[2;r` means top 2, bottom 0 to pyte).
+fn param_written(params: &Params, index: usize) -> Option<usize> {
+    params
+        .iter()
+        .nth(index)
+        .map(|values| values.first().copied().unwrap_or(0) as usize)
+}
+
 fn private_marker(intermediates: &[u8]) -> bool {
     intermediates.contains(&b'?')
 }
 
 impl Perform for Screen {
     fn print(&mut self, c: char) {
-        // pyte's `Stream` never draws NUL or DEL (`NUL_OR_DEL`); vte hands DEL to `print`. Skipping them
-        // also leaves pyte's "abandon the rest of the run" state alone, as a skipped character would.
+        // pyte's `Stream` never draws NUL or DEL (`NUL_OR_DEL`); vte hands DEL to `print`. Neither takes
+        // a cell nor changes the cursor.
         if c == '\0' || c == '\x7f' {
             return;
         }
@@ -715,7 +737,6 @@ impl Perform for Screen {
     }
 
     fn execute(&mut self, byte: u8) {
-        self.print_suspended = false;
         match byte {
             0x07 => {}
             0x08 => self.cursor_back(1),
@@ -729,7 +750,6 @@ impl Perform for Screen {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
-        self.print_suspended = false;
         let private = private_marker(intermediates);
         let first = param(params, 0);
         let second = param(params, 1);
@@ -781,7 +801,7 @@ impl Perform for Screen {
                 }
             }
             'm' => {}
-            'r' => self.set_margins(first, second),
+            'r' => self.set_margins(param_written(params, 0), param_written(params, 1)),
             '\'' => self.cursor_to_column(first),
             // pyte has no handler for these (`Stream` dispatches them to `debug`): DA, DSR, window ops
             // and the rest must draw nothing and change nothing.
@@ -790,7 +810,6 @@ impl Perform for Screen {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        self.print_suspended = false;
         if !intermediates.is_empty() {
             // `ESC ( B`, `ESC # 8`, `ESC % G`: pyte ignores the charset selections and only DECALN draws.
             if intermediates == [b'#'] && byte == b'8' {
@@ -817,7 +836,7 @@ impl Perform for Screen {
     }
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        self.print_suspended = false;
+        // Titles and the like: this model draws nothing and keeps no state for them.
     }
 }
 
