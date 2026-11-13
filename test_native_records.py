@@ -276,10 +276,13 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                 options=["Approve", "Deny"], source="omp_tui_screen_detector",
                 metadata={"command": full, "call_id": "c1"},
             )
+            sess._omp_open_approvals["c2"] = {"event": {"call_id": "c2"}, "registered": True}
             self.append(path, result("c2"))
             await self.until(lambda: "c2" not in sess._open_transcript_tools)
             self.assertIsNotNone(sess.pending_interaction)
             self.assertEqual(sess._inflight_transcript_tool["call_id"], "c1")
+            # A finished call's approval request is over even when its resolution was never read.
+            self.assertNotIn("c2", sess._omp_open_approvals)
             self.append(path, result("c1"))
             await self.until(lambda: sess.pending_interaction is None)
             self.assertEqual(sess._open_transcript_tools, {})

@@ -954,6 +954,10 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
 # - bypass: no checks (the profile's `bypass_approvals: true`, or a session override).
 ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
 OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
+# The omp extension that appends omp's own tool approval events to the file named by
+# OMP_APPROVAL_LOG_ENV (one per hub session): approval boxes are learnt from omp, not the screen.
+OMP_APPROVAL_EXTENSION_NAME = "omp_approval_event_log.ts"
+OMP_APPROVAL_LOG_ENV = "HUB_OMP_APPROVAL_LOG"
 CLAUDE_APPROVAL_SETTINGS_NAME = "claude-approval.json"
 CLAUDE_AUTO_SETTINGS_NAME = "claude-auto-approval.json"
 APPROVAL_MODES = ("auto", "ask", "bypass")
@@ -966,6 +970,11 @@ AGY_SESSION_SETTINGS: Dict[str, Any] = {"agentMode": "auto"}
 def omp_approval_overlay_path() -> Path:
     """D2: the omp settings overlay shipped in the repo (bash allowed, high-risk patterns prompt)."""
     return ENGINE_POLICIES_DIR / OMP_APPROVAL_OVERLAY_NAME
+
+
+def omp_approval_extension_path() -> Path:
+    """The omp extension shipped in the repo that logs omp's tool approval events for the hub."""
+    return ENGINE_POLICIES_DIR / OMP_APPROVAL_EXTENSION_NAME
 
 
 def _render_claude_overlay(name: str, events: tuple) -> Path:
@@ -1028,6 +1037,11 @@ def _is_omp_overlay_path(value: str) -> bool:
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_OVERLAY_NAME
 
 
+def _is_omp_approval_extension_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_EXTENSION_NAME
+
+
 def _is_claude_approval_settings_path(value: str) -> bool:
     raw = str(value or "").strip().strip('"').strip("'")
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() in (
@@ -1055,6 +1069,10 @@ def _approval_flag_tokens(engine: str, args: List[str]):
             elif a.startswith("--config=") and _is_omp_overlay_path(a.split("=", 1)[1]):
                 width, label = 1, "--config="
             elif a == "--config" and _is_omp_overlay_path(nxt(i)):
+                width = 2
+            elif a.startswith("--extension=") and _is_omp_approval_extension_path(a.split("=", 1)[1]):
+                width, label = 1, "--extension="
+            elif a in ("--extension", "-e") and _is_omp_approval_extension_path(nxt(i)):
                 width = 2
         elif eng == "kimi":
             if a in ("--auto", "--yolo", "-y"):
@@ -1143,7 +1161,8 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
     """The flags the hub injects so `engine` runs with high-risk approval on (D2-D5)."""
     eng = (engine or "").strip().lower()
     if eng == "omp":
-        return ["--approval-mode=write", f"--config={omp_approval_overlay_path()}"]
+        return ["--approval-mode=write", f"--config={omp_approval_overlay_path()}",
+                f"--extension={omp_approval_extension_path()}"]
     if eng == "kimi":
         return ["-y"]
     if eng == "codex":
@@ -1452,10 +1471,28 @@ def parse_omp_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
 # registered with the box's own text. omp writes the call before it draws the box; the watcher reads
 # the transcript every TRANSCRIPT_TAIL_INTERVAL_SEC.
 OMP_BOX_CALL_WAIT_SEC = 1.0
+# omp's approval events (engine_policies/omp_approval_event_log.ts). omp writes the request just
+# before it draws the box, after the call is in its transcript: a request waits this long for the
+# box (its option rows) and for the call (the full command) before it is registered without them.
+OMP_EVENT_BOX_WAIT_SEC = 1.5
+# With the events working, a box on screen that no open request covers is registered from the
+# screen only once it has stayed this long (omp stopped sending the events, or one went missing).
+OMP_SCREEN_FALLBACK_GRACE_SEC = 3.0
 CLIPPED_COMMAND_NOTE = (
     "The command is cut off on the worker's screen and its full text was not found in the "
     "worker's transcript: inspect the session before approving."
 )
+UNREAD_OMP_BOX_NOTE = (
+    "omp asked for approval, but its box could not be read and the call is not in the worker's "
+    "transcript yet: inspect the session before approving."
+)
+# The options offered for an omp approval whose box could not be read (the answer keys still work).
+OMP_UNREAD_BOX_OPTIONS = ("Approve", "Deny")
+
+
+def omp_approval_request_id(call_id: str) -> str:
+    """The interaction id of omp's approval request for one tool call (stable across reads)."""
+    return "omp-" + hashlib.sha1(str(call_id).encode("utf-8")).hexdigest()[:12]
 
 
 def screen_command_clipped(command: str) -> bool:
@@ -2191,6 +2228,12 @@ class AgentSession:
         self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
         # omp runs tool calls side by side: every started call without a result yet, by call id.
         self._open_transcript_tools: Dict[str, Dict[str, Any]] = {}
+        # omp's approval events: read offset; requests not resolved yet, by call id (in order); set
+        # once the log shows the extension loaded; when a box no request covers was first seen.
+        self._omp_approval_offset: int = 0
+        self._omp_open_approvals: Dict[str, Dict[str, Any]] = {}
+        self._omp_approval_events_live: bool = False
+        self._omp_uncovered_box_since: float = 0.0
         self._claude_hook_offset: int = 0
         self._kimi_wire_interaction_offset: int = 0
 
@@ -5110,6 +5153,8 @@ class HubSessionManager:
                     sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
                 except OSError:
                     sess._claude_hook_offset = 0
+        elif engine == "omp":
+            self._prime_omp_approval_log(sess, resume_env)
         try:
             # A9: a failed spawn (bad command, missing binary) must leave the archived record exactly
             # as it was — no zombie row, and the old ended object back in the live list.
@@ -8560,6 +8605,8 @@ class HubSessionManager:
                         elif role == "toolResult":
                             result_call_id = str(msg.get("toolCallId") or "").strip()
                             session._open_transcript_tools.pop(result_call_id, None)
+                            # A finished call asks nothing any more, even if its resolution was lost.
+                            session._omp_open_approvals.pop(result_call_id, None)
                             session._inflight_transcript_tool = next(
                                 reversed(session._open_transcript_tools.values()), None
                             )
@@ -11663,18 +11710,23 @@ class HubSessionManager:
                 return None
             await asyncio.sleep(0.05)
 
-    async def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
-        """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered.
+    @staticmethod
+    def _omp_approval_fields(
+        tool: str, parsed: Optional[Dict[str, Any]], call: Optional[Dict[str, Any]], reason: str = ""
+    ) -> Dict[str, Any]:
+        """Title, prompt, options and metadata of one omp tool approval (register_pending_interaction).
 
-        omp cuts long commands on the box, so the parent gets the command from the box's tool call
-        in the transcript (command_source=transcript). Without that call the box text is used, and a
-        cut one is marked command_truncated with a note, so the parent never approves it blind.
+        `parsed` is the box read off the screen (None: not read), `call` the transcript tool call it
+        asks about (None: not known). omp cuts long commands on the box, so the command comes from
+        the call (command_source=transcript); otherwise from the box, marked command_truncated with a
+        note when the box cut it, so the parent never approves it blind. "Always Approve …" grants
+        persist and are not offered. Without the box the options are Approve / Deny, which the
+        answer keys (Ctrl+Q / Escape) reach on any box.
         """
-        offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
-        tool = str(parsed.get("tool") or "").strip()
-        screen_cmd = str(parsed.get("command") or "").strip()
-        call = await self._omp_tool_call_for_box(session, tool, screen_cmd)
-        details = list(parsed.get("details") or [])
+        box = parsed or {}
+        details = list(box.get("details") or [])
+        if not details and reason:
+            details = [f"Reason: {reason}"]
         full_cmd = str((call or {}).get("command") or "").strip()
         if full_cmd:
             command, source = full_cmd, "transcript"
@@ -11682,7 +11734,7 @@ class HubSessionManager:
             cut_at = next((i for i, row in enumerate(details) if row.startswith("Command:")), len(details))
             details = details[:cut_at]
         else:
-            command, source = screen_cmd, "screen"
+            command, source = str(box.get("command") or "").strip(), ("screen" if parsed else "none")
         truncated = source == "screen" and screen_command_clipped(command)
         tool_label = tool or str((call or {}).get("tool_name") or "")
         lines = [f"Allow tool: {tool_label or '?'}"] + details
@@ -11690,25 +11742,172 @@ class HubSessionManager:
             lines.append(f"Command: {command}")
         if truncated:
             lines.append(CLIPPED_COMMAND_NOTE)
-        return await self.register_pending_interaction(
-            session=session,
-            kind="approval_request",
-            title=f"OMP Tool Approval ({tool_label or 'tool'})",
-            prompt="\n".join(lines),
-            options=offered,
-            source="omp_tui_screen_detector",
-            metadata={
+        elif source == "none":
+            lines.append(UNREAD_OMP_BOX_NOTE)
+        box_options = list(box.get("options") or [])
+        offered = [o for o in (box_options or list(OMP_UNREAD_BOX_OPTIONS)) if classify_approval_label(o) != "persist"]
+        return {
+            "title": f"OMP Tool Approval ({tool_label or 'tool'})",
+            "prompt": "\n".join(lines),
+            "options": offered,
+            "metadata": {
                 "omp_prompt": "tool",
-                "omp_options": list(parsed.get("options") or []),
-                "selected_index": int(parsed.get("selected_index") or 0),
-                "session_label": parsed.get("session_label"),
+                "omp_options": box_options,
+                "selected_index": int(box.get("selected_index") or 0),
+                "session_label": box.get("session_label"),
                 "command": command,
                 "command_source": source,
                 "command_truncated": truncated,
                 "transcript_tool": (call or {}).get("tool_name"),
                 "call_id": (call or {}).get("call_id") or None,
             },
+        }
+
+    async def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
+        """D7: omp's tool approval box, read off the screen: the path without omp's approval events
+        (an omp started before they were wired in, or one that stopped sending them)."""
+        tool = str(parsed.get("tool") or "").strip()
+        call = await self._omp_tool_call_for_box(session, tool, str(parsed.get("command") or "").strip())
+        return await self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            source="omp_tui_screen_detector",
+            **self._omp_approval_fields(tool, parsed, call),
         )
+
+    def _omp_approval_log_path(self, session: AgentSession) -> Optional[Path]:
+        """The file engine_policies/omp_approval_event_log.ts appends this session's events to."""
+        sid = str(session.session_id or "")
+        if not re.match(r"^[A-Za-z0-9_.\-]+$", sid):
+            return None
+        return self.runtime_configs_dir / f"omp_approvals_{sid}.jsonl"
+
+    def _prime_omp_approval_log(self, session: AgentSession, env: Dict[str, str]) -> None:
+        """Points an omp about to start at its session's approval log; only what it writes from now
+        on is read (a resumed session's old records are not asked again)."""
+        log_path = self._omp_approval_log_path(session)
+        if log_path is None:
+            return
+        env[OMP_APPROVAL_LOG_ENV] = str(log_path)
+        try:
+            session._omp_approval_offset = log_path.stat().st_size if log_path.is_file() else 0
+        except OSError:
+            session._omp_approval_offset = 0
+
+    async def _drain_omp_approval_events(self, session: AgentSession) -> None:
+        """Reads omp's approval events appended since the last read (omp_approval_event_log.ts).
+
+        A request means omp is about to ask about one tool call; a resolution means that box was
+        answered (by anyone) or aborted, and clears its registration. The oldest open request not
+        registered yet is registered once nothing else is pending, so side-by-side calls ask one at
+        a time. A box the screen detector registered first is adopted by its request.
+        """
+        log_path = self._omp_approval_log_path(session)
+        if log_path is None or not log_path.is_file():
+            return
+        try:
+            lines, session._omp_approval_offset = read_complete_lines(log_path, int(session._omp_approval_offset or 0))
+        except OSError:
+            return
+        opened = session._omp_open_approvals
+        try:
+            for raw in lines:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                session._omp_approval_events_live = True
+                call_id = str(ev.get("call_id") or "").strip()
+                if not call_id:
+                    continue
+                if ev.get("event") == "tool_approval_requested":
+                    opened[call_id] = {"event": ev, "registered": False}
+                elif ev.get("event") == "tool_approval_resolved":
+                    opened.pop(call_id, None)
+                    await self._clear_omp_call_approval(session, call_id)
+            pending = session.pending_interaction
+            if pending is not None and not (
+                pending is getattr(session, "_unadopted_screen_interaction", None)
+                and (pending.get("metadata") or {}).get("omp_prompt") == "tool"
+            ):
+                return
+            head = next((cid for cid, entry in opened.items() if not entry["registered"]), None)
+            if head is not None:
+                opened[head]["registered"] = True
+                await self._register_omp_event_approval(session, opened[head]["event"])
+        except PersistenceUnavailable:
+            raise
+        except Exception:
+            logger.exception("[%s] reading omp approval events failed", session.session_id)
+
+    async def _clear_omp_call_approval(self, session: AgentSession, call_id: str) -> None:
+        """Clears the pending approval of one omp tool call (its box was answered or aborted)."""
+        pending = session.pending_interaction
+        if not pending:
+            return
+        meta = pending.get("metadata") or {}
+        if omp_approval_request_id(call_id) in self._interaction_ids(pending) or str(meta.get("call_id") or "") == call_id:
+            await self.clear_pending_interaction(session)
+
+    @staticmethod
+    def _omp_box_shows_call(parsed: Dict[str, Any], tool: str, call: Optional[Dict[str, Any]]) -> bool:
+        """Whether a box on screen is the one asking about `tool` / `call` and not an earlier box
+        still drawn: the same tool, and (call known) a command the call's command starts with."""
+        box_tool = str(parsed.get("tool") or "").strip()
+        if tool and box_tool and box_tool != tool:
+            return False
+        if call is None:
+            return True
+        return tool_call_for_approval_box(box_tool, str(parsed.get("command") or ""), [call]) is not None
+
+    async def _register_omp_event_approval(self, session: AgentSession, ev: Dict[str, Any]):
+        """Registers omp's approval request for one tool call (an event, not the box's text).
+
+        The request is written just before omp draws the box; it waits up to OMP_EVENT_BOX_WAIT_SEC
+        for the box (its option rows, for the answer keys) and the call (its full command).
+        """
+        call_id = str(ev.get("call_id") or "")
+        tool = str(ev.get("tool_name") or "").strip()
+        max_rows = max(38, int(getattr(session, "rows", 38) or 38))
+        deadline = time.monotonic() + OMP_EVENT_BOX_WAIT_SEC
+        while True:
+            call = session._open_transcript_tools.get(call_id)
+            parsed = parse_omp_approval_prompt(session.get_clean_screen_text(max_lines=max_rows))
+            if parsed is not None and not self._omp_box_shows_call(parsed, tool, call):
+                parsed = None
+            if (parsed is not None and call is not None) or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        fields = self._omp_approval_fields(tool, parsed, call, reason=str(ev.get("reason") or ""))
+        fields["metadata"].update({
+            "call_id": call_id,
+            "detected_by": "omp_event",
+            "approval_reason": ev.get("reason"),
+            "approval_mode": ev.get("approval_mode"),
+        })
+        return await self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            source="omp_approval_event",
+            request_id=omp_approval_request_id(call_id),
+            **fields,
+        )
+
+    def _omp_box_left_to_events(self, session: AgentSession) -> bool:
+        """With omp's approval events live, a box on screen is theirs to register: an open request
+        covers it, or its request is expected within OMP_SCREEN_FALLBACK_GRACE_SEC. A box no request
+        covers for longer is registered from the screen (omp stopped sending the events)."""
+        if not getattr(session, "_omp_approval_events_live", False):
+            return False
+        if getattr(session, "_omp_open_approvals", None):
+            session._omp_uncovered_box_since = 0.0
+            return True
+        now = time.monotonic()
+        if not session._omp_uncovered_box_since:
+            session._omp_uncovered_box_since = now
+        return now - session._omp_uncovered_box_since < OMP_SCREEN_FALLBACK_GRACE_SEC
 
     async def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """Claude Code permission prompt fallback: options are offered by label."""
@@ -11923,6 +12122,8 @@ class HubSessionManager:
             await self._drain_claude_hook_events(session)
         elif eng == "kimi":
             await self._drain_kimi_wire_interactions_once(session)
+        elif eng == "omp":
+            await self._drain_omp_approval_events(session)
         if session.pending_interaction is not None:
             return session.pending_interaction
         # D7: an answered prompt can stay on screen for a moment; it is not a new one.
@@ -12016,8 +12217,14 @@ class HubSessionManager:
             return None
 
         # 4) OMP tool approval box ("Allow tool: <name>" + "Approve…" rows + "Deny").
+        # With omp's approval events live, the box is registered from its event (see
+        # _omp_box_left_to_events); the screen only stands in when the events stop.
         omp_prompt = parse_omp_approval_prompt(scr) if eng == "omp" else None
+        if eng == "omp" and omp_prompt is None:
+            session._omp_uncovered_box_since = 0.0
         if omp_prompt is not None:
+            if self._omp_box_left_to_events(session):
+                return None
             sig = f"omp_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
@@ -12704,6 +12911,8 @@ class HubSessionManager:
                     sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
                 except OSError:
                     sess._claude_hook_offset = 0
+        elif engine == "omp":
+            self._prime_omp_approval_log(sess, env_overrides)
         sess.start_pty(loop, env_overrides=env_overrides or None)
         self.sessions[session_id] = sess
         await self.persist_session(sess)
