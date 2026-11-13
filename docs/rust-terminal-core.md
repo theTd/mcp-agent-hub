@@ -170,19 +170,23 @@ hub_terminal_core.pyd (cdylib; kernel32 for ConPTY/pipes/jobs, bcrypt for the ti
 
 ### 5.2 Calls from Python
 
-Every call that can block releases the GIL first (`Python::allow_threads`, exact API name depends on the
-PyO3 version — unverified) and waits on the core's own state with a deadline. A call that misses its
-deadline returns the last cached value and leaves the session marked `degraded`, so a wedged reader
-thread can never hold the hub's loop.
+Every call that can block releases the GIL first (`Python::detach` in PyO3 0.30, which replaced
+`allow_threads`) and waits on the core's own state with a deadline. A call that misses its deadline
+returns the last cached value and leaves the session `degraded`; `degraded` is itself a dirty flag, so the
+next drain reports it without waiting for new output, and the next call that gets its lock again clears
+it. A call that cannot do its work inside the deadline reports that instead of a partial success: `write`
+raises `TimeoutError` with nothing queued. `spawn`'s 2 s is a gate, not a timer — `CreateProcessW` cannot
+be interrupted once entered — so the selftest measures 20 `cmd.exe` spawns and fails the release when p99
+exceeds 2 s, a spawn over the bound is logged with its measured time, and the reply carries `elapsed_ms`.
 
 | call | arguments | reply | deadline | replaces |
 |---|---|---|---|---|
-| `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows | 2 s | `PtyProcess.spawn` (`:2262`), `push_ws_frame` of the resume banner (`:2271`) |
+| `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows, elapsed_ms | 2 s, measured by the selftest (not interruptible) | `PtyProcess.spawn` (`:2262`), `push_ws_frame` of the resume banner (`:2271`) |
 | `attach_text` | session_id, cols, rows, flags, seed | ok | 50 ms | `HubTerminalScreen` for DSH virtual sessions |
 | `feed` | session_id, text | rev | 50 ms | `_on_pty_output` for virtual sessions |
-| `write` | session_id, text | queued bytes | 50 ms | `pty.write` (`:2465`) |
-| `resize` | session_id, cols, rows | cols, rows | 50 ms | `pty.setwinsize` + `screen.resize` (`:2490`) |
-| `kill` | session_id, grace_ms | exit_code | 2 s | `taskkill /T /F` (`:2593`, `:5680`) |
+| `write` | session_id, text | bytes queued: the whole text or nothing; `0` for empty text; `TimeoutError` when the queue is still full at the deadline | 50 ms | `pty.write` (`:2465`) |
+| `resize` | session_id, cols, rows | cols, rows; `ValueError` when the pseudoconsole is already closing/closed, `TimeoutError` when the console is busy past the deadline | 50 ms | `pty.setwinsize` + `screen.resize` (`:2490`) |
+| `kill` | session_id, grace_ms | exit_code (None when the process outlived the budget) | 2 s for the whole call: the exit wait, then the same teardown the reaper runs (console close, wait for the reader's last bytes), which publishes on its deadline at the latest | `taskkill /T /F` (`:2593`, `:5680`) |
 | `screen` | session_id, max_lines | text, cursor, cols, rows, rev | 50 ms | `get_clean_screen_text` (`:2499`) |
 | `scrollback` | session_id, max_lines | text, rev | 50 ms | `get_full_scrollback_text` (`:2516`) |
 | `raw` | session_id | text, bytes, rev | 50 ms | `"".join(raw_history)` (`:4454`) |
@@ -191,8 +195,13 @@ thread can never hold the hub's loop.
 | `ws_ticket` | session_id, ttl_ms | url, expires_at | 1 ms | nothing (the ticket is new, §6.4) |
 | `close_sockets` | session_id | count | 50 ms | `close_ws_frontends` (`:2415`, W7: normal close, code 1000) |
 | `snapshot_all` | max_lines, max_bytes | per-session dict | whole 8 s budget | graceful shutdown (`graceful-budget`) |
-| `kill_all` | grace_ms | ok | 2 s after `snapshot_all` | shutdown (`shutdown-ends-cli`) |
-| `stats` | — | counters | 5 ms | diagnostics; the 50 ms drain is the normal reader |
+| `kill_all` | grace_ms | ok; `TimeoutError` when the session table could not be snapshotted inside the budget | 2 s for the whole set after `snapshot_all`, every session in parallel | shutdown (`shutdown-ends-cli`) |
+| `stats` | — | counters (GIL released, table read bounded) | 5 ms | diagnostics; the 50 ms drain is the normal reader |
+
+The write queue's cap is 1 MiB (`CoreOptions::write_queue_bytes`). The cap bounds what *waits* in the
+queue, not what one call may hand it: a text larger than the cap is accepted whole when the queue is
+empty, so a paste bigger than 1 MiB behaves as it did under pywinpty, and only a second write that
+arrives while the first is still queued gets `TimeoutError`.
 
 `flags` for `spawn`/`attach_text`: `strip_esc3j_on_output` (true when `resume_count > 0`),
 `strip_osc_color_queries` (always true today), `history_rows` (3000), `raw_cap_bytes` (512 KiB),
@@ -214,19 +223,32 @@ interval, however much output arrived:
 - Ticker every 5 ms: flush batches that are due (§5.4) to the core's own sockets.
 - At most every 50 ms (the drain interval) and only if any session is dirty, the ticker calls the one
   callback the hub registered, from a thread that attaches to the interpreter just for that call
-  (`Python::attach` — the name is version dependent, unverified) and calls
+  (`Python::try_attach` in PyO3 0.30; during interpreter finalization it returns `None` and the tick is
+  dropped) and calls
   `loop.call_soon_threadsafe(hub._on_core_tick)`. One wakeup for all sessions.
 - `hub._on_core_tick` runs on the loop and makes a single `core.drain()` call, which returns only the
   sessions whose flags were set and clears them: `(session_id, last_output_at, bytes_total,
   chunks_total, screen_rev, alive, exit_code, dropped_bytes, screen_text)` — `screen_text` only for a
   watched session whose `screen_rev` changed.
-- Exits are not queued behind the interval: the reader thread sets `alive = false` and an `urgent` flag,
-  and the ticker notifies on its next 5 ms tick even if the 50 ms window has not elapsed. That is one
-  extra wakeup per session end, and the hub sees a process die within 5 ms.
-
-An exit also carries the only payload the hub wants with it: the core keeps the final screen, so the
-drain record carries `exit_code` and the hub asks for `scrollback(80)` in the same handler, exactly where
-`_finish_read` does it today (`:2305`).
+- Exits are detected on the process handle, not on the output pipe. The write end of the console's
+  output pipe belongs to conhost, which lives as long as we hold the HPCON, so a session that exits by
+  itself never ends the reader's read. Each session therefore has one reaper thread (512 KiB stack: its
+  teardown ends in the `log` callback) blocked in `WaitForSingleObject(process, INFINITE)`; on the signal
+  it records `GetExitCodeProcess` (a failed query logs and leaves `exit_code = None`) and runs the **one**
+  exit teardown, the same one `kill` runs: take the pseudoconsole with the close deadline,
+  `ClosePseudoConsole` on a helper thread, wait for the reader's end of output inside the remaining
+  budget, then publish — or publish on the deadline, because a wedged close must cost the last bytes,
+  never the record (§12.7). The console slot is three-state (`open`/`closing`/`closed`), never "the
+  handle is gone, so it is closed", so a second closer that finds another one inside
+  `ClosePseudoConsole` waits for that completion instead of publishing over a live read. The death
+  record (`alive = false`, one dirty record, `urgent`, so the ticker notifies on its next 5 ms tick)
+  therefore never precedes the session's last byte: the hub sees a process die within 5 ms and asks for
+  `scrollback(80)` in the same handler, exactly where `_finish_read` does it today (`:2305`).
+- A code learned after the death record went out — a crashed session the hub drained and then killed,
+  or a late `GetExitCodeProcess` — marks the session dirty and pending, so the next drain carries it;
+  the drain record stays the hub's only exit-code source. `kill` reads the code before
+  `TerminateJobObject`, because a process that has exited but is still terminating can have its code
+  replaced by the job's termination code.
 
 Note that Windows' Proactor loop has no `add_reader` (`NotImplementedError`, verified on CPython 3.14.7),
 so a self-pipe cannot be used to wake the loop; `call_soon_threadsafe` is the only mechanism, which is
@@ -425,9 +447,17 @@ today.
 - Sessions end with the hub by construction: the module and its threads die with the interpreter, so
   `shutdown-ends-cli` needs no supervision code — but it does need ordering, or agents are left with a
   dead MCP endpoint. Shutdown keeps the recorded order (`graceful-budget`): stop producers,
-  `snapshot_all(max_lines=250, max_bytes=512 KiB)` per live session, `kill_all(grace_ms=2000)`
-  (`TerminateJobObject` per session job), then drain persistence inside the shared 8 s budget.
-  `snapshot_all` returns what `persist_session` archives today (`:4369`), so the rows do not change.
+  `snapshot_all(max_lines=250, max_bytes=512 KiB)` per live session, `kill_all(grace_ms=2000)` — every
+  session terminated in parallel inside one 2 s budget, `TerminateJobObject` first and
+  `ClosePseudoConsole` on a helper that may outlive the call — then drain persistence inside the shared
+  8 s budget. `snapshot_all` returns what `persist_session` archives today (`:4369`), so the rows do not
+  change.
+- Interpreter exit does not kill sessions by itself: the per-session job objects do. Each session holds a
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job, so the CLI trees die when the interpreter's handles close even
+  if `kill_all` never ran (a crash, a `taskkill`), which is the guarantee the desktop app's outer job gave
+  pywinpty. Two paths skip rather than wait during finalization: the ticker's `notify`
+  (`Python::try_attach` returns `None`, the tick is dropped) and the join in `Core`'s drop (the ticker is
+  left to exit by itself).
 - Each session gets its own job object at spawn (`CreateJobObjectW` +
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `AssignProcessToJobObject`). Inside the desktop app the hub
   already runs in the app's kill-on-close job (`owned_hub.rs:142`), so these jobs are nested; nested jobs
@@ -694,11 +724,19 @@ Run only when the machine is idle; it is not part of the default suite.
    access violation) kills the whole hub. Mitigation: `cargo metadata` profile assertion in CI, and no
    `unsafe` outside the `windows` FFI wrappers, each with a `// SAFETY:` note in the existing style.
 6. **Control path on the event loop.** A wedged reader costs up to the deadline per call (50 ms for
-   screen/scrollback/raw, 2 s for spawn/kill). Mitigation: deadline, cached-snapshot fallback, `degraded`
-   marking, and the readers never taking the session mutex for longer than a batch append.
+   write/resize/screen/scrollback/raw/stats, 2 s for spawn/kill/kill_all). Mitigation: deadline,
+   cached-snapshot fallback, `degraded` marking (itself a dirty flag, cleared by the next successful
+   call), and readers that hold the session mutex only for one buffer append. `spawn`'s 2 s cannot be
+   enforced — `CreateProcessW` is not interruptible — so it is a release gate measured by the selftest
+   (20 spawns, p50/p99 printed) and logged when exceeded, not a timer.
 7. **ConPTY close/resize races.** Closing a pseudoconsole while a read is pending is a known source of
-   hangs (unverified specifics). Mitigation: close on a helper thread with a deadline after
-   `TerminateJobObject`, and never close the console handle from the reader thread.
+   hangs (unverified specifics). Mitigation: the close happens exactly once, through a three-state slot,
+   always on a helper thread with a deadline, never on the reader thread; `resize` holds that slot across
+   `ResizePseudoConsole` (releasing it would let a close invalidate the HPCON), and every other acquirer
+   uses a deadline, so a stalled resize costs the last bytes of one session and one blocked reader
+   thread — the death record, `kill` and `kill_all` still complete inside their budgets. A close helper
+   that outlives its deadline keeps running; the slot stays `closing` until it returns, and callers
+   publish on their own deadline (measured: a few seconds at most under load on a busy machine).
 8. **Nested job objects.** The hub already runs inside the app's kill-on-close job (`owned_hub.rs:142`) and
    the core creates one job per session. Nested jobs are supported on Windows 8+, but whether the outer
    job's limits let the inner handle behave needs the one-hour experiment before step 1 is called done.
@@ -710,8 +748,11 @@ Run only when the machine is idle; it is not part of the default suite.
    build-script fix, not a gate exemption.
 10. **Fixture provenance.** Today's captures came from the bundled `conpty.dll` (pywinpty 3.1.2), while the
     core uses the system ConPTY, so the byte stream can differ in repaint/erase details on day one. Step 0
-    therefore freezes the corpus, and step 1 re-records it against the system ConPTY; where the two differ,
-    the system version wins and the difference is written down.
+    therefore froze the corpus, and step 2a re-recorded claude, codex, kimi and omp on the system ConPTY
+    (exact read bytes, `chunk_encoding: utf8_bytes`); `live-agy` keeps its bundled recording
+    (`agy-bundled-case`). Observed differences: conhost answers DA1, window-title and OSC 10/11 queries
+    itself, so the live streams no longer carry them (the `edge-osc-*` cases still pin the strips), and
+    reads are smaller.
 11. **No Python-side batching.** The parallel unit's Task 1 does not land (owner decision 7). The core's
     coalescing is the only batching, which means before the merge there is no batching at all and after it
     there is exactly one layer — never two, so there is no double-batching case to reason about.
@@ -719,6 +760,12 @@ Run only when the machine is idle; it is not part of the default suite.
     evidence where marked (the `windows` console/job exports, the lock contents, uvicorn's deflate
     default) and marked unverified otherwise (PyO3's panic conversion and abi3 range, `tungstenite`'s
     deflate support); pin them when step 1 opens.
+13. **Exit-code fidelity.** The reaper reads `GetExitCodeProcess` after the handle is signalled, and `kill`
+    reads it *before* `TerminateJobObject` — a process that has exited but is still terminating can have
+    its code replaced by the job's termination code, so the pre-read is what keeps `cmd /c "exit 3"`
+    reporting 3 when the hub kills it in that window. A failed query logs and leaves `exit_code = None`
+    (archived as a crash) instead of a fake 0; a code that arrives after the death record is re-carried
+    by the next drain.
 
 Open questions for the owner: none blocking. Two are deferred by design rather than unanswered: whether
 the `.pyd` ultimately ships as abi3 or per-minor follows from step 1's abi3 probe, and permessage-deflate

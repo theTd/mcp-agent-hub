@@ -4,7 +4,8 @@ Design decisions confirmed by the owner. Change a line here before changing the 
 
 ## Rust terminal core (2026-11-12, owner: decision page `hub-rust-core-1112`)
 
-Planned design: `docs/rust-terminal-core.md`. Nothing in it is implemented yet.
+Design: `docs/rust-terminal-core.md`. On `feat/rust-terminal-core`: step 0 (frozen corpus), step 1 (ConPTY
+skeleton) and step 2a (corpus re-recorded on the system ConPTY). The hub does not use the core yet.
 
 | id | decision |
 |---|---|
@@ -26,6 +27,8 @@ Medium decisions taken while building steps 0 and 1. Each is easy to reverse; th
 | write-contract | `write` queues all or nothing: it returns the bytes queued, 0 for empty text, and raises `TimeoutError` when the queue is still full at the deadline (doc §5.2). | Partial writes that return a count. | Contract change in §5.2 and in step 3's caller. |
 | kill-all-parallel | `kill_all` terminates every session in parallel inside one 2 s budget. | Serial, with a per-session cap. | Local to the core. |
 | scrub-uuids | The corpus scrub replaces every UUID-shaped token and `session_<hex>` with a placeholder. | Engine-specific rules only. | Narrow the rule and re-render. |
+| write-oversize | A `write` larger than the 1 MiB queue cap is accepted whole when the queue is empty, so a paste over 1 MiB works as it did under pywinpty; otherwise all-or-nothing with `TimeoutError` (doc §5.2). | Reject it up front with `ValueError` and have step 3 split pastes. | Swap the fit test; one test. |
+| agy-bundled-case | `live-agy` keeps its pywinpty (bundled ConPTY) recording: the owner's agy config enables the `agent-hub` MCP server on 4444 and agy has no session-scoped switch, so the recorder refuses. The conhost differences are engine-independent and the other four engines cover them. | Disable agy's hub MCP server for one recording (owner's call), or record with the live hub attached. | Re-run the recorder for agy once the server is disabled. |
 | tests-fail-without-pyd | `test_terminal_core_client.py` fails, not skips, when the extension is missing: after the cut-over the hub cannot run without it. | Skip with a warning. | One decorator. |
 
 ## Event-loop stalls (2026-11-12, owner: batch decision page, all defaults)
