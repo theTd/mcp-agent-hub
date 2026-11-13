@@ -35,12 +35,12 @@ a golden ends in whatever the hub's rendered text ends in (usually no newline, b
 ``trim``     trimmed.txt: ``trim_history_text`` of the joined corpus with meta's ``max_bytes``.
 ``input``    stripped.txt: what ``strip_osc_terminal_replies`` lets through, message by message.
 
-``chunk_encoding`` in meta.json is ``text`` for recordings (winpty hands the hub ``str``) and
-``utf8_bytes`` for the byte-level edge case: the chunks are base64 of what a ConPTY pipe delivers.
-``pywinpty``'s own ``read`` completes a split character *inside the same chunk* (it may exceed the
-read size), so today's transport has no carry; the decoder below instead carries the partial bytes
-into the next chunk, which is the 3-byte carry the core plans (design §5.4).  Either way the text the
-hub is fed is the same, so the goldens do not depend on which of the two is modelled.
+``chunk_encoding`` in meta.json is ``text`` for the step-0 pywinpty recordings (winpty hands the hub
+``str``) and ``utf8_bytes`` for a system-ConPTY recording and for the byte-level edge case: ``chunk``
+is base64 of exactly what one ``ReadFile`` returned (one pipe read, 8 KiB buffer), so a multi-byte
+character split across two reads stays split.  The decoder below carries the partial bytes into the
+next chunk, which is the 3-byte carry the core implements (design §5.4); the text the hub is fed is
+the same either way, so the goldens do not depend on which of the two is modelled.
 """
 
 from __future__ import annotations

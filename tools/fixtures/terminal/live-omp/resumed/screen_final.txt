@@ -5,28 +5,27 @@
                                                          ▒▒  ██                  █
                                                              ██       v18.20.0
 
-                                           Tip: Press ⇧⇥ to cycle through reasoning effort levels
+                                  Tip: Say `orchestrate` in your message to drive a multi-phase task with
+                                               parallel subagents — watch it glow as you type
 
 
 
- [Hub Session: session_id=rtc-corpus-omp-d07fe9b0] list the files in this folder and say how many there are; change nothing
+ [Hub Session: session_id=rtc-corpus-omp-6a290039] list the files in this folder and say how many there are; change nothing
 
 
- Top-level of task-files: 3 files + 1 directory = 4 entries.
+ Three files, no subdirectories:
 
- ┌───────────┬──────┬──────┐
- │ Entry     │ Type │ Size │
- ├───────────┼──────┼──────┤
- │ alpha.txt │ file │ 9 B  │
- ├───────────┼──────┼──────┤
- │ beta.txt  │ file │ 8 B  │
- ├───────────┼──────┼──────┤
- │ gamma.md  │ file │ 14 B │
- ├───────────┼──────┼──────┤
- │ data/     │ dir  │ —    │
- └───────────┴──────┴──────┘
+ ┌───────────┬──────┐
+ │ File      │ Size │
+ ├───────────┼──────┤
+ │ alpha.txt │ 6 B  │
+ ├───────────┼──────┤
+ │ beta.txt  │ 5 B  │
+ ├───────────┼──────┤
+ │ gamma.txt │ 6 B  │
+ └───────────┴──────┘
 
- Inside data/: one file, small.csv (19 B). Total files including that: 4. Nothing changed.
+ (The ./.. entries are directory links, not files.) Nothing modified.
 
  Closing session…
 
@@ -34,6 +33,6 @@
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯                                                                                                               ⇧⇥ to change thinking effort
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
- π · ⦸ DeepSeek Flash (clay) · 📁 <SCRATCH>\task-files · ◫ 0.8%/1M ⟲ · $0.00 ↑
-TPS — tok/s · TTFT 7.1s
+ π · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.8%/1M ⟲ · $0.00 ↓
+TPS — tok/s · TTFT 6.7s
 u

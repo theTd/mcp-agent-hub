@@ -4,8 +4,8 @@
   "cols": 120,
   "rows": 36,
   "resize": {
-    "at_ms": 30080,
-    "chunk_index": 365,
+    "at_ms": 36843,
+    "chunk_index": 493,
     "from": [
       120,
       36
@@ -15,7 +15,11 @@
       44
     ]
   },
-  "chunk_encoding": "text",
+  "chunk_encoding": "utf8_bytes",
+  "pty": "system-conpty",
+  "windows_build": "10.0.26220.9836",
+  "read_buffer_bytes": 8192,
+  "resume_count": 1,
   "launch": {
     "command": "omp.EXE",
     "args": [
@@ -24,7 +28,7 @@
       "--approval-mode=write",
       "--no-session",
       "--no-title",
-      "[Hub Session: session_id=rtc-corpus-omp-d07fe9b0] list the files in this folder and say how many there are; change nothing"
+      "[Hub Session: session_id=rtc-corpus-omp-6a290039] list the files in this folder and say how many there are; change nothing"
     ],
     "task_mode": "positional"
   },
@@ -33,18 +37,20 @@
     "isolated_hub_port": 4599,
     "env_keys": [
       "PI_CODING_AGENT_DIR"
-    ]
+    ],
+    "mcp_disabled": [],
+    "mcp_files_inspected": 0
   },
   "session_files": {
     "engine_session_id": null
   },
-  "task": "[Hub Session: session_id=rtc-corpus-omp-d07fe9b0] list the files in this folder and say how many there are; change nothing",
+  "task": "[Hub Session: session_id=rtc-corpus-omp-6a290039] list the files in this folder and say how many there are; change nothing",
   "recorder": {
-    "version": 1,
-    "recorded_at": "2026-11-13T15:56:06+0800",
-    "chunk_count": 385,
-    "bytes": 158530,
-    "max_chunk_bytes": 4097,
+    "version": 2,
+    "recorded_at": "2026-11-13T18:54:29+0800",
+    "chunk_count": 518,
+    "bytes": 77627,
+    "max_chunk_bytes": 3083,
     "events": [
       {
         "event": "spawn",
@@ -53,57 +59,51 @@
       {
         "event": "keys",
         "reason": "approve_read_only",
-        "at_ms": 7419,
-        "bytes": 1
-      },
-      {
-        "event": "keys",
-        "reason": "approve_read_only",
-        "at_ms": 12509,
+        "at_ms": 24447,
         "bytes": 1
       },
       {
         "event": "answer_settled",
-        "at_ms": 30080
+        "at_ms": 33853
       },
       {
         "event": "idle_reached",
-        "at_ms": 50825
+        "at_ms": 57017
       },
       {
         "event": "keys",
         "reason": "exit",
-        "at_ms": 50825,
+        "at_ms": 57017,
         "bytes": 6
       }
     ],
     "exit": {
       "stop_reason": "exited",
       "exit_code": 0,
-      "duration_ms": 51540
-    }
+      "duration_ms": 62515
+    },
+    "read_error": null
   },
   "scrub": {
     "rules": [
       {
-        "label": "extra_scratch",
-        "count": 100
+        "label": "profile_path_4",
+        "count": 2
       },
       {
-        "label": "profile_path_4",
-        "count": 1
+        "label": "window_scratch",
+        "count": 325
       }
     ],
-    "replacements": 101,
-    "chunks": 385,
-    "chunk_encoding": "text",
+    "replacements": 327,
+    "chunks": 518,
+    "chunk_encoding": "utf8_bytes",
     "runs": 2,
     "last_run": {
       "rules": [],
       "replacements": 0,
-      "chars_before": 143060,
-      "chars_after": 143060
+      "chars_before": 61253,
+      "chars_after": 61253
     }
-  },
-  "resume_count": 1
+  }
 }

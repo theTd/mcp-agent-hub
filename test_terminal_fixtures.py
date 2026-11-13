@@ -17,6 +17,7 @@ Line endings: goldens are compared with ``newline=""``, so a golden's own ``\\r\
 the check is byte-exact rather than whatever the platform's universal-newline reader would give.
 """
 
+import base64
 import inspect
 import json
 import os
@@ -28,7 +29,7 @@ import session_manager
 from tools import render_terminal_fixtures as renderer
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "tools" / "fixtures" / "terminal"
-LIVE_CASES = ("live-agy", "live-codex", "live-kimi", "live-omp")
+LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-kimi", "live-omp")
 EDGE_CASES = (
     "edge-osc-color-query",
     "edge-osc-color-query-split",
@@ -73,16 +74,25 @@ def golden(name, path):
     return renderer.read_text_exact(FIXTURES_ROOT / name / path)
 
 
+def corpus_bytes(meta, records):
+    """The corpus size on the wire: base64-decoded pipes bytes, or the text form's UTF-8 length."""
+    if meta.get("chunk_encoding") == "utf8_bytes":
+        return sum(len(base64.b64decode(str(record["chunk"]))) for record in records)
+    return len("".join(str(record["chunk"]) for record in records).encode("utf-8"))
+
+
 def case_texts():
-    """Every string a fixture holds: file text, joined chunk text, and decoded meta values."""
+    """Every string a fixture holds: file text, the decoded chunk stream, and decoded meta values."""
     for path in sorted(FIXTURES_ROOT.rglob("*")):
         if not path.is_file():
             continue
         raw = path.read_bytes().decode("utf-8", "replace")
         yield path, raw
         if path.suffix == ".jsonl":
-            chunks = [json.loads(line)["chunk"] for line in raw.splitlines() if line.strip()]
-            yield path, "".join(chunks)
+            records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            # The stream as the hub will see it: base64 chunks are the pipe's bytes, decoded with
+            # the renderer's UTF-8 carry, so a byte corpus is scanned like a text one.
+            yield path, "".join(renderer.decode_chunks(case_meta(path.parent.name), records))
         elif path.suffix == ".json":
             # The JSON file's own text escapes the separators; the decoded values carry them plainly.
             yield path, json.dumps(json.loads(raw), ensure_ascii=False)
@@ -121,10 +131,29 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
             recorded = meta["recorder"]
             records = renderer.read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
             self.assertEqual(recorded["chunk_count"], len(records), name)
-            joined = "".join(str(record["chunk"]) for record in records)
-            self.assertLessEqual(len(joined.encode("utf-8")), MAX_CORPUS_BYTES, name)
+            self.assertLessEqual(corpus_bytes(meta, records), MAX_CORPUS_BYTES, name)
             self.assertTrue(recorded["exit"]["stop_reason"], name)
             self.assertGreaterEqual(recorded["max_chunk_bytes"], 1, name)
+
+    def test_system_conpty_corpora_carry_exact_bytes(self):
+        # Step 2a: a system-ConPTY case is the pipe's bytes, base64 in chunks.jsonl, and the stream is
+        # one valid UTF-8 sequence whose chunk boundaries may cut a character (the core's 3-byte carry).
+        system = set()
+        for name in LIVE_CASES:
+            meta = case_meta(name)
+            self.assertIn(meta["chunk_encoding"], ("text", "utf8_bytes"), name)
+            if meta.get("pty") != "system-conpty":
+                continue
+            system.add(name)
+            self.assertEqual(meta["chunk_encoding"], "utf8_bytes", name)
+            self.assertEqual(meta["read_buffer_bytes"], 8192, name)
+            self.assertRegex(str(meta["windows_build"]), r"^\d+\.\d+\.\d+(\.\d+)?$", name)
+            records = renderer.read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
+            joined = b"".join(base64.b64decode(str(record["chunk"])) for record in records)
+            joined.decode("utf-8")  # a byte corpus that is not one UTF-8 stream would render as U+FFFD
+        # live-agy is still the step-0 pywinpty capture: agy's own MCP config points at the live hub
+        # and it has no session-scoped MCP flag, so the recorder refused to run it (step 2a report).
+        self.assertEqual(system, {"live-claude", "live-codex", "live-kimi", "live-omp"})
 
     def test_scrub_report_is_per_run(self):
         # Labels and counts only: the record names categories, never what was replaced.

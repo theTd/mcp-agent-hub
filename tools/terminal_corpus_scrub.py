@@ -15,8 +15,11 @@ adds one case-specific regular expression, and ``--extra-window LABEL=PATH`` mas
 with every wrapped fragment of it: an engine that scrolls or wraps the task folder prints the path in
 pieces, and each piece is a contiguous window of the whole.
 
-``chunk_encoding`` must be ``text``: a ``utf8_bytes`` corpus holds base64 of raw pipe bytes, and a
-regex pass over that could silently corrupt the byte stream.
+``chunk_encoding`` selects how the chunk bytes are read.  ``text`` is the step-0 pywinpty corpus.
+``utf8_bytes`` (base64 of the exact pipe bytes, what the system-ConPTY recorder writes) is decoded as
+one UTF-8 stream — a chunk boundary may cut a character — scrubbed as text, and then re-split at the
+same chunk boundaries in bytes, so a character split across two reads stays split and the byte count
+only changes where a rule replaced something.
 
 Every rule is reported by label and count only, never by value.  The report in ``meta.json`` keeps
 cumulative totals (so a corpus scrubbed in two passes still says what both removed) plus this run's
@@ -26,11 +29,13 @@ own counts under ``last_run``; it never re-persists a previous pass's character 
 from __future__ import annotations
 
 import argparse
+import base64
+import bisect
 import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # One replacement: label used in the report, pattern, and the placeholder written instead.
 Rule = Tuple[str, "re.Pattern[str]", str]
@@ -79,6 +84,15 @@ def build_rules(extra: Optional[List[Tuple[str, str]]] = None,
     if machine:
         add("machine_name", r"(?<![A-Za-z0-9_\-])" + _escaped(machine) + r"(?![A-Za-z0-9_\-])",
             "<MACHINE>", re.IGNORECASE)
+    # A drive-rooted path that is not the user's profile is still this machine's layout (conhost
+    # writes the child's image path into the title: ``C:\Program Files\nodejs\node.exe``). The first
+    # rule keeps the spaces inside a path segment ("Program Files"), the second covers the plain form;
+    # both stop at characters a command line or a wrapped line puts after a path.
+    add("absolute_path_spaces",
+        r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/](?:[^\\/:*?\"<>|\x00-\x1f]+[\\/])+[^\s\\/:*?\"<>|\x00-\x1f]*",
+        "<PATH>", re.IGNORECASE)
+    add("absolute_path", r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\\/:*?\"<>|\x00-\x1f]*", "<PATH>",
+        re.IGNORECASE)
     add("email", r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+", "<EMAIL>")
     add("api_key", r"\b(?:sk|pk|api|ghp|glpat)[-_][A-Za-z0-9_\-]{16,}\b", "<KEY>")
     # A resume handle is account-scoped: ``kimi`` prints ``Session: session_<uuid>`` and some engines
@@ -213,6 +227,64 @@ def scrub_values(value, rules: List[Rule], counts: Dict[str, int],
     return value
 
 
+def byte_offsets(text: str) -> List[int]:
+    """UTF-8 byte offset of every character, plus the end: a chunk boundary can fall inside one."""
+    offsets = [0]
+    total = 0
+    for character in text:
+        total += len(character.encode("utf-8"))
+        offsets.append(total)
+    return offsets
+
+
+def locate_offset(offsets: List[int], boundary: int) -> Tuple[int, int]:
+    """``(character index, bytes of it before the boundary)`` for a UTF-8 byte offset."""
+    index = bisect.bisect_left(offsets, boundary)
+    if index < len(offsets) and offsets[index] == boundary:
+        return index, 0
+    index = max(0, index - 1)
+    return index, boundary - offsets[index]
+
+
+def inside_a_replacement(character: int, spans: List[Tuple[int, int, str, str]]) -> bool:
+    """True when the character itself is replaced, so its byte prefix no longer exists."""
+    return any(start <= character < end for start, end, _replacement, _label in spans)
+
+
+def split_byte_chunks(parts: List[bytes], text: str, scrubbed: str,
+                      spans: List[Tuple[int, int, str, str]]) -> List[bytes]:
+    """Re-splits the scrubbed text at the original chunk boundaries, in bytes.
+
+    A boundary that fell inside a multi-byte character stays inside the same character: the character
+    survives an edit unless a rule replaced it, and then the boundary snaps to the character's start.
+    The byte stream is the exact pipe bytes, so a split character must stay split (design §5.4).
+    """
+    original_offsets = byte_offsets(text)
+    cleaned_offsets = byte_offsets(scrubbed)
+    cleaned = scrubbed.encode("utf-8")
+    new_offsets: List[int] = []
+    boundary = 0
+    for part in parts:
+        boundary += len(part)
+        character, prefix = locate_offset(original_offsets, boundary)
+        mapped = map_boundaries([character], spans)[0]
+        mapped = min(max(0, mapped), len(cleaned_offsets) - 1)
+        offset = cleaned_offsets[mapped]
+        if prefix and not inside_a_replacement(character, spans) and mapped + 1 < len(cleaned_offsets):
+            offset = min(offset + prefix, cleaned_offsets[mapped + 1])
+        if new_offsets:
+            offset = max(offset, new_offsets[-1])
+        new_offsets.append(min(offset, len(cleaned)))
+    chunks: List[bytes] = []
+    start = 0
+    for offset in new_offsets:
+        chunks.append(cleaned[start:offset])
+        start = offset
+    # Whatever follows the last original boundary belongs to the last chunk.
+    chunks[-1] += cleaned[start:]
+    return chunks
+
+
 def scrub_case(case_dir: Path, extra: Optional[List[Tuple[str, str]]] = None,
                extra_patterns: Optional[List[Tuple[str, str]]] = None,
                windows: Optional[List[Tuple[str, str]]] = None) -> Dict[str, object]:
@@ -223,37 +295,58 @@ def scrub_case(case_dir: Path, extra: Optional[List[Tuple[str, str]]] = None,
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     encoding = str(meta.get("chunk_encoding") or "text")
-    if encoding != "text":
-        # utf8_bytes chunks are base64 of raw pipe bytes; a text regex cannot see inside them.
-        raise SystemExit(f"{case_dir}: chunk_encoding {encoding!r} cannot be scrubbed; "
-                         "scrub the decoded text before it is encoded")
+    if encoding not in ("text", "utf8_bytes"):
+        raise SystemExit(f"{case_dir}: unknown chunk_encoding {encoding!r}")
 
     records = [json.loads(line) for line in chunks_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    texts = [str(record["chunk"]) for record in records]
-    joined = "".join(texts)
-    spans, counts = find_spans(joined, rules, windows)
-    scrubbed, _counts = scrub_joined(joined, rules, windows)
+    if encoding == "text":
+        texts = [str(record["chunk"]) for record in records]
+        joined = "".join(texts)
+        spans, counts = find_spans(joined, rules, windows)
+        scrubbed, _counts = scrub_joined(joined, rules, windows)
 
-    bounds: List[int] = []
-    offset = 0
-    for text in texts:
-        offset += len(text)
-        bounds.append(offset)
-    mapped = map_boundaries(bounds, spans)
-    start = 0
-    new_texts: List[str] = []
-    for boundary in mapped:
-        new_texts.append(scrubbed[start:boundary])
-        start = boundary
-    # Whatever follows the last original boundary belongs to the last chunk: the piece count must
-    # stay exactly what was recorded.
-    new_texts[-1] += scrubbed[start:]
-    if len(new_texts) != len(texts):
-        raise SystemExit(f"{case_dir}: chunk count changed during scrub")
+        bounds: List[int] = []
+        offset = 0
+        for text in texts:
+            offset += len(text)
+            bounds.append(offset)
+        mapped = map_boundaries(bounds, spans)
+        start = 0
+        new_texts: List[str] = []
+        for boundary in mapped:
+            new_texts.append(scrubbed[start:boundary])
+            start = boundary
+        # Whatever follows the last original boundary belongs to the last chunk: the piece count must
+        # stay exactly what was recorded.
+        new_texts[-1] += scrubbed[start:]
+        if len(new_texts) != len(texts):
+            raise SystemExit(f"{case_dir}: chunk count changed during scrub")
+        payloads: List[Union[str, bytes]] = list(new_texts)
+    else:
+        # Base64 of the exact pipe bytes. Decoded once as a stream — the chunks are one UTF-8 stream
+        # whose boundaries may cut a character — scrubbed as text, then re-split at the same
+        # boundaries, so a split character stays split and the byte count only changes where a rule
+        # replaced something.
+        parts = [base64.b64decode(str(record["chunk"])) for record in records]
+        joined_bytes = b"".join(parts)
+        try:
+            joined = joined_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemExit(f"{case_dir}: chunk bytes are not valid UTF-8 ({exc}); the text rules "
+                             "cannot run on them") from exc
+        spans, counts = find_spans(joined, rules, windows)
+        scrubbed, _counts = scrub_joined(joined, rules, windows)
+        new_parts = split_byte_chunks(parts, joined, scrubbed, spans)
+        if len(new_parts) != len(parts):
+            raise SystemExit(f"{case_dir}: chunk count changed during scrub")
+        payloads = list(new_parts)
 
     with open(chunks_path, "w", encoding="utf-8", newline="\n") as fh:
-        for record, text in zip(records, new_texts):
-            fh.write(json.dumps({"delay_ms": record["delay_ms"], "chunk": text}, ensure_ascii=False) + "\n")
+        for record, payload in zip(records, payloads):
+            chunk = (payload if isinstance(payload, str)
+                     else base64.b64encode(payload).decode("ascii"))
+            fh.write(json.dumps({"delay_ms": record["delay_ms"], "chunk": chunk},
+                                ensure_ascii=False) + "\n")
 
     # meta.json carries text too (the task, launch argv, notes): scrub its string values as well.
     # Cumulative totals say what this corpus has had removed over every pass; ``last_run`` says what
@@ -271,7 +364,7 @@ def scrub_case(case_dir: Path, extra: Optional[List[Tuple[str, str]]] = None,
     meta["scrub"] = {
         "rules": [{"label": label, "count": count} for label, count in sorted(totals.items())],
         "replacements": sum(totals.values()),
-        "chunks": len(new_texts),
+        "chunks": len(payloads),
         "chunk_encoding": encoding,
         "runs": int(previous.get("runs") or 0) + 1,
         "last_run": {

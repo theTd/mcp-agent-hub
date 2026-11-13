@@ -1,13 +1,16 @@
-"""Record one live engine session as a terminal corpus chunk stream (design doc §9 step 0).
+"""Record one live engine session as a terminal corpus chunk stream (design doc §9 steps 0 and 2a).
 
-The corpus is the input the pyte oracle renders in ``tools/render_terminal_fixtures.py``; step 1
-re-records the same cases against the system ConPTY before the Rust core is compared to them.
+The corpus is the input the pyte oracle renders in ``tools/render_terminal_fixtures.py``.  The default
+backend runs the engine on the **system** ConPTY through ``conpty_record_tap`` — the same spawn,
+command-line, job and ``ReadFile`` code the Rust core runs — so the fixtures come from the producer the
+core will use, not from the ``conpty.dll`` pywinpty bundles.  ``--backend pywinpty`` keeps the step-0
+transport reachable until pywinpty is deleted in step 5.
 
-Spawn mirrors the hub exactly: ``winpty.PtyProcess.spawn`` with the hub's default 120x36 size and
-the env policy of ``AgentSession.start_pty`` (session_manager.py:2245), argv passed through the
-hub's own ``unwrap_windows_cmd_shim`` (:1864), chunks read with ``pty.read(4096)`` from one reader
-thread the way ``_read_loop`` (:2280) reads them.  Only the bookkeeping after the read differs:
-this tool timestamps every chunk so the stream can be replayed instead of recorded again.
+Spawn mirrors the hub exactly: the hub's default 120x36 size, the env policy of
+``AgentSession.start_pty`` (session_manager.py:2245), and argv passed through the hub's own
+``unwrap_windows_cmd_shim`` (:1864).  Chunks are the bytes one ``ReadFile`` returned, in the tap's
+8 KiB buffer — the size the core's reader uses too — each with the tap's own timestamp, so the stream
+can be replayed instead of recorded again.  Only the bookkeeping after the read differs from the hub's.
 
 Isolation rules (RULES.md, brief §1):
 - the task text carries ``[Hub Session: session_id=rtc-corpus-<engine>-<random>]`` so no hub
@@ -36,18 +39,26 @@ What is isolated per engine, and by what:
   (``agy mcp list``) and has no session-scoped switch for it, so the recorder refuses when that file
   enables a server on 4444/4445; ``agy mcp disable`` is the operator's call, not the tool's.
 
-Chunks are recorded as ``(delay_ms since the previous chunk, text)`` in ``chunks.jsonl``.  Personal
-data is removed afterwards by ``tools/terminal_corpus_scrub.py``; never commit a raw recording.
+Chunks are recorded as ``{"delay_ms": <since the previous chunk>, "chunk": …}`` in ``chunks.jsonl``.
+With the system backend ``chunk`` is **base64 of the exact bytes** one read returned
+(``chunk_encoding: "utf8_bytes"`` in meta.json), because the core decodes UTF-8 itself with a carry and
+a character split across two reads must stay split; with ``--backend pywinpty`` it is the text
+``pty.read`` returned (``chunk_encoding: "text"``), as step 0 recorded it.  Personal data is removed
+afterwards by ``tools/terminal_corpus_scrub.py``; never commit a raw recording.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import codecs
 import json
 import os
+import platform
 import re
 import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -55,7 +66,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -69,7 +80,15 @@ from session_manager import (  # noqa: E402
 )
 from winpty import PtyProcess  # noqa: E402
 
-RECORDER_VERSION = 1
+# The default backend: the core's own spawn/read code as a headless tap (conpty_record_tap.rs).
+TAP_EXE = REPO_ROOT / "terminal-core" / "target" / "release" / "conpty_record_tap.exe"
+# The read size the tap uses (conpty_session/src/session.rs `IO_CHUNK`): one frame is one read.
+TAP_READ_BYTES = 8192
+# The tap's frame header on both pipes: kind, then a little-endian u32 payload length.
+TAP_FRAME_HEADER = struct.Struct("<BI")
+# CREATE_NO_WINDOW: the tap is a console binary, and nothing may appear on the desktop.
+CREATE_NO_WINDOW = 0x08000000
+RECORDER_VERSION = 2
 # The hub's default PTY size (SessionManager.default_cols/default_rows, session_manager.py:2922).
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 36
@@ -82,7 +101,9 @@ ISOLATED_PORT = 4599
 # Brief §1: about 3 minutes and about 2 MB per recording.
 MAX_DURATION_SEC = 180.0
 MAX_CORPUS_BYTES = 2 * 1024 * 1024
-# Read size of one chunk: AgentSession._read_loop uses 4096 (session_manager.py:2282).
+# The size asked of the backend's ``read``. The tap ignores it: one frame is one ReadFile on the
+# core's 8 KiB buffer (TAP_READ_BYTES), which is the chunk boundary this corpus records. pywinpty
+# reads up to 4096, as AgentSession._read_loop does (session_manager.py:2282).
 READ_SIZE = 4096
 IDLE_SLEEP_SEC = 0.02
 
@@ -113,6 +134,10 @@ READ_ONLY_COMMAND = r"\b(?:ls|dir|find|findstr|type|cat|Get-ChildItem|Select-Obj
 ANSWERS: Dict[str, List[Answer]] = {
     "claude": [
         Answer("trust_folder", r"Do you trust the files in this folder", "\r", delay_after_match_sec=0.5),
+        # Newer builds draw a two-line choice whose cursor starts on "No, exit": the only way to
+        # trust the folder is Down (to "Yes, I trust this folder"), then Enter.
+        Answer("trust_folder_choice", r"Yes, I trust this folder", "\x1b[B\r", guard=r"No, exit",
+               delay_after_match_sec=1.0, repeat_after_sec=5.0),
         Answer("read_only_permission", r"Do you want to proceed\?", "1\r", guard=READ_ONLY_COMMAND),
     ],
     "codex": [
@@ -151,6 +176,8 @@ ENGINES: Dict[str, Dict[str, object]] = {
         # Cheapest model and lowest effort; no session file (nothing for a hub watcher to claim) and
         # user/plugin MCP servers replaced by an empty set so nothing dials the live hub. The
         # variadic --mcp-config stays behind the prompt, or it would swallow the prompt as a config.
+        # The binary must be the hub's own profile launcher (--command ...\reclaude.exe): a bare
+        # ``claude`` answers "Not logged in" because the hub never launches it directly.
         "args_before_task": ["--model", "haiku", "--effort", "low"],
         "args_after_task": ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'],
         "task_mode": "positional",
@@ -193,6 +220,33 @@ ENGINES: Dict[str, Dict[str, object]] = {
 def marker_session_id(engine: str) -> str:
     """An id no hub session has: the transcripts this recording creates can never be claimed."""
     return f"rtc-corpus-{engine}-{secrets.token_hex(4)}"
+
+
+def windows_build() -> str:
+    """The full OS build (``10.0.26220.9836``): platform.version() omits the UBR."""
+    version = platform.version()
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            ubr = winreg.QueryValueEx(key, "UBR")[0]
+    except OSError:
+        return version
+    return f"{version}.{int(ubr)}"
+
+
+def engine_binary(engine: str, override: Optional[str] = None) -> str:
+    """The engine's executable, as the hub's profile launches it.
+
+    ``--command`` carries the one profile-specific binary the recorder must use instead of the
+    default: the hub's claude profile launches the owner's account wrapper (``reclaude.exe``), not a
+    bare ``claude``, so a bare one would answer "Not logged in". The path stays on the command line,
+    never in meta.json.
+    """
+    if override:
+        return override
+    return HubSessionManager._default_engine_binary(engine)
 
 
 # The two ports a hub listens on; nothing this recorder starts may dial either of them.
@@ -361,15 +415,17 @@ def build_env(engine: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, 
     return env
 
 
-def build_argv(engine: str, task: str, engine_session_id: Optional[str] = None
-               ) -> Tuple[str, List[str]]:
+def build_argv(engine: str, task: str, engine_session_id: Optional[str] = None,
+               command: Optional[str] = None) -> Tuple[str, List[str]]:
     """The engine's own CLI with the task in the position the hub's task_mode puts it.
 
     ``engine_session_id`` is the hub's claude_positional behaviour (session_manager.py:12499): the
     hub names the conversation id up front, so the recorder knows which transcript it created.
+    ``command`` overrides the engine's binary (``--command``): the hub's claude profile launches the
+    account wrapper, and a bare ``claude`` would answer "Not logged in".
     """
     spec = ENGINES[engine]
-    command = HubSessionManager._default_engine_binary(engine)
+    command = engine_binary(engine, command)
     args = list(spec.get("args_before_task") or [])  # type: ignore[arg-type]
     if engine == "claude" and engine_session_id:
         args.extend(["--session-id", engine_session_id])
@@ -385,12 +441,194 @@ def build_argv(engine: str, task: str, engine_session_id: Optional[str] = None
     return command, args
 
 
+class TapFailed(RuntimeError):
+    """The tap could not spawn the engine, or died before it reported one."""
+
+
+class TapSession:
+    """One engine on the system ConPTY, driven through ``conpty_record_tap``.
+
+    The surface is the one ``winpty.PtyProcess`` gave the step-0 recorder (``read``, ``write``,
+    ``setwinsize``, ``isalive``, ``terminate``, ``exitstatus``, ``pid``, ``close``), plus the tap's own
+    clock: ``read`` returns ``(bytes, at_us)`` where ``at_us`` is when the read returned, so the
+    recorded delays are the tap's rather than Python's.
+    """
+
+    def __init__(self, exe: Path, cmd_list: List[str], cwd: Path, env: Dict[str, str],
+                 cols: int, rows: int):
+        if not exe.is_file():
+            raise SystemExit(f"tap not built: {exe}\nbuild: cargo build --release -p conpty_session "
+                             "--bin conpty_record_tap (from terminal-core/)")
+        argv = [str(exe), "--cols", str(cols), "--rows", str(rows), "--cwd", str(cwd), "--"]
+        argv.extend(cmd_list)
+        self._lock = threading.Lock()
+        self._log: List[str] = []
+        self._exit_code: Optional[int] = None
+        self._eof = False
+        # CREATE_NO_WINDOW plus pipes: the tap and its ConPTY child never show a window. Its stderr is
+        # dropped because the tap reports its own failures as a frame.
+        self._proc = subprocess.Popen(
+            argv, cwd=str(cwd), env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        self.pid = self._await_spawn()
+
+    def _await_spawn(self) -> int:
+        while True:
+            frame = self._read_frame()
+            if frame is None:
+                code = self._proc.poll()
+                raise TapFailed(f"tap exited ({code}) before reporting its spawn" +
+                                (f": {self._log[-1]}" if self._log else ""))
+            kind, payload = frame
+            if kind == b"L":
+                self._log.append(payload.decode("utf-8", "replace"))
+            elif kind == b"F":
+                raise TapFailed(payload.decode("utf-8", "replace"))
+            elif kind == b"S":
+                if len(payload) < 8:
+                    raise TapFailed("spawn frame is short")
+                return struct.unpack_from("<I", payload, 0)[0]
+
+    def _read_frame(self) -> Optional[Tuple[bytes, bytes]]:
+        assert self._proc.stdout is not None
+        header = self._proc.stdout.read(TAP_FRAME_HEADER.size)
+        if not header or len(header) != TAP_FRAME_HEADER.size:
+            return None
+        kind, length = TAP_FRAME_HEADER.unpack(header)
+        payload = self._proc.stdout.read(length) if length else b""
+        if payload is None or len(payload) != length:
+            return None
+        return bytes([kind]), payload
+
+    def _send(self, kind: bytes, payload: bytes = b"") -> bool:
+        with self._lock:
+            if self._proc.stdin is None or self._proc.stdin.closed:
+                return False
+            try:
+                self._proc.stdin.write(TAP_FRAME_HEADER.pack(kind[0], len(payload)) + payload)
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                return False
+        return True
+
+    def read(self, size: int) -> Optional[Tuple[bytes, int]]:
+        """The next ReadFile result and its tap time; ``None`` once the tap reported its exit."""
+        while True:
+            frame = self._read_frame()
+            if frame is None:
+                self._eof = True
+                return None
+            kind, payload = frame
+            if kind == b"C":
+                if len(payload) < 8:
+                    continue
+                return payload[8:], struct.unpack_from("<Q", payload, 0)[0]
+            if kind == b"L":
+                self._log.append(payload.decode("utf-8", "replace"))
+            elif kind == b"F":
+                self._eof = True
+                raise TapFailed(payload.decode("utf-8", "replace"))
+            elif kind == b"E":
+                self._exit_code = struct.unpack("<i", payload)[0]
+                self._eof = True
+                return None
+
+    def write(self, keys: str) -> None:
+        self._send(b"I", keys.encode("utf-8", "replace"))
+
+    def setwinsize(self, rows: int, cols: int) -> None:
+        self._send(b"R", struct.pack("<HH", cols, rows))
+
+    def isalive(self) -> bool:
+        return not self._eof and self._exit_code is None
+
+    def terminate(self, force: bool = True) -> None:
+        """Kill the engine's job; the tap's job handle also kills the tree if this process dies."""
+        self._send(b"K")
+        try:
+            self._proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+    @property
+    def exitstatus(self) -> Optional[int]:
+        return self._exit_code if self._exit_code is not None else self._proc.returncode
+
+    @property
+    def log(self) -> List[str]:
+        return list(self._log)
+
+    def close(self) -> None:
+        for stream in (self._proc.stdin, self._proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        if self._proc.poll() is None:
+            self._proc.kill()
+
+
+class PywinptySession:
+    """``winpty.PtyProcess`` behind ``TapSession``'s surface: the step-0 transport, text chunks."""
+
+    def __init__(self, cmd_list: List[str], cwd: Path, env: Dict[str, str], cols: int, rows: int):
+        self._pty = PtyProcess.spawn(cmd_list, cwd=str(cwd), env=env, dimensions=(rows, cols))
+        self.pid = self._pty.pid
+
+    def read(self, size: int) -> Optional[Tuple[str, None]]:
+        try:
+            data = self._pty.read(size)
+        except EOFError:
+            return None
+        if not data:
+            return None
+        return data, None
+
+    def write(self, keys: str) -> None:
+        self._pty.write(keys)
+
+    def setwinsize(self, rows: int, cols: int) -> None:
+        self._pty.setwinsize(rows, cols)
+
+    def isalive(self) -> bool:
+        return bool(self._pty.isalive())
+
+    def terminate(self, force: bool = True) -> None:
+        self._pty.terminate(force=force)
+
+    @property
+    def exitstatus(self) -> Optional[int]:
+        try:
+            return self._pty.exitstatus
+        except Exception:
+            return None
+
+    @property
+    def log(self) -> List[str]:
+        return []
+
+    def close(self) -> None:
+        try:
+            self._pty.close()
+        except Exception:
+            pass
+
+
 class Recorder:
     def __init__(self, engine: str, out_dir: Path, task_dir: Path, task: str,
                  cols: int, rows: int, resize_after_idle_sec: float, idle_sec: float,
                  min_duration_sec: float, max_duration_sec: float,
-                 extra_env: Optional[Dict[str, str]] = None):
+                 extra_env: Optional[Dict[str, str]] = None, backend: str = "system",
+                 tap: Optional[Path] = None, command: Optional[str] = None):
+        if backend not in ("system", "pywinpty"):
+            raise SystemExit(f"unknown backend {backend!r}")
         self.engine = engine
+        self.backend = backend
+        self.tap = Path(tap) if tap else TAP_EXE
+        self.command = command
         self.out_dir = out_dir
         self.task_dir = task_dir
         self.task = task
@@ -403,8 +641,11 @@ class Recorder:
         self.extra_env = dict(extra_env or {})
         # Latest moment for the resize when the answer never produces a quiet second.
         self.resize_deadline_sec = min_duration_sec + 20.0
+        # The system ConPTY hands back pipe bytes; the core decodes them with a carry, so the corpus
+        # keeps them as bytes. pywinpty already returns text and is kept as step 0 recorded it.
+        self.chunk_encoding = "utf8_bytes" if backend == "system" else "text"
 
-        self.chunks: List[Tuple[int, str]] = []
+        self.chunks: List[Tuple[int, Union[str, bytes]]] = []
         # The conversation id this engine will name its own session file with (claude: --session-id).
         self.engine_session_id: Optional[str] = None
         self.bytes_total = 0
@@ -417,10 +658,15 @@ class Recorder:
         self._lock = threading.Lock()
         self._screen = HubTerminalScreen(cols, rows)
         self._stream = HubTerminalStream(self._screen)
+        # The screen sees the same text the hub will: one incremental decoder, so a character split
+        # across two reads is fed once the second half arrives.
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._last_chunk_at = time.monotonic()
         self._last_prev_at: Optional[float] = None
+        self._last_chunk_us: Optional[int] = None
         self._eof = threading.Event()
-        self.pty: Optional[PtyProcess] = None
+        self._read_error: Optional[str] = None
+        self.pty: Optional[Union[TapSession, PywinptySession]] = None
         self.pid: Optional[int] = None
 
     # ---- bookkeeping ---------------------------------------------------------------------
@@ -437,16 +683,33 @@ class Recorder:
             lines.pop()
         return "\n".join(lines[-self.rows:])
 
-    def _record_chunk(self, chunk: str, started: float) -> None:
+    @staticmethod
+    def _chunk_bytes(chunk: Union[str, bytes]) -> bytes:
+        return chunk.encode("utf-8", "replace") if isinstance(chunk, str) else chunk
+
+    def _chunk_text(self, chunk: Union[str, bytes]) -> str:
+        """The text the hub's stream would see; the carry keeps a split character out of the screen."""
+        return chunk if isinstance(chunk, str) else self._decoder.decode(chunk, final=False)
+
+    def _record_chunk(self, chunk: Union[str, bytes], at_us: Optional[int], started: float) -> None:
         now = time.monotonic()
-        prev = self._last_prev_at if self._last_prev_at is not None else started
-        delay_ms = int(round((now - prev) * 1000))
+        if at_us is not None:
+            # The tap's own read clock: the delay is between two ReadFile returns, not two Python ones.
+            previous_us = self._last_chunk_us if self._last_chunk_us is not None else 0
+            delay_ms = int(round((at_us - previous_us) / 1000))
+            self._last_chunk_us = at_us
+        else:
+            previous = self._last_prev_at if self._last_prev_at is not None else started
+            delay_ms = int(round((now - previous) * 1000))
         self._last_prev_at = now
+        data = self._chunk_bytes(chunk)
+        text = self._chunk_text(chunk)
         with self._lock:
             self.chunks.append((max(0, delay_ms), chunk))
-            self.bytes_total += len(chunk.encode("utf-8", "replace"))
+            self.bytes_total += len(data)
             try:
-                self._stream.feed(chunk)
+                if text:
+                    self._stream.feed(text)
             except Exception:
                 # K4: one bad sequence costs only itself; the corpus keeps the bytes regardless.
                 pass
@@ -458,14 +721,17 @@ class Recorder:
             if pty is None or not pty.isalive():
                 break
             try:
-                data = pty.read(READ_SIZE)
-                if not data:
+                result = pty.read(READ_SIZE)
+                if result is None:
                     time.sleep(IDLE_SLEEP_SEC)
                     continue
-                self._record_chunk(data, started)
-            except EOFError:
+                data, at_us = result
+                self._record_chunk(data, at_us, started)
+            except (EOFError, TapFailed) as exc:
+                self._read_error = str(exc) or type(exc).__name__
                 break
-            except Exception:
+            except Exception as exc:
+                self._read_error = f"{type(exc).__name__}: {exc}"
                 break
         self._eof.set()
 
@@ -540,13 +806,15 @@ class Recorder:
             self.mcp_files = [inspected] if inspected else []
         self.engine_session_id = str(uuid.uuid4()) if self.engine == "claude" else None
         command, args = build_argv(self.engine, "" if task_mode == "pty_input" else self.task,
-                                   self.engine_session_id)
+                                   self.engine_session_id, self.command)
         self.mcp_disabled = [part[len("mcp_servers."):-len(".enabled=false")] for part in args
                              if part.startswith("mcp_servers.") and part.endswith(".enabled=false")]
         cmd_list = unwrap_windows_cmd_shim(command, args, env=env)
         started = time.monotonic()
-        self.pty = PtyProcess.spawn(cmd_list, cwd=str(self.task_dir), env=env,
-                                    dimensions=(self.rows, self.cols))
+        if self.backend == "system":
+            self.pty = TapSession(self.tap, cmd_list, self.task_dir, env, self.cols, self.rows)
+        else:
+            self.pty = PywinptySession(cmd_list, self.task_dir, env, self.cols, self.rows)
         self.pid = self.pty.pid
         self.events.append({"event": "spawn", "at_ms": 0})
 
@@ -625,7 +893,14 @@ class Recorder:
             "cols": self.cols if self.resize is None else self.resize["from"][0],
             "rows": self.rows if self.resize is None else self.resize["from"][1],
             "resize": self.resize,
-            "chunk_encoding": "text",
+            "chunk_encoding": self.chunk_encoding,
+            # Which ConPTY produced the bytes (owner decision terminal-core-conpty) and the OS build
+            # whose conhost/OpenConsole wrote them: a rebuild on another build must say so.
+            "pty": "system-conpty" if self.backend == "system" else "pywinpty",
+            "windows_build": windows_build(),
+            "read_buffer_bytes": TAP_READ_BYTES if self.backend == "system" else None,
+            # Which resume the ``resumed/`` goldens model (render_terminal_fixtures.py).
+            "resume_count": 1,
             "launch": {
                 "command": Path(cmd_list[0]).name,
                 "args": [Path(part).name if os.path.sep in part else part for part in cmd_list[1:]],
@@ -647,9 +922,10 @@ class Recorder:
                 "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "chunk_count": len(chunks),
                 "bytes": self.bytes_total,
-                "max_chunk_bytes": max((len(c.encode("utf-8", "replace")) for _, c in chunks), default=0),
+                "max_chunk_bytes": max((len(self._chunk_bytes(c)) for _, c in chunks), default=0),
                 "events": self.events,
                 "exit": self.exit_info,
+                "read_error": self._read_error,
             },
         }
         self._write_case(chunks, meta)
@@ -681,12 +957,18 @@ class Recorder:
                 pass
         return exit_code
 
-    def _write_case(self, chunks: List[Tuple[int, str]], meta: Dict[str, object]) -> None:
+    def _write_case(self, chunks: List[Tuple[int, Union[str, bytes]]],
+                    meta: Dict[str, object]) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         chunks_path = self.out_dir / "chunks.jsonl"
         with open(chunks_path, "w", encoding="utf-8", newline="\n") as fh:
             for delay_ms, chunk in chunks:
-                fh.write(json.dumps({"delay_ms": delay_ms, "chunk": chunk}, ensure_ascii=False) + "\n")
+                # Byte chunks are base64 of the exact read: JSON cannot carry a split character, and the
+                # core's carry must see the split the pipe produced.
+                payload = (chunk if isinstance(chunk, str)
+                           else base64.b64encode(chunk).decode("ascii"))
+                fh.write(json.dumps({"delay_ms": delay_ms, "chunk": payload},
+                                    ensure_ascii=False) + "\n")
         with open(self.out_dir / "meta.json", "w", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
 
@@ -710,6 +992,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-duration", type=float, default=MAX_DURATION_SEC)
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                         help="one extra child variable, e.g. PI_CODING_AGENT_DIR=<isolated omp dir>")
+    parser.add_argument("--backend", choices=("system", "pywinpty"), default="system",
+                        help="PTY backend: the system ConPTY through the tap (default), or pywinpty")
+    parser.add_argument("--tap", type=Path, default=TAP_EXE,
+                        help="the conpty_record_tap binary (default: the crate's release build)")
+    parser.add_argument("--command", default=None,
+                        help="the engine binary to launch instead of the hub's default, e.g. the "
+                             "reclaude.exe account wrapper the hub's claude profile uses")
     args = parser.parse_args(argv)
 
     task_dir = args.task_dir.resolve()
@@ -739,9 +1028,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_duration_sec=args.min_duration,
         max_duration_sec=min(args.max_duration, MAX_DURATION_SEC),
         extra_env=extra_env,
+        backend=args.backend,
+        tap=args.tap,
+        command=args.command,
     )
     meta = recorder.run()
     recorded = meta["recorder"]  # type: ignore[index]
+    if not recorded["chunk_count"]:
+        raise SystemExit(f"no output recorded: {recorded.get('read_error') or 'the engine printed nothing'}")
     print(json.dumps({"case": str(args.out), "marker_id": marker_id, **recorded},
                      ensure_ascii=False, indent=2))
     return 0
