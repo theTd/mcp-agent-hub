@@ -368,10 +368,13 @@ is minted, keeping the console's existing not-found path.
 **Frames and semantics.** The core reproduces `/ws/pty`'s contract, because both the console JS and
 `test_hub_persistence.py:276` parse it:
 
-- Replay: on connect the core sends the whole trimmed raw history as one text frame (OSC colour queries
-  stripped, `:2437`), then `{"type": "replay_end"}`. `isReplayEndFrame`
-  (`static/js/session-workspace.js:33`) already accepts a server that sends the marker, and the 1.5 s
-  fallback timer covers one that does not, so no JS change is needed for the marker itself.
+- Replay: on connect the core sends the *ring as it stands* — `join(raw_history)`, already collapsed by
+  the in-loop W9 trigger when it fired, and **not** the 512 KiB `_scrollback_blob` trim — followed by one
+  more `OSC_COLOR_QUERY_RE` pass over the joined text (`attach_ws_queue`, `:2426-2437`; the per-chunk
+  strip at `:2333` cannot see a query split across two chunks, so this second pass is what removes it),
+  then `{"type": "replay_end"}`. `isReplayEndFrame` (`static/js/session-workspace.js:33`) already
+  accepts a server that sends the marker, and the 1.5 s fallback timer covers one that does not, so no
+  JS change is needed for the marker itself.
 - Q11 atomicity lives in the core: one session mutex covers "append to the raw ring + publish to
   subscribers" and "snapshot the replay + register this socket", so a chunk is either inside the replay
   or in the socket's queue, never both and never neither. There is no Python lock left to race.
@@ -564,7 +567,7 @@ widths), `winpty-rs` and `portable-pty` (§7.1).
 | W8: `ESC[3J` (erase saved lines) is dropped on resumed sessions only, with a split-sequence carry | `_strip_saved_lines_erase` `:2390` | same algorithm in the core, `strip_esc3j_on_output` flag, per-session carry ≤3 bytes |
 | OSC 10/11/12/4 colour queries never reach the console or the history | `OSC_COLOR_QUERY_RE` `:1852` `:2334` `:2437` | same regex in the core, applied before append and before replay |
 | OSC replies from the browser never reach the PTY | `strip_osc_terminal_replies` `:1856`, used in `ws_pty_endpoint` | moves into the core: it owns the socket that receives the input, so it strips with the same pattern before `write` (§6.4) |
-| W9: raw history capped at 512 KiB, 64 KiB slack, trimmed at a line break, newest `── 已恢复（第 N 次）──` banner kept, `[较早的输出已截断]` prefix | `trim_history_text` `:630`, `_scrollback_blob` `:4437` | byte-identical Rust implementation, proven by golden fixtures (§10) |
+| W9: the raw ring is trimmed to ≤ 512 KiB when it passes 512 KiB + 64 KiB of slack, and `_scrollback_blob` trims the same way on read: cut at a line break, `[较早的输出已截断]` prefix; the newest `── 已恢复（第 N 次）──` banner is protected only when the cut is at or before its start — the block then restores the banner's two leading bytes (`\r\n`) and nothing else, and a cut inside the banner line drops the banner | `trim_history_text` `:630`, `_on_pty_output` `:2358-2370`, `_scrollback_blob` `:4437` | byte-identical Rust implementation; the in-loop collapse, the prefix and all three banner outcomes are golden fixtures (§10) |
 | history sizes: screen `history=3000`, `snapshot_all`/`scrollback` caps | `:2157`, `:4369`, `:2516` | `spawn.flags.history_rows` |
 | K4: one unparseable sequence costs only itself | `HubTerminalStream` `:1832`, `HubTerminalScreen` `:1792` | `vte` cannot fail; `catch_unwind` around the feed so a handler bug costs one chunk, not the session |
 | B9: liveness is the process, never the status string | `is_process_alive` `:2562` | `alive` in the drain record, set false by the reader thread; no syscall and no round trip, and `to_dict["idle_seconds"]` reads the same record |
@@ -619,10 +622,15 @@ Existing tests that cover this behaviour and what porting them means:
 
 New tests, none run by this unit:
 
-- Rust, parser and history: the shim-unwrap table (same fixtures as `test_session_launch_args.py`), W9
-  trim golden fixtures (UTF-8 split, newest-banner rule, `[较早的输出已截断]` prefix), W8 split carry,
-  OSC query strip and OSC reply strip, UTF-8 carry across reads, the step-0 corpus rendered
-  screen-for-screen against the frozen pyte output.
+- Rust, parser and history: the shim-unwrap table (same fixtures as `test_session_launch_args.py`) and
+  the step-0 corpus (`tools/fixtures/terminal/`, rendered screen-for-screen against the frozen Python
+  output): W9 trim goldens (UTF-8 split, `budget <= 0`, and the three banner outcomes — banner after the
+  cut, cut inside the banner line, banner older than the budget); the in-loop W9 trigger
+  (`edge-w9-inloop-trigger`: regenerate `chunks.jsonl` from its `generator` block, then the ring must
+  collapse to one entry with the entry/byte counts `trigger.json` records, the trimmed text in
+  `raw.txt`, and the 64 KiB tail unchanged); the W8 carry for all three splits; the per-chunk OSC query
+  strip and the per-stream replay strip (`replay.txt`); the OSC reply strip including the `52` and
+  `1[01]\d` branches; UTF-8 carry across reads.
 - Rust, mechanics: coalescing (bytes preserved and order kept, frame cap honoured), Q11 (a socket that
   connects during a write storm sees every chunk exactly once, checked by a monotone counter in the
   stream), `catch_unwind` per reader thread (a panic marks one session `crashed` and leaves the others
