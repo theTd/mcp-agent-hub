@@ -14,6 +14,180 @@ import httpx
 from dsh_endpoint import dsh_url
 
 
+_TOKEN_COUNT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(KI|K|MI|M|GI|G)?\s*$", re.IGNORECASE)
+_TOKEN_MULTIPLIERS = {
+    None: 1,
+    "": 1,
+    "K": 1_000,
+    "M": 1_000_000,
+    "G": 1_000_000_000,
+    "KI": 1024,
+    "MI": 1024 * 1024,
+    "GI": 1024 * 1024 * 1024,
+}
+
+
+def parse_token_count(raw: Any) -> Optional[int]:
+    """Parses an integer token count or compact suffix string (e.g. '1M', '256k', '256Ki')."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, float):
+        val = int(round(raw))
+        return val if val > 0 else None
+    text = str(raw).strip().replace(",", "").replace("_", "")
+    if not text:
+        return None
+    m = _TOKEN_COUNT_RE.match(text)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = (m.group(2) or "").upper()
+    mult = _TOKEN_MULTIPLIERS.get(unit)
+    if mult is None:
+        return None
+    val = int(round(num * mult))
+    return val if val > 0 else None
+
+
+def _strip_yaml_inline_comment(text: str) -> str:
+    in_quote: Optional[str] = None
+    for idx, ch in enumerate(text):
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+        elif ch in ("'", '"'):
+            in_quote = ch
+        elif ch == "#" and (idx == 0 or text[idx - 1].isspace()):
+            return text[:idx].rstrip()
+    return text.rstrip()
+
+
+def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, int]]:
+    """Extracts exact {provider/model: {context_window_tokens, max_output_tokens}} from ~/.omp/agent/models.yml."""
+    if not path.exists():
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return {}
+
+    result: Dict[str, Dict[str, int]] = {}
+    providers_indent: Optional[int] = None
+    current_provider: Optional[str] = None
+    provider_indent: Optional[int] = None
+    models_indent: Optional[int] = None
+    item_indent: Optional[int] = None
+    current_item: Optional[Dict[str, Any]] = None
+
+    def flush_item() -> None:
+        nonlocal current_item
+        if not current_item or not current_provider:
+            current_item = None
+            return
+        mid = str(current_item.get("id") or "").strip().strip("'\"")
+        if mid:
+            entry: Dict[str, int] = {}
+            if current_item.get("context_window_tokens"):
+                entry["context_window_tokens"] = current_item["context_window_tokens"]
+            if current_item.get("max_output_tokens"):
+                entry["max_output_tokens"] = current_item["max_output_tokens"]
+            if entry:
+                result[f"{current_provider}/{mid}"] = entry
+        current_item = None
+
+    for raw in lines:
+        cleaned = _strip_yaml_inline_comment(raw)
+        if not cleaned.strip():
+            continue
+        indent = len(cleaned) - len(cleaned.lstrip(" "))
+        stripped = cleaned.lstrip(" ")
+
+        if providers_indent is None:
+            if stripped == "providers:":
+                providers_indent = indent
+            continue
+
+        if indent <= providers_indent and not stripped.startswith("-"):
+            flush_item()
+            if stripped == "providers:":
+                providers_indent = indent
+                current_provider = None
+                provider_indent = None
+                models_indent = None
+                item_indent = None
+            else:
+                providers_indent = None
+                current_provider = None
+                provider_indent = None
+                models_indent = None
+                item_indent = None
+            continue
+
+        if provider_indent is None or (indent <= provider_indent and not stripped.startswith("-")):
+            flush_item()
+            models_indent = None
+            item_indent = None
+            if stripped.endswith(":"):
+                current_provider = stripped[:-1].strip().strip("'\"")
+                provider_indent = indent
+            else:
+                current_provider = None
+                provider_indent = None
+            continue
+
+        if models_indent is not None and indent <= models_indent and not stripped.startswith("-"):
+            flush_item()
+            models_indent = None
+            item_indent = None
+
+        if models_indent is None:
+            if stripped == "models:":
+                models_indent = indent
+            continue
+
+        if stripped.startswith("- ") or stripped == "-":
+            if item_indent is None or indent <= item_indent:
+                flush_item()
+                item_indent = indent
+                current_item = {}
+                rest = stripped[1:].strip()
+                if ":" in rest:
+                    k, v = rest.split(":", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k == "id":
+                        current_item["id"] = v
+                    elif k == "contextWindow":
+                        tok = parse_token_count(v)
+                        if tok:
+                            current_item["context_window_tokens"] = tok
+                    elif k == "maxTokens":
+                        tok = parse_token_count(v)
+                        if tok:
+                            current_item["max_output_tokens"] = tok
+                continue
+
+        if current_item is not None and (item_indent is None or indent > item_indent) and ":" in stripped:
+            k, v = stripped.split(":", 1)
+            k = k.strip()
+            v = v.strip().strip("'\"")
+            if k == "id":
+                current_item["id"] = v
+            elif k == "contextWindow":
+                tok = parse_token_count(v)
+                if tok:
+                    current_item["context_window_tokens"] = tok
+            elif k == "maxTokens":
+                tok = parse_token_count(v)
+                if tok:
+                    current_item["max_output_tokens"] = tok
+
+    flush_item()
+    return result
+
+
 class AgentModelDiscovery:
     """
     Automatically discovers available LLM models and supported thinking/effort levels
@@ -67,6 +241,7 @@ class AgentModelDiscovery:
         thinking_levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
         models: List[Dict[str, Any]] = []
         seen_ids = set()
+        yml_models = parse_omp_models_yml(self.home / ".omp" / "agent" / "models.yml")
 
         # 1. Run `omp.exe models` to parse live provider tables
         if omp_bin.exists():
@@ -98,12 +273,15 @@ class AgentModelDiscovery:
                                     if "," in think_col
                                     else (["low", "medium", "high", "max"] if think_col == "yes" else ["off"])
                                 )
+                                yml_info = yml_models.get(full_id) or {}
+                                ctx_tokens = yml_info.get("context_window_tokens") or parse_token_count(ctx)
                                 models.append(
                                     {
                                         "id": full_id,
                                         "provider": current_provider,
                                         "model": m_name,
                                         "context_window": ctx,
+                                        "context_window_tokens": ctx_tokens,
                                         "max_output": max_out,
                                         "supported_thinking_levels": m_thinks,
                                     }
@@ -112,6 +290,25 @@ class AgentModelDiscovery:
                 pass
 
         # 2. Fallback/supplement from ~/.omp/agent/models.yml
+        for full_id, yml_info in yml_models.items():
+            if full_id in seen_ids:
+                continue
+            seen_ids.add(full_id)
+            provider, m_name = full_id.split("/", 1) if "/" in full_id else ("", full_id)
+            ctx_tokens = yml_info.get("context_window_tokens")
+            max_out_tokens = yml_info.get("max_output_tokens")
+            models.append(
+                {
+                    "id": full_id,
+                    "provider": provider,
+                    "model": m_name,
+                    "context_window": str(ctx_tokens) if ctx_tokens else "",
+                    "context_window_tokens": ctx_tokens,
+                    "max_output": str(max_out_tokens) if max_out_tokens else "",
+                    "supported_thinking_levels": ["low", "medium", "high", "max"],
+                }
+            )
+
         if not models:
             models.append(
                 {
@@ -119,6 +316,7 @@ class AgentModelDiscovery:
                     "provider": "clay",
                     "model": "deepseek-flash",
                     "context_window": "1M",
+                    "context_window_tokens": 1_048_576,
                     "max_output": "393K",
                     "supported_thinking_levels": ["low", "high", "max"],
                 }
@@ -225,7 +423,13 @@ class AgentModelDiscovery:
     def _discover_agy(self) -> Dict[str, Any]:
         agy_bin = Path(shutil.which("agy") or (self.home / "AppData" / "Local" / "agy" / "bin" / "agy.EXE"))
         models: List[Dict[str, Any]] = []
-        thinking_levels = ["low", "medium", "high"]
+        thinking_levels = ["low", "medium", "high", "xhigh"]
+
+        def _infer_agy_effort(model_id: str) -> Optional[str]:
+            for lvl in ("xhigh", "high", "medium", "low"):
+                if model_id.endswith(f"-{lvl}"):
+                    return lvl
+            return None
 
         if agy_bin.exists():
             try:
@@ -244,11 +448,7 @@ class AgentModelDiscovery:
                     parts = line.split("\t", 1)
                     m_id = parts[0].strip()
                     label = parts[1].strip() if len(parts) > 1 else m_id
-                    inferred_effort = None
-                    for lvl in ("low", "medium", "high"):
-                        if m_id.endswith(f"-{lvl}"):
-                            inferred_effort = lvl
-                            break
+                    inferred_effort = _infer_agy_effort(m_id)
                     models.append(
                         {
                             "id": m_id,
@@ -268,6 +468,10 @@ class AgentModelDiscovery:
                 ("gemini-4-argon-low", "Gemini 4 Argon (Low)"),
                 ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
                 ("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+                ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+                ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+                ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+                ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
                 ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
                 ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
                 ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
@@ -276,7 +480,15 @@ class AgentModelDiscovery:
                 ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
                 ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
             ]:
-                models.append({"id": m_id, "display_name": label, "supported_thinking_levels": thinking_levels})
+                inferred_effort = _infer_agy_effort(m_id)
+                models.append(
+                    {
+                        "id": m_id,
+                        "display_name": label,
+                        "built_in_thinking_level": inferred_effort,
+                        "supported_thinking_levels": [inferred_effort] if inferred_effort else thinking_levels,
+                    }
+                )
 
         return {
             "engine": "agy",
@@ -373,6 +585,14 @@ class AgentModelDiscovery:
                                 vis = m_entry.get("visibility", "list")
                                 if slug not in discovered_models:
                                     discovered_models.append(slug)
+                                ctx_win = parse_token_count(m_entry.get("context_window"))
+                                auto_compact_lim = parse_token_count(m_entry.get("auto_compact_token_limit"))
+                                eff_pct_raw = m_entry.get("effective_context_window_percent")
+                                eff_pct = (
+                                    int(round(eff_pct_raw))
+                                    if isinstance(eff_pct_raw, (int, float)) and not isinstance(eff_pct_raw, bool) and eff_pct_raw > 0
+                                    else None
+                                )
                                 models.append({
                                     "id": slug,
                                     "display_name": m_entry.get("display_name") or slug,
@@ -380,6 +600,9 @@ class AgentModelDiscovery:
                                     "default_thinking_level": m_entry.get("default_reasoning_level") or default_effort,
                                     "supported_thinking_levels": eff_list or thinking_levels,
                                     "provider": default_provider,
+                                    "context_window_tokens": ctx_win,
+                                    "auto_compact_token_limit": auto_compact_lim,
+                                    "effective_context_window_percent": eff_pct,
                                 })
                             if all_efforts_seen:
                                 thinking_levels = all_efforts_seen

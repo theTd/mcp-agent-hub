@@ -8,6 +8,7 @@ transcript_tail.py
 transcript_feed.py
 native_session_launch.py
 compaction_threshold.py
+context_window_usage.py
 session_mcp_config.py
 model_discovery.py
 dsh_endpoint.py

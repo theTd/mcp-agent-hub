@@ -357,7 +357,7 @@
 .tx-choice:hover { border-color: var(--accent); background: var(--accent-soft); }
 .tx-choice.is-danger:hover { border-color: var(--danger); background: var(--danger-soft); }
 .tx-choice:disabled { opacity: 0.5; cursor: default; }
-.tx-reply { display: flex; gap: 7px; }
+.tx-reply { display: flex; align-items: center; gap: 7px; }
 .tx-reply-input {
   flex: 1;
   min-width: 0;
@@ -412,6 +412,212 @@
 .tx-compose-note { margin: 6px 4px 0; color: var(--danger-text); font-size: 12px; }
 .tx-compose-note[data-tone="info"] { color: var(--text-3); }
 
+/* ------------------------------------------------------------ context window gauge */
+/* A 26px instrument chip beside 发送 (transcript-view.js renderContextWindowHtml): a 16px ring
+   (full circle = the model's window, clockwise from 12 o'clock, a hairline tick at the
+   auto-compaction threshold) and the used share. Neutral until it matters: colour is the signal. */
+.tx-ctx {
+  /* What the chip sits on. The tick's knock-out is painted in the chip's fill, derived from it. */
+  --tx-ctx-surface: var(--bg-2);
+  display: inline-flex;
+  flex: none;
+}
+.tx-ctx[hidden] { display: none; }
+.tx-compose-row:has(.tx-compose-input:disabled) .tx-ctx { --tx-ctx-surface: var(--bg-1); }
+
+.tx-ctx-wrap {
+  --tx-ctx-tone: var(--text-2);
+  --tx-ctx-tone-text: var(--text-2);
+  --tx-ctx-dot: var(--success);
+  position: relative;
+  display: inline-flex;
+}
+.tx-ctx-wrap[data-tone="warn"] { --tx-ctx-tone: var(--warning); --tx-ctx-tone-text: var(--warning-text); --tx-ctx-dot: var(--warning); }
+.tx-ctx-wrap[data-tone="danger"] { --tx-ctx-tone: var(--danger); --tx-ctx-tone-text: var(--danger-text); --tx-ctx-dot: var(--danger); }
+.tx-ctx-wrap[data-tone="compact"] { --tx-ctx-tone: var(--violet); --tx-ctx-tone-text: #c4b5fd; --tx-ctx-dot: var(--violet); }
+
+.tx-ctx-trigger {
+  --tx-ctx-fill: var(--tx-ctx-surface);
+  --tx-ctx-edge: var(--line);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  margin: 0;
+  padding: 0 8px 0 6px;
+  border: 1px solid var(--tx-ctx-edge);
+  border-radius: var(--r-sm);
+  background: var(--tx-ctx-fill);
+  color: var(--tx-ctx-tone-text);
+  font: 500 11px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease), color 0.15s var(--ease);
+}
+.tx-ctx-wrap:is(:hover, :focus-within) .tx-ctx-trigger { --tx-ctx-fill: var(--bg-3); --tx-ctx-edge: var(--line-3); }
+.tx-ctx-wrap[data-tone="warn"] .tx-ctx-trigger { --tx-ctx-edge: rgba(242, 179, 71, 0.3); }
+.tx-ctx-wrap[data-tone="compact"] .tx-ctx-trigger { --tx-ctx-edge: rgba(167, 139, 250, 0.34); }
+.tx-ctx-wrap[data-tone="danger"] .tx-ctx-trigger {
+  --tx-ctx-fill: color-mix(in srgb, var(--danger) 9%, var(--tx-ctx-surface));
+  --tx-ctx-edge: rgba(242, 107, 107, 0.4);
+}
+.tx-ctx-wrap[data-tone="warn"]:is(:hover, :focus-within) .tx-ctx-trigger { --tx-ctx-edge: rgba(242, 179, 71, 0.5); }
+.tx-ctx-wrap[data-tone="compact"]:is(:hover, :focus-within) .tx-ctx-trigger { --tx-ctx-edge: rgba(167, 139, 250, 0.55); }
+.tx-ctx-wrap[data-tone="danger"]:is(:hover, :focus-within) .tx-ctx-trigger {
+  --tx-ctx-fill: color-mix(in srgb, var(--danger) 15%, var(--bg-3));
+  --tx-ctx-edge: rgba(242, 107, 107, 0.6);
+}
+
+.tx-ctx-ring { display: block; flex: none; width: 16px; height: 16px; overflow: visible; }
+.tx-ctx-track { fill: none; stroke: var(--line-3); stroke-width: 2; }
+.tx-ctx-wrap[data-estimated="true"] .tx-ctx-track { stroke: var(--text-3); stroke-opacity: 0.7; }
+.tx-ctx-arc {
+  fill: none;
+  stroke: var(--tx-ctx-tone);
+  stroke-width: 2;
+  stroke-linecap: butt;
+  transition: stroke-dasharray 0.35s var(--ease), stroke 0.2s var(--ease);
+}
+/* Just compacted: the arc still shows the reading from before, so it steps back until the next one. */
+.tx-ctx-wrap[data-tone="compact"] .tx-ctx-arc { stroke-opacity: 0.55; }
+.tx-ctx-mark-halo { stroke: var(--tx-ctx-fill); stroke-width: 2.6; transition: stroke 0.15s var(--ease); }
+.tx-ctx-mark-line { stroke: var(--text-1); stroke-width: 1.1; stroke-linecap: round; }
+
+/* The details card opens above the chip, right-aligned so it never leaves a tiled pane. */
+.tx-ctx-pop {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  width: 272px;
+  max-width: calc(100cqw - 88px);
+  max-height: calc(100cqh - 64px);
+  overflow-y: auto;
+  padding: 12px 13px 11px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-lg);
+  background: var(--bg-3);
+  box-shadow: var(--shadow-pop);
+  color: var(--text-1);
+  font: 12px/1.45 var(--font-ui);
+  text-align: left;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(4px);
+  transition: opacity 0.14s var(--ease) 0.08s, transform 0.14s var(--ease) 0.08s, visibility 0s linear 0.22s;
+}
+.tx-ctx-wrap:is(:hover, :focus-within) .tx-ctx-pop {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  transition: opacity 0.14s var(--ease) 0.06s, transform 0.14s var(--ease) 0.06s, visibility 0s 0.06s;
+}
+.tx-ctx-wrap:focus-within .tx-ctx-pop { transition-delay: 0s; }
+/* Hover bridge over the 8px gap: the pointer travels from the chip into the card without the card
+   closing. It exists only while the card is open, so it never catches a passing pointer. */
+.tx-ctx-wrap::before {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  display: none;
+  width: min(272px, calc(100cqw - 88px));
+  height: 10px;
+}
+.tx-ctx-wrap:is(:hover, :focus-within)::before { display: block; }
+
+.tx-ctx-pop-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.tx-ctx-pop-heading { min-width: 0; }
+.tx-ctx-pop-title { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text-1); font-size: 12px; font-weight: 600; }
+.tx-ctx-pop-badge {
+  padding: 0 5px;
+  border: 1px dashed var(--line-3);
+  border-radius: 4px;
+  color: var(--text-2);
+  font: 500 10.5px/15px var(--font-ui);
+}
+.tx-ctx-pop-state { display: flex; align-items: center; gap: 6px; margin: 3px 0 0; color: var(--tx-ctx-tone-text); font-size: 11px; }
+.tx-ctx-pop-state::before { content: ''; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--tx-ctx-dot); }
+.tx-ctx-pop-pct {
+  flex: none;
+  color: var(--tx-ctx-tone-text);
+  font: 600 17px/1.15 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.tx-ctx-wrap[data-tone="normal"] .tx-ctx-pop-pct { color: var(--text-1); }
+
+/* The same reading as a bar: fill = used, the light hairline = auto-compaction threshold. */
+.tx-ctx-meter {
+  position: relative;
+  height: 6px;
+  margin: 11px 0 12px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.07);
+}
+.tx-ctx-wrap[data-estimated="true"] .tx-ctx-meter {
+  background: repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.09) 0 6px, transparent 6px 8px);
+}
+.tx-ctx-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  max-width: 100%;
+  border-radius: inherit;
+  background: var(--tx-ctx-tone);
+  transition: width 0.35s var(--ease), background-color 0.2s var(--ease);
+}
+.tx-ctx-wrap[data-tone="compact"] .tx-ctx-meter-fill { opacity: 0.55; }
+.tx-ctx-meter-mark {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--text-1);
+  box-shadow: 0 0 0 1.5px var(--bg-3);
+}
+
+.tx-ctx-pop-rows {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 5px 16px;
+  margin: 0;
+}
+.tx-ctx-pop-rows dt { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+.tx-ctx-pop-rows dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-1);
+  font: 11.5px/1.45 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tx-ctx-pop-rows dd small { margin-left: 7px; color: var(--text-3); font-size: 10.5px; }
+.tx-ctx-pop-rows dd[data-tone="over"] { color: var(--danger-text); }
+
+.tx-ctx-pop-notes { display: grid; gap: 5px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line-2); }
+.tx-ctx-pop-note { display: flex; gap: 7px; margin: 0; color: var(--text-3); font-size: 11px; line-height: 1.5; }
+.tx-ctx-pop-note::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--line-3);
+}
+.tx-ctx-pop-note[data-kind="compact"] { color: #c4b5fd; }
+.tx-ctx-pop-note[data-kind="compact"]::before { background: var(--violet); }
+.tx-ctx-pop-note[data-kind="estimated"] { color: var(--text-2); }
+.tx-ctx-pop-note[data-kind="estimated"]::before { border: 1px dashed var(--text-3); background: none; }
+
 /* ------------------------------------------------------------ narrow panes (tiled layout) */
 @container transcript (max-width: 620px) {
   .tx-list { padding: 12px 12px 6px; }
@@ -432,12 +638,20 @@
   .tx-reply-input { height: 28px; }
   .tx-compose-row { padding: 4px 4px 4px 10px; }
   .tx-compose-input { max-height: 96px; }
+  .tx-ctx-pop { padding: 9px 11px 8px; }
+  .tx-ctx-meter { margin: 8px 0 9px; }
+  .tx-ctx-pop-rows { row-gap: 2px; }
+  .tx-ctx-pop-notes { margin-top: 7px; padding-top: 6px; }
 }
 @container transcript (max-width: 420px) {
   .tx-row-head > .tx-row-meta { display: none; }
   .tx-ask-head > time { display: none; }
+  /* The gauge folds to a 26×26 ring; the share stays in the card and the label. */
+  .tx-ctx-trigger { justify-content: center; width: 26px; padding: 0; }
+  .tx-ctx-pct { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .tx-spin, .tx-pulse, .tx-pending-dot { animation: none; }
+  .tx-ctx-trigger, .tx-ctx-arc, .tx-ctx-mark-halo, .tx-ctx-pop, .tx-ctx-meter-fill { transition: none; }
 }

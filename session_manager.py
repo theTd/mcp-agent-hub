@@ -59,6 +59,14 @@ from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
 from dsh_workspace_permissions import prepare_dsh_workspace
 from model_discovery import AgentModelDiscovery
+from context_window_usage import (
+    ContextWindowCatalog,
+    ContextWindowTracker,
+    SUPPORTED_CONTEXT_ENGINES,
+    context_window_signature,
+    resolve_native_transcript_path,
+    scan_file_into_tracker,
+)
 from transcript_summarizer import (
     ENGINE_BUSY_LINE_RES,
     ENGINE_BUSY_PHRASES,
@@ -144,8 +152,8 @@ TUI_TOOL_PATTERN = re.compile(
 
 DEFAULT_HUB_PORT = 4444
 KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh", "pwsh")
-AGY_THINKING_LEVELS = ("low", "medium", "high")
-AGY_SUFFIX_RE = re.compile(r"-(low|medium|high)$")
+AGY_THINKING_LEVELS = ("low", "medium", "high", "xhigh")
+AGY_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh)$")
 # A profile with an absurdly long argument list is a mistake, not a launch recipe.
 MAX_LAUNCH_ARGS = 4096
 MAX_ENV_VARS = 256
@@ -2106,6 +2114,7 @@ class AgentSession:
         self.transcript_user_text: str = ""
         self.effective_model: Optional[str] = None
         self.effective_thinking_level: Optional[str] = None
+        self._context_tracker: Optional[ContextWindowTracker] = None
 
         # Archive spec §3: everything the final record needs in order to view and revive this session.
         self.end_reason: Optional[str] = None
@@ -2661,6 +2670,11 @@ class AgentSession:
         # Older sessions have no provenance; preserve their existing notification behavior.
         return str(self.profile_snapshot.get("launch_source") or "user")
 
+    def context_window_snapshot(self) -> Optional[Dict[str, Any]]:
+        if self._context_tracker is None:
+            return None
+        return self._context_tracker.snapshot()
+
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
         if not alive and self.pty is not None and self.status not in (
@@ -2706,6 +2720,7 @@ class AgentSession:
             "sandbox_preparation": self.sandbox_preparation,
             "effective_model": self.effective_model,
             "effective_thinking_level": self.effective_thinking_level,
+            "context_window": self.context_window_snapshot(),
             # Round 2: true = high-risk approval on, false = the profile's bypass_approvals was on
             # for this launch, null = the engine has no hub approval (dsh, pwsh).
             "high_risk_approval": self.high_risk_approval,
@@ -2896,6 +2911,8 @@ class HubSessionManager:
         self._shutdown_task = None
         self.summarizer_registry = TranscriptSummarizerRegistry()
         self.model_discovery = AgentModelDiscovery()
+        self.context_window_catalog = ContextWindowCatalog(discovery=self.model_discovery)
+        self._archived_context_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self.profiles: Dict[str, Dict[str, Any]] = {}
         self.engines_catalog: Dict[str, Any] = {}
         self.engine_policies: Dict[str, Dict[str, Any]] = {}
@@ -3459,12 +3476,12 @@ class HubSessionManager:
                     grp["enabled"] = True
             for base in order:
                 grp = groups[base]
-                # Keep the engine's own order (low, medium, high), then anything unexpected.
+                # Keep the engine's own order (low, medium, high, xhigh), then anything unexpected.
                 levels = [l for l in AGY_THINKING_LEVELS if l in grp["levels"]]
                 levels += [l for l in grp["levels"] if l not in AGY_THINKING_LEVELS]
                 first_detail = detail_by_id.get(grp["first"]) or {}
                 label = str(first_detail.get("display_name") or base)
-                label = re.sub(r"\s*\((low|medium|high)\)\s*$", "", label, flags=re.IGNORECASE).strip() or base
+                label = re.sub(r"\s*\((low|medium|high|xhigh)\)\s*$", "", label, flags=re.IGNORECASE).strip() or base
                 _first_base, first_suffix = split_agy_model_id(grp["first"])
                 result.append(
                     {
@@ -4445,6 +4462,7 @@ class HubSessionManager:
         # A11: the thread is built on the exit/archive write only; every other persist passes "" and
         # the COALESCE upsert keeps what the final record already stored.
         thread = self._mailbox_thread(session.session_id) if final else []
+        cw = session.context_window_snapshot()
         return {
             "end_reason": session.end_reason,
             "archived_at": session.archived_at,
@@ -4462,6 +4480,7 @@ class HubSessionManager:
             "last_resumed_at": session.last_resumed_at,
             "resumable": None if session.resumable is None else (1 if session.resumable else 0),
             "resume_block_reason": session.resume_block_reason,
+            "context_window_json": json.dumps(cw, ensure_ascii=False) if cw else "",
         }
 
     @staticmethod
@@ -4843,6 +4862,10 @@ class HubSessionManager:
             sess.sandbox_preparation = snapshot.get("sandbox_preparation")
             sess.dsh_job_id = ref.get("dsh_job_id")
             sess.dsh_session_id = ref.get("dsh_session_id")
+        self._ensure_session_context_tracker(
+            sess,
+            initial_snapshot=record.get("context_window") if isinstance(record.get("context_window"), dict) else None,
+        )
         self._restore_parent_mailbox(session_id, record)
         return sess
 
@@ -5742,6 +5765,71 @@ class HubSessionManager:
         else:
             mark()
 
+    def _ensure_session_context_tracker(
+        self,
+        session: AgentSession,
+        initial_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ContextWindowTracker]:
+        eng = str(session.engine or "").strip().lower()
+        if eng not in SUPPORTED_CONTEXT_ENGINES:
+            return None
+        if session._context_tracker is not None:
+            if session.effective_model and not session._context_tracker.model:
+                session._context_tracker.model = str(session.effective_model)
+            return session._context_tracker
+        snap = session.profile_snapshot if isinstance(session.profile_snapshot, dict) else {}
+        omp_overlay = (self.runtime_configs_dir / f"omp_compaction_{session.session_id}.yml") if eng == "omp" else None
+        model_hint = session.effective_model or snap.get("cli_model") or snap.get("model")
+        tracker = ContextWindowTracker(
+            eng,
+            model=model_hint,
+            catalog=self.context_window_catalog,
+            session_compaction_threshold=snap.get("compaction_threshold"),
+            extra_env=snap.get("env"),
+            cli_args=session.args or snap.get("args"),
+            omp_overlay_path=omp_overlay,
+            initial_snapshot=initial_snapshot,
+        )
+        session._context_tracker = tracker
+        return tracker
+
+    def _observe_context_record(self, session: AgentSession, rec: Any) -> bool:
+        if not isinstance(rec, dict):
+            return False
+        tracker = self._ensure_session_context_tracker(session)
+        if tracker is None:
+            return False
+        return tracker.observe_record(rec)
+
+    def _backfill_archived_context_window(self, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        eng = str(meta.get("engine") or "").strip().lower()
+        if eng not in SUPPORTED_CONTEXT_ENGINES:
+            return None
+        snap = meta.get("profile_snapshot")
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        snap_dict = snap if isinstance(snap, dict) else {}
+        sid = str(meta.get("session_id") or "").strip()
+        omp_overlay = (self.runtime_configs_dir / f"omp_compaction_{sid}.yml") if (eng == "omp" and sid) else None
+        tracker = ContextWindowTracker(
+            eng,
+            model=meta.get("effective_model") or snap_dict.get("cli_model") or snap_dict.get("model"),
+            catalog=self.context_window_catalog,
+            session_compaction_threshold=snap_dict.get("compaction_threshold"),
+            extra_env=snap_dict.get("env"),
+            cli_args=snap_dict.get("args"),
+            omp_overlay_path=omp_overlay,
+        )
+        native_path = resolve_native_transcript_path(
+            eng, meta, home=self.context_window_catalog.home
+        )
+        if native_path is not None:
+            return scan_file_into_tracker(native_path, tracker)
+        return tracker.snapshot()
+
     def transcript_version(self, session_id: str, limit: int) -> Optional[str]:
         """A token that changes whenever the session's transcript can change; None when unknown.
 
@@ -5764,6 +5852,7 @@ class HubSessionManager:
             str(sess.status or ""), bool(sess.final_response_from_previous_turn),
             str(sess.final_response or ""), str(sess.last_task or ""),
             str(pending.get("request_id") or ""), str(pending.get("prompt") or ""),
+            context_window_signature(sess.context_window_snapshot()),
         )
         return hashlib.sha1(repr(parts).encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -7801,16 +7890,35 @@ class HubSessionManager:
         except (TypeError, ValueError):
             limit = FEED_DEFAULT_LIMIT
         # Taken before anything is read: a change that lands during the build gets a new version.
+        sess = self.sessions.get(session_id)
+        if sess is not None:
+            self._ensure_session_context_tracker(sess)
         version = self.transcript_version(session_id, limit)
         if since and version and since == version:
             return {"session_id": session_id, "unchanged": True, "version": version}
-        sess = self.sessions.get(session_id)
         if sess is not None:
             meta = sess.to_dict()
         else:
             meta = await self.db.get_session_record(session_id)
             if not meta:
                 raise ValueError(f"找不到会话 {session_id}")
+            if meta.get("context_window") is None:
+                eng = str(meta.get("engine") or "").strip().lower()
+                if eng in SUPPORTED_CONTEXT_ENGINES:
+                    if session_id in self._archived_context_cache:
+                        cw = self._archived_context_cache[session_id]
+                    else:
+                        cw = await asyncio.to_thread(self._backfill_archived_context_window, dict(meta))
+                        self._archived_context_cache[session_id] = cw
+                        if cw is not None:
+                            try:
+                                await self.db.update_archive_fields(
+                                    session_id,
+                                    context_window_json=json.dumps(cw, ensure_ascii=False),
+                                )
+                            except Exception:
+                                pass
+                    meta["context_window"] = cw
 
         # A tool is two events and the feed hides plumbing, so read a wider event window than the
         # entry limit.  The memory ring is freshest; SQLite fills the gap after a restart or once
@@ -7952,6 +8060,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    self._observe_context_record(session, obj)
                     otype = obj.get("type")
                     payload = obj.get("payload") or {}
                     ptype = payload.get("type")
@@ -8285,6 +8394,7 @@ class HubSessionManager:
             return
 
         turn_has_step = False
+        pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         while self._transcript_watch_alive(session):
             try:
                 lines, offset = read_complete_lines(target_file, offset)
@@ -8296,13 +8406,28 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    self._observe_context_record(session, obj)
                     otype = obj.get("type")
                     ctype = obj.get("customType")
                     if otype == "custom" and ctype == "tool_execution_start":
                         turn_has_step = True
                         data = obj.get("data") or {}
-                        tname = data.get("toolName", "tool")
-                        targs = data.get("args") or {}
+                        call_id = str(data.get("toolCallId") or "").strip()
+                        cached_tc = pending_tool_calls.pop(call_id, None) if call_id else None
+                        tname = data.get("toolName") or (cached_tc or {}).get("name") or "tool"
+                        raw_args = data.get("args")
+                        cached_args = (cached_tc or {}).get("arguments")
+                        if isinstance(cached_args, dict) and cached_args:
+                            targs = {**cached_args, **(raw_args if isinstance(raw_args, dict) else {})}
+                        else:
+                            targs = raw_args if raw_args is not None else {}
+                        intent = str(
+                            data.get("intent")
+                            or (cached_tc or {}).get("intent")
+                            or (targs.get("intent") if isinstance(targs, dict) else "")
+                            or (targs.get("i") if isinstance(targs, dict) and isinstance(targs.get("i"), str) else "")
+                            or ""
+                        ).strip()
                         cmd_val = ""
                         if isinstance(targs, dict):
                             cmd_val = str(
@@ -8318,7 +8443,7 @@ class HubSessionManager:
                             "tool_name": str(tname or "tool"),
                             "command": cmd_val,
                             "args": targs,
-                            "call_id": str(data.get("toolCallId") or ""),
+                            "call_id": call_id,
                         }
                         await self.record_telemetry(
                             session.session_id,
@@ -8327,6 +8452,9 @@ class HubSessionManager:
                                 "hook_event": "PreToolUse",
                                 "tool_name": tname,
                                 "tool_input": targs,
+                                "call_id": call_id,
+                                "tool_title": intent or None,
+                                "step_title": intent or None,
                             },
                         )
                         if tname == "ask" and isinstance(targs, dict):
@@ -8378,15 +8506,16 @@ class HubSessionManager:
                             session._inflight_transcript_tool = None
                             if session.pending_interaction:
                                 await self.clear_pending_interaction(session)
-                            await self.record_telemetry(
-                                session.session_id,
-                                {
-                                    "source": "omp_jsonl",
-                                    "hook_event": "PostToolUse",
-                                    "tool_name": msg.get("toolName"),
-                                    "tool_response": content,
-                                },
-                            )
+                            tr_payload: Dict[str, Any] = {
+                                "source": "omp_jsonl",
+                                "hook_event": "PostToolUse",
+                                "tool_name": msg.get("toolName"),
+                                "tool_response": content,
+                                "call_id": str(msg.get("toolCallId") or "").strip(),
+                            }
+                            if "isError" in msg:
+                                tr_payload["tool_ok"] = not bool(msg.get("isError"))
+                            await self.record_telemetry(session.session_id, tr_payload)
                         elif role == "assistant" and isinstance(content, list):
                             thoughts = []
                             texts = []
@@ -8402,6 +8531,21 @@ class HubSessionManager:
                                 elif ptype in ("toolCall", "tool_use"):
                                     has_tool_use = True
                                     turn_has_step = True
+                                    tc_id = str(part.get("id") or "").strip()
+                                    tc_args = part.get("arguments") if isinstance(part.get("arguments"), dict) else {}
+                                    tc_intent = str(
+                                        part.get("intent")
+                                        or (tc_args.get("i") if isinstance(tc_args.get("i"), str) else "")
+                                        or ""
+                                    ).strip()
+                                    if tc_id:
+                                        if len(pending_tool_calls) >= 64:
+                                            pending_tool_calls.pop(next(iter(pending_tool_calls)), None)
+                                        pending_tool_calls[tc_id] = {
+                                            "name": str(part.get("name") or ""),
+                                            "arguments": tc_args,
+                                            "intent": tc_intent,
+                                        }
                                     if part.get("name") == "ask" and isinstance(part.get("arguments"), dict):
                                         targs = part["arguments"]
                                         qs = targs.get("questions") or []
@@ -8638,6 +8782,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    self._observe_context_record(session, obj)
 
                     if obj.get("type") in ("interaction.request", "interaction.resolved"):
                         continue
@@ -8903,6 +9048,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    self._observe_context_record(session, obj)
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
@@ -9235,6 +9381,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    self._observe_context_record(session, obj)
                     otype = obj.get("type")
                     if otype == "user":
                         msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
@@ -12416,6 +12563,7 @@ class HubSessionManager:
                     "label": "成功",
                 }
 
+        self._ensure_session_context_tracker(sess)
         if task_mode == "dsh_hub_api":
             # B6 rule 4 / V-3: dsh injects no args. resolve_launch already built the dsh spec
             # (tier, provider/model split, effort), so the session and the preview use one value.
