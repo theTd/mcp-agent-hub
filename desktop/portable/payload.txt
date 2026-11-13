@@ -23,6 +23,7 @@ engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/claude-auto-approval.json
 engine_policies/omp-approval.yml
+engine_policies/omp_approval_event_log.ts
 static/index.html
 static/css/hub-console.css
 static/css/transcript-view.css

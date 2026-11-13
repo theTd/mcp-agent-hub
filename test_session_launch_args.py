@@ -11,7 +11,7 @@ import httpx
 from fastmcp import Client
 
 from native_session_launch import normalize_extra_args
-from session_manager import AgentSession, HubSessionManager
+from session_manager import AgentSession, HubSessionManager, OMP_APPROVAL_EXTENSION_NAME, OMP_APPROVAL_LOG_ENV
 
 
 class ExtraArgsValidationTests(unittest.TestCase):
@@ -87,6 +87,22 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(extra[1], resumed["args"])
                 self.assertIn(extra[2], resumed["args"])
                 self.assertNotIn("--changed-after-spawn", resumed["args"])
+
+    async def test_omp_starts_with_its_approval_event_log(self):
+        """omp loads the hub's approval event extension once and is told where to write."""
+        started = {}
+        with patch.object(AgentSession, "start_pty", lambda s, loop, env_overrides=None: started.update(env_overrides or {})), \
+                patch.object(self.hub, "_schedule", lambda coro: coro.close()):
+            sess = await self.hub.create_session("omp", task="fixture task", cwd=str(self.root))
+        extension = [a for a in sess.args if a.startswith("--extension=")]
+        self.assertEqual(len(extension), 1)
+        self.assertTrue(extension[0].endswith(OMP_APPROVAL_EXTENSION_NAME))
+        self.assertEqual(started[OMP_APPROVAL_LOG_ENV], str(self.hub._omp_approval_log_path(sess)))
+        await self.hub.db.flush()
+        record = await self.hub.db.get_session_record(sess.session_id)
+        record["conversation_ref"] = {"session_id": "fixture", "session_file": "fixture"}
+        resumed = self.hub.build_resume_launch(record)
+        self.assertEqual(sum(a.startswith("--extension=") for a in resumed["args"]), 1)
 
     async def test_non_cli_and_invalid_input_rejected_before_spawn(self):
         for profile, kwargs in (("dsh", {}), ("desktop-gui", {"hwnd": 123})):

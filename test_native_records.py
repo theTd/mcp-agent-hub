@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from native_session_launch import strip_legacy_worker_bridge_args
 from session_manager import AgentSession, HubSessionManager, approval_launch_flags
+from transcript_summarizer import KimiTranscriptSummarizer
 from transcript_tail import read_complete_lines
 
 
@@ -240,6 +241,57 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
     async def test_kimi_native_roundtrip(self):
         await self.exercise("kimi")
 
+    async def test_omp_cut_start_record_keeps_the_full_call(self):
+        """omp's tool_execution_start cuts string arguments to 200 chars + "…"; the tool call is whole.
+
+        Side-by-side calls are tracked by id: one call's result does not end another call's approval.
+        """
+        sess = self.session("omp", "-cut")
+        work = self.root / "omp-cut"
+        work.mkdir()
+        path = work / "native.jsonl"
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_file": str(path)}
+        full = "cd wt && rm -rf ../scratch/bitetest && " + "echo " + "y" * 300
+        other = "git status --short"
+        result = lambda call_id: {"type": "message", "message": {
+            "role": "toolResult", "toolCallId": call_id, "toolName": "bash", "content": [{"type": "text", "text": "ok"}]}}
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            self.append(
+                path,
+                {"type": "message", "message": {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": full, "i": "Clean up"}},
+                    {"type": "toolCall", "id": "c2", "name": "bash", "arguments": {"command": other}}]}},
+                {"type": "custom", "customType": "tool_execution_start",
+                 "data": {"toolName": "bash", "toolCallId": "c1", "args": {"command": full[:200] + "…"}}},
+                {"type": "custom", "customType": "tool_execution_start",
+                 "data": {"toolName": "bash", "toolCallId": "c2", "args": {"command": other}}},
+            )
+            await self.until(lambda: "c2" in sess._open_transcript_tools)
+            self.assertEqual(sess._open_transcript_tools["c1"]["command"], full)
+            self.assertEqual(sess._open_transcript_tools["c1"]["args"]["i"], "Clean up")
+            await self.hub.register_pending_interaction(
+                sess, kind="approval_request", title="OMP Tool Approval (bash)", prompt=full,
+                options=["Approve", "Deny"], source="omp_tui_screen_detector",
+                metadata={"command": full, "call_id": "c1"},
+            )
+            sess._omp_open_approvals["c2"] = {"event": {"call_id": "c2"}, "registered": True}
+            self.append(path, result("c2"))
+            await self.until(lambda: "c2" not in sess._open_transcript_tools)
+            self.assertIsNotNone(sess.pending_interaction)
+            self.assertEqual(sess._inflight_transcript_tool["call_id"], "c1")
+            # A finished call's approval request is over even when its resolution was never read.
+            self.assertNotIn("c2", sess._omp_open_approvals)
+            self.append(path, result("c1"))
+            await self.until(lambda: sess.pending_interaction is None)
+            self.assertEqual(sess._open_transcript_tools, {})
+            self.assertIsNone(sess._inflight_transcript_tool)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def keep_thinking_out_of_messages(self, engine, streamed=False):
         """Thinking parts become console-only reasoning; parents and the final reply only get the text."""
         sess = self.session(engine, "-think")
@@ -366,6 +418,77 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    def kimi_wire(self, suffix):
+        sess = self.session("kimi", suffix)
+        work = self.root / f"kimi{suffix}"
+        path = work / "agents/main/wire.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_dir": str(work)}
+        return sess, path
+
+    @staticmethod
+    def kimi_step(text):
+        part = {"type": "content.part", "part": {"type": "text", "text": text}}
+        return [{"type": "context.append_loop_event", "event": {"type": "step.begin"}},
+                {"type": "context.append_loop_event", "event": part},
+                {"type": "context.append_loop_event", "event": {"type": "step.end", "finishReason": "end_turn"}}]
+
+    @staticmethod
+    def kimi_turn_ended(turn_id):
+        return {"type": "turn.ended", "agentId": "main", "turnId": turn_id, "reason": "completed"}
+
+    async def test_kimi_turn_ended_alone_completes_the_turn(self):
+        # kimi-ed1ee650 (2026-11-13): current Kimi writes only turn.ended, and the session stayed
+        # "running" after its answer because the watcher waited for agent.turn.ended.
+        sess, path = self.kimi_wire("-turn-ended")
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            self.append(path, *self.kimi_step("审计已写好。"), self.kimi_turn_ended(0),
+                        {"type": "prompt.completed", "agentId": "main", "reason": "completed"})
+            await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "审计已写好。")
+            self.assertTrue(sess.completion_reported)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_kimi_late_legacy_turn_end_does_not_end_the_next_turn(self):
+        # Older builds wrote agent.turn.ended in the end-of-turn batch, often after the next prompt.
+        sess, path = self.kimi_wire("-legacy-late")
+        prompt = {"type": "turn.prompt", "origin": {"kind": "user"}, "input": [{"type": "text", "text": "再查一遍"}]}
+        legacy_batch = [{"kind": "event", "type": "agent.message.appended", "message": {"message": {
+                            "role": "assistant", "content": [{"type": "text", "text": "第一轮结论。"}]}}},
+                        {"kind": "event", "type": "agent.turn.ended", "turnId": 0, "outcome": "done"}]
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            self.append(path, *self.kimi_step("第一轮结论。"), self.kimi_turn_ended(0))
+            await self.until(lambda: sess.status == "completed")
+            self.append(path, prompt, *legacy_batch)
+            await self.until(lambda: sess.final_response_from_previous_turn)
+            await asyncio.sleep(0.6)  # more than two watcher ticks, so the late legacy row is read
+            self.assertEqual(sess.status, "running")
+            self.append(path, *self.kimi_step("第二轮结论。"), self.kimi_turn_ended(1))
+            await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "第二轮结论。")
+            ends = [e for e in self.hub.worker_events
+                    if e["session_id"] == sess.session_id and e["type"] == "turn_completed"]
+            self.assertEqual([e["content"] for e in ends], ["第一轮结论。", "第二轮结论。"])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_kimi_summary_counts_turns_once_in_either_format(self):
+        current = self.root / "kimi-summary-current.jsonl"
+        both = self.root / "kimi-summary-both.jsonl"
+        legacy = self.root / "kimi-summary-legacy.jsonl"
+        self.append(current, *self.kimi_step("a"), self.kimi_turn_ended(0), *self.kimi_step("b"), self.kimi_turn_ended(1))
+        self.append(both, self.kimi_turn_ended(0), {"kind": "event", "type": "agent.turn.ended", "turnId": 0})
+        self.append(legacy, {"kind": "event", "type": "agent.turn.ended"})
+        summarize = lambda path: KimiTranscriptSummarizer().summarize(path, {}, [], [])["turns_completed"]
+        self.assertEqual([summarize(current), summarize(both), summarize(legacy)], [2, 1, 1])
 
     async def test_text_the_engine_writes_as_the_user_is_not_a_typed_prompt(self):
         for engine in ("codex", "claude"):
@@ -593,6 +716,104 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                         row("function_call", name="read_file", call_id="progress", arguments="{}"))
             await self.until(lambda: sess.step_count == 3)
             self.assertEqual(sess.pending_question_id, "async")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def watched_codex(self, name):
+        sess = self.session("codex", f"-{name}")
+        path = self.root / f"codex-{name}.jsonl"
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"rollout_path": str(path)}
+        return sess, path, self.hub._schedule(self.hub._watch_codex_rollout(sess, self.root))
+
+    async def wait_handle(self, sess):
+        info = await self.hub.wait_inbox.ensure_for_sessions([sess.session_id], {sess.session_id: sess.turn_id})
+        sess.wait_handle = info["wait_handle"]
+        return info["wait_handle"]
+
+    @staticmethod
+    def codex_message(role, text):
+        return {"type": "response_item", "payload": {"type": "message", "role": role,
+                                                     "content": [{"type": "input_text", "text": text}]}}
+
+    async def deny_codex_approval(self, sess, path, feedback=None):
+        """The parent denies a codex command approval; Codex aborts the turn for the `n`."""
+        self.append(path, {"type": "event_msg", "payload": {"type": "exec_approval_request", "call_id": "c1",
+                                                            "command": ["rm", "-r", "out"]}})
+        await self.until(lambda: sess.pending_interaction is not None)
+        await self.hub.respond_to_interaction(sess.session_id, decision="deny", custom_input=feedback)
+        await self.until(lambda: "n" in sess.pty.inputs)
+        # Real order (rollout of codex-1146485d): the developer marker, then the abort event.
+        self.append(path, self.codex_message("developer", "<turn_aborted>\nThe previous turn was interrupted on purpose.</turn_aborted>"),
+                    {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}})
+
+    async def test_codex_abort_ends_the_turn_and_wakes_the_parent(self):
+        # 2026-11-13: an abort (here the parent's deny) only set "waiting_parent" with nothing
+        # pending, so the parent's wait URL stayed "waiting" until the parent gave up.
+        sess, path, task = self.watched_codex("abort")
+        try:
+            handle = await self.wait_handle(sess)
+            await self.deny_codex_approval(sess, path)
+            self.assertEqual(sess.pty.inputs, ["n"])
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual(done["state"], "done")
+            self.assertTrue(done["final_response"].startswith("Codex turn aborted (interrupted): the turn ended"))
+            self.assertEqual(done["results"][0]["data"]["outcome"], "aborted")
+            self.assertEqual(sess.status, "completed")
+            events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual((events.count("turn_aborted"), events.count("turn_completed")), (1, 1))
+            # Whatever is typed next starts a new turn.
+            self.append(path, self.codex_message("user", "Rename it instead."))
+            await self.until(lambda: sess.status == "running")
+            self.assertTrue(sess.final_response_from_previous_turn)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_codex_deny_feedback_is_the_next_message_and_holds_the_abort(self):
+        # 2026-11-12 (codex-5eaf74c6, codex-aeb2403d): the feedback, typed raw with Enter 0.25 s
+        # after `n`, stayed in the composer unsent. It now goes in through the checked submit as the
+        # next message, and the abort waits for it instead of ending the turn.
+        sess, path, task = self.watched_codex("feedback")
+        sent = []
+        async def deliver(session_id, text, **kwargs):
+            sent.append((session_id, text))
+            return {"delivered": True}
+        try:
+            handle = await self.wait_handle(sess)
+            with patch.object(self.hub, "deliver_parent_message", deliver), \
+                    patch("session_manager.AGY_DENY_FEEDBACK_DELAY_SEC", 0.01):
+                await self.deny_codex_approval(sess, path, feedback="Rename it instead.")
+                await self.until(lambda: bool(sent))
+            self.assertEqual(sent, [(sess.session_id, "Rename it instead.")])
+            self.assertEqual(sess.pty.inputs, ["n"])
+            self.assertEqual((await self.hub.wait_inbox.wait(handle, 0.6))["state"], "waiting")
+            self.assertEqual(sess.status, "running")
+            self.append(path, self.codex_message("user", "Rename it instead."),
+                        {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Renamed it."}})
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual((done["state"], done["final_response"]), ("done", "Renamed it."))
+            events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual(events.count("turn_completed"), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_codex_abort_held_for_feedback_ends_the_turn_when_none_arrives(self):
+        # The real checked submit fails here (the fixture draws no composer), so nothing reaches Codex.
+        sess, path, task = self.watched_codex("lost-feedback")
+        try:
+            handle = await self.wait_handle(sess)
+            with patch("session_manager.AGY_DENY_FEEDBACK_DELAY_SEC", 0.01), \
+                    patch("session_manager.CODEX_DENY_FEEDBACK_HOLD_SEC", 1.0):
+                await self.deny_codex_approval(sess, path, feedback="Rename it instead.")
+            done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual(done["state"], "done")
+            self.assertIn("the deny's feedback never reached Codex", done["final_response"])
+            self.assertTrue(done["results"][0]["data"]["feedback_missing"])
+            self.assertEqual(sess.status, "completed")
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
