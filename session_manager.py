@@ -17,10 +17,11 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import httpx
 import pyte
@@ -53,7 +54,7 @@ from session_mcp_config import (
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
-from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
+from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
 from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 
 from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
@@ -143,6 +144,52 @@ def _clip_detail(text: str) -> str:
     if len(text) <= TOOL_DETAIL_LIMIT:
         return text
     return f"{text[:TOOL_DETAIL_LIMIT]}\n…（已截断，原文 {len(text)} 字符）"
+
+
+def _stored_telemetry(data: Dict[str, Any]) -> Dict[str, Any]:
+    """`data` for record_telemetry with the tool input/output reduced to the forms that get stored.
+
+    The write is sized from its arguments before it runs (logical_write: 1 MB + 8 x their pickle).
+    A raw tool output of ~4 MB (a Codex `view_image` result is several MB of base64) sized past the
+    32 MB queue, the write raised, and the transcript watcher that made it ended for good: the
+    session stayed "running" and its later turn ends were never seen (codex-732d4e3a and five
+    more, 2026-11-10..13). Only the summaries, the clipped details and the title below are kept,
+    so they are made here, from the full values, and the raw ones never reach the write.
+    """
+    tool_input = data.get("tool_input")
+    tool_response = data.get("tool_response")
+    hook_event = data.get("hook_event", "")
+    if isinstance(tool_input, (dict, list)):
+        input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
+        input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+    else:
+        input_str = "" if tool_input is None else str(tool_input)[:600]
+        input_detail = "" if tool_input is None else str(tool_input)
+    if isinstance(tool_response, (dict, list)):
+        resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
+    else:
+        resp_str = "" if tool_response is None else str(tool_response)[:600]
+    full_title = ""
+    if (hook_event not in ("PostToolUse", "ReportStep") and not data.get("tool_title")
+            and len(input_detail) > TOOL_DETAIL_LIMIT):
+        # The stored arguments are clipped and may lose the describing one (a long Bash command
+        # ahead of its description): name the call from the whole text now.
+        full_title = tool_title(str(data.get("tool_name") or ""), input_detail)[:300]
+    stored = {key: value for key, value in data.items() if key not in ("tool_input", "tool_response")}
+    stored["_tool"] = {
+        "has_response": tool_response is not None,
+        "input_str": input_str,
+        "resp_str": resp_str,
+        "input_detail": _clip_detail(input_detail),
+        "output_detail": (
+            _clip_detail(tool_output_text(tool_response)) if hook_event == "PostToolUse" and tool_response is not None
+            else ""
+        ),
+        "full_title": full_title,
+    }
+    if data.get("reasoning") is not None:
+        stored["reasoning"] = _clip_detail(str(data["reasoning"]).strip())
+    return stored
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
@@ -383,6 +430,11 @@ STICKY_RESUME_BLOCK_PREFIXES = ("codex 已把该会话归档",)
 # A3: after a resumed agy process starts, a brand-new conversation dir can only be that process
 # opening an empty conversation for an id it does not know. The window keeps the scan bounded.
 AGY_RESUME_VERIFY_WINDOW_SEC = 30.0
+# agy writes an ERROR_MESSAGE row for every failed model call and retries on its own; most runs recover
+# within seconds (retry backoff seen up to ~25 s). When it gives up (8 failed attempts, then "There was a
+# network issue" on screen) it writes nothing more and sits idle at its prompt. An error row followed by
+# this long a silence ends the turn, so the parent's wait does not stay "running" for good.
+AGY_ERROR_TURN_END_SEC = 60.0
 # The hub's anchor (time.time()) and the filesystem's birth time are different clock sources and can
 # round against each other; a dir born in the same tick as the spawn is still the new conversation.
 AGY_CONVERSATION_ANCHOR_SLACK_SEC = 0.05
@@ -475,6 +527,15 @@ TUI_SUBMIT_RETRY_STEP_SEC = 1.0
 TUI_TYPE_SETTLE_SEC = 0.8
 TUI_TYPE_SETTLE_POLL_SEC = 0.1
 TUI_TYPE_SETTLE_CAP_SEC = 10.0
+# Codex on Windows takes a paste in a few words per frame (live: ~60 chars/s, an 850-char follow-up
+# still growing at the 10 s cap). Past the cap the wait goes on while the composer keeps changing,
+# and gives up once it has stood still this long or at the hard cap.
+TUI_TYPE_STALL_SEC = 3.0
+TUI_TYPE_SETTLE_HARD_CAP_SEC = 120.0
+# Codex caps its composer's height; a taller draft scrolls and marks the hidden rows with an arrow
+# at the right edge of its top visible row. The visible end must then be at least this long.
+TUI_CODEX_SCROLL_MARK_RE = re.compile(r"(?<=\s)↑(?=\s)")
+TUI_CODEX_SCROLLED_MIN_CHARS = 40
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
@@ -964,6 +1025,10 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
 # - bypass: no checks (the profile's `bypass_approvals: true`, or a session override).
 ENGINE_POLICIES_DIR = Path(__file__).resolve().parent / "engine_policies"
 OMP_APPROVAL_OVERLAY_NAME = "omp-approval.yml"
+# The omp extension that appends omp's own tool approval events to the file named by
+# OMP_APPROVAL_LOG_ENV (one per hub session): approval boxes are learnt from omp, not the screen.
+OMP_APPROVAL_EXTENSION_NAME = "omp_approval_event_log.ts"
+OMP_APPROVAL_LOG_ENV = "HUB_OMP_APPROVAL_LOG"
 CLAUDE_APPROVAL_SETTINGS_NAME = "claude-approval.json"
 CLAUDE_AUTO_SETTINGS_NAME = "claude-auto-approval.json"
 APPROVAL_MODES = ("auto", "ask", "bypass")
@@ -976,6 +1041,11 @@ AGY_SESSION_SETTINGS: Dict[str, Any] = {"agentMode": "auto"}
 def omp_approval_overlay_path() -> Path:
     """D2: the omp settings overlay shipped in the repo (bash allowed, high-risk patterns prompt)."""
     return ENGINE_POLICIES_DIR / OMP_APPROVAL_OVERLAY_NAME
+
+
+def omp_approval_extension_path() -> Path:
+    """The omp extension shipped in the repo that logs omp's tool approval events for the hub."""
+    return ENGINE_POLICIES_DIR / OMP_APPROVAL_EXTENSION_NAME
 
 
 def _render_claude_overlay(name: str, events: tuple) -> Path:
@@ -1038,6 +1108,11 @@ def _is_omp_overlay_path(value: str) -> bool:
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_OVERLAY_NAME
 
 
+def _is_omp_approval_extension_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() == OMP_APPROVAL_EXTENSION_NAME
+
+
 def _is_claude_approval_settings_path(value: str) -> bool:
     raw = str(value or "").strip().strip('"').strip("'")
     return bool(raw) and os.path.basename(raw.replace("\\", "/")).lower() in (
@@ -1065,6 +1140,10 @@ def _approval_flag_tokens(engine: str, args: List[str]):
             elif a.startswith("--config=") and _is_omp_overlay_path(a.split("=", 1)[1]):
                 width, label = 1, "--config="
             elif a == "--config" and _is_omp_overlay_path(nxt(i)):
+                width = 2
+            elif a.startswith("--extension=") and _is_omp_approval_extension_path(a.split("=", 1)[1]):
+                width, label = 1, "--extension="
+            elif a in ("--extension", "-e") and _is_omp_approval_extension_path(nxt(i)):
                 width = 2
         elif eng == "kimi":
             if a in ("--auto", "--yolo", "-y"):
@@ -1153,7 +1232,8 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
     """The flags the hub injects so `engine` runs with high-risk approval on (D2-D5)."""
     eng = (engine or "").strip().lower()
     if eng == "omp":
-        return ["--approval-mode=write", f"--config={omp_approval_overlay_path()}"]
+        return ["--approval-mode=write", f"--config={omp_approval_overlay_path()}",
+                f"--extension={omp_approval_extension_path()}"]
     if eng == "kimi":
         return ["-y"]
     if eng == "codex":
@@ -1331,8 +1411,12 @@ APPROVAL_SESSION_DECISIONS = (
 APPROVAL_DENY_DECISIONS = ("deny", "reject", "no", "n", "cancel")
 # omp ignores keys for 500 ms after its prompt opens (research 2026-11-07); the hub waits longer.
 OMP_PROMPT_KEY_GUARD_SEC = 0.6
-# agy: after a deny the turn ends; the feedback is typed as the next message once the composer is back.
+# agy, claude and codex: a deny ends the turn; the feedback is typed as the next message once the
+# composer is back.
 AGY_DENY_FEEDBACK_DELAY_SEC = 1.2
+# codex: the abort of a deny with feedback is held this long for that message (its checked submit
+# included); if none arrives, the abort ends the turn as a plain deny does.
+CODEX_DENY_FEEDBACK_HOLD_SEC = 30.0
 # A machine record (kimi wire) of a prompt the screen detector already registered and the parent
 # already answered is the same prompt if it arrives this soon after the screen registration.
 SCREEN_ADOPT_WINDOW_SEC = 20.0
@@ -1456,6 +1540,64 @@ def parse_omp_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
         "session_label": session_label,
         "deny_label": deny[0],
     }
+
+
+# How long an omp approval box waits for its tool call to reach the transcript watcher before it is
+# registered with the box's own text. omp writes the call before it draws the box; the watcher reads
+# the transcript every TRANSCRIPT_TAIL_INTERVAL_SEC.
+OMP_BOX_CALL_WAIT_SEC = 1.0
+# omp's approval events (engine_policies/omp_approval_event_log.ts). omp writes the request just
+# before it draws the box, after the call is in its transcript: a request waits this long for the
+# box (its option rows) and for the call (the full command) before it is registered without them.
+OMP_EVENT_BOX_WAIT_SEC = 1.5
+# With the events working, a box on screen that no open request covers is registered from the
+# screen only once it has stayed this long (omp stopped sending the events, or one went missing).
+OMP_SCREEN_FALLBACK_GRACE_SEC = 3.0
+CLIPPED_COMMAND_NOTE = (
+    "The command is cut off on the worker's screen and its full text was not found in the "
+    "worker's transcript: inspect the session before approving."
+)
+UNREAD_OMP_BOX_NOTE = (
+    "omp asked for approval, but its box could not be read and the call is not in the worker's "
+    "transcript yet: inspect the session before approving."
+)
+# The options offered for an omp approval whose box could not be read (the answer keys still work).
+OMP_UNREAD_BOX_OPTIONS = ("Approve", "Deny")
+
+
+def omp_approval_request_id(call_id: str) -> str:
+    """The interaction id of omp's approval request for one tool call (stable across reads)."""
+    return "omp-" + hashlib.sha1(str(call_id).encode("utf-8")).hexdigest()[:12]
+
+
+def screen_command_clipped(command: str) -> bool:
+    """A command read off a TUI box that the box cut short (omp: `…` and `[…Nch elided…]`)."""
+    return "…" in str(command or "")
+
+
+def _without_whitespace(text: Any) -> str:
+    return "".join(str(text or "").split())
+
+
+def tool_call_for_approval_box(
+    tool: str, screen_command: str, calls: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The open transcript tool call an approval box asks about, or None.
+
+    The box's command up to its first `…` must start the call's full command; whitespace is
+    ignored because the box wraps lines and the parser joins them. A box without a command (edit /
+    write boxes show `File:` rows) fits every call of its tool; a call of another tool never fits.
+    When the box fits calls with different commands, it is unclear which one asks: None.
+    """
+    prefix = _without_whitespace(str(screen_command or "").split("…", 1)[0]).removesuffix("[")
+    fits = [
+        call for call in calls
+        if not (tool and call.get("tool_name") and str(call.get("tool_name")) != tool)
+        and (not prefix or _without_whitespace(call.get("command")).startswith(prefix))
+    ]
+    if not fits or len({str(call.get("command") or "") for call in fits}) > 1:
+        return None
+    return fits[-1]
 
 
 def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
@@ -1813,6 +1955,29 @@ class HubTerminalScreen(pyte.HistoryScreen):
             return
         super().report_device_status(mode)
 
+    def draw(self, data: str) -> None:
+        """Skips a zero-width or unprintable character instead of dropping the rest of the text.
+
+        pyte's draw stops at the first character that is zero-width and not combining (ZWSP, ZWJ, the
+        emoji selector VS16 in "⚠️") or unprintable, so everything after it in the same run of plain
+        text never reached the screen. Here pyte draws the runs around such a character; the character
+        itself changes nothing, as in a real terminal (it does not even trigger a pending wrap).
+        """
+        if data.isascii() and data.isprintable():
+            super().draw(data)
+            return
+        width_of = pyte.screens.wcwidth
+        run_start = 0
+        for index, char in enumerate(data):
+            width = width_of(char)
+            if width > 0 or (width == 0 and unicodedata.combining(char)):
+                continue
+            if index > run_start:
+                super().draw(data[run_start:index])
+            run_start = index + 1
+        if run_start < len(data):
+            super().draw(data[run_start:])
+
     @property
     def display(self) -> List[str]:
         """Safe display renderer that tolerates orphaned wide-char stubs (Char.data == '').
@@ -1845,7 +2010,28 @@ class HubTerminalStream(pyte.Stream):
     pyte resets its parser when a handler raises but re-raises, and Stream.feed then abandons every
     byte after it (the raw scrollback kept them, the screen model did not). Here the failed
     character is dropped and the next one is parsed by the fresh parser.
+
+    Also drops the CSIs pyte ends early (``_split_marker_csi``): a kitty-keyboard marker such as
+    kimi's ``ESC[<u`` used to reach the screen as the text ``u``.
     """
+
+    def __init__(self, screen: Optional[pyte.Screen] = None, strict: bool = True) -> None:
+        super().__init__(screen, strict)
+        self._marker_csi_carry = ""
+
+    def feed(self, data: str) -> None:
+        if not self._marker_csi_carry and "\x1b" not in data and "\x9b" not in data:
+            # No escape byte and nothing held over: the filter could not change this text, and the
+            # per-call cost matters because virtual sessions feed one character at a time.
+            super().feed(data)
+            return
+        # A PTY chunk can split any sequence; the kept tail goes in front of the next chunk, so the
+        # filter always sees whole sequences.
+        text = self._marker_csi_carry + data
+        self._marker_csi_carry = ""
+        filtered, self._marker_csi_carry = _split_marker_csi(text)
+        if filtered:
+            super().feed(filtered)
 
     def _send_to_parser(self, data: str) -> Optional[bool]:
         try:
@@ -1853,6 +2039,83 @@ class HubTerminalStream(pyte.Stream):
         except Exception:
             # pyte's own handler already re-initialised the parser; report its plain-text state.
             return self._taking_plain_text
+
+
+# pyte 0.8.2 ends a CSI at the first byte that is not a digit, ';', '?', a space or '>', and
+# dispatches that byte as the final character. ECMA-48, and the vte parser of the coming Rust core,
+# read 0x30-0x3F as parameter bytes instead. The three bytes where the two readings differ are the
+# ones the CLIs send: ':' (SGR subparameters) and the '<' '=' private markers of the kitty keyboard
+# protocol (kimi and omp send ESC[<u, agy ESC[=5;1u and ESC[<1u).
+_CSI_MARKER_CHARS = ":<="
+# pyte's two CSI starts: ESC [ and the 8-bit CSI, which pyte accepts as one.
+_CSI_START_RE = re.compile("\x1b\\[|\x9b")
+# A real CSI is a few dozen bytes. A longer unterminated run can only be junk, and pyte holds such a
+# run in its own parser anyway, so the filter stops carrying it rather than buffering without bound.
+_CSI_CARRY_MAX = 512
+
+
+def _split_marker_csi(text: str) -> Tuple[str, str]:
+    """Splits PTY text into ``(what pyte must parse, a trailing partial CSI for the next chunk)``.
+
+    A CSI whose parameter bytes include ':' '<' or '=' is removed whole: vte reads the same bytes as
+    one sequence and draws nothing for it, while pyte would draw the rest of the sequence as text.
+    Every sequence pyte parses today is handed over unchanged - '?' private modes, '>' secondary
+    parameters, '$', and CAN/SUB cancelling a sequence (the CAN/SUB itself stays in the text, so
+    pyte's own cancel path still runs).
+    """
+    kept: List[str] = []
+    pos = 0
+    length = len(text)
+    while True:
+        match = _CSI_START_RE.search(text, pos)
+        if match is None:
+            tail = text[pos:]
+            if tail.endswith("\x1b"):
+                # An ESC at the very end: the next chunk decides what it starts, and pyte holds it
+                # in its own parser meanwhile, so nothing is drawn either way.
+                kept.append(tail[:-1])
+                return "".join(kept), "\x1b"
+            kept.append(tail)
+            return "".join(kept), ""
+        start = match.start()
+        kept.append(text[pos:start])
+        i = match.end()
+        marker = False
+        final_end = -1  # just past the final byte: where pyte itself ends the sequence
+        cancel_at = -1  # the CAN/SUB that cancels the sequence
+        while i < length:
+            char = text[i]
+            if "@" <= char <= "~":      # final byte: the CSI is complete
+                final_end = i + 1
+                break
+            if " " <= char <= "?":      # parameter and intermediate bytes
+                if char in _CSI_MARKER_CHARS:
+                    marker = True
+                i += 1
+            elif char == "\x7f":
+                i += 1                  # DEL is transparent inside a sequence
+            elif char in "\x18\x1a":
+                cancel_at = i
+                break
+            else:
+                break                   # not a byte ECMA-48 allows inside a CSI
+        if final_end < 0 and cancel_at < 0:
+            if i == length:
+                tail = text[start:]
+                if len(tail) <= _CSI_CARRY_MAX:
+                    return "".join(kept), tail
+                kept.append(tail)       # runaway sequence: pyte holds it in its own parser
+                return "".join(kept), ""
+            # A byte pyte reads in its own way; keep the bytes and look for the next start behind it.
+            kept.append(text[start:i])
+            pos = i
+            continue
+        end = final_end if final_end >= 0 else cancel_at
+        if marker:
+            pos = end                   # consumed whole and drawing nothing, as vte does
+        else:
+            kept.append(text[start:end])
+            pos = end
 
 
 # OSC 10/11/12/4 color queries emitted by TUI apps (e.g. Codex CLI) at startup, and the OSC
@@ -2159,6 +2422,14 @@ class AgentSession:
         self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
         self._prompt_quiet_until: float = 0.0
         self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
+        # omp runs tool calls side by side: every started call without a result yet, by call id.
+        self._open_transcript_tools: Dict[str, Dict[str, Any]] = {}
+        # omp's approval events: read offset; requests not resolved yet, by call id (in order); set
+        # once the log shows the extension loaded; when a box no request covers was first seen.
+        self._omp_approval_offset: int = 0
+        self._omp_open_approvals: Dict[str, Dict[str, Any]] = {}
+        self._omp_approval_events_live: bool = False
+        self._omp_uncovered_box_since: float = 0.0
         self._claude_hook_offset: int = 0
         self._kimi_wire_interaction_offset: int = 0
 
@@ -5078,6 +5349,8 @@ class HubSessionManager:
                     sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
                 except OSError:
                     sess._claude_hook_offset = 0
+        elif engine == "omp":
+            self._prime_omp_approval_log(sess, resume_env)
         try:
             # A9: a failed spawn (bad command, missing binary) must leave the archived record exactly
             # as it was — no zombie row, and the old ended object back in the live list.
@@ -5902,58 +6175,45 @@ class HubSessionManager:
                 "content": _clip_detail(text),
             })
 
-    @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser."""
+        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser.
+
+        The raw tool input/output is reduced first (`_stored_telemetry`), outside the sized write.
+        """
+        return await self._record_stored_telemetry(session_id, _stored_telemetry(data))
+
+    @logical_write
+    async def _record_stored_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
         if sess and data.get("transcript_path"):
             sess.transcript_path = Path(str(data["transcript_path"]))
         hook_event = data.get("hook_event", "")
         source = data.get("source", "telemetry")
         tool_name = data.get("tool_name")
-        tool_input = data.get("tool_input")
-        tool_response = data.get("tool_response")
+        tool_fields = data["_tool"]  # see _stored_telemetry
         step_title = data.get("step_title")
         intermediate_list = data.get("intermediate_messages") or []
         final_text = data.get("final_assistant_text")
 
-        input_str = ""
-        if isinstance(tool_input, (dict, list)):
-            input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
-        elif tool_input is not None:
-            input_str = str(tool_input)[:600]
+        # 600-character summaries for status/trace consumers.
+        input_str = tool_fields["input_str"]
+        resp_str = tool_fields["resp_str"]
 
-        resp_str = ""
-        if isinstance(tool_response, (dict, list)):
-            resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
-        elif tool_response is not None:
-            resp_str = str(tool_response)[:600]
-
-        # The transcript feed shows a tool's arguments and output; the 600-character summaries
-        # above stay as they were for status/trace consumers.
+        # The transcript feed shows a tool's arguments and output (clipped details).
         call_id = str(data.get("call_id") or "").strip()
-        if isinstance(tool_input, (dict, list)):
-            input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
-        else:
-            input_detail = "" if tool_input is None else str(tool_input)
-        output_detail = tool_output_text(tool_response) if tool_response is not None else ""
         tool_data: Dict[str, Any] = {"tool": tool_name or "", "call_id": call_id}
         if hook_event == "PostToolUse":
-            tool_data["output"] = _clip_detail(output_detail)
+            tool_data["output"] = tool_fields["output_detail"]
             if isinstance(data.get("tool_ok"), bool):
                 tool_data["ok"] = data["tool_ok"]
         else:
-            tool_data["input"] = _clip_detail(input_detail)
+            tool_data["input"] = tool_fields["input_detail"]
             if hook_event == "ReportStep":
                 tool_data["step_marker"] = True  # a step counter (`llm_inference`), not a real tool
             if data.get("tool_title"):
                 tool_data["title"] = str(data["tool_title"])[:300]
-            elif len(input_detail) > TOOL_DETAIL_LIMIT and hook_event != "ReportStep":
-                # The stored arguments are clipped and may lose the describing one (a long Bash
-                # command ahead of its description): name the call from the whole text now.
-                full_title = tool_title(str(tool_name or ""), input_detail)
-                if full_title:
-                    tool_data["title"] = full_title[:300]
+            elif tool_fields["full_title"]:
+                tool_data["title"] = tool_fields["full_title"]
 
         step_num = sess.step_count if sess else 0
 
@@ -5989,7 +6249,7 @@ class HubSessionManager:
                 await self._add_transcript_message(session_id, step_num, str(msg).strip(), source=source)
 
         if (tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected")) or (
-            hook_event == "PostToolUse" and (tool_name or tool_response is not None)
+            hook_event == "PostToolUse" and (tool_name or tool_fields["has_response"])
         ):
             # A result without a tool name (Claude, Kimi, AGY records) still closes its call in the
             # transcript; the feed pairs it by call id or call order.
@@ -6008,7 +6268,7 @@ class HubSessionManager:
                 "type": "reasoning",
                 "category": "progress",
                 "status": "running",
-                "content": _clip_detail(str(data["reasoning"]).strip()),
+                "content": data["reasoning"],  # clipped by _stored_telemetry
             })
         elif hook_event == "AssistantMessage" and intermediate_list:
             await self.record_worker_event(session_id, {
@@ -6870,14 +7130,17 @@ class HubSessionManager:
         return trace, note, downgraded
 
     async def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
-        """D7 (agy): the feedback of a deny, typed as the next message once the prompt has closed.
+        """D7 (agy, claude, codex): the feedback of a deny, typed as the next message once the prompt
+        has closed.
 
         A new interaction pending by then would take the text as its own answer (a deny), so the
-        feedback is dropped instead, and the drop is recorded."""
+        feedback is dropped instead, and the drop is recorded. A dropped codex feedback also ends the
+        hold on its abort, so the turn ends now instead of after CODEX_DENY_FEEDBACK_HOLD_SEC."""
         sess = self.sessions.get(session_id)
         if sess is None or not sess.is_process_alive():
             return
         if sess.pending_interaction is not None:
+            sess._codex_abort_hold_until = 0.0
             logger.warning("[%s] deny feedback not typed: a new interaction is pending", session_id)
             await self._add_transcript_message(
                 session_id, sess.step_count,
@@ -7166,12 +7429,15 @@ class HubSessionManager:
                     if feedback:
                         notes.append("MCP Cancel 不支持拒绝反馈输入；未向终端追加反馈")
                 elif approval_action in ("deny", "deny_feedback"):
-                    steps = [(0.0, "n")]
+                    # `n` aborts the codex turn. The feedback goes in afterwards as the next message
+                    # through the checked submit (below): typed raw with Enter 0.25 s after `n`, it
+                    # stayed in the composer unsent (2026-11-12, codex-5eaf74c6 / codex-aeb2403d).
                     if approval_action == "deny_feedback":
-                        steps.append((0.25, feedback + "\r"))
-                    self._write_keys_scheduled(sess, loop, steps)
+                        # The rollout watcher holds the abort for that message instead of ending the turn.
+                        sess._codex_abort_hold_until = time.monotonic() + CODEX_DENY_FEEDBACK_HOLD_SEC
+                    self._write_keys_scheduled(sess, loop, [(0.0, "n")])
                     action_trace = "Codex approval key 'n' (Reject)" + (
-                        f" + feedback {feedback!r}" if approval_action == "deny_feedback" else ""
+                        f" + feedback as next message {feedback!r}" if approval_action == "deny_feedback" else ""
                     )
                 elif approval_action == "approve_session" and meta.get("codex_session_key") == "p":
                     # Round 2 (owner): a command prompt's "don't ask again" is p, read from the
@@ -7319,9 +7585,9 @@ class HubSessionManager:
         )
         await self.persist_session(sess, final=True)
 
-        if eng in ("agy", "claude") and approval_action == "deny_feedback" and (custom_input or "").strip():
-            # D7: agy and claude end the turn on a deny; the feedback goes in as the next message once
-            # the composer is back (after the interaction above is cleared, never into the prompt).
+        if eng in ("agy", "claude", "codex") and approval_action == "deny_feedback" and (custom_input or "").strip():
+            # D7: agy, claude and codex end the turn on a deny; the feedback goes in as the next message
+            # once the composer is back (after the interaction above is cleared, never into the prompt).
             feedback_text = (custom_input or "").strip()
             if loop is not None:
                 loop.call_later(AGY_DENY_FEEDBACK_DELAY_SEC, lambda: self._schedule(self._deliver_deny_feedback(session_id, feedback_text)))
@@ -7995,6 +8261,44 @@ class HubSessionManager:
             session.ended_at = time.time()
         return time.time() < session.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC
 
+    @staticmethod
+    def _skip_unstorable_record(session: AgentSession, reader: str, error: Exception) -> None:
+        """A native record that can never be stored is skipped; its reader keeps following.
+
+        Re-raising it (as for storage that is down or closing) ended the reader for good, and the
+        session stayed "running" through every later turn end. The rest of the batch it was read
+        with is lost with it; record_telemetry already reduces tool input/output, so only an
+        unforeseen huge record lands here.
+        """
+        logger.warning("%s skipped a record too large to store (%s): %s", reader, session.session_id, error)
+
+    async def _end_aborted_codex_turn(
+        self, session: AgentSession, reason: str, feedback_missing: bool = False
+    ) -> None:
+        """An aborted codex turn is over: Codex is idle at its prompt with no answer for this turn.
+
+        It ends the way task_complete does (turn_completed, so the parent's wait URL returns done),
+        with data.outcome "aborted" and a final response that says so, not an answer.
+        """
+        missing = "the deny's feedback never reached Codex; " if feedback_missing else ""
+        if session.status == "waiting_parent" and session.pending_interaction is None:
+            session.status = "running"  # so the turn end below can mark it completed
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": (
+                    f"Codex turn aborted ({reason}): {missing}the turn ended without a final answer "
+                    f"and Codex is idle at its prompt."
+                ),
+                "data": {"outcome": "aborted", "abort_reason": reason, "feedback_missing": feedback_missing},
+            },
+        )
+        session.current_activity = f"Turn aborted ({reason}) — idle at prompt"
+        await self.persist_session(session)
+
     async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails the Codex rollout jsonl files for a spawned Codex session.
 
@@ -8051,6 +8355,9 @@ class HubSessionManager:
 
         turn_has_step = False
         rescan_at = 0.0
+        # The reason of an abort held for a deny's feedback (see respond_to_interaction): the next
+        # user message continues the turn; none by session._codex_abort_hold_until ends it.
+        held_abort: Optional[str] = None
         while self._transcript_watch_alive(session):
             # The record is read every tick; the folder checks below at most once a second.
             if time.monotonic() >= rescan_at:
@@ -8166,6 +8473,10 @@ class HubSessionManager:
                                 if session.pending_interaction:
                                     await self.clear_pending_interaction(session)
                                 turn_has_step = False
+                                # The deny's feedback (or any message) arrived: the held abort was not
+                                # the end of this turn.
+                                held_abort = None
+                                session._codex_abort_hold_until = 0.0
                                 if session.status == "completed":
                                     self.begin_new_turn(session, status="running")
                         elif ptype == "message" and payload.get("role") == "assistant":
@@ -8253,25 +8564,41 @@ class HubSessionManager:
                             },
                         )
                     elif otype == "event_msg" and ptype == "turn_aborted":
+                        # A deny (`n`), Esc in the console or a replaced task. Codex then sits idle at
+                        # its prompt, so the abort ends the turn and wakes the parent like
+                        # task_complete; before 2026-11-13 it only set "waiting_parent" with nothing
+                        # pending, and the parent's wait URL stayed "waiting" for good.
                         abort_reason = str(payload.get("reason") or "interrupted")
                         if session.pending_interaction:
                             await self.clear_pending_interaction(session)
                         await self.db.complete_latest_tool_call(
                             session.session_id, None, f"Turn aborted ({abort_reason})"
                         )
-                        if session.status == "running":
-                            session.status = "waiting_parent"
-                        session.current_activity = f"Turn aborted ({abort_reason}) — idle at prompt"
-                        await self.persist_session(session)
+                        held = time.monotonic() < getattr(session, "_codex_abort_hold_until", 0.0)
+                        # The console's "turn interrupted" row.
                         await self.record_worker_event(
                             session.session_id,
                             {
                                 "type": "turn_aborted",
                                 "category": "turn_completed",
-                                "status": "waiting_parent",
+                                "status": "running" if held else "turn_idle",
                                 "content": f"Codex turn aborted ({abort_reason})",
                             },
                         )
+                        if held:
+                            held_abort = abort_reason
+                            session.current_activity = (
+                                f"Turn aborted ({abort_reason}) by a deny; its feedback follows as the next message"
+                            )
+                            await self.persist_session(session)
+                        else:
+                            await self._end_aborted_codex_turn(session, abort_reason)
+                if held_abort is not None and time.monotonic() >= getattr(session, "_codex_abort_hold_until", 0.0):
+                    # The deny's feedback never reached Codex (dropped, or its submit failed).
+                    await self._end_aborted_codex_turn(session, held_abort, feedback_missing=True)
+                    held_abort = None
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Codex rollout watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -8435,7 +8762,10 @@ class HubSessionManager:
                         raw_args = data.get("args")
                         cached_args = (cached_tc or {}).get("arguments")
                         if isinstance(cached_args, dict) and cached_args:
-                            targs = {**cached_args, **(raw_args if isinstance(raw_args, dict) else {})}
+                            # The start record is a display copy: omp cuts every string argument
+                            # longer than 200 characters to 200 + "…" and leaves some keys out. The
+                            # assistant message's tool call has the arguments in full, so it wins.
+                            targs = {**(raw_args if isinstance(raw_args, dict) else {}), **cached_args}
                         else:
                             targs = raw_args if raw_args is not None else {}
                         intent = str(
@@ -8462,6 +8792,8 @@ class HubSessionManager:
                             "args": targs,
                             "call_id": call_id,
                         }
+                        if call_id:
+                            session._open_transcript_tools[call_id] = session._inflight_transcript_tool
                         await self.record_telemetry(
                             session.session_id,
                             {
@@ -8514,21 +8846,32 @@ class HubSessionManager:
                             if user_txts:
                                 await self.note_native_user_prompt(session, " ".join(user_txts).strip())
                             session._inflight_transcript_tool = None
+                            session._open_transcript_tools.clear()
                             if session.pending_interaction:
                                 await self.clear_pending_interaction(session)
                             turn_has_step = False
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
                         elif role == "toolResult":
-                            session._inflight_transcript_tool = None
-                            if session.pending_interaction:
+                            result_call_id = str(msg.get("toolCallId") or "").strip()
+                            session._open_transcript_tools.pop(result_call_id, None)
+                            # A finished call asks nothing any more, even if its resolution was lost.
+                            session._omp_open_approvals.pop(result_call_id, None)
+                            session._inflight_transcript_tool = next(
+                                reversed(session._open_transcript_tools.values()), None
+                            )
+                            pending = session.pending_interaction
+                            pending_call_id = str(((pending or {}).get("metadata") or {}).get("call_id") or "")
+                            # A side-by-side call's result does not answer the approval of another call.
+                            if pending and (not pending_call_id or not result_call_id
+                                            or pending_call_id == result_call_id):
                                 await self.clear_pending_interaction(session)
                             tr_payload: Dict[str, Any] = {
                                 "source": "omp_jsonl",
                                 "hook_event": "PostToolUse",
                                 "tool_name": msg.get("toolName"),
                                 "tool_response": content,
-                                "call_id": str(msg.get("toolCallId") or "").strip(),
+                                "call_id": result_call_id,
                             }
                             if "isError" in msg:
                                 tr_payload["tool_ok"] = not bool(msg.get("isError"))
@@ -8613,6 +8956,8 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "OMP session watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -8720,7 +9065,7 @@ class HubSessionManager:
         return session.pending_interaction
 
     async def _watch_kimi_session(self, session: AgentSession, root: Optional[Path] = None):
-        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and agent.turn.ended.
+        """Live tails Kimi Code CLI's wire.jsonl for toolCalls, assistant thoughts/messages, and turn ends.
 
         `root` points the watcher at a synthetic copy of the layout for tests; production uses
         ~/.kimi-code/sessions/<session>/agents/main/wire.jsonl.
@@ -8787,6 +9132,12 @@ class HubSessionManager:
         # turn).  Once the stream is seen, the messages are a second copy of the same step.
         streamed_steps = False
         step_texts: List[str] = []  # streamed text parts of the current step
+        # Kimi ends a turn with `turn.ended` (reason completed / cancelled / failed). Builds before
+        # 2026-11-13 also wrote a legacy `agent.turn.ended` event in the end-of-turn batch, often
+        # after the next prompt; current builds write only `turn.ended` (kimi-ed1ee650 stayed
+        # "running" when the watcher waited for the legacy event). Once `turn.ended` is seen, the
+        # legacy event is a late copy and must not end the next turn.
+        turn_ended_rows = False
         while self._transcript_watch_alive(session):
             try:
                 await self._drain_kimi_wire_interactions_once(session)
@@ -8818,7 +9169,14 @@ class HubSessionManager:
                             self.begin_new_turn(session, status="running")
                         continue
 
-                    if obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
+                    turn_end = obj.get("type") == "turn.ended" and obj.get("agentId", "main") == "main"
+                    if turn_end:
+                        turn_ended_rows = True
+                    elif obj.get("kind") == "event" and obj.get("type") == "agent.turn.ended":
+                        if turn_ended_rows:
+                            continue
+                        turn_end = True
+                    if turn_end:
                         if latest_assistant_text:
                             if not turn_has_step:
                                 turn_has_step = True
@@ -8949,6 +9307,8 @@ class HubSessionManager:
                                 "tool_response": content,
                             },
                         )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Kimi wire watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9041,6 +9401,8 @@ class HubSessionManager:
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
+        # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
+        error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
                 try:
@@ -9066,6 +9428,15 @@ class HubSessionManager:
                     except Exception:
                         continue
                     self._observe_context_record(session, obj)
+                    if obj.get("type") == "ERROR_MESSAGE":
+                        err_txt = str(obj.get("error") or obj.get("content") or "").strip() or "agy engine error"
+                        error_tail = (err_txt, time.monotonic())
+                        await self.record_worker_event(
+                            session.session_id,
+                            {"type": "error", "category": "progress", "status": "running", "content": err_txt},
+                        )
+                        continue
+                    error_tail = None  # any later row means agy recovered or moved on
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
@@ -9208,11 +9579,43 @@ class HubSessionManager:
                                     "content": final_text,
                                 },
                             )
+                if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
+                    err_txt = error_tail[0]
+                    error_tail = None
+                    await self._end_agy_error_turn(session, err_txt)
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "AGY transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
                 pass
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    async def _end_agy_error_turn(self, session: AgentSession, error: str) -> None:
+        """agy gave up on a model call (its last row is an ERROR_MESSAGE) and is idle at its prompt.
+
+        It ends the way a normal turn does (turn_completed, so the parent's wait URL returns done),
+        with data.outcome "error" and a final response that says so, not an answer. A turn that is
+        already over, or waits on the parent, is left alone.
+        """
+        if session.status not in ("starting", "running") or session.pending_interaction is not None:
+            return
+        session._inflight_transcript_tool = None
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": (
+                    f"agy turn ended on an engine error: {error} — agy stopped retrying and is idle at "
+                    f"its prompt; send a message to continue."
+                ),
+                "data": {"outcome": "error", "error": error},
+            },
+        )
+        session.current_activity = f"Turn ended on an engine error — idle at prompt: {error[:80]}"
+        await self.persist_session(session)
 
     @staticmethod
     def _agy_conversation_is_durable(brain_dir: Path) -> bool:
@@ -9694,6 +10097,8 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Streaming response — {latest_line[:70]}"
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Claude transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -10209,6 +10614,29 @@ class HubSessionManager:
             return None
 
     @staticmethod
+    def _codex_composer_shows_whole(line: Optional[str], expected: str) -> bool:
+        """The Codex composer shows the whole expected text (whitespace ignored).
+
+        Either all of it is visible, or the composer scrolled (TUI_CODEX_SCROLL_MARK_RE marks the
+        hidden rows) and what is visible is exactly the text's end, at least
+        TUI_CODEX_SCROLLED_MIN_CHARS long. A partial draft is never accepted: a scrolled view of a
+        draft that is still growing shows the end of what arrived so far, not of the whole text.
+        """
+        if line is None:
+            return False
+        want = re.sub(r"\s+", "", expected or "")
+        if not want:
+            return False
+        if re.sub(r"\s+", "", line) == want:
+            return True
+        padded = f" {line} "
+        for mark in TUI_CODEX_SCROLL_MARK_RE.finditer(padded):
+            seen = re.sub(r"\s+", "", padded[:mark.start()] + padded[mark.end():])
+            if TUI_CODEX_SCROLLED_MIN_CHARS <= len(seen) < len(want) and want.endswith(seen):
+                return True
+        return False
+
+    @staticmethod
     def _codex_composer_empty(session: AgentSession, line: Optional[str]) -> bool:
         if line is None:
             return False
@@ -10460,6 +10888,9 @@ class HubSessionManager:
         K7 (fix 9d): the composer of every known engine is read whole (kimi's box, the wrapped rows
         of omp/agy/codex), and codex's paste placeholder for the typed length counts as the end
         shown, so the cap is a safety net only: reaching it means detection failed, and it warns.
+        For codex the cap waits on while the composer keeps changing (TUI_TYPE_STALL_SEC,
+        TUI_TYPE_SETTLE_HARD_CAP_SEC), and a scrolled composer showing the text's end counts as
+        the whole text (_codex_composer_shows_whole).
         """
         started = time.time()
         cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC,
@@ -10477,7 +10908,7 @@ class HubSessionManager:
             )
             if engine == "codex" and expected_text is not None:
                 # Repeated tails can appear before ConPTY has consumed the whole write.
-                shown = (re.sub(r"\s+", "", line or "") == re.sub(r"\s+", "", expected_text)
+                shown = (self._codex_composer_shows_whole(line, expected_text)
                          or self._tui_paste_placeholder_holds(engine, line, typed_len))
             now = time.time()
             key = (line, shown)
@@ -10486,6 +10917,9 @@ class HubSessionManager:
             echoed = shown or self._composer_holds(line, probe, tail)
             if shown and now - quiet_since >= TUI_TYPE_SETTLE_SEC:
                 return screen, echoed, True, now - started
+            if (now >= cap and engine == "codex" and now - quiet_since < TUI_TYPE_STALL_SEC
+                    and now - started < TUI_TYPE_SETTLE_HARD_CAP_SEC):
+                continue  # still being typed in: wait while it grows
             if now >= cap:
                 logger.warning(
                     "K5: %s typed text never settled on the composer after %.1fs",
@@ -11389,6 +11823,8 @@ class HubSessionManager:
                             msg_cursor = max(msg_cursor, seq)
                         # Only the first batch read after re-attaching is the replay.
                         replay = None
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH record reader", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:
@@ -11498,6 +11934,8 @@ class HubSessionManager:
                                     },
                                 )
                             break
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH job watcher", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:
@@ -11570,6 +12008,7 @@ class HubSessionManager:
         inflight_cmd = str(inflight.get("command") or "").strip()
         screen_cmd = str(parsed.get("command") or "").strip()
         best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
+        truncated = best_cmd != inflight_cmd and screen_command_clipped(best_cmd)
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
@@ -11579,6 +12018,8 @@ class HubSessionManager:
             lines.append(f"{what}: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -11590,36 +12031,228 @@ class HubSessionManager:
                 "agy_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
                 "command": best_cmd,
+                "command_truncated": truncated,
                 "transcript_tool": inflight.get("tool_name") if inflight else None,
             },
         )
 
+    async def _omp_tool_call_for_box(self, session: AgentSession, tool: str, screen_cmd: str) -> Optional[Dict[str, Any]]:
+        """The transcript tool call behind an omp approval box (see tool_call_for_approval_box).
+
+        omp writes the call to its transcript before it draws the box, but the box can be read
+        first; a box that shows no full command waits up to OMP_BOX_CALL_WAIT_SEC for the call.
+        """
+        deadline = time.monotonic() + OMP_BOX_CALL_WAIT_SEC
+        while True:
+            calls = list(getattr(session, "_open_transcript_tools", {}).values())
+            inflight = getattr(session, "_inflight_transcript_tool", None)
+            if not calls and inflight:
+                calls = [inflight]
+            call = tool_call_for_approval_box(tool, screen_cmd, calls)
+            if call is not None or (screen_cmd and not screen_command_clipped(screen_cmd)):
+                return call
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
+
+    @staticmethod
+    def _omp_approval_fields(
+        tool: str, parsed: Optional[Dict[str, Any]], call: Optional[Dict[str, Any]], reason: str = ""
+    ) -> Dict[str, Any]:
+        """Title, prompt, options and metadata of one omp tool approval (register_pending_interaction).
+
+        `parsed` is the box read off the screen (None: not read), `call` the transcript tool call it
+        asks about (None: not known). omp cuts long commands on the box, so the command comes from
+        the call (command_source=transcript); otherwise from the box, marked command_truncated with a
+        note when the box cut it, so the parent never approves it blind. "Always Approve …" grants
+        persist and are not offered. Without the box the options are Approve / Deny, which the
+        answer keys (Ctrl+Q / Escape) reach on any box.
+        """
+        box = parsed or {}
+        details = list(box.get("details") or [])
+        if not details and reason:
+            details = [f"Reason: {reason}"]
+        full_cmd = str((call or {}).get("command") or "").strip()
+        if full_cmd:
+            command, source = full_cmd, "transcript"
+            # The box's own `Command:` rows (the last details) are the cut copy of the same text.
+            cut_at = next((i for i, row in enumerate(details) if row.startswith("Command:")), len(details))
+            details = details[:cut_at]
+        else:
+            command, source = str(box.get("command") or "").strip(), ("screen" if parsed else "none")
+        truncated = source == "screen" and screen_command_clipped(command)
+        tool_label = tool or str((call or {}).get("tool_name") or "")
+        lines = [f"Allow tool: {tool_label or '?'}"] + details
+        if command and command not in "\n".join(lines):
+            lines.append(f"Command: {command}")
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
+        elif source == "none":
+            lines.append(UNREAD_OMP_BOX_NOTE)
+        box_options = list(box.get("options") or [])
+        offered = [o for o in (box_options or list(OMP_UNREAD_BOX_OPTIONS)) if classify_approval_label(o) != "persist"]
+        return {
+            "title": f"OMP Tool Approval ({tool_label or 'tool'})",
+            "prompt": "\n".join(lines),
+            "options": offered,
+            "metadata": {
+                "omp_prompt": "tool",
+                "omp_options": box_options,
+                "selected_index": int(box.get("selected_index") or 0),
+                "session_label": box.get("session_label"),
+                "command": command,
+                "command_source": source,
+                "command_truncated": truncated,
+                "transcript_tool": (call or {}).get("tool_name"),
+                "call_id": (call or {}).get("call_id") or None,
+            },
+        }
+
     async def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
-        """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered."""
-        offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
-        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
-        inflight_cmd = str(inflight.get("command") or "").strip()
-        screen_cmd = str(parsed.get("command") or "").strip()
-        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
-        lines = [f"Allow tool: {parsed.get('tool') or inflight.get('tool_name') or '?'}"] + list(parsed.get("details") or [])
-        if best_cmd and best_cmd not in "\n".join(lines):
-            lines.append(f"Command: {best_cmd}")
+        """D7: omp's tool approval box, read off the screen: the path without omp's approval events
+        (an omp started before they were wired in, or one that stopped sending them)."""
+        tool = str(parsed.get("tool") or "").strip()
+        call = await self._omp_tool_call_for_box(session, tool, str(parsed.get("command") or "").strip())
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
-            title=f"OMP Tool Approval ({parsed.get('tool') or inflight.get('tool_name') or 'tool'})",
-            prompt="\n".join(lines),
-            options=offered,
             source="omp_tui_screen_detector",
-            metadata={
-                "omp_prompt": "tool",
-                "omp_options": list(parsed.get("options") or []),
-                "selected_index": int(parsed.get("selected_index") or 0),
-                "session_label": parsed.get("session_label"),
-                "command": best_cmd,
-                "transcript_tool": inflight.get("tool_name") if inflight else None,
-            },
+            **self._omp_approval_fields(tool, parsed, call),
         )
+
+    def _omp_approval_log_path(self, session: AgentSession) -> Optional[Path]:
+        """The file engine_policies/omp_approval_event_log.ts appends this session's events to."""
+        sid = str(session.session_id or "")
+        if not re.match(r"^[A-Za-z0-9_.\-]+$", sid):
+            return None
+        return self.runtime_configs_dir / f"omp_approvals_{sid}.jsonl"
+
+    def _prime_omp_approval_log(self, session: AgentSession, env: Dict[str, str]) -> None:
+        """Points an omp about to start at its session's approval log; only what it writes from now
+        on is read (a resumed session's old records are not asked again)."""
+        log_path = self._omp_approval_log_path(session)
+        if log_path is None:
+            return
+        env[OMP_APPROVAL_LOG_ENV] = str(log_path)
+        try:
+            session._omp_approval_offset = log_path.stat().st_size if log_path.is_file() else 0
+        except OSError:
+            session._omp_approval_offset = 0
+
+    async def _drain_omp_approval_events(self, session: AgentSession) -> None:
+        """Reads omp's approval events appended since the last read (omp_approval_event_log.ts).
+
+        A request means omp is about to ask about one tool call; a resolution means that box was
+        answered (by anyone) or aborted, and clears its registration. The oldest open request not
+        registered yet is registered once nothing else is pending, so side-by-side calls ask one at
+        a time. A box the screen detector registered first is adopted by its request.
+        """
+        log_path = self._omp_approval_log_path(session)
+        if log_path is None or not log_path.is_file():
+            return
+        try:
+            lines, session._omp_approval_offset = read_complete_lines(log_path, int(session._omp_approval_offset or 0))
+        except OSError:
+            return
+        opened = session._omp_open_approvals
+        try:
+            for raw in lines:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                session._omp_approval_events_live = True
+                call_id = str(ev.get("call_id") or "").strip()
+                if not call_id:
+                    continue
+                if ev.get("event") == "tool_approval_requested":
+                    opened[call_id] = {"event": ev, "registered": False}
+                elif ev.get("event") == "tool_approval_resolved":
+                    opened.pop(call_id, None)
+                    await self._clear_omp_call_approval(session, call_id)
+            pending = session.pending_interaction
+            if pending is not None and not (
+                pending is getattr(session, "_unadopted_screen_interaction", None)
+                and (pending.get("metadata") or {}).get("omp_prompt") == "tool"
+            ):
+                return
+            head = next((cid for cid, entry in opened.items() if not entry["registered"]), None)
+            if head is not None:
+                opened[head]["registered"] = True
+                await self._register_omp_event_approval(session, opened[head]["event"])
+        except PersistenceUnavailable:
+            raise
+        except Exception:
+            logger.exception("[%s] reading omp approval events failed", session.session_id)
+
+    async def _clear_omp_call_approval(self, session: AgentSession, call_id: str) -> None:
+        """Clears the pending approval of one omp tool call (its box was answered or aborted)."""
+        pending = session.pending_interaction
+        if not pending:
+            return
+        meta = pending.get("metadata") or {}
+        if omp_approval_request_id(call_id) in self._interaction_ids(pending) or str(meta.get("call_id") or "") == call_id:
+            await self.clear_pending_interaction(session)
+
+    @staticmethod
+    def _omp_box_shows_call(parsed: Dict[str, Any], tool: str, call: Optional[Dict[str, Any]]) -> bool:
+        """Whether a box on screen is the one asking about `tool` / `call` and not an earlier box
+        still drawn: the same tool, and (call known) a command the call's command starts with."""
+        box_tool = str(parsed.get("tool") or "").strip()
+        if tool and box_tool and box_tool != tool:
+            return False
+        if call is None:
+            return True
+        return tool_call_for_approval_box(box_tool, str(parsed.get("command") or ""), [call]) is not None
+
+    async def _register_omp_event_approval(self, session: AgentSession, ev: Dict[str, Any]):
+        """Registers omp's approval request for one tool call (an event, not the box's text).
+
+        The request is written just before omp draws the box; it waits up to OMP_EVENT_BOX_WAIT_SEC
+        for the box (its option rows, for the answer keys) and the call (its full command).
+        """
+        call_id = str(ev.get("call_id") or "")
+        tool = str(ev.get("tool_name") or "").strip()
+        max_rows = max(38, int(getattr(session, "rows", 38) or 38))
+        deadline = time.monotonic() + OMP_EVENT_BOX_WAIT_SEC
+        while True:
+            call = session._open_transcript_tools.get(call_id)
+            parsed = parse_omp_approval_prompt(session.get_clean_screen_text(max_lines=max_rows))
+            if parsed is not None and not self._omp_box_shows_call(parsed, tool, call):
+                parsed = None
+            if (parsed is not None and call is not None) or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        fields = self._omp_approval_fields(tool, parsed, call, reason=str(ev.get("reason") or ""))
+        fields["metadata"].update({
+            "call_id": call_id,
+            "detected_by": "omp_event",
+            "approval_reason": ev.get("reason"),
+            "approval_mode": ev.get("approval_mode"),
+        })
+        return await self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            source="omp_approval_event",
+            request_id=omp_approval_request_id(call_id),
+            **fields,
+        )
+
+    def _omp_box_left_to_events(self, session: AgentSession) -> bool:
+        """With omp's approval events live, a box on screen is theirs to register: an open request
+        covers it, or its request is expected within OMP_SCREEN_FALLBACK_GRACE_SEC. A box no request
+        covers for longer is registered from the screen (omp stopped sending the events)."""
+        if not getattr(session, "_omp_approval_events_live", False):
+            return False
+        if getattr(session, "_omp_open_approvals", None):
+            session._omp_uncovered_box_since = 0.0
+            return True
+        now = time.monotonic()
+        if not session._omp_uncovered_box_since:
+            session._omp_uncovered_box_since = now
+        return now - session._omp_uncovered_box_since < OMP_SCREEN_FALLBACK_GRACE_SEC
 
     async def _register_claude_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """Claude Code permission prompt fallback: options are offered by label."""
@@ -11630,6 +12263,7 @@ class HubSessionManager:
         inflight_cmd = str(inflight.get("command") or "").strip()
         screen_cmd = str(parsed.get("command") or "").strip()
         best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
+        truncated = best_cmd != inflight_cmd and screen_command_clipped(best_cmd)
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
@@ -11637,6 +12271,8 @@ class HubSessionManager:
             lines.append(f"Command: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
         persists_opt = next((o for o in offered_opts if o.get("action") == "approve_session" and o.get("persists")), None)
         has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
         if persists_opt is not None:
@@ -11657,6 +12293,7 @@ class HubSessionManager:
                 "claude_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
                 "command": best_cmd,
+                "command_truncated": truncated,
             },
         )
 
@@ -11830,6 +12467,8 @@ class HubSessionManager:
             await self._drain_claude_hook_events(session)
         elif eng == "kimi":
             await self._drain_kimi_wire_interactions_once(session)
+        elif eng == "omp":
+            await self._drain_omp_approval_events(session)
         if session.pending_interaction is not None:
             return session.pending_interaction
         # D7: an answered prompt can stay on screen for a moment; it is not a new one.
@@ -11923,8 +12562,14 @@ class HubSessionManager:
             return None
 
         # 4) OMP tool approval box ("Allow tool: <name>" + "Approve…" rows + "Deny").
+        # With omp's approval events live, the box is registered from its event (see
+        # _omp_box_left_to_events); the screen only stands in when the events stop.
         omp_prompt = parse_omp_approval_prompt(scr) if eng == "omp" else None
+        if eng == "omp" and omp_prompt is None:
+            session._omp_uncovered_box_since = 0.0
         if omp_prompt is not None:
+            if self._omp_box_left_to_events(session):
+                return None
             sig = f"omp_appr:{hash(scr.strip()[-400:])}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
@@ -12611,6 +13256,8 @@ class HubSessionManager:
                     sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
                 except OSError:
                     sess._claude_hook_offset = 0
+        elif engine == "omp":
+            self._prime_omp_approval_log(sess, env_overrides)
         sess.start_pty(loop, env_overrides=env_overrides or None)
         self.sessions[session_id] = sess
         await self.persist_session(sess)

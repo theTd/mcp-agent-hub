@@ -458,7 +458,8 @@ async def send_to_subagent(
 ) -> Dict[str, Any]:
     """Deliver a message immediately and return the session's existing opaque wait handle.
 
-    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
+    Keep ``text`` short: put a longer follow-up in a file under the session cwd and send a
+    one-line pointer to it. ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
     if not text.strip() and not clear_input:

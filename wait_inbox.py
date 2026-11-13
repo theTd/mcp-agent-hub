@@ -247,6 +247,16 @@ class WaitInbox:
                 raise WaitHandleError("unknown wait handle")
             turns = self._load(row["turn_ids_json"], {})
             turns[str(session_id)] = str(turn_id)
+            # A turn end of this session's earlier turn that nobody collected is superseded: the new
+            # message must not be answered with it (a codex deny ends the turn at once, and parents
+            # often send new instructions right after the deny without reading the wait URL).
+            for event in conn.execute(
+                "SELECT id,payload_json FROM wait_inbox_events WHERE handle=? AND consumed=0 AND event_type='turn_completed'",
+                (handle,),
+            ).fetchall():
+                payload = self._load(event["payload_json"], {})
+                if str(payload.get("session_id") or "") == str(session_id) and str(payload.get("turn_id") or "") != str(turn_id):
+                    conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (event["id"],))
             conn.execute("UPDATE wait_handles SET turn_ids_json=?,state='waiting',updated_at=? WHERE handle=?", (self._json(turns), time.time(), handle))
 
     async def _next_event(self, handle: str) -> Optional[Dict[str, Any]]:
