@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import zlib
 from pathlib import Path
@@ -53,7 +54,7 @@ from session_mcp_config import (
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
-from hub_persistence import HubPersistence, PersistenceUnavailable, logical_write
+from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
 from wait_inbox import WaitInbox, WAKE_EVENT_TYPES
 
 from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
@@ -143,6 +144,52 @@ def _clip_detail(text: str) -> str:
     if len(text) <= TOOL_DETAIL_LIMIT:
         return text
     return f"{text[:TOOL_DETAIL_LIMIT]}\n…（已截断，原文 {len(text)} 字符）"
+
+
+def _stored_telemetry(data: Dict[str, Any]) -> Dict[str, Any]:
+    """`data` for record_telemetry with the tool input/output reduced to the forms that get stored.
+
+    The write is sized from its arguments before it runs (logical_write: 1 MB + 8 x their pickle).
+    A raw tool output of ~4 MB (a Codex `view_image` result is several MB of base64) sized past the
+    32 MB queue, the write raised, and the transcript watcher that made it ended for good: the
+    session stayed "running" and its later turn ends were never seen (codex-732d4e3a and five
+    more, 2026-11-10..13). Only the summaries, the clipped details and the title below are kept,
+    so they are made here, from the full values, and the raw ones never reach the write.
+    """
+    tool_input = data.get("tool_input")
+    tool_response = data.get("tool_response")
+    hook_event = data.get("hook_event", "")
+    if isinstance(tool_input, (dict, list)):
+        input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
+        input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+    else:
+        input_str = "" if tool_input is None else str(tool_input)[:600]
+        input_detail = "" if tool_input is None else str(tool_input)
+    if isinstance(tool_response, (dict, list)):
+        resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
+    else:
+        resp_str = "" if tool_response is None else str(tool_response)[:600]
+    full_title = ""
+    if (hook_event not in ("PostToolUse", "ReportStep") and not data.get("tool_title")
+            and len(input_detail) > TOOL_DETAIL_LIMIT):
+        # The stored arguments are clipped and may lose the describing one (a long Bash command
+        # ahead of its description): name the call from the whole text now.
+        full_title = tool_title(str(data.get("tool_name") or ""), input_detail)[:300]
+    stored = {key: value for key, value in data.items() if key not in ("tool_input", "tool_response")}
+    stored["_tool"] = {
+        "has_response": tool_response is not None,
+        "input_str": input_str,
+        "resp_str": resp_str,
+        "input_detail": _clip_detail(input_detail),
+        "output_detail": (
+            _clip_detail(tool_output_text(tool_response)) if hook_event == "PostToolUse" and tool_response is not None
+            else ""
+        ),
+        "full_title": full_title,
+    }
+    if data.get("reasoning") is not None:
+        stored["reasoning"] = _clip_detail(str(data["reasoning"]).strip())
+    return stored
 
 # Heuristic regex for detecting TUI tool calls on terminal lines when native hooks aren't present
 TUI_TOOL_PATTERN = re.compile(
@@ -383,6 +430,11 @@ STICKY_RESUME_BLOCK_PREFIXES = ("codex 已把该会话归档",)
 # A3: after a resumed agy process starts, a brand-new conversation dir can only be that process
 # opening an empty conversation for an id it does not know. The window keeps the scan bounded.
 AGY_RESUME_VERIFY_WINDOW_SEC = 30.0
+# agy writes an ERROR_MESSAGE row for every failed model call and retries on its own; most runs recover
+# within seconds (retry backoff seen up to ~25 s). When it gives up (8 failed attempts, then "There was a
+# network issue" on screen) it writes nothing more and sits idle at its prompt. An error row followed by
+# this long a silence ends the turn, so the parent's wait does not stay "running" for good.
+AGY_ERROR_TURN_END_SEC = 60.0
 # The hub's anchor (time.time()) and the filesystem's birth time are different clock sources and can
 # round against each other; a dir born in the same tick as the spawn is still the new conversation.
 AGY_CONVERSATION_ANCHOR_SLACK_SEC = 0.05
@@ -475,6 +527,15 @@ TUI_SUBMIT_RETRY_STEP_SEC = 1.0
 TUI_TYPE_SETTLE_SEC = 0.8
 TUI_TYPE_SETTLE_POLL_SEC = 0.1
 TUI_TYPE_SETTLE_CAP_SEC = 10.0
+# Codex on Windows takes a paste in a few words per frame (live: ~60 chars/s, an 850-char follow-up
+# still growing at the 10 s cap). Past the cap the wait goes on while the composer keeps changing,
+# and gives up once it has stood still this long or at the hard cap.
+TUI_TYPE_STALL_SEC = 3.0
+TUI_TYPE_SETTLE_HARD_CAP_SEC = 120.0
+# Codex caps its composer's height; a taller draft scrolls and marks the hidden rows with an arrow
+# at the right edge of its top visible row. The visible end must then be at least this long.
+TUI_CODEX_SCROLL_MARK_RE = re.compile(r"(?<=\s)↑(?=\s)")
+TUI_CODEX_SCROLLED_MIN_CHARS = 40
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
@@ -1893,6 +1954,29 @@ class HubTerminalScreen(pyte.HistoryScreen):
         if kwargs.get("private"):
             return
         super().report_device_status(mode)
+
+    def draw(self, data: str) -> None:
+        """Skips a zero-width or unprintable character instead of dropping the rest of the text.
+
+        pyte's draw stops at the first character that is zero-width and not combining (ZWSP, ZWJ, the
+        emoji selector VS16 in "⚠️") or unprintable, so everything after it in the same run of plain
+        text never reached the screen. Here pyte draws the runs around such a character; the character
+        itself changes nothing, as in a real terminal (it does not even trigger a pending wrap).
+        """
+        if data.isascii() and data.isprintable():
+            super().draw(data)
+            return
+        width_of = pyte.screens.wcwidth
+        run_start = 0
+        for index, char in enumerate(data):
+            width = width_of(char)
+            if width > 0 or (width == 0 and unicodedata.combining(char)):
+                continue
+            if index > run_start:
+                super().draw(data[run_start:index])
+            run_start = index + 1
+        if run_start < len(data):
+            super().draw(data[run_start:])
 
     @property
     def display(self) -> List[str]:
@@ -6091,58 +6175,45 @@ class HubSessionManager:
                 "content": _clip_detail(text),
             })
 
-    @logical_write
     async def record_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser."""
+        """Processes telemetry from Claude Hooks, Codex JSONL Tailer, native engine events, or TUI Heuristic Parser.
+
+        The raw tool input/output is reduced first (`_stored_telemetry`), outside the sized write.
+        """
+        return await self._record_stored_telemetry(session_id, _stored_telemetry(data))
+
+    @logical_write
+    async def _record_stored_telemetry(self, session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         sess = self.sessions.get(session_id)
         if sess and data.get("transcript_path"):
             sess.transcript_path = Path(str(data["transcript_path"]))
         hook_event = data.get("hook_event", "")
         source = data.get("source", "telemetry")
         tool_name = data.get("tool_name")
-        tool_input = data.get("tool_input")
-        tool_response = data.get("tool_response")
+        tool_fields = data["_tool"]  # see _stored_telemetry
         step_title = data.get("step_title")
         intermediate_list = data.get("intermediate_messages") or []
         final_text = data.get("final_assistant_text")
 
-        input_str = ""
-        if isinstance(tool_input, (dict, list)):
-            input_str = json.dumps(tool_input, ensure_ascii=False)[:600]
-        elif tool_input is not None:
-            input_str = str(tool_input)[:600]
+        # 600-character summaries for status/trace consumers.
+        input_str = tool_fields["input_str"]
+        resp_str = tool_fields["resp_str"]
 
-        resp_str = ""
-        if isinstance(tool_response, (dict, list)):
-            resp_str = json.dumps(tool_response, ensure_ascii=False)[:600]
-        elif tool_response is not None:
-            resp_str = str(tool_response)[:600]
-
-        # The transcript feed shows a tool's arguments and output; the 600-character summaries
-        # above stay as they were for status/trace consumers.
+        # The transcript feed shows a tool's arguments and output (clipped details).
         call_id = str(data.get("call_id") or "").strip()
-        if isinstance(tool_input, (dict, list)):
-            input_detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
-        else:
-            input_detail = "" if tool_input is None else str(tool_input)
-        output_detail = tool_output_text(tool_response) if tool_response is not None else ""
         tool_data: Dict[str, Any] = {"tool": tool_name or "", "call_id": call_id}
         if hook_event == "PostToolUse":
-            tool_data["output"] = _clip_detail(output_detail)
+            tool_data["output"] = tool_fields["output_detail"]
             if isinstance(data.get("tool_ok"), bool):
                 tool_data["ok"] = data["tool_ok"]
         else:
-            tool_data["input"] = _clip_detail(input_detail)
+            tool_data["input"] = tool_fields["input_detail"]
             if hook_event == "ReportStep":
                 tool_data["step_marker"] = True  # a step counter (`llm_inference`), not a real tool
             if data.get("tool_title"):
                 tool_data["title"] = str(data["tool_title"])[:300]
-            elif len(input_detail) > TOOL_DETAIL_LIMIT and hook_event != "ReportStep":
-                # The stored arguments are clipped and may lose the describing one (a long Bash
-                # command ahead of its description): name the call from the whole text now.
-                full_title = tool_title(str(tool_name or ""), input_detail)
-                if full_title:
-                    tool_data["title"] = full_title[:300]
+            elif tool_fields["full_title"]:
+                tool_data["title"] = tool_fields["full_title"]
 
         step_num = sess.step_count if sess else 0
 
@@ -6178,7 +6249,7 @@ class HubSessionManager:
                 await self._add_transcript_message(session_id, step_num, str(msg).strip(), source=source)
 
         if (tool_name and hook_event in ("PreToolUse", "ToolCall", "ReportStep", "TuiToolDetected")) or (
-            hook_event == "PostToolUse" and (tool_name or tool_response is not None)
+            hook_event == "PostToolUse" and (tool_name or tool_fields["has_response"])
         ):
             # A result without a tool name (Claude, Kimi, AGY records) still closes its call in the
             # transcript; the feed pairs it by call id or call order.
@@ -6197,7 +6268,7 @@ class HubSessionManager:
                 "type": "reasoning",
                 "category": "progress",
                 "status": "running",
-                "content": _clip_detail(str(data["reasoning"]).strip()),
+                "content": data["reasoning"],  # clipped by _stored_telemetry
             })
         elif hook_event == "AssistantMessage" and intermediate_list:
             await self.record_worker_event(session_id, {
@@ -8190,6 +8261,17 @@ class HubSessionManager:
             session.ended_at = time.time()
         return time.time() < session.ended_at + NATIVE_TRANSCRIPT_DRAIN_SEC
 
+    @staticmethod
+    def _skip_unstorable_record(session: AgentSession, reader: str, error: Exception) -> None:
+        """A native record that can never be stored is skipped; its reader keeps following.
+
+        Re-raising it (as for storage that is down or closing) ended the reader for good, and the
+        session stayed "running" through every later turn end. The rest of the batch it was read
+        with is lost with it; record_telemetry already reduces tool input/output, so only an
+        unforeseen huge record lands here.
+        """
+        logger.warning("%s skipped a record too large to store (%s): %s", reader, session.session_id, error)
+
     async def _end_aborted_codex_turn(
         self, session: AgentSession, reason: str, feedback_missing: bool = False
     ) -> None:
@@ -8515,6 +8597,8 @@ class HubSessionManager:
                     # The deny's feedback never reached Codex (dropped, or its submit failed).
                     await self._end_aborted_codex_turn(session, held_abort, feedback_missing=True)
                     held_abort = None
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Codex rollout watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -8872,6 +8956,8 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "OMP session watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9221,6 +9307,8 @@ class HubSessionManager:
                                 "tool_response": content,
                             },
                         )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Kimi wire watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -9313,6 +9401,8 @@ class HubSessionManager:
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
+        # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
+        error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
                 try:
@@ -9338,6 +9428,15 @@ class HubSessionManager:
                     except Exception:
                         continue
                     self._observe_context_record(session, obj)
+                    if obj.get("type") == "ERROR_MESSAGE":
+                        err_txt = str(obj.get("error") or obj.get("content") or "").strip() or "agy engine error"
+                        error_tail = (err_txt, time.monotonic())
+                        await self.record_worker_event(
+                            session.session_id,
+                            {"type": "error", "category": "progress", "status": "running", "content": err_txt},
+                        )
+                        continue
+                    error_tail = None  # any later row means agy recovered or moved on
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
@@ -9480,11 +9579,43 @@ class HubSessionManager:
                                     "content": final_text,
                                 },
                             )
+                if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
+                    err_txt = error_tail[0]
+                    error_tail = None
+                    await self._end_agy_error_turn(session, err_txt)
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "AGY transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
                 pass
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    async def _end_agy_error_turn(self, session: AgentSession, error: str) -> None:
+        """agy gave up on a model call (its last row is an ERROR_MESSAGE) and is idle at its prompt.
+
+        It ends the way a normal turn does (turn_completed, so the parent's wait URL returns done),
+        with data.outcome "error" and a final response that says so, not an answer. A turn that is
+        already over, or waits on the parent, is left alone.
+        """
+        if session.status not in ("starting", "running") or session.pending_interaction is not None:
+            return
+        session._inflight_transcript_tool = None
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": (
+                    f"agy turn ended on an engine error: {error} — agy stopped retrying and is idle at "
+                    f"its prompt; send a message to continue."
+                ),
+                "data": {"outcome": "error", "error": error},
+            },
+        )
+        session.current_activity = f"Turn ended on an engine error — idle at prompt: {error[:80]}"
+        await self.persist_session(session)
 
     @staticmethod
     def _agy_conversation_is_durable(brain_dir: Path) -> bool:
@@ -9966,6 +10097,8 @@ class HubSessionManager:
                             session.current_activity = (
                                 f"Step {max(1, session.step_count)}: Streaming response — {latest_line[:70]}"
                             )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Claude transcript watcher", exc)
             except PersistenceUnavailable:
                 raise
             except Exception:
@@ -10481,6 +10614,29 @@ class HubSessionManager:
             return None
 
     @staticmethod
+    def _codex_composer_shows_whole(line: Optional[str], expected: str) -> bool:
+        """The Codex composer shows the whole expected text (whitespace ignored).
+
+        Either all of it is visible, or the composer scrolled (TUI_CODEX_SCROLL_MARK_RE marks the
+        hidden rows) and what is visible is exactly the text's end, at least
+        TUI_CODEX_SCROLLED_MIN_CHARS long. A partial draft is never accepted: a scrolled view of a
+        draft that is still growing shows the end of what arrived so far, not of the whole text.
+        """
+        if line is None:
+            return False
+        want = re.sub(r"\s+", "", expected or "")
+        if not want:
+            return False
+        if re.sub(r"\s+", "", line) == want:
+            return True
+        padded = f" {line} "
+        for mark in TUI_CODEX_SCROLL_MARK_RE.finditer(padded):
+            seen = re.sub(r"\s+", "", padded[:mark.start()] + padded[mark.end():])
+            if TUI_CODEX_SCROLLED_MIN_CHARS <= len(seen) < len(want) and want.endswith(seen):
+                return True
+        return False
+
+    @staticmethod
     def _codex_composer_empty(session: AgentSession, line: Optional[str]) -> bool:
         if line is None:
             return False
@@ -10732,6 +10888,9 @@ class HubSessionManager:
         K7 (fix 9d): the composer of every known engine is read whole (kimi's box, the wrapped rows
         of omp/agy/codex), and codex's paste placeholder for the typed length counts as the end
         shown, so the cap is a safety net only: reaching it means detection failed, and it warns.
+        For codex the cap waits on while the composer keeps changing (TUI_TYPE_STALL_SEC,
+        TUI_TYPE_SETTLE_HARD_CAP_SEC), and a scrolled composer showing the text's end counts as
+        the whole text (_codex_composer_shows_whole).
         """
         started = time.time()
         cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC,
@@ -10749,7 +10908,7 @@ class HubSessionManager:
             )
             if engine == "codex" and expected_text is not None:
                 # Repeated tails can appear before ConPTY has consumed the whole write.
-                shown = (re.sub(r"\s+", "", line or "") == re.sub(r"\s+", "", expected_text)
+                shown = (self._codex_composer_shows_whole(line, expected_text)
                          or self._tui_paste_placeholder_holds(engine, line, typed_len))
             now = time.time()
             key = (line, shown)
@@ -10758,6 +10917,9 @@ class HubSessionManager:
             echoed = shown or self._composer_holds(line, probe, tail)
             if shown and now - quiet_since >= TUI_TYPE_SETTLE_SEC:
                 return screen, echoed, True, now - started
+            if (now >= cap and engine == "codex" and now - quiet_since < TUI_TYPE_STALL_SEC
+                    and now - started < TUI_TYPE_SETTLE_HARD_CAP_SEC):
+                continue  # still being typed in: wait while it grows
             if now >= cap:
                 logger.warning(
                     "K5: %s typed text never settled on the composer after %.1fs",
@@ -11661,6 +11823,8 @@ class HubSessionManager:
                             msg_cursor = max(msg_cursor, seq)
                         # Only the first batch read after re-attaching is the replay.
                         replay = None
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH record reader", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:
@@ -11770,6 +11934,8 @@ class HubSessionManager:
                                     },
                                 )
                             break
+                except PersistenceRecordTooLarge as exc:
+                    self._skip_unstorable_record(session, "DSH job watcher", exc)
                 except PersistenceUnavailable:
                     raise
                 except Exception:
