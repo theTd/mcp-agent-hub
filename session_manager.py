@@ -480,6 +480,15 @@ TUI_SUBMIT_RETRY_STEP_SEC = 1.0
 TUI_TYPE_SETTLE_SEC = 0.8
 TUI_TYPE_SETTLE_POLL_SEC = 0.1
 TUI_TYPE_SETTLE_CAP_SEC = 10.0
+# Codex on Windows takes a paste in a few words per frame (live: ~60 chars/s, an 850-char follow-up
+# still growing at the 10 s cap). Past the cap the wait goes on while the composer keeps changing,
+# and gives up once it has stood still this long or at the hard cap.
+TUI_TYPE_STALL_SEC = 3.0
+TUI_TYPE_SETTLE_HARD_CAP_SEC = 120.0
+# Codex caps its composer's height; a taller draft scrolls and marks the hidden rows with an arrow
+# at the right edge of its top visible row. The visible end must then be at least this long.
+TUI_CODEX_SCROLL_MARK_RE = re.compile(r"(?<=\s)↑(?=\s)")
+TUI_CODEX_SCROLLED_MIN_CHARS = 40
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
@@ -10429,6 +10438,29 @@ class HubSessionManager:
             return None
 
     @staticmethod
+    def _codex_composer_shows_whole(line: Optional[str], expected: str) -> bool:
+        """The Codex composer shows the whole expected text (whitespace ignored).
+
+        Either all of it is visible, or the composer scrolled (TUI_CODEX_SCROLL_MARK_RE marks the
+        hidden rows) and what is visible is exactly the text's end, at least
+        TUI_CODEX_SCROLLED_MIN_CHARS long. A partial draft is never accepted: a scrolled view of a
+        draft that is still growing shows the end of what arrived so far, not of the whole text.
+        """
+        if line is None:
+            return False
+        want = re.sub(r"\s+", "", expected or "")
+        if not want:
+            return False
+        if re.sub(r"\s+", "", line) == want:
+            return True
+        padded = f" {line} "
+        for mark in TUI_CODEX_SCROLL_MARK_RE.finditer(padded):
+            seen = re.sub(r"\s+", "", padded[:mark.start()] + padded[mark.end():])
+            if TUI_CODEX_SCROLLED_MIN_CHARS <= len(seen) < len(want) and want.endswith(seen):
+                return True
+        return False
+
+    @staticmethod
     def _codex_composer_empty(session: AgentSession, line: Optional[str]) -> bool:
         if line is None:
             return False
@@ -10680,6 +10712,9 @@ class HubSessionManager:
         K7 (fix 9d): the composer of every known engine is read whole (kimi's box, the wrapped rows
         of omp/agy/codex), and codex's paste placeholder for the typed length counts as the end
         shown, so the cap is a safety net only: reaching it means detection failed, and it warns.
+        For codex the cap waits on while the composer keeps changing (TUI_TYPE_STALL_SEC,
+        TUI_TYPE_SETTLE_HARD_CAP_SEC), and a scrolled composer showing the text's end counts as
+        the whole text (_codex_composer_shows_whole).
         """
         started = time.time()
         cap = started + max(TUI_TYPE_SETTLE_CAP_SEC, TUI_TYPE_SETTLE_SEC,
@@ -10697,7 +10732,7 @@ class HubSessionManager:
             )
             if engine == "codex" and expected_text is not None:
                 # Repeated tails can appear before ConPTY has consumed the whole write.
-                shown = (re.sub(r"\s+", "", line or "") == re.sub(r"\s+", "", expected_text)
+                shown = (self._codex_composer_shows_whole(line, expected_text)
                          or self._tui_paste_placeholder_holds(engine, line, typed_len))
             now = time.time()
             key = (line, shown)
@@ -10706,6 +10741,9 @@ class HubSessionManager:
             echoed = shown or self._composer_holds(line, probe, tail)
             if shown and now - quiet_since >= TUI_TYPE_SETTLE_SEC:
                 return screen, echoed, True, now - started
+            if (now >= cap and engine == "codex" and now - quiet_since < TUI_TYPE_STALL_SEC
+                    and now - started < TUI_TYPE_SETTLE_HARD_CAP_SEC):
+                continue  # still being typed in: wait while it grows
             if now >= cap:
                 logger.warning(
                     "K5: %s typed text never settled on the composer after %.1fs",

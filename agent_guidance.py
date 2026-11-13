@@ -44,6 +44,8 @@ SERVER_INSTRUCTIONS = (
     "send_to_subagent to steer it, and resume_subagent to restore an ended session. "
     "Never blindly resend a failed/unconfirmed Codex submission: inspect it, then clear an idle "
     "nonempty draft with send_to_subagent(text='', clear_input=true) before sending new text. "
+    "Keep sent text short: put a follow-up longer than a few lines in a file under the session cwd "
+    "and send a one-line pointer to it; long text is typed into the terminal slowly and can fail to land. "
     "Retrieve persisted answers with get_subagent_final_response only when an HTTP result is unavailable.\n"
     + "\n".join(f"- {rule}" for rule in ROUTING_RULES)
 )
