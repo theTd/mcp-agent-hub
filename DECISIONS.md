@@ -2,6 +2,19 @@
 
 Design decisions confirmed by the owner. Change a line here before changing the behaviour it records.
 
+## Rust terminal core (2026-11-12, owner: decision page `hub-rust-core-1112`)
+
+Planned design: `docs/rust-terminal-core.md`. Nothing in it is implemented yet.
+
+| id | decision |
+|---|---|
+| terminal-core-start | Start the terminal-core work now; no prerequisite load test of Python-side changes. |
+| terminal-core-host | The terminal core is a PyO3 extension module (`hub_terminal_core`) inside the hub process, not a sidecar process and not the desktop app. It owns every PTY, parses on its own native threads with the GIL released, and writes the terminal sockets itself, so the hub's event loop is not on the output path. A Rust panic ends one session (archived `crashed`, last screen kept); `abort`, a stack overflow or an access violation still takes the hub down, accepted. |
+| terminal-core-ws | The core serves the terminal WebSocket to the console itself, behind a short-lived HMAC ticket the core mints (`GET /api/sessions/{id}/terminal-ticket`), on a `127.0.0.1` ephemeral port. Replay, `replay_end`, Q11 atomicity, A1 resume and W8 keep their current contract. `/mcp`, REST and the console push socket stay in the hub. |
+| terminal-core-replaces | The core replaces pywinpty and pyte outright: no `HUB_TERMINAL_CORE` mode, no per-profile switch, no `HUB_TERMINAL_WS` fallback and no Python PTY path kept alongside. Rollback is reverting the merge. pyte survives only as an offline fixture oracle until the port lands. Sessions still end with the hub (`shutdown-ends-cli`). |
+| terminal-core-batching | The core's per-session coalescing is the only PTY output batching; the separate Python-side output batching unit is dropped and never lands. |
+| terminal-core-conpty | The core uses the system ConPTY through the `windows` crate (`CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`), not the bundled `conpty.dll` / `OpenConsole.exe` pywinpty ships. Existing captures came from the bundled implementation, so parser fixtures are re-recorded against the system version. |
+
 ## Event-loop stalls (2026-11-12, owner: batch decision page, all defaults)
 
 | id | decision |
