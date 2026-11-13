@@ -1,0 +1,119 @@
+{
+  "kind": "session",
+  "engine": "claude",
+  "cols": 120,
+  "rows": 36,
+  "resize": {
+    "at_ms": 31098,
+    "chunk_index": 90,
+    "from": [
+      120,
+      36
+    ],
+    "to": [
+      140,
+      44
+    ]
+  },
+  "chunk_encoding": "utf8_bytes",
+  "pty": "system-conpty",
+  "windows_build": "10.0.26220.9836",
+  "read_buffer_bytes": 8192,
+  "resume_count": 1,
+  "launch": {
+    "command": "reclaude.exe",
+    "args": [
+      "--model",
+      "haiku",
+      "--effort",
+      "low",
+      "--session-id",
+      "<UUID>",
+      "[Hub Session: session_id=rtc-corpus-claude-2294e88c] list the files in this folder and say how many there are; change nothing",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}"
+    ],
+    "task_mode": "positional"
+  },
+  "flags": {
+    "ephemeral": true,
+    "isolated_hub_port": 4599,
+    "env_keys": [],
+    "mcp_disabled": [],
+    "mcp_files_inspected": 0
+  },
+  "session_files": {
+    "engine_session_id": "<UUID>"
+  },
+  "task": "[Hub Session: session_id=rtc-corpus-claude-2294e88c] list the files in this folder and say how many there are; change nothing",
+  "recorder": {
+    "version": 2,
+    "recorded_at": "2026-11-13T18:59:44+0800",
+    "chunk_count": 103,
+    "bytes": 10293,
+    "max_chunk_bytes": 1723,
+    "events": [
+      {
+        "event": "spawn",
+        "at_ms": 0
+      },
+      {
+        "event": "keys",
+        "reason": "trust_folder_choice",
+        "at_ms": 15633,
+        "bytes": 4
+      },
+      {
+        "event": "answer_settled",
+        "at_ms": 28065
+      },
+      {
+        "event": "idle_reached",
+        "at_ms": 51284
+      },
+      {
+        "event": "keys",
+        "reason": "exit",
+        "at_ms": 51284,
+        "bytes": 6
+      }
+    ],
+    "exit": {
+      "stop_reason": "exited",
+      "exit_code": 0,
+      "duration_ms": 55213
+    },
+    "read_error": null
+  },
+  "scrub": {
+    "rules": [
+      {
+        "label": "extra_plan",
+        "count": 3
+      },
+      {
+        "label": "profile_path_4",
+        "count": 5
+      },
+      {
+        "label": "uuid",
+        "count": 3
+      },
+      {
+        "label": "window_scratch",
+        "count": 7
+      }
+    ],
+    "replacements": 18,
+    "chunks": 103,
+    "chunk_encoding": "utf8_bytes",
+    "runs": 3,
+    "last_run": {
+      "rules": [],
+      "replacements": 0,
+      "chars_before": 7621,
+      "chars_after": 7621
+    }
+  }
+}

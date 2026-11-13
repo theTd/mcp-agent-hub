@@ -4,8 +4,8 @@
   "cols": 120,
   "rows": 36,
   "resize": {
-    "at_ms": 35640,
-    "chunk_index": 1747,
+    "at_ms": 40078,
+    "chunk_index": 894,
     "from": [
       120,
       36
@@ -15,7 +15,11 @@
       44
     ]
   },
-  "chunk_encoding": "text",
+  "chunk_encoding": "utf8_bytes",
+  "pty": "system-conpty",
+  "windows_build": "10.0.26220.9836",
+  "read_buffer_bytes": 8192,
+  "resume_count": 1,
   "launch": {
     "command": "node.exe",
     "args": [
@@ -30,72 +34,76 @@
       "model_reasoning_effort=minimal",
       "-c",
       "mcp_servers.agent-hub.enabled=false",
-      "[Hub Session: session_id=rtc-corpus-codex-1df64f69] list the files in this folder and say how many there are; change nothing"
+      "[Hub Session: session_id=rtc-corpus-codex-12eced85] list the files in this folder and say how many there are; change nothing"
     ],
     "task_mode": "positional"
   },
   "flags": {
     "ephemeral": true,
     "isolated_hub_port": 4599,
-    "env_keys": []
+    "env_keys": [],
+    "mcp_disabled": [
+      "agent-hub"
+    ],
+    "mcp_files_inspected": 0
   },
   "session_files": {
     "engine_session_id": null
   },
-  "task": "[Hub Session: session_id=rtc-corpus-codex-1df64f69] list the files in this folder and say how many there are; change nothing",
+  "task": "[Hub Session: session_id=rtc-corpus-codex-12eced85] list the files in this folder and say how many there are; change nothing",
   "recorder": {
-    "version": 1,
-    "recorded_at": "2026-11-13T15:54:59+0800",
-    "chunk_count": 1766,
-    "bytes": 39890,
-    "max_chunk_bytes": 1024,
+    "version": 2,
+    "recorded_at": "2026-11-13T18:53:00+0800",
+    "chunk_count": 953,
+    "bytes": 27243,
+    "max_chunk_bytes": 2069,
     "events": [
       {
         "event": "spawn",
         "at_ms": 0
       },
       {
-        "event": "answer_settled",
-        "at_ms": 32595
-      },
-      {
         "event": "idle_reached",
-        "at_ms": 56252
+        "at_ms": 65350
       },
       {
         "event": "keys",
         "reason": "exit",
-        "at_ms": 56252,
+        "at_ms": 65350,
         "bytes": 6
       },
       {
         "event": "killed",
-        "at_ms": 64444
+        "at_ms": 76128
       }
     ],
     "exit": {
       "stop_reason": "exit_timeout",
-      "exit_code": 2,
-      "duration_ms": 64444
-    }
+      "exit_code": 1,
+      "duration_ms": 76128
+    },
+    "read_error": null
   },
   "scrub": {
     "rules": [
       {
-        "label": "extra_scratch",
-        "count": 5
+        "label": "absolute_path_spaces",
+        "count": 1
+      },
+      {
+        "label": "window_scratch",
+        "count": 225
       }
     ],
-    "replacements": 5,
-    "chunks": 1766,
-    "chunk_encoding": "text",
+    "replacements": 226,
+    "chunks": 953,
+    "chunk_encoding": "utf8_bytes",
     "runs": 2,
     "last_run": {
       "rules": [],
       "replacements": 0,
-      "chars_before": 38164,
-      "chars_after": 38164
+      "chars_before": 25152,
+      "chars_after": 25152
     }
-  },
-  "resume_count": 1
+  }
 }

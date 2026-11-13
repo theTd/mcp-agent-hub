@@ -1,0 +1,5 @@
+reclaude: 旧目录尚未完全迁移（not a plain directory: <HOME>\.rec
+remove <HOME>\.reclaude: The directory is not empty.）；文件已保留，下次启动会重试
+
+Resume this session with:
+claude --resume <UUID>
