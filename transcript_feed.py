@@ -91,8 +91,8 @@ GENERIC_ASK_LINES = frozenset({"Would you like to run the following command?"})
 PATCH_FILE_OP = re.compile(r"\*\*\* (Add|Update|Delete) File: (.+?)(?=\\n|\n|\"|$)")
 # Argument names that describe a call, best first, matched case-insensitively. `toolSummary` is
 # AGY's one-line description of each call; `CommandLine` / `Path` are AGY's spellings.
-TITLE_KEYS = ("toolsummary", "description", "title", "commandline", "command", "cmd", "file_path",
-              "filepath", "path", "pattern", "query", "url", "prompt", "text")
+TITLE_KEYS = ("toolsummary", "intent", "description", "title", "commandline", "command", "cmd", "file_path",
+              "filepath", "path", "pattern", "query", "url", "prompt", "text", "code")
 # A search names its pattern first and the place searched second (`pattern · …\dir`).
 SEARCH_KEYS = ("pattern", "query")
 # AGY's own cut of a long argument value: the head of its JSON text and the bytes left out.
@@ -259,6 +259,8 @@ def _title_from_fields(fields: Dict[str, Any]) -> str:
     search = next((lower[key] for key in SEARCH_KEYS
                    if isinstance(lower.get(key), str) and lower[key].strip()), "")
     for key in TITLE_KEYS:
+        if key == "description" and isinstance(lower.get("i"), str) and lower["i"].strip():
+            return _one_line(lower["i"], 200)
         value = lower.get(key)
         if isinstance(value, list):
             value = " ".join(str(item) for item in value if not isinstance(item, (dict, list)))
@@ -267,6 +269,8 @@ def _title_from_fields(fields: Dict[str, Any]) -> str:
         if search and key in ("file_path", "filepath", "path"):
             return f"{_one_line(search, 120)} · {_one_line(value, 120)}"
         return _one_line(value, 200)
+    if isinstance(lower.get("items"), list) and lower["items"] and isinstance(lower.get("op"), str):
+        return f"待办 {len(lower['items'])} 项"
     # No describing argument: name the first few scalar ones (e.g. `cell_id=88`).
     scalars = [f"{key}={value}" for key, value in fields.items()
                if isinstance(value, (str, int, float)) and not isinstance(value, bool)
@@ -733,6 +737,7 @@ def build_transcript_feed(
         "pending_interaction": interaction_view(pending) if pending else None,
         "final_response": final_text,
         "updated_at": meta.get("updated_at"),
+        "context_window": meta.get("context_window") if isinstance(meta.get("context_window"), dict) else None,
         "entries": result,
         "limit": limit,
         "has_more": total > limit or window_saturated,

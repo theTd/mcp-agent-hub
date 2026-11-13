@@ -25,6 +25,169 @@ const LIVE_STATUSES = new Set(['starting', 'running']);
 // Statuses whose session takes a message as it is; any other one is resumed by the send.
 const RECEIVING_STATUSES = new Set(['starting', 'running', 'waiting_parent', 'completed']);
 const COMPOSE_MAX_PX = 168; // the message box grows with its text up to about seven lines
+// Context window gauge (renderContextWindowHtml): a 16px ring in a 26px chip beside 发送. The full
+// circle is the model's window, filled clockwise from 12 o'clock; a hairline tick crossing the
+// band marks the auto-compaction threshold.
+const CTX_RING_C = 8; // centre of the 16×16 viewBox
+const CTX_RING_R = 6; // the 2px band spans r 5…7
+const CTX_RING_LEN = 2 * Math.PI * CTX_RING_R;
+const CTX_RING_MIN_ARC = 0.75; // any usage at all stays visible as a sliver
+const CTX_TRACK_SEGMENTS = 16; // an estimated window (AGY) draws its track in segments
+
+export function formatTokenCount(n) {
+  const num = Number(n);
+  if (!Number.isFinite(num) || num < 0) return '0';
+  if (num < 1000) return String(Math.round(num));
+  if (num < 1_000_000) {
+    const k = num / 1000;
+    const text = num >= 100_000 ? Math.round(k).toString() : k.toFixed(1).replace(/\.0$/, '');
+    return `${text}k`;
+  }
+  const m = num / 1_000_000;
+  return `${m.toFixed(2).replace(/\.?0+$/, '')}M`;
+}
+
+const fmtPct = (pct) => `${pct.toFixed(1)}%`;
+const exactTokens = (n) => Math.round(n).toLocaleString('en-US');
+
+// The chip's share: a whole percent that never rounds a sliver to "empty" or 99.6% to "full".
+function chipPct(pct) {
+  if (pct <= 0) return '0%';
+  if (pct < 1) return '<1%';
+  if (pct >= 100) return '100%';
+  return `${Math.min(99, Math.max(1, Math.round(pct)))}%`;
+}
+
+function ringPoint(ratio, radius) {
+  const theta = ratio * 2 * Math.PI - Math.PI / 2;
+  return [CTX_RING_C + radius * Math.cos(theta), CTX_RING_C + radius * Math.sin(theta)];
+}
+
+function contextRingSvg(ratio, markRatio, estimated) {
+  const c = CTX_RING_C;
+  const circle = (cls, extra = '') => `<circle class="${cls}" cx="${c}" cy="${c}" r="${CTX_RING_R}" transform="rotate(-90 ${c} ${c})"${extra}/>`;
+  let trackExtra = '';
+  if (estimated) {
+    const seg = CTX_RING_LEN / CTX_TRACK_SEGMENTS;
+    const dash = seg * 0.6;
+    const gap = seg - dash;
+    // A gap, not a dash, sits at 12 o'clock so the segments read symmetric.
+    trackExtra = ` stroke-dasharray="${dash.toFixed(3)} ${gap.toFixed(3)}" stroke-dashoffset="${(dash + gap / 2).toFixed(3)}"`;
+  }
+  const arcLen = ratio > 0 ? Math.max(CTX_RING_MIN_ARC, ratio * CTX_RING_LEN) : 0;
+  const arc = arcLen > 0
+    ? circle('tx-ctx-arc', ` stroke-dasharray="${arcLen.toFixed(2)} ${CTX_RING_LEN.toFixed(2)}"`)
+    : '';
+  let mark = '';
+  if (markRatio != null) {
+    // A knock-out in the chip's own colour, then a hairline: the tick reads on the track and on
+    // the arc alike and overhangs the 2px band by half a pixel at most.
+    const line = (cls, inner, outer) => {
+      const [x1, y1] = ringPoint(markRatio, inner);
+      const [x2, y2] = ringPoint(markRatio, outer);
+      return `<line class="${cls}" x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}"/>`;
+    };
+    mark = `<g class="tx-ctx-mark">${line('tx-ctx-mark-halo', CTX_RING_R - 1.9, CTX_RING_R + 1.9)}${line('tx-ctx-mark-line', CTX_RING_R - 1.5, CTX_RING_R + 1.5)}</g>`;
+  }
+  return `<svg class="tx-ctx-ring" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false">${circle('tx-ctx-track', trackExtra)}${arc}${mark}</svg>`;
+}
+
+/**
+ * The context window gauge for the reply / message box: a 26px chip (ring + used share) whose
+ * hover or focus opens a details card. `ctx` is the feed's `context_window`; no window (DSH,
+ * PowerShell, desktop GUI, or nothing measured yet) renders nothing.
+ */
+export function renderContextWindowHtml(ctx) {
+  if (!ctx || typeof ctx !== 'object') return '';
+  const win = Number(ctx.window_tokens);
+  if (!Number.isFinite(win) || win <= 0) return '';
+
+  const used = Math.max(0, Number(ctx.used_tokens) || 0);
+  const pct = (used / win) * 100;
+  const ratio = Math.min(1, pct / 100);
+  const compactRaw = Number(ctx.compact_tokens);
+  const compact = Number.isFinite(compactRaw) && compactRaw > 0 ? compactRaw : 0;
+  const estimated = Boolean(ctx.window_estimated);
+  const awaiting = Boolean(ctx.awaiting_post_compact);
+  // The threshold gets a tick only strictly inside the window: at 100% (AGY's estimated window is
+  // its measured compaction point) it would only sit on 12 o'clock and say nothing.
+  const markRatio = compact && compact < win ? compact / win : null;
+  const nearCompact = compact > 0 && used >= compact * 0.85;
+  const reachedCompact = compact > 0 && used >= compact && !estimated;
+
+  let tone = 'normal';
+  if (awaiting) tone = 'compact';
+  else if (reachedCompact || ratio >= 0.9) tone = 'danger';
+  else if (nearCompact || ratio >= 0.75) tone = 'warn';
+
+  let state = '余量充足';
+  if (tone === 'compact') state = '压缩后待校准';
+  else if (tone === 'danger') state = reachedCompact ? '已达压缩线' : nearCompact ? '即将自动压缩' : '接近窗口上限';
+  else if (tone === 'warn') state = nearCompact ? '接近压缩线' : '用量偏高';
+
+  const approx = estimated ? '~' : '';
+  const rows = [];
+  const row = (label, value, aside = '', attrs = '') => {
+    rows.push(`<dt>${label}</dt><dd${attrs}>${escapeHtml(value)}${aside ? `<small>${escapeHtml(aside)}</small>` : ''}</dd>`);
+  };
+  row(awaiting ? '已用（压缩前）' : '已用', formatTokenCount(used), used >= 1000 ? exactTokens(used) : '');
+  row(estimated ? '估算上限' : '物理窗口', approx + formatTokenCount(win), win >= 1000 ? approx + exactTokens(win) : '');
+  if (markRatio != null) row('自动压缩线', formatTokenCount(compact), `${(markRatio * 100).toFixed(1).replace(/\.0$/, '')}%`);
+  // Headroom derived from a reading taken before the compaction would be wrong: wait for the next.
+  if (!awaiting) {
+    if (markRatio != null) {
+      const headroom = compact - used;
+      row('距压缩线', headroom >= 0 ? formatTokenCount(headroom) : `已超 ${formatTokenCount(-headroom)}`, '',
+        headroom < 0 ? ' data-tone="over"' : '');
+    }
+    row(estimated ? '估算剩余' : '剩余可用', approx + formatTokenCount(Math.max(0, win - used)));
+  }
+  const model = String(ctx.model || '').trim();
+  if (model) row('模型', model, '', ` title="${escapeHtml(model)}"`);
+
+  const notes = [];
+  if (awaiting) notes.push(['compact', '刚完成自动压缩：圆环暂为压缩前用量，下一轮回复后校准']);
+  else if (ctx.compacted) notes.push(['history', '本会话已发生过自动压缩']);
+  if (ctx.estimated_note) notes.push(['estimated', String(ctx.estimated_note)]);
+
+  const aria = [`上下文窗口${estimated ? '（估算）' : ''}已用 ${fmtPct(pct)}`, `${formatTokenCount(used)} / ${approx}${formatTokenCount(win)}`];
+  if (markRatio != null) aria.push(`自动压缩线 ${formatTokenCount(compact)}`);
+  aria.push(state);
+  const meterFill = used > 0 ? Math.max(1, ratio * 100) : 0;
+
+  return `<div class="tx-ctx-wrap" data-tone="${tone}"${estimated ? ' data-estimated="true"' : ''}>`
+    + `<button type="button" class="tx-ctx-trigger" aria-label="${escapeHtml(aria.join('，'))}">`
+    + `${contextRingSvg(ratio, markRatio, estimated)}<span class="tx-ctx-pct">${escapeHtml(chipPct(pct))}</span></button>`
+    + '<div class="tx-ctx-pop" role="tooltip">'
+    + '<header class="tx-ctx-pop-head"><div class="tx-ctx-pop-heading">'
+    + `<p class="tx-ctx-pop-title">上下文窗口${estimated ? '<span class="tx-ctx-pop-badge">估算</span>' : ''}</p>`
+    + `<p class="tx-ctx-pop-state">${state}</p></div>`
+    + `<strong class="tx-ctx-pop-pct">${approx}${fmtPct(pct)}</strong></header>`
+    + `<div class="tx-ctx-meter"><span class="tx-ctx-meter-fill" style="width:${meterFill.toFixed(2)}%"></span>`
+    + `${markRatio != null ? `<span class="tx-ctx-meter-mark" style="left:${(markRatio * 100).toFixed(2)}%"></span>` : ''}</div>`
+    + `<dl class="tx-ctx-pop-rows">${rows.join('')}</dl>`
+    + (notes.length
+      ? `<div class="tx-ctx-pop-notes">${notes.map(([kind, text]) => `<p class="tx-ctx-pop-note" data-kind="${kind}">${escapeHtml(text)}</p>`).join('')}</div>`
+      : '')
+    + '</div></div>';
+}
+
+// Bring `node` in line with `next` (same tag) while keeping every element whose place in the tree
+// did not change, so focus, :hover and running transitions survive a new reading.
+function morphElement(node, next) {
+  for (const { name } of [...node.attributes]) if (!next.hasAttribute(name)) node.removeAttribute(name);
+  for (const { name, value } of [...next.attributes]) if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+  const have = [...node.childNodes];
+  const want = [...next.childNodes];
+  if (have.length !== want.length || have.some((child, index) => child.nodeName !== want[index].nodeName)) {
+    node.replaceChildren(...want);
+    return;
+  }
+  have.forEach((child, index) => {
+    if (child.nodeType === Node.ELEMENT_NODE) morphElement(child, want[index]);
+    else if (child.nodeValue !== want[index].nodeValue) child.nodeValue = want[index].nodeValue;
+  });
+}
 
 const ROLE_LABELS = {
   task: '任务',
@@ -357,6 +520,7 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
         ${onSend ? `<form class="tx-compose" data-ref="compose" autocomplete="off">
           <div class="tx-compose-row">
             <textarea class="tx-compose-input" data-ref="compose-input" rows="1" aria-label="发送消息给 Agent"></textarea>
+            <div class="tx-ctx" data-ref="ctx" hidden></div>
             <button type="submit" class="btn btn-sm btn-primary tx-compose-send" data-ref="compose-send" title="发送（Enter）">发送</button>
           </div>
           <p class="tx-compose-note" data-ref="compose-note" hidden></p>
@@ -368,7 +532,7 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
     top: ref('top'), blocks: ref('blocks'), live: ref('live'), liveText: ref('live-text'),
     empty: ref('empty'), jump: ref('jump-text').parentElement, jumpText: ref('jump-text'), pending: ref('pending'),
     compose: ref('compose'), composeInput: ref('compose-input'), composeSend: ref('compose-send'),
-    composeNote: ref('compose-note'),
+    composeNote: ref('compose-note'), ctx: ref('ctx'),
   };
   if (els.composeInput) els.composeInput.value = ui.compose || '';
   let sending = false;
@@ -541,13 +705,37 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
       ${buttons ? `<div class="tx-choices">${buttons}</div>` : ''}
       <div class="tx-reply">
         <input class="tx-reply-input" type="text" data-ref="reply" placeholder="${buttons ? '或输入自定义回复…' : '输入回复…'}" value="${escapeHtml(ui.draft.text)}" />
+        <div class="tx-ctx" data-ref="pending-ctx" hidden></div>
         <button type="button" class="btn btn-sm btn-primary" data-tx="submit">发送</button>
       </div>
     </section>`;
   }
 
+  // The gauge sits in the message box and, while a question waits, in the reply card (whose markup
+  // is only rebuilt for a new question, so its slot is filled here on every poll). Unchanged markup
+  // is left alone; changed markup is patched in place so an open details card stays open.
+  function paintContextWindow(slot, html) {
+    if (!slot) return;
+    if (slot.hidden !== !html) slot.hidden = !html;
+    if ((slot.dataset.html ?? '') === html) return;
+    slot.dataset.html = html;
+    const current = slot.firstElementChild;
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    const next = template.content.firstElementChild;
+    if (current && next && current.nodeName === next.nodeName && slot.childElementCount === 1) morphElement(current, next);
+    else slot.innerHTML = html;
+  }
+
+  function renderContextWindow() {
+    const html = renderContextWindowHtml(data?.context_window);
+    paintContextWindow(els.ctx, html);
+    paintContextWindow(els.pending.querySelector('[data-ref="pending-ctx"]'), html);
+  }
+
   // The message box stands in for the reply card's input while no question or approval waits.
   function renderCompose() {
+    renderContextWindow();
     if (!els.compose) return;
     const waiting = Boolean(els.pending.firstElementChild);
     if (els.compose.hidden !== waiting) els.compose.hidden = waiting;
@@ -816,7 +1004,9 @@ export function createTranscriptView(host, ui, { onRespond, onLoadMore, onRetry,
   function onKeydown(ev) {
     // Enter sends; Shift+Enter is a new line; Enter that confirms an IME composition is neither.
     const plainEnter = ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229;
-    if (ev.target.matches?.('[data-ref="reply"]')) {
+    if (ev.key === 'Escape' && ev.target.matches?.('.tx-ctx-trigger')) {
+      ev.target.blur(); // closes the context window details opened by focus
+    } else if (ev.target.matches?.('[data-ref="reply"]')) {
       if (plainEnter) {
         ev.preventDefault();
         submit(els.pending.querySelector('[data-tx="submit"]'), null);

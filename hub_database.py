@@ -53,7 +53,7 @@ END_REASON_LABELS = {
 ARCHIVE_COLUMNS = (
     "end_reason", "archived_at", "spawned_at", "profile_snapshot", "conversation_ref",
     "scrollback", "last_screen", "parent_messages", "resume_count", "last_resumed_at",
-    "resumable", "resume_block_reason",
+    "resumable", "resume_block_reason", "context_window_json",
 )
 
 
@@ -148,6 +148,7 @@ class HubDatabase:
                     transcript_path TEXT DEFAULT ''
                     ,turn_id TEXT DEFAULT ''
                     ,wait_handle TEXT DEFAULT ''
+                    ,context_window_json TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -208,6 +209,7 @@ class HubDatabase:
                 "ALTER TABLE sessions ADD COLUMN resume_block_reason TEXT",
                 "ALTER TABLE sessions ADD COLUMN turn_id TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN wait_handle TEXT DEFAULT ''",
+                "ALTER TABLE sessions ADD COLUMN context_window_json TEXT",
                 # Transcript feed: structured tool fields (tool, call id, input, output, ok) of an event.
                 "ALTER TABLE worker_events ADD COLUMN data_json TEXT",
             ):
@@ -279,6 +281,7 @@ class HubDatabase:
             "last_resumed_at": arc.get("last_resumed_at"),
             "resumable": arc.get("resumable"),
             "resume_block_reason": arc.get("resume_block_reason"),
+            "context_window_json": arc.get("context_window_json"),
         }
         columns = list(values.keys())
         placeholders = ", ".join(f":{c}" for c in columns)
@@ -291,7 +294,8 @@ class HubDatabase:
             # keeps the previous answer too, and the new turn overwrites it through set_final_response.
             if col in ("ended_at", "exit_code", "archived_at", "spawned_at",
                        "profile_snapshot", "conversation_ref", "parent_messages",
-                       "last_resumed_at", "end_reason", "final_response", "final_response_source"):
+                       "last_resumed_at", "end_reason", "final_response", "final_response_source",
+                       "context_window_json"):
                 updates.append(f"{col}=COALESCE(NULLIF(excluded.{col}, ''), sessions.{col})")
             elif col == "scrollback_text":
                 updates.append(
@@ -432,6 +436,7 @@ class HubDatabase:
             d["profile_snapshot"] = self._decode_json_column(d.pop("profile_snapshot", None), None)
             d["conversation_ref"] = self._decode_json_column(d.pop("conversation_ref", None), None)
             d["parent_messages"] = self._decode_json_column(d.pop("parent_messages", None), [])
+            d["context_window"] = self._decode_json_column(d.pop("context_window_json", None), None)
             d.pop("scrollback", None)
             d["archived"] = bool(d.get("archived_at"))
             return d

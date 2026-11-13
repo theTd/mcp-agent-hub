@@ -11,6 +11,7 @@
 - **活动组**：两条消息之间连续的工具调用和思考折叠成一组，组头显示数量、用到的工具、失败数和最新一步；最后一组在 Agent 工作时保持展开。
 - **提问 / 审批**：已处理的显示成普通行，标题是被审批的命令或问题本身，右侧是回复内容；被自动审批规则放行的也显示一行，标为「已自动批准」；等待回复的高亮显示。worker 自己转发给主 Agent 的审批通知不再重复显示。
 - **最终回复**和**生命周期提示**（终止、出错、投递失败等）。
+- **上下文窗口指示**：消息框和等待回复卡片的「发送」按钮左侧各有一个 26px 高的小标签：16px 圆环加已用百分比（窄窗格只留圆环）。满圆对应模型物理窗口，从 12 点顺时针填充；自动压缩阈值低于窗口时在对应角度画一条跨过圆环的细刻度线。颜色只在需要注意时出现：接近压缩线或窗口 75% 为琥珀色，达到压缩线（估算模式除外）或窗口 90% 为红色，刚压缩、等待下一轮校准为紫色。悬停或聚焦（Esc 关闭）弹出详情：百分比与状态、带阈值线的进度条、已用 / 物理窗口 / 自动压缩线 / 距压缩线 / 剩余可用 / 模型，以及压缩和估算说明。支持 Codex、Kimi、OMP、Claude 和 AGY（AGY 未公开物理上限，圆环轨道画成分段虚线，按实测 256k 自动压缩线估算，此时阈值与窗口重合，不画刻度线）；DSH / PowerShell 等非 CLI 引擎隐藏该指示器。
 
 ## 交互
 
@@ -51,6 +52,7 @@ DSH 原生网页界面需要 `dsh web` 打印的访问令牌，Hub 无法代为�
 | `entries[].tool` | `name`、`title`、`input`、`output`、`status`（`running` / `ok` / `error` / `unknown`）、`started_at`、`ended_at` |
 | `entries[].interaction` | `request_id`、`kind`、`title`、`summary`、`prompt`、`options`；另有 `pending` 和 `resolution`（`text`、`by`: `parent` / `auto`） |
 | `pending_interaction` | 当前等待回复的提问或审批（同上结构，不含引擎元数据） |
+| `context_window` | CLI 会话的上下文窗口用量（`used_tokens`、`window_tokens`、`compact_tokens`、`used_pct`、`compact_pct`、`window_estimated`、`awaiting_post_compact`、`compacted`、`model`、`source`、`estimated_note`）；非 CLI 或尚无窗口数据时为 `null` |
 | `has_more` / `hidden_count` | 是否还有更早的条目、被截掉的条目数 |
 | `status`、`step_count`、`current_activity`、`final_response`、`updated_at` | 会话状态摘要 |
 
