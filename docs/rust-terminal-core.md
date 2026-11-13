@@ -114,6 +114,11 @@ ticket issuing and the console-facing HTTP API.
 
 Every current reader of the pyte screen or the raw history, what it needs, and its new call.
 
+The anchors are line numbers at `b3d0614`, the commit this design was written against. Master has moved
+since (the fixes in §8.1 added screen readers and shifted every line), so step 3 re-derives this table on
+its branch head: every read of `session.screen` (`display`, `cursor`, `history`, `buffer`), every
+`get_clean_screen_text`, `get_scrollback_text` and `raw_history` use, by name, not by line.
+
 | consumer | anchor | needs | new call |
 |---|---|---|---|
 | terminal WebSocket (console) | `server.py:1308`, `static/js/session-workspace.js:1079` | replay + live raw chunks with Q11 atomicity, input, resize | no Python consumer: the console fetches a ticket from the hub and connects to the core's socket directly (§6.4) |
@@ -121,6 +126,8 @@ Every current reader of the pyte screen or the raw history, what it needs, and i
 | `read_subagent_screen` (MCP) | `server.py:631` | exact screen, ≤80 lines | `screen` |
 | screen-based approval / dialog / composer detection | `:7133`, `:7392`, `:10220`, `:10260`, `:10390`, `:10414`, `:10461`, `:10739`, `:11796`, `:11829`, `:12656` | exact screen, `max(38, rows)` lines | `screen` |
 | Codex empty-composer check | `:10209` | `cursor.x`, cols, rows | `screen` reply carries cursor and size |
+| typed-text settle before Enter (`_await_typed_text_settled`, `_codex_composer_shows_whole`; master `0e17c54`) | not at `b3d0614` | screen 40 lines every 0.1 s, for up to 120 s while the composer keeps changing; Codex's scroll mark `↑` (U+2191) between spaces as text | `screen`; `rev` may gate the re-read, the verdict stays on the text |
+| OMP approval box paired with its tool call (`_omp_box_shows_call`, `_register_omp_screen_approval`, `_omp_box_left_to_events`, `tool_call_for_approval_box`, `screen_command_clipped`; master `6276c63`, `c527749`) | not at `b3d0614` | exact box rows: the command is compared with the transcript's call with whitespace removed, so a wrapped row must render exactly as pyte renders it | `screen` |
 | Kimi banner session id, Codex "is archived", Claude spinner | `:8742`, `:8273`, `:9667` | screen, 35 lines | `screen` |
 | generic-engine TUI tool lines | `:2345` | every changed visible row | `watch_screen` snapshot (informational only) |
 | exit snapshot for `final_response` | `:2305` | scrollback 80 lines, once | `scrollback` in the drain handler that sees `alive = false` |
@@ -359,6 +366,15 @@ path to run. It also cannot survive the process dying, which is what §6.3 is ab
   through `classify_end_reason` (`:2312`) the way it archives a failed exit today. The console shows a
   crashed pane, not a frozen one. A panic in the ticker thread is caught and logged and the thread
   continues; a panic on the accept thread refuses that connection and keeps the listener.
+- An error *returned* by one item is handled the same way as a panic: it costs that item, never the
+  loop. A socket write that fails closes that socket; a frame a sink cannot take is dropped and counted;
+  an accept that fails is logged and retried (§6.4). Only the reader's own end of pipe ends a reader, and
+  only `shutdown` ends the ticker and the accept thread. A `?` that leaves a native thread's loop on any
+  other error is a bug. Master `3874299` is the Python case of this: one tool output too large to store
+  raised out of the transcript watcher and ended it for the session's remaining life. The step 3 drain
+  handler isolates sessions the same way: an exception while handling one session's record (a scrollback
+  write that persistence refuses, a broken archive) is logged against that session and the drain goes
+  on with the next.
 - Residual risk the owner accepted with in-process hosting: `abort()`, a stack overflow, an access
   violation, or a second panic while unwinding takes the **whole hub** down — every session, every MCP
   stream, every wait handle. Any dependency compiled with `panic = "abort"` restores exactly that
@@ -376,6 +392,18 @@ remote-console path and no proxy in the tree. Its port comes from `HUB_PORT` (de
 there is no retry loop and no "port + 1" guess. A loopback bind raises no Windows Firewall prompt.
 Reaching the console from another machine is a separate decision — a non-loopback listener would need
 its own TLS and ticket story, and until then the listener stays on `127.0.0.1`.
+
+**A failed accept never closes the listener** (master `4b06139`). On Windows an accept fails when a client
+drops its connection mid-accept (WinError 64, `ERROR_NETNAME_DELETED`); asyncio's Proactor loop then
+closed the hub's listening socket, and the hub kept serving open connections while refusing every new one
+until `windows_accept_guard` was added. A Rust accept loop written as `for s in listener.incoming() { s?; … }`
+or one that `break`s on `Err` has the same bug. The core's accept thread treats every `Err` from `accept`
+as that one connection's failure: it logs the first and every 100th, waits 0, 50 ms, 200 ms, then 1 s
+between consecutive failures (the guard's `RETRY_DELAYS`), and accepts again; only `shutdown` ends it.
+The hub's health check includes the listener: `Core.ws_listening()` is false when the accept thread has
+ended, and the hub reports that the way the desktop app now reports a hub whose port stopped listening.
+Step 4's test injects accept failures through a `test-hooks` seam and proves the next connection is
+served.
 
 **Ticket.** `core.ws_ticket(session_id, ttl_ms=30_000)` returns
 `ws://127.0.0.1:<port>/ws/pty/<session_id>?ticket=<token>`; the token is
@@ -614,6 +642,27 @@ threads die with the interpreter plus `kill_all` on the recorded shutdown path, 
 scrollback cap is preserved byte-for-byte by W9 in the core. Six new rows record this design itself:
 `terminal-core-start`, `-host`, `-ws`, `-replaces`, `-batching` and `-conpty`.
 
+### 8.1 Fixes on master since this design
+
+Master took these fixes after `b3d0614` (and on 2026-11-12, while the design was drafted). Each row says
+what the core or the cut-over must do so the bug does not come back. The integration branch merges master
+before each step starts and again before step 6, so the Python suites of these fixes run in every gate.
+
+| master commit | bug fixed | what the core and the cut-over keep | where it is checked |
+|---|---|---|---|
+| `4e693ce` | pyte drew the residue of a CSI with a `:`, `<` or `=` marker as text | §8 row; `vte` reads the sequence whole, `csi_marker.rs` (step 2's copy of the bug) is deleted in step 2c | 12 re-rendered screen goldens; `edge-screen-*` marker cases |
+| `ee943e3` | a trim cut inside the newest resume banner dropped it | §8 W9 row; `history.rs` carries `BANNER_LINE_MAX_BYTES` | `edge-w9-*` goldens |
+| `defa26b` (branch `fix/pyte-zero-width-draw`, not on master yet) | pyte dropped the rest of a text run after a zero-width character (ZWSP, ZWJ, VS16 in `⚠️`) | a zero-width character that is not combining takes no cell, starts no pending wrap, and the text after it is drawn | `edge-screen-*` zero-width cases; `test_terminal_screen_zero_width` |
+| `4b06139` | one failed accept closed the hub's listener for good | §6.4: the core's accept loop survives every accept error; `ws_listening()` in the health check | step 4 test with injected accept failures |
+| `3874299` | one oversized record ended a long-lived watcher loop | §6.3: an error costs its item, never the loop, in every native thread and in the step 3 drain handler | step 2c/3 review checks every `?` and `break` in the native loops; a step 3 test makes one session's scrollback write fail and sees the next session drained |
+| `0e17c54` | a scrolled or slowly typed Codex paste never settled, so no Enter was sent | new consumer (§4): the settle loop reads the composer every 0.1 s and must see the scroll mark `↑` and each new frame as pyte does | step 3 live capture `live-codex-scrolled-paste` (§10) |
+| `c527749`, `6276c63` | OMP approvals showed a clipped command; a box was not paired with its own call | new consumers (§4): box rows, wrapped or not, must render exactly as pyte renders them, since the command is matched against the transcript with whitespace removed | step 3 live capture `live-omp-approval-box` (§10) |
+| `3418da9` | a Codex abort did not wake the parent; deny feedback was not submitted | the key guards (`OMP_PROMPT_KEY_GUARD_SEC` 0.6 s after the box is seen, `AGY_DENY_FEEDBACK_DELAY_SEC`, `CODEX_DENY_FEEDBACK_HOLD_SEC`) are measured in Python from when it sees the box; `write` only ever lands later than it is called, so the guards hold as long as `write` keeps arrival order (D7) | `test_session_approvals`, `test_native_records` in the step 3 gate |
+
+Not terminal work, so nothing for the core: `e2a7030` and `8ca5931` (transcript-driven turn ends),
+`a2abf90` and `b718834` (DSH TLS context, logging, a DB index), `54db9b3` and `0168939` (wait handles),
+`68bcd0c` and the `transcript_feed` commits.
+
 ## 9. Migration plan
 
 No flag, no shadow mode, no dual ownership. The work happens on the long-lived `feat/rust-terminal-core`
@@ -668,7 +717,16 @@ New tests, none run by this unit:
   stream), `catch_unwind` per reader thread (a panic marks one session `crashed` and leaves the others
   alive), the ticket
   (expiry, wrong session id, reused nonce, bad MAC), slow-client drop accounting, `kill` ends a child
-  tree (a spawned `cmd /c start` grandchild must not survive).
+  tree (a spawned `cmd /c start` grandchild must not survive), a failed accept followed by a served
+  connection (§6.4, master `4b06139`).
+- Live captures for the screen readers master added after this design (§8.1), recorded in step 3 with
+  the step 0 recorder and rendered by the oracle: `live-codex-scrolled-paste` (Codex at 80×24, a
+  ~900-character follow-up that scrolls the composer, so the `↑` mark shows) and `live-omp-approval-box`
+  (an OMP approval box whose command is longer than the box is wide). Besides the golden match, the step 3
+  test runs the real consumers on the core's screen: `_codex_composer_shows_whole` accepts the settled
+  composer, and the OMP box parse yields the command and its `command_truncated` flag as it does on pyte's
+  screen. Today their tests pass the screen in as a string, so no test feeds their bytes through either
+  screen model.
 - Rust, build config: CI asserts the extension's profile unwinds (a `cargo metadata`
   `profile.release.panic` check for the core crate), because a stray `panic = "abort"` silently turns
   every caught panic back into a hub kill.
