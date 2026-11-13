@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from hub_persistence import HubPersistence, PersistenceUnavailable
+from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable
 from transcript_tail import TranscriptTail
 
 
@@ -118,6 +118,21 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PersistenceUnavailable):
             await self.store.add_tool_call("test", 2, "two", "x" * 700)
         self.assertLessEqual(self.store.status()["pending_bytes"], 1024)
+        lock.rollback()
+        await self.store.flush()
+
+    async def test_a_write_larger_than_the_queue_says_so(self):
+        # Readers skip this one record and keep going; a full queue stays a plain, retryable error.
+        self.store.max_bytes = 1024
+        with self.assertRaises(PersistenceRecordTooLarge):
+            async with self.store.unit(2048):
+                pass
+        lock = self.lock()
+        self.store.admission_timeout = 0.05
+        await self.store.add_tool_call("test", 1, "one", "x" * 700)
+        with self.assertRaises(PersistenceUnavailable) as full:
+            await self.store.add_tool_call("test", 2, "two", "x" * 700)
+        self.assertNotIsInstance(full.exception, PersistenceRecordTooLarge)
         lock.rollback()
         await self.store.flush()
 

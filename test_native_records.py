@@ -8,6 +8,7 @@ from contextlib import closing
 from unittest.mock import patch
 
 from native_session_launch import strip_legacy_worker_bridge_args
+from hub_persistence import PersistenceRecordTooLarge
 from session_manager import AgentSession, HubSessionManager, approval_launch_flags
 from transcript_summarizer import KimiTranscriptSummarizer
 from transcript_tail import read_complete_lines
@@ -804,6 +805,58 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         sess.resume_attach = True
         sess.conversation_ref = {"rollout_path": str(path)}
         return sess, path, self.hub._schedule(self.hub._watch_codex_rollout(sess, self.root))
+
+    async def test_codex_huge_tool_output_keeps_the_watcher_following(self):
+        # 2026-11-10..13: a tool output of ~4 MB or more (a view_image result) sized its write past
+        # the 32 MB queue; the watcher ended for good and the session stayed "running" through the
+        # turn's task_complete (codex-732d4e3a and five more).
+        sess, path, task = self.watched_codex("huge-output")
+        try:
+            image = "data:image/png;base64," + "A" * (5 * 1024 * 1024)
+            output = json.dumps([{"type": "input_text", "text": "Viewed the sheet."},
+                                 {"type": "input_image", "image_url": image}])
+            self.append(
+                path,
+                {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
+                                                      "call_id": "v1", "input": "tools.view_image(...)"}},
+                {"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "v1",
+                                                      "output": output}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Audit done."}},
+            )
+            await self.until(lambda: sess.final_response == "Audit done.")
+            self.assertFalse(task.done(), "the watcher keeps following after the huge record")
+            events = self.hub.get_worker_events(sess.session_id)
+            result = next(e for e in events if e["type"] == "tool_result")
+            self.assertEqual(result["data"]["output"], "Viewed the sheet.\n[图片]")
+            self.assertLessEqual(len(result["content"]), 610)
+            self.assertTrue(any(e["type"] == "turn_completed" for e in events))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_a_record_too_large_to_store_is_skipped_not_fatal(self):
+        # Backstop: any write that can never fit skips its record; re-raising ended the watcher.
+        sess, path, task = self.watched_codex("unstorable")
+        original = self.hub.record_telemetry
+
+        async def record(session_id, data):
+            if data.get("call_id") == "big":
+                raise PersistenceRecordTooLarge("单次持久化数据超过队列容量")
+            return await original(session_id, data)
+
+        try:
+            with patch.object(self.hub, "record_telemetry", record), \
+                    self.assertLogs("mcp-agent-hub.session_manager", "WARNING") as logs:
+                self.append(path, {"type": "response_item", "payload": {"type": "function_call", "name": "shell",
+                                                                        "call_id": "big", "arguments": "{}"}})
+                await self.until(lambda: any("too large to store" in line for line in logs.output))
+                self.append(path, {"type": "event_msg",
+                                   "payload": {"type": "task_complete", "last_agent_message": "Still followed."}})
+                await self.until(lambda: sess.final_response == "Still followed.")
+            self.assertFalse(task.done())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def wait_handle(self, sess):
         info = await self.hub.wait_inbox.ensure_for_sessions([sess.session_id], {sess.session_id: sess.turn_id})
