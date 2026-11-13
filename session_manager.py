@@ -617,6 +617,9 @@ TUI_SUBMIT_EVIDENCE_SEC = 15.0
 # with a little slack instead of on every 4 KB PTY chunk (the cap is still enforced on the tail).
 HISTORY_TRIM_SLACK_BYTES = 64 * 1024
 HISTORY_TRUNCATED_PREFIX = "\x1b[90m[较早的输出已截断]\x1b[0m\r\n"
+# W9: the longest line trim_history_text treats as the newest resume banner (the banner is ~50 bytes);
+# it bounds how far the trimmed history may exceed its cap to keep that banner whole.
+HISTORY_BANNER_LINE_MAX_BYTES = 128
 # R7: an agy resume whose archived transcript is still locked by another watcher gets this long
 # to become claimable, then the watcher stops instead of spinning for the session's lifetime.
 AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
@@ -631,9 +634,12 @@ def trim_history_text(text: str, max_bytes: int) -> str:
     """W9: cap a raw terminal history at max_bytes without cutting a line or the newest banner.
 
     The old buffer dropped whole PTY chunks, so the archived scrollback and every resume banner
-    left in one step. This cuts bytes from the front, moves to the next line break, prefixes a
-    grey notice, and never eats the newest "── 已恢复（第 N 次）──" line (nor what follows it)
-    unless that part alone is larger than the whole budget.
+    left in one step. This cuts bytes from the front, moves to the next line break and prefixes a
+    grey notice. The newest "── 已恢复（第 N 次）──" line is kept whole, with its leading line
+    break, whenever the cut falls before its end: a cut inside the banner line keeps the banner and
+    everything after it, so the result may exceed max_bytes by less than that line
+    (HISTORY_BANNER_LINE_MAX_BYTES). A banner that ends before the cut is older than the budget and
+    goes with the rest.
     """
     if max_bytes <= 0:
         return ""
@@ -644,18 +650,22 @@ def trim_history_text(text: str, max_bytes: int) -> str:
     budget = max_bytes - len(prefix.encode("utf-8"))
     if budget <= 0:
         return prefix
-    start = len(raw) - budget
-    next_break = raw.find(b"\n", start)
+    cut = len(raw) - budget
+    start = cut
+    next_break = raw.find(b"\n", cut)
     if next_break >= 0:
         start = next_break + 1
-    # Keep the newest banner and everything after it when that tail alone fits.
     marker = "\x1b[90m── 已恢复（"
     idx = text.rfind(marker)
     if idx >= 0:
-        banner_start = len(text[:idx].encode("utf-8", "replace"))
+        marker_start = len(text[:idx].encode("utf-8", "replace"))
+        banner_start = marker_start
         if banner_start >= 2 and text[:idx].endswith("\r\n"):
             banner_start -= 2
-        if len(raw) - banner_start <= budget and banner_start < start:
+        line_break = raw.find(b"\n", marker_start)
+        banner_end = line_break + 1 if line_break >= 0 else len(raw)
+        if (banner_start < start and cut < banner_end
+                and banner_end - banner_start <= HISTORY_BANNER_LINE_MAX_BYTES):
             start = banner_start
     body = raw[start:].decode("utf-8", "replace")
     return prefix + body
