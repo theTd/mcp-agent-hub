@@ -45,6 +45,7 @@ use crate::conpty::ConPtyProcess;
 use crate::handles::{OwnedHandle, OwnedPseudoConsole};
 use crate::job::JobObject;
 use crate::job_tree;
+use crate::sink_fanout::{Delivery, SinkFanout};
 
 /// How long the exit/kill teardown waits for a helper thread to close the pseudoconsole (§12.7).
 pub const CONSOLE_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
@@ -490,11 +491,6 @@ enum Ingest<'a> {
     Text(&'a str),
 }
 
-struct SinkEntry {
-    handle: u64,
-    sink: Arc<dyn FrameSink>,
-}
-
 /// `screen`'s reply (§5.2): the rendered rows, the cursor, the size and the revision.
 #[derive(Clone, Debug)]
 pub struct ScreenReply {
@@ -557,17 +553,25 @@ pub struct Session {
     resources: Option<Arc<Resources>>,
     text: Mutex<TextState>,
     cached: Mutex<CachedText>,
-    /// Frames reach the sinks one at a time, in stream order.
+    /// Frames reach the sinks one at a time, in stream order. This belongs to the session **id**, not to
+    /// this incarnation (§6.4 A1): a resume hands this session's predecessor's structure over, so an
+    /// attached socket keeps its registration and its handle, and the resume banner reaches it.
     ///
     /// Lock order is one-directional: `delivery` before `text`, and `sinks` only under `delivery`.
     /// Nothing takes `delivery` while holding `text`, `sinks` or `cached`. A frame is taken out of the
-    /// batch and fanned out inside this lock, so the reader (`ingest`) and the ticker (`flush_frames`)
+    /// batch and fanned out inside that lock, so the reader (`ingest`) and the ticker (`flush_frames`)
     /// cannot deliver frame n+1 before frame n, and `attach_sink`'s snapshot and registration sit in one
     /// gap between deliveries. `FrameSink::deliver` must not block, so holding it costs the reader no
     /// more than the sink's own queue lock would.
-    delivery: Mutex<()>,
-    sinks: Mutex<Vec<SinkEntry>>,
-    next_sink: AtomicU64,
+    fanout: Arc<SinkFanout>,
+    /// Set by the successor's handover: whatever this incarnation would still deliver (a reader that
+    /// outlived its exit record, i.e. B1's wedged close) is dropped and counted instead of reaching the
+    /// sockets after the resume banner (§6.4 A1).
+    superseded: AtomicBool,
+    /// `true` once this incarnation has a reader that can deliver; `push_frame`'s precondition (§5.4).
+    reader_started: AtomicBool,
+    /// `true` once the superseded drop was logged, so a wedged reader logs it once, not per frame.
+    superseded_drop_logged: AtomicBool,
     writer: WriteQueue,
     alive: AtomicBool,
     exit_code: AtomicI32,
@@ -593,6 +597,8 @@ pub struct Session {
 impl Session {
     /// The state both constructors share. `seed_history` is a resumed session's archived scrollback:
     /// history, not output, so the byte counters stay at zero until the new process prints (A1).
+    /// `previous` is the incarnation this one resumes for the same id: its sink fan-out is carried over
+    /// (sinks and handles belong to the id, §6.4 A1), and it is the old session `take_over` retires.
     #[allow(clippy::too_many_arguments)]
     fn new_state(
         id: String,
@@ -605,6 +611,7 @@ impl Session {
         panics: Arc<AtomicU64>,
         log: Arc<dyn Fn(&str) + Send + Sync>,
         seed_history: Option<&str>,
+        previous: Option<&Arc<Session>>,
     ) -> Arc<Self> {
         let mut stream = TerminalStream::new(StreamOptions {
             cols: cols as usize,
@@ -631,9 +638,13 @@ impl Session {
                 frame: Vec::with_capacity(8192),
             }),
             cached: Mutex::new(CachedText::default()),
-            delivery: Mutex::new(()),
-            sinks: Mutex::new(Vec::new()),
-            next_sink: AtomicU64::new(1),
+            fanout: match previous {
+                Some(previous) => Arc::clone(&previous.fanout),
+                None => Arc::new(SinkFanout::default()),
+            },
+            superseded: AtomicBool::new(false),
+            reader_started: AtomicBool::new(false),
+            superseded_drop_logged: AtomicBool::new(false),
             writer: WriteQueue::new(options.write_queue_bytes),
             alive: AtomicBool::new(true),
             exit_code: AtomicI32::new(-1),
@@ -657,6 +668,9 @@ impl Session {
     /// Wraps a spawned process and starts its reader, writer and reaper threads. The returned lines are
     /// the spawn's log lines: the caller logs them after it re-attaches, because this runs with the GIL
     /// released (§5.2: no Python callback inside the detached spawn path).
+    ///
+    /// `previous` is the dead session currently in the table for this id, if any: its sinks are carried
+    /// over and its pending batch is delivered before `ws_prefix` goes out (§6.4 A1).
     pub fn start(
         id: String,
         process: ConPtyProcess,
@@ -668,6 +682,7 @@ impl Session {
         log: Arc<dyn Fn(&str) + Send + Sync>,
         seed_history: Option<String>,
         ws_prefix: Option<String>,
+        previous: Option<Arc<Session>>,
     ) -> Result<(Arc<Self>, Vec<String>), String> {
         let ConPtyProcess {
             pid,
@@ -709,17 +724,23 @@ impl Session {
             panics,
             log,
             seed_history.as_deref(),
+            previous.as_ref(),
         );
 
-        // A1: the resume separator reaches every socket already attached to this id before the first
-        // byte of the new process, which is why it goes out here rather than from Python's spawn path.
-        if let Some(prefix) = ws_prefix.as_deref() {
-            session.push_frame(prefix);
-        }
+        // A1's handover, before the reader exists: the old incarnation's pending bytes, then the resume
+        // separator, both to the sinks that are attached to the **id** (carried over by `new_state`).
+        // This is why the separator reaches a socket at all, and why it cannot outrun the old process's
+        // last frame — one delivery lock covers both steps, and a sink that attaches during the swap
+        // lands on either side of them, never between.
+        session.take_over(previous.as_ref(), ws_prefix.as_deref());
 
         // Thread starts are the last step that can fail, and a failure here used to leave a live process
         // with no table entry: unreachable, unreaped (rereview item 3). The error path ends the tree and
         // closes the console, then reports the failure so `core.spawn` raises instead of hiding it.
+        // Past this point the incarnation is meant to have a reader, so `push_frame` (a prefix or a
+        // seed) is no longer legal for it (§5.4's precondition); set before the first thread so there is
+        // no window in which a reader exists and the flag does not.
+        session.reader_started.store(true, Ordering::Release);
         let started = (|| -> std::io::Result<()> {
             let reader = Arc::clone(&session);
             thread::Builder::new()
@@ -737,6 +758,18 @@ impl Session {
             Ok(())
         })();
         if let Err(error) = started {
+            // The handover already flushed the predecessor's batch and sent the banner, but the
+            // predecessor is still the session the table names and nobody else will resume it: letting
+            // it deliver again keeps its sockets working instead of dropping everything its reader
+            // still has after a failed spawn (edge case: this is the only failure after the handover).
+            if let Some(previous) = previous.as_ref() {
+                if previous.superseded.swap(false, Ordering::AcqRel) {
+                    previous.log(&format!(
+                        "session {}: the successor could not start; this incarnation keeps delivering",
+                        session.id
+                    ));
+                }
+            }
             let resources = session.resources.clone().expect("a spawned session has resources");
             let terminated = if resources.job_assigned {
                 resources.job.terminate(1)
@@ -763,6 +796,9 @@ impl Session {
     /// A session with no process (`attach_text`, §5.2): the DSH virtual sessions' screen and raw history,
     /// fed through `feed`, alive for as long as the hub keeps it. `kill`/`resize` never touch a console
     /// that does not exist.
+    ///
+    /// `seed` is the DSH resume's separator (§6.4 A1) and goes out under the same handover `spawn`'s
+    /// `ws_prefix` uses, so it follows the predecessor's pending batch to the same carried-over sinks.
     pub fn start_text(
         id: String,
         cols: u16,
@@ -772,10 +808,78 @@ impl Session {
         panics: Arc<AtomicU64>,
         log: Arc<dyn Fn(&str) + Send + Sync>,
         seed_history: Option<&str>,
+        seed: Option<&str>,
+        previous: Option<Arc<Session>>,
     ) -> Arc<Self> {
-        Self::new_state(id, 0, None, cols, rows, options, tick, panics, log, seed_history)
+        let session = Self::new_state(
+            id,
+            0,
+            None,
+            cols,
+            rows,
+            options,
+            tick,
+            panics,
+            log,
+            seed_history,
+            previous.as_ref(),
+        );
+        session.take_over(previous.as_ref(), seed);
+        session
     }
 
+    /// A1's handover from the previous incarnation of this id, run once before this incarnation can
+    /// deliver anything (§6.4 A1). Under the id's delivery lock: the predecessor's pending batch goes to
+    /// the shared sinks, then the predecessor is superseded, then the separator (`ws_prefix` for a
+    /// spawn, the seed for `attach_text`) goes out. A sink attached to the id therefore sees the old
+    /// incarnation's last bytes, the separator, and the new incarnation's output, each exactly once.
+    ///
+    /// The delivery lock is what makes a sink attached during the swap safe: `attach_sink` either takes
+    /// its replay and registers before this begins (and gets the separator), or after it ends (and its
+    /// replay already holds the old bytes and the separator).
+    fn take_over(self: &Arc<Self>, previous: Option<&Arc<Session>>, separator: Option<&str>) {
+        let (delivery, retired) = {
+            let _delivery = self.fanout.lock_delivery();
+            let retired = match previous {
+                Some(previous) => Some((previous, previous.retire())),
+                None => None,
+            };
+            // From here on this incarnation owns the id: a sink that attaches (through either object)
+            // takes its replay from this ring, so the successor's already delivered frames cannot fall
+            // between an old ring's end and the registration.
+            self.fanout.set_owner(Arc::downgrade(self));
+            let delivery = match separator {
+                Some(separator) => self.push_frame(separator),
+                None => Delivery::default(),
+            };
+            (delivery, retired)
+        };
+        // Reporting logs, and a log call reaches Python: it happens with no core lock held (§6.5).
+        if let Some((previous, (flushed, first))) = retired {
+            previous.report_delivery(flushed);
+            if first {
+                previous.log(&format!(
+                    "session {}: superseded by a new incarnation for this id; its later output is \
+                     dropped, not delivered",
+                    previous.id
+                ));
+            }
+        }
+        self.report_delivery(delivery);
+    }
+
+    /// Retires this incarnation under the id's delivery lock, as its successor's handover requires: its
+    /// pending batch goes to the shared sinks first (so the old process's last bytes reach the sockets
+    /// before the resume banner), then it is marked superseded, so anything its reader still files is
+    /// dropped and counted instead of landing after the banner.
+    ///
+    /// Returns the flush's report and whether this call is the one that retired it, so the caller logs
+    /// the retirement once, outside the lock.
+    fn retire(&self) -> (Delivery, bool) {
+        let flushed = self.pump_locked(None);
+        let first = !self.superseded.swap(true, Ordering::AcqRel);
+        (flushed, first)
+    }
 
     /// One place that reaches the core's `log` callable, so every line goes through the same path.
     fn log(&self, message: &str) {
@@ -1516,55 +1620,109 @@ impl Session {
 
     /// Registers a sink and hands back the replay that goes with the registration (Q11).
     ///
-    /// Atomic against `pump`/`push_frame` for this session: the delivery lock is held from the pending
-    /// batch through the snapshot and the registration, so no frame can be taken and fanned out in
-    /// between (a chunk would otherwise be in neither the replay nor any frame). The pending batch is
-    /// fanned out to the sinks that existed before this one only, because the replay already carries
-    /// those bytes; the new sink gets them once, from the replay.
+    /// Atomic against `pump`/`push_frame`: the id's delivery lock is held from the pending batch
+    /// through the snapshot and the registration, so no frame can be taken and fanned out in between (a
+    /// chunk would otherwise be in neither the replay nor any frame). The pending batch is fanned out to
+    /// the sinks that existed before this one only, because the replay already carries those bytes; the
+    /// new sink gets them once, from the replay.
+    ///
+    /// Wire order for the caller: the sink must write the returned replay and the `replay_end` marker
+    /// **before** draining the sink's own queue. A direct write from `deliver` puts a frame on the wire
+    /// before the replay, because the registration is complete when this returns and frames start landing
+    /// immediately (§6.4: replay, one more strip, the marker, then frames). Step 4's socket sink is a
+    /// bounded queue drained by the socket's own thread for exactly this reason.
+    ///
+    /// Never returns a handle it did not register: a sink that panicked earlier leaves a poisoned sink
+    /// list behind, and `register` recovers it with `into_inner`.
     pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, u64) {
-        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
-        let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
-        let pending = text.batch.take_all();
-        let replay = text.stream.replay_text();
-        drop(text);
-        let handle = self.next_sink.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "test-hooks")]
-        crate::test_hooks::attach_delay();
-        if let Ok(mut sinks) = self.sinks.lock() {
-            sinks.push(SinkEntry { handle, sink });
-        }
-        if let Some(frame) = pending {
-            self.fan_out(&frame, Some(handle));
-        }
+        let (replay, handle, delivery) = {
+            let _delivery = self.fanout.lock_delivery();
+            // The replay, and the pending batch that goes with it, must come from the incarnation whose
+            // frames will follow: during a resume that is the successor (set by the handover before the
+            // separator), not this session, whose ring stops at the takeover. A retired incarnation
+            // refuses to fan out, so handing its batch back through it would lose those bytes.
+            let (pending, replay, owner) = match self.fanout.take_replay() {
+                Some((owner, pending, replay)) => (pending, replay, Some(owner)),
+                None => {
+                    let (pending, replay) = self.take_replay();
+                    (pending, replay, None)
+                }
+            };
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::attach_delay();
+            let handle = self.fanout.register(sink);
+            // The pending batch already reached the other sinks, except when the frame that carried it
+            // was taken by a sink that has since detached; `skip` is this sink, whose replay holds those
+            // bytes.
+            let delivery = match pending {
+                Some(frame) => match owner {
+                    Some(owner) => owner.fan_out(&frame, Some(handle)),
+                    None => self.fan_out(&frame, Some(handle)),
+                },
+                None => Delivery::default(),
+            };
+            (replay, handle, delivery)
+        };
+        self.report_delivery(delivery);
         (replay, handle)
     }
 
+    /// Removes a handle from the id's sink set, whichever incarnation registered it; `false` when it is
+    /// not attached (never registered here, already detached, or removed by its own panic).
     pub fn detach_sink(&self, handle: u64) -> bool {
-        let Ok(mut sinks) = self.sinks.lock() else {
-            return false;
-        };
-        let before = sinks.len();
-        sinks.retain(|entry| entry.handle != handle);
-        sinks.len() != before
+        self.fanout.detach(handle)
     }
 
     /// One frame straight to the attached sinks, not through the batch: `spawn(ws_prefix=…)` and
-    /// `attach_text(seed=…)` (§5.2, A1). No sink is attached unless a socket already follows the id.
-    pub fn push_frame(&self, frame: &str) {
+    /// `attach_text(seed=…)` (§5.2, A1). Returns what the fan-out cost for `report_delivery`.
+    ///
+    /// Preconditions, all asserted in debug builds: the caller holds the id's delivery lock; this
+    /// incarnation's reader has not started, so no `ingest` can have queued a batch whose bytes this
+    /// frame would then overtake; and the batch is empty for the same reason. The only caller is
+    /// `take_over`, which runs before the reader thread starts and under that lock.
+    fn push_frame(&self, frame: &str) -> Delivery {
         if frame.is_empty() {
-            return;
+            return Delivery::default();
         }
-        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
-        self.fan_out(frame.as_bytes(), None);
+        debug_assert!(
+            !self.reader_started.load(Ordering::Acquire),
+            "push_frame on {} after its reader started: it would overtake a pending frame",
+            self.id
+        );
+        debug_assert!(
+            self.text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .batch
+                .pending_bytes()
+                == 0,
+            "push_frame on {} with a pending batch: it would jump the batch's bytes",
+            self.id
+        );
+        self.fan_out(frame.as_bytes(), None)
     }
 
     /// Takes the frame that is due (or whatever the batch holds, for the final flush) and fans it out —
-    /// both inside the delivery lock, which is what keeps frame order.
-    ///
-    /// Lock order here is delivery → text: `ingest` releases the text lock before calling this, so the
-    /// reader never holds `text` while waiting for a delivery that another thread is making.
+    /// both inside the delivery lock, which is what keeps frame order. The report is delivered after the
+    /// lock is released, because reporting may log and `log` reaches Python.
     fn pump(&self, now: Option<Instant>) {
-        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        // The test seam: a held batch is what the resume tests need to see delivered by the handover,
+        // so only the handover's own `pump_locked` bypasses it.
+        #[cfg(feature = "test-hooks")]
+        if crate::test_hooks::frames_held() {
+            return;
+        }
+        let delivery = {
+            let _delivery = self.fanout.lock_delivery();
+            self.pump_locked(now)
+        };
+        self.report_delivery(delivery);
+    }
+
+    /// `pump`'s body; the caller holds the id's delivery lock. Lock order is delivery → text: `ingest`
+    /// releases the text lock before calling `pump`, so the reader never holds `text` while waiting for
+    /// a delivery another thread is making.
+    fn pump_locked(&self, now: Option<Instant>) -> Delivery {
         let frame = {
             let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
             match now {
@@ -1572,38 +1730,45 @@ impl Session {
                 None => text.batch.take_all(),
             }
         };
-        if let Some(frame) = frame {
-            self.fan_out(&frame, None);
+        match frame {
+            Some(frame) => self.fan_out(&frame, None),
+            None => Delivery::default(),
         }
     }
 
-    /// Delivers one coalesced frame to every attached sink, skipping `skip` (the sink that is being
-    /// registered and already has these bytes in its replay); the drops each sink reports land in
-    /// `dropped_bytes` (§5.4). The caller holds the delivery lock, and `FrameSink::deliver` never blocks,
-    /// so a slow sink costs the reader its queue push, never its read.
-    fn fan_out(&self, frame: &[u8], skip: Option<u64>) {
-        let mut dropped = 0u64;
-        match self.sinks.lock() {
-            Ok(mut sinks) => {
-                for entry in sinks.iter_mut() {
-                    if Some(entry.handle) == skip {
-                        continue;
-                    }
-                    dropped += entry.sink.deliver(&self.id, frame);
-                }
-            }
-            Err(error) => {
-                let sinks = error.into_inner();
-                for entry in sinks.iter() {
-                    if Some(entry.handle) == skip {
-                        continue;
-                    }
-                    dropped += entry.sink.deliver(&self.id, frame);
-                }
-            }
+    /// What one fan-out cost, carried out of the delivery lock and reported by `report_delivery`: a `log`
+    /// call reaches Python, and no core lock is held across one (§6.5, "Python may hold a lock and call
+    /// back in"). `superseded` marks a frame this incarnation was not allowed to deliver.
+    fn fan_out(&self, frame: &[u8], skip: Option<u64>) -> Delivery {
+        if self.superseded.load(Ordering::Acquire) {
+            return Delivery {
+                dropped: frame.len() as u64,
+                panicked: Vec::new(),
+                superseded: true,
+            };
         }
-        if dropped > 0 {
-            self.dropped_bytes.fetch_add(dropped, Ordering::Relaxed);
+        self.fanout.fan_out(&self.id, frame, skip)
+    }
+
+    /// Counts and logs what `fan_out` reported. Called with the delivery lock released: the counters are
+    /// atomics, and the log line reaches a Python callback.
+    fn report_delivery(&self, delivery: Delivery) {
+        if delivery.dropped > 0 {
+            self.dropped_bytes
+                .fetch_add(delivery.dropped, Ordering::Relaxed);
+        }
+        for (handle, message) in delivery.panicked {
+            self.note_panic();
+            self.log(&format!(
+                "session {}: sink {handle} panicked in deliver and was detached ({message})",
+                self.id
+            ));
+        }
+        if delivery.superseded && !self.superseded_drop_logged.swap(true, Ordering::AcqRel) {
+            self.log(&format!(
+                "session {}: superseded; later output is dropped, not delivered",
+                self.id
+            ));
         }
     }
 
@@ -1750,6 +1915,17 @@ impl Drop for Session {
         // Unblocks the writer thread and lets it exit; the pipes close with `Resources`. No `log` call
         // here: this can run on the Python GC thread during interpreter teardown.
         self.writer.close();
+    }
+}
+
+impl Session {
+    /// The ring and the pending batch a new sink's replay is taken from. Called by `attach_sink` while
+    /// it holds the id's delivery lock (and `delivery → text` is the one lock order), so no frame can be
+    /// taken from this batch between the snapshot and the registration that follows it.
+    pub(crate) fn take_replay(&self) -> (Option<Vec<u8>>, String) {
+        let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = text.batch.take_all();
+        (pending, text.stream.replay_text())
     }
 }
 

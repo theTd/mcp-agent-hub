@@ -65,6 +65,20 @@ impl RecordingSink {
         }
     }
 
+    /// The bytes delivered so far, as one string (the wire a socket would have written).
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.delivered.lock().unwrap_or_else(|e| e.into_inner()).bytes)
+            .into_owned()
+    }
+
+    fn text_len(&self) -> usize {
+        self.delivered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes
+            .len()
+    }
+
     /// Blocks until at least one delivery is inside `deliver`; `false` on the timeout.
     fn wait_until_delivering(&self, timeout: Duration) -> bool {
         let mut inside = self.inside.lock().unwrap_or_else(|e| e.into_inner());
@@ -224,4 +238,96 @@ fn attach_sink_takes_its_replay_and_registers_in_one_step() {
         );
         assert_eq!(received, expected, "sink attached in round {index}");
     }
+}
+/// A sink that panics on its first delivery: step 4's socket sink with a bug in it.
+struct PanickingSink {
+    delivered: Mutex<usize>,
+}
+
+impl FrameSink for PanickingSink {
+    fn deliver(&self, _session_id: &str, _frame: &[u8]) -> u64 {
+        let mut delivered = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
+        *delivered += 1;
+        panic!("sink out of order");
+    }
+}
+
+/// §6.3 + review finding 2: one sink's panic costs that sink, never the session. The reader's own path
+/// (`feed`, which calls `ingest` and then `pump`) must survive it: the session stays alive and keeps
+/// taking text, the healthy sink gets every byte in order, the panicked handle is gone so `detach_sink`
+/// answers `false`, a sink attached afterwards registers and receives, and the panic counter rose by one.
+#[test]
+fn a_panicking_sink_costs_that_sink_and_not_the_session() {
+    let core = core();
+    core.attach_text(text_request("panic")).expect("attach_text");
+    let healthy = Arc::new(RecordingSink::new(Duration::ZERO));
+    let (_healthy_replay, healthy_handle) = core
+        .attach_sink("panic", healthy.clone())
+        .expect("attach_sink healthy");
+    let bad = Arc::new(PanickingSink {
+        delivered: Mutex::new(0),
+    });
+    let (_bad_replay, panic_handle) = core
+        .attach_sink("panic", bad.clone())
+        .expect("attach_sink bad");
+    let before = core.stats(FEED_DEADLINE).panics;
+
+    core.feed("panic", "AAA", FEED_DEADLINE).expect("feed");
+    // Delivery is coalesced, so drive the ticker's own pass too; `pump` is what runs the fan-out.
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while healthy.text_len() < 3 && std::time::Instant::now() < end {
+        core.feed("panic", "", FEED_DEADLINE).expect("empty feed is a no-op");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(core.stats(FEED_DEADLINE).panics, before + 1, "the panic must be counted once");
+    assert_eq!(
+        *bad.delivered.lock().unwrap_or_else(|e| e.into_inner()),
+        1,
+        "the sink panicked on its first delivery and was removed, so it must not be called again"
+    );
+    let text = healthy.text();
+    assert!(text.starts_with("AAA"), "healthy sink got {text:?}");
+
+    // The session is untouched: alive, not crashed, still takes output, and still renders a screen.
+    let record = core
+        .drain()
+        .into_iter()
+        .find(|record| record.session_id == "panic")
+        .expect("a drain record after the panic");
+    assert!(record.alive, "record: {record:?}");
+    assert!(!record.crashed, "record: {record:?}");
+    assert!(!record.degraded, "record: {record:?}");
+
+    core.feed("panic", "BBB", FEED_DEADLINE).expect("feed after the panic");
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while healthy.text_len() < 6 && std::time::Instant::now() < end {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(healthy.text(), "AAABBB", "the healthy sink lost or reordered bytes");
+
+    // A sink attached after the panic registers (the sink list is not silently dead on poison) and
+    // receives; the panicked handle is not attached, so a detach of it answers false.
+    let later = Arc::new(RecordingSink::new(Duration::ZERO));
+    let (_replay, later_handle) = core.attach_sink("panic", later.clone()).expect("attach_sink after");
+    core.feed("panic", "CCC", FEED_DEADLINE).expect("feed CCC");
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while later.text_len() < 3 && std::time::Instant::now() < end {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        later.text(),
+        "CCC",
+        "a sink attached after the panic must receive the bytes that follow it"
+    );
+    assert!(
+        core.detach_sink("panic", later_handle).expect("detach later"),
+        "a sink attached after the panic must detach"
+    );
+    assert!(
+        !core.detach_sink("panic", panic_handle).expect("detach panicked"),
+        "the panicking sink was removed by its panic, so its handle must not detach"
+    );
+    assert!(core.detach_sink("panic", healthy_handle).expect("detach healthy"));
+    core.kill("panic", Duration::from_millis(100)).expect("kill");
 }

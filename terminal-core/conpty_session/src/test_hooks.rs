@@ -16,6 +16,14 @@ static CLOSE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// every normal run. Widens the Q11 window for the test that proves the delivery lock closes it.
 static ATTACH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// `true` while `pump` takes no frame, so a coalescing batch stays pending.
+///
+/// The resume tests (`tests/sink_handover.rs`) need the predecessor to die with bytes still in its
+/// batch: with the batch pending, the handover's flush is the thing that delivers them, and the order
+/// "old bytes, separator, new bytes" is observable in one sink. `take_over` calls `pump_locked` and is
+/// not held by this.
+static HOLD_FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// `true` while `resize` should keep the console slot after taking it.
 static HOLD_RESIZE: Mutex<bool> = Mutex::new(false);
 /// Wakes `resize` when the test releases the gate.
@@ -52,6 +60,23 @@ pub(crate) fn attach_delay() {
     if millis > 0 {
         std::thread::sleep(Duration::from_millis(millis));
     }
+}
+
+/// Makes `pump` leave the batch pending (a batch survives to the exit while it is held).
+pub fn hold_frames() {
+    HOLD_FRAMES.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Undoes one `hold_frames`.
+pub fn release_frames() {
+    let _ = HOLD_FRAMES.try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+        Some(held.saturating_sub(1))
+    });
+}
+
+/// Called by `pump` before it takes a frame: `true` means "leave it in the batch".
+pub(crate) fn frames_held() -> bool {
+    HOLD_FRAMES.load(Ordering::Acquire) > 0
 }
 
 /// Makes the next `resize` calls hold the console slot until `release_resize`.

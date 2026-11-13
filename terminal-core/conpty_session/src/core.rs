@@ -270,12 +270,15 @@ impl Core {
         if cols == 0 || rows == 0 {
             return Err(CoreError::Invalid("spawn needs cols and rows >= 1".into()));
         }
-        if let Some(existing) = self
+        // The dead incarnation this spawn resumes for the same id, if any (§6.4 A1): its sink fan-out
+        // and its pending batch are handed to the new session, so the sockets attached to the id keep
+        // working and the resume banner reaches them.
+        let previous = self
             .sessions
             .read()
             .ok()
-            .and_then(|map| map.get(&session_id).cloned())
-        {
+            .and_then(|map| map.get(&session_id).cloned());
+        if let Some(existing) = previous.as_ref() {
             // A session whose process has exited is replaceable even when its reader is still winding
             // down: `alive` is the only "still running" signal, and the reaper publishes it as soon as
             // the process is gone (B1).
@@ -308,6 +311,7 @@ impl Core {
             Arc::clone(&self.log),
             seed_history,
             ws_prefix,
+            previous,
         )
         // A thread that cannot start leaves a live process with no table entry, so `Session::start`
         // ends the tree and reports it here instead of returning a half-built session.
@@ -319,9 +323,11 @@ impl Core {
             log_lines,
         };
         // A dead session under the same id is replaced: resume spawns a new process for an id whose
-        // previous session has exited, and the hub's screens come from `seed_history` (§8 A1). The old
-        // `Arc<Session>` is released here: its reader has hit EOF, so `Session::drop` closes the pipes and
-        // `Resources::drop` the console, leaving no HPCON, conhost or reader behind.
+        // previous session has exited, and the hub's screens come from `seed_history` (§8 A1). The new
+        // session took the old one's sink fan-out over (`Session::start`), so the sockets attached to the
+        // id were never detached; the old `Arc<Session>` is released here: its reader has hit EOF, so
+        // `Session::drop` closes the pipes and `Resources::drop` the console, leaving no HPCON, conhost or
+        // reader behind.
         let replaced = self
             .sessions
             .write()
@@ -493,18 +499,21 @@ impl Core {
                 "attach_text needs cols and rows >= 1".into(),
             ));
         }
-        if let Some(existing) = self
+        let previous = self
             .sessions
             .read()
             .ok()
-            .and_then(|map| map.get(&session_id).cloned())
-        {
+            .and_then(|map| map.get(&session_id).cloned());
+        if let Some(existing) = previous.as_ref() {
             if existing.alive() {
                 return Err(CoreError::Invalid(format!(
                     "session {session_id} is already running in the core"
                 )));
             }
         }
+        // The seed (the DSH resume separator) and the handover happen inside `start_text`, under the
+        // id's delivery lock and before the session is reachable: a sink attached to the id gets the old
+        // session's pending bytes, then the seed, exactly once (§6.4 A1).
         let session = Session::start_text(
             session_id.clone(),
             cols,
@@ -517,10 +526,9 @@ impl Core {
             Arc::clone(&self.panics),
             Arc::clone(&self.log),
             seed_history.as_deref(),
+            seed.as_deref(),
+            previous,
         );
-        if let Some(seed) = seed.as_deref() {
-            session.push_frame(seed);
-        }
         let reply = SpawnReply {
             pid: 0,
             cols,

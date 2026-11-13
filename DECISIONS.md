@@ -16,11 +16,14 @@ skeleton) and step 2a (corpus re-recorded on the system ConPTY). The hub does no
 | terminal-core-batching | The core's per-session coalescing is the only PTY output batching; the separate Python-side output batching unit is dropped and never lands. |
 | terminal-core-conpty | The core uses the system ConPTY through the `windows` crate (`CreatePseudoConsole` / `ResizePseudoConsole` / `ClosePseudoConsole`), not the bundled `conpty.dll` / `OpenConsole.exe` pywinpty ships. Existing captures came from the bundled implementation, so parser fixtures are re-recorded against the system version. |
 
-## Rust terminal core, implementation (2026-11-13, decided by the orchestrator, reviewed by the owner)
+## Rust terminal core, implementation (2026-11-13, decided by the orchestrator)
 
 Medium decisions taken while building steps 0 to 2. Each is easy to reverse; the last column says how.
-The owner reviewed them on the batch decision page `hub-rtc-review-1113` (2026-11-13): `oracle-bugs`
-changed as recorded in its row; every other row kept its default.
+The owner reviewed `oracle-bugs`, `replay-shape`, `write-contract`, `write-oversize`, `kill-all-parallel`,
+`tests-fail-without-pyd` and `agy-bundled-case` on the batch decision page `hub-rtc-review-1113`
+(2026-11-13): `oracle-bugs` changed as recorded in its row, the others kept their defaults.
+`parser-vte-own-screen`, `w9-banner-overshoot` and the four `rtc-sink-*` rows are on the page
+`hub-rtc-step2-1114`, not answered yet; `csi-residue-fix` and `scrub-uuids` were reported in an audit list.
 
 | id | decision | alternative not taken | how to reverse |
 |---|---|---|---|
@@ -35,6 +38,10 @@ changed as recorded in its row; every other row kept its default.
 | write-oversize | A `write` larger than the 1 MiB queue cap is accepted whole when the queue is empty, so a paste over 1 MiB works as it did under pywinpty; otherwise all-or-nothing with `TimeoutError` (doc §5.2). | Reject it up front with `ValueError` and have step 3 split pastes. | Swap the fit test; one test. |
 | agy-bundled-case | `live-agy` keeps its pywinpty (bundled ConPTY) recording: the owner's agy config enables the `agent-hub` MCP server on 4444 and agy has no session-scoped switch, so the recorder refuses. The conhost differences are engine-independent and the other four engines cover them. | Disable agy's hub MCP server for one recording (owner's call), or record with the live hub attached. | Re-run the recorder for agy once the server is disabled. |
 | tests-fail-without-pyd | `test_terminal_core_client.py` fails, not skips, when the extension is missing: after the cut-over the hub cannot run without it. | Skip with a warning. | One decorator. |
+| rtc-sinks-per-id | Step 2d, review of step 2c: the delivery lock, the sink list and the handle counter are one `Arc<SinkFanout>` per session **id**, carried over by each new incarnation (`spawn`/`attach_text` of a dead id). The handover, under that lock: flush the predecessor's pending batch, mark it superseded, then send the resume separator, so an attached socket sees the old output, the banner, the new output, each once (doc §5.4, §6.4 A1). | Keep sinks per `Session` and re-attach sockets in Python on resume. | Give each incarnation its own `SinkFanout` and drop the handover. |
+| rtc-sink-superseded | A superseded incarnation never delivers again: a frame its reader still files is dropped, counted in its `dropped_bytes` and logged once, never written after its successor's banner. | Let the old reader deliver until its EOF, after the banner. | Drop the `superseded` check in `fan_out`. |
+| rtc-sink-panic | A panic in one `FrameSink::deliver` costs that sink: caught, detached, counted in `stats.panics`, logged once with its handle; no lock on the delivery path skips its work on poison (doc §6.3). | Let the panic end the session's reader. | Remove `catch_unwind` from `SinkFanout::fan_out`. |
+| rtc-sink-contract | `deliver` must not block and must not write a socket; the step 4 socket sink is a bounded `FrameQueue` whose own thread writes the replay and `replay_end` before the first queued frame. Per-socket drop counts and the cost of rendering the replay under the delivery lock (~1.5 ms at the cap) are step 4's. | A sink that writes the socket from `deliver` (a frame could precede the replay). | Change the step 4 sink and the trait doc. |
 
 Two owner answers on the same page that are not core decisions: `perf/session-cache-offloop-scans` and
 `perf/console-push-updates` are not merged into master; their need is re-assessed after the Rust core
