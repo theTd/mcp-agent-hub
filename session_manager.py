@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import zlib
 from pathlib import Path
@@ -1953,6 +1954,29 @@ class HubTerminalScreen(pyte.HistoryScreen):
         if kwargs.get("private"):
             return
         super().report_device_status(mode)
+
+    def draw(self, data: str) -> None:
+        """Skips a zero-width or unprintable character instead of dropping the rest of the text.
+
+        pyte's draw stops at the first character that is zero-width and not combining (ZWSP, ZWJ, the
+        emoji selector VS16 in "⚠️") or unprintable, so everything after it in the same run of plain
+        text never reached the screen. Here pyte draws the runs around such a character; the character
+        itself changes nothing, as in a real terminal (it does not even trigger a pending wrap).
+        """
+        if data.isascii() and data.isprintable():
+            super().draw(data)
+            return
+        width_of = pyte.screens.wcwidth
+        run_start = 0
+        for index, char in enumerate(data):
+            width = width_of(char)
+            if width > 0 or (width == 0 and unicodedata.combining(char)):
+                continue
+            if index > run_start:
+                super().draw(data[run_start:index])
+            run_start = index + 1
+        if run_start < len(data):
+            super().draw(data[run_start:])
 
     @property
     def display(self) -> List[str]:
