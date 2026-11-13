@@ -8,7 +8,10 @@ CLEANUP_HINT = (
 
 WAIT_HANDLE_HINT = (
     "Waiting: spawn, send, resume and respond return at once with wait_url, one URL per session or spawn group "
-    "for all its turns, with no cursor or session parameters. GET it, and again after a timeout. "
+    "for all its turns, with no cursor or session parameters. GET it; a timeout returns state=waiting. "
+    "If you can run background commands, loop the GET inside one background command while the reply is waiting "
+    "and exit on anything else (ask, done, failed, an HTTP error), so a timeout never wakes you; "
+    "otherwise GET it again after each timeout. "
     "States are waiting, ask, done, failed. Every ask is an open approval or question: answer it at once "
     "with respond_to_subagent and its request_id (idempotent). After answering, and while any task is unfinished, "
     "GET wait_url again; it returns the next ask or the result. "
