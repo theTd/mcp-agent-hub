@@ -211,19 +211,17 @@ class TerminalFixtureOracleTests(unittest.TestCase):
         self.assertEqual(renderer.replay_frame(session), direct)
         self.assertEqual(direct, "ac")
 
-    def test_mirrored_hub_expressions_still_match_the_hub(self):
-        # Both are literals in the hub, so there is no name to import; pin their source text instead.
+    def test_the_seam_names_the_hub_uses_are_the_ones_the_renderer_calls(self):
+        # Both were literals before step 3a; now each is a seam call, so they are pinned by name.
         diagnostic = " ".join(inspect.getsource(
             session_manager.HubSessionManager._capture_submit_diagnostic).split())
-        self.assertIn('"".join(session.raw_history)[-65536:]', diagnostic)
-        self.assertEqual(renderer.RAW_TAIL_CHARS, 65536)
+        self.assertIn("session.read_raw_tail(SUBMIT_DIAGNOSTIC_TAIL_CHARS)", diagnostic)
+        self.assertEqual(renderer.RAW_TAIL_CHARS, session_manager.SUBMIT_DIAGNOSTIC_TAIL_CHARS)
         resumed = " ".join(inspect.getsource(
             session_manager.HubSessionManager._make_resumed_session).split())
-        for expression in ('seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)',
-                           "sess.raw_history = [seed]",
-                           'sess.raw_history_bytes = len(seed.encode("utf-8", "replace"))',
-                           "sess.raw_history_rev = 1"):
-            self.assertIn(expression, resumed)
+        self.assertIn('seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)',
+                      resumed)
+        self.assertIn("sess.seed_history(seed)", resumed)
         self.assertEqual(renderer.resume_seed("old", 2), "old" + session_manager.resume_banner(2))
         self.assertEqual(renderer.resume_seed("", 2), session_manager.resume_banner(2))
 

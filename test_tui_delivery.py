@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from session_manager import AgentSession, HubSessionManager
+from session_manager import AgentSession, HubSessionManager, ScreenRead
 from test_native_records import FakePty
 
 
@@ -28,7 +28,7 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
         self.screen = "› \n\n  ? for shortcuts"
-        self.sess.get_clean_screen_text = lambda **kw: self.screen
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
         self.path = self.root / "rollout.jsonl"
         self.path.write_text("", encoding="utf-8")
@@ -255,7 +255,7 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "kimi": {"type": "turn.prompt", "origin": {"kind": "user"}, "input": [{"text": text}]},
             "agy": {"type": "USER_INPUT", "content": text},
         }
-        with patch.object(self.sess, "get_clean_screen_text", side_effect=AssertionError("Screen is not a submit proof")):
+        with patch.object(self.sess, "read_screen", side_effect=AssertionError("Screen is not a submit proof")):
             for engine, record in records.items():
                 with self.subTest(engine=engine):
                     self.path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -265,7 +265,7 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_five_engines_do_not_fall_back_to_screen_or_transcript_growth(self):
         self.path.write_text('{"type":"event_msg","payload":{"type":"token_count"}}\n', encoding="utf-8")
-        with patch.object(self.sess, "get_clean_screen_text", side_effect=AssertionError("Screen must not decide submission")):
+        with patch.object(self.sess, "read_screen", side_effect=AssertionError("Screen must not decide submission")):
             for engine in ("codex", "claude", "omp", "kimi", "agy"):
                 with self.subTest(engine=engine):
                     result = await self.hub._confirm_tui_submit(self.sess, "native", "message", 0, engine,

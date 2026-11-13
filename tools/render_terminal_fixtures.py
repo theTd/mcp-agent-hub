@@ -6,15 +6,15 @@ these files byte for byte.  Nothing here reimplements the hub's behaviour — it
 - ``AgentSession._on_pty_output`` (:2326): W8 strip on resumed sessions, OSC colour-query strip,
   the raw-history append and the W9 trim with its slack, all in the order the PTY reader uses;
 - ``HubTerminalScreen``/``HubTerminalStream`` (:1792/:1832) through the session's ``stream.feed``;
-- ``get_clean_screen_text`` (:2499), ``get_full_scrollback_text`` (:2516),
-  ``trim_history_text`` (:630) and ``resume_banner`` (:625);
+- ``AgentSession.read_screen``/``read_scrollback``/``read_raw``/``read_raw_tail``/``seed_history``
+  (the seam, design §5.2), ``trim_history_text`` (:630) and ``resume_banner`` (:625);
 - ``AgentSession.attach_ws_queue`` (:2426) for the replay frame, so the golden is the frame the hub
   hands a newly attached console rather than a second copy of that expression;
 - ``OSC_TERMINAL_REPLY_RE``/``strip_osc_terminal_replies`` (:1853) for the browser→PTY input cases.
 
-Two hub expressions are still mirrored, because neither is reachable as a name: the 65536-character
-submit-diagnostic tail (:10194) and the resumed-session seed (:4862-4866).  ``test_terminal_fixtures``
-pins their hub source text, so a change there fails the test instead of leaving the goldens stale.
+The submit-diagnostic tail and the resumed seed are no longer mirrored expressions: both are seam
+calls (``read_raw_tail``, ``seed_history``) and the tail's bound is the imported
+``SUBMIT_DIAGNOSTIC_TAIL_CHARS``, so a change in the hub moves the goldens with it.
 
 Goldens are UTF-8 written with newline translation off, so a golden's own ``\\r\\n`` stays byte-exact;
 a golden ends in whatever the hub's rendered text ends in (usually no newline, but ``raw`` and
@@ -62,6 +62,7 @@ from session_manager import (  # noqa: E402  (the oracle: import it, never copy 
     HISTORY_TRIM_SLACK_BYTES,
     OSC_TERMINAL_REPLY_RE,
     RESUME_SCROLLBACK_MAX_BYTES,
+    SUBMIT_DIAGNOSTIC_TAIL_CHARS,
     resume_banner,
     strip_osc_terminal_replies,
     trim_history_text,
@@ -71,9 +72,8 @@ FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures" / "terminal"
 # The two limits the hub reads: screen 80 lines, scrollback 250 (design doc §4 consumer map).
 SCREEN_LINES = 80
 SCROLLBACK_LINES = 250
-# Mirrored: ``_capture_submit_diagnostic`` slices the joined history with the literal ``[-65536:]``;
-# there is no name to import, so the test pins that source text instead.
-RAW_TAIL_CHARS = 65536
+# ``_capture_submit_diagnostic``'s bound, imported from the hub so the two cannot drift.
+RAW_TAIL_CHARS = SUBMIT_DIAGNOSTIC_TAIL_CHARS
 RESUMED_DIR = "resumed"
 
 
@@ -165,19 +165,17 @@ def new_session(engine: str, cols: int, rows: int, resume_count: int = 0, seed: 
     session.engine = engine
     session.resume_count = int(resume_count)
     if seed:
-        # _make_resumed_session: the archived output plus the separator, one seed entry, rev 1.
-        session.raw_history = [seed]
-        session.raw_history_bytes = len(seed.encode("utf-8", "replace"))
-        session.raw_history_rev = 1
+        # the seam's spawn.seed_history: archived output plus separator, one entry, rev 1.
+        session.seed_history(seed)
     return session
 
 
 def screen_text(session: AgentSession) -> str:
-    return session.get_clean_screen_text(SCREEN_LINES)
+    return session.read_screen(SCREEN_LINES).text
 
 
 def joined_raw(session: AgentSession) -> str:
-    return "".join(session.raw_history)
+    return session.read_raw().text
 
 
 def trimmed_raw(session: AgentSession) -> str:
@@ -217,9 +215,9 @@ def render_session(case: Case, resume_count: int = 0, seed: str = "") -> Dict[st
     at_resize = feed_session(session, case)
     goldens = {
         "screen_final.txt": screen_text(session),
-        "scrollback_250.txt": session.get_full_scrollback_text(SCROLLBACK_LINES),
+        "scrollback_250.txt": session.read_scrollback(SCROLLBACK_LINES).text,
         "raw.txt": trimmed_raw(session),
-        "raw_tail.txt": joined_raw(session)[-RAW_TAIL_CHARS:],
+        "raw_tail.txt": session.read_raw_tail(RAW_TAIL_CHARS),
         "replay.txt": replay_frame(session),
     }
     if at_resize is not None:
@@ -289,7 +287,7 @@ def render_trigger(case: Case) -> Dict[str, str]:
     # be the same 512 KB file.  What is worth pinning here is the collapse, which trigger.json says.
     return {
         "raw.txt": joined_raw(session),
-        "raw_tail.txt": joined_raw(session)[-RAW_TAIL_CHARS:],
+        "raw_tail.txt": session.read_raw_tail(RAW_TAIL_CHARS),
         "trigger.json": json.dumps(record, indent=2) + "\n",
     }
 
