@@ -385,6 +385,83 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    def watched_agy(self, name):
+        sess = self.session("agy", f"-{name}")
+        work = self.root / f"agy-{name}"
+        path = work / ".system_generated/logs/transcript.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"brain_dir": str(work)}
+        return sess, path, self.hub._schedule(self.hub._watch_agy_transcript(sess, self.root))
+
+    @staticmethod
+    def agy_error(attempt):
+        return {"type": "ERROR_MESSAGE", "source": "SYSTEM", "status": "DONE",
+                "error": f'API error (attempt {attempt}): request failed: Post "https://x/v1:streamGenerateContent": EOF'}
+
+    async def test_agy_turn_that_gives_up_on_an_engine_error_ends_and_wakes_the_parent(self):
+        # 2026-11-13 (farview-ios-growth-run): agy failed 8 model calls, showed "There was a network
+        # issue" and sat idle; with no closing planner response the session stayed "running" for good.
+        sess, path, task = self.watched_agy("gave-up")
+        try:
+            handle = await self.wait_handle(sess)
+            with patch("session_manager.AGY_ERROR_TURN_END_SEC", 0.3):
+                self.append(path, {"type": "PLANNER_RESPONSE", "content": "", "tool_calls": json.dumps(
+                    [{"name": "run_command", "args": {"CommandLine": json.dumps("grow.py lock-release")}}]
+                )})
+                self.append(path, {"type": "GENERIC", "status": "RUNNING", "content": "Tool is running as a background task"})
+                self.append(path, *(self.agy_error(n) for n in range(1, 9)))
+                done = await self.hub.wait_inbox.wait(handle, 3)
+            self.assertEqual(done["state"], "done")
+            self.assertTrue(done["final_response"].startswith("agy turn ended on an engine error: API error (attempt 8)"))
+            self.assertEqual(done["results"][0]["data"]["outcome"], "error")
+            self.assertEqual(sess.status, "completed")
+            events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual((events.count("error"), events.count("turn_completed")), (8, 1))
+            feed = await self.hub.get_transcript_view(sess.session_id)
+            self.assertTrue(any(e["kind"] == "notice" and e.get("tone") == "error" for e in feed["entries"]))
+            # Whatever is typed next starts a new turn.
+            self.append(path, {"type": "USER_INPUT", "content": "continue"})
+            await self.until(lambda: sess.status == "running")
+            self.assertTrue(sess.final_response_from_previous_turn)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_agy_error_that_agy_recovers_from_does_not_end_the_turn(self):
+        sess, path, task = self.watched_agy("recovered")
+        try:
+            with patch("session_manager.AGY_ERROR_TURN_END_SEC", 0.3):
+                self.append(path, self.agy_error(1))
+                await self.until(lambda: any(e["type"] == "error" for e in self.hub.worker_events
+                                             if e["session_id"] == sess.session_id))
+                self.append(path, {"type": "PLANNER_RESPONSE", "content": "", "tool_calls": json.dumps(
+                    [{"name": "run_command", "args": {"CommandLine": json.dumps("ls")}}]
+                )})
+                await asyncio.sleep(0.8)  # well past the window: the recovery row cleared the error
+                self.assertEqual(sess.status, "running")
+                self.append(path, {"type": "PLANNER_RESPONSE", "content": "真正的结果", "tool_calls": "[]"})
+                await self.until(lambda: sess.status == "completed")
+            self.assertEqual(sess.final_response, "真正的结果")
+            events = [e for e in self.hub.worker_events if e["session_id"] == sess.session_id]
+            self.assertEqual(sum(e["type"] == "turn_completed" for e in events), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_agy_error_waits_out_the_retry_window(self):
+        sess, path, task = self.watched_agy("retrying")
+        try:
+            self.append(path, self.agy_error(1))
+            await self.until(lambda: any(e["type"] == "error" for e in self.hub.worker_events
+                                         if e["session_id"] == sess.session_id))
+            await asyncio.sleep(0.6)  # agy's own backoff runs up to ~25 s; the default window is 60 s
+            self.assertEqual(sess.status, "running")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_clipped_tool_arguments_keep_a_title_from_the_whole_text(self):
         sess = self.session("claude", "-long")
         long_command = "echo " + "x" * 5000

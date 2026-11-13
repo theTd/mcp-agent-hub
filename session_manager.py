@@ -20,7 +20,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import httpx
 import pyte
@@ -383,6 +383,11 @@ STICKY_RESUME_BLOCK_PREFIXES = ("codex 已把该会话归档",)
 # A3: after a resumed agy process starts, a brand-new conversation dir can only be that process
 # opening an empty conversation for an id it does not know. The window keeps the scan bounded.
 AGY_RESUME_VERIFY_WINDOW_SEC = 30.0
+# agy writes an ERROR_MESSAGE row for every failed model call and retries on its own; most runs recover
+# within seconds (retry backoff seen up to ~25 s). When it gives up (8 failed attempts, then "There was a
+# network issue" on screen) it writes nothing more and sits idle at its prompt. An error row followed by
+# this long a silence ends the turn, so the parent's wait does not stay "running" for good.
+AGY_ERROR_TURN_END_SEC = 60.0
 # The hub's anchor (time.time()) and the filesystem's birth time are different clock sources and can
 # round against each other; a dir born in the same tick as the spawn is still the new conversation.
 AGY_CONVERSATION_ANCHOR_SLACK_SEC = 0.05
@@ -9215,6 +9220,8 @@ class HubSessionManager:
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
+        # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
+        error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
             if session.resume_attach and not resume_confirmed:
                 try:
@@ -9240,6 +9247,15 @@ class HubSessionManager:
                     except Exception:
                         continue
                     self._observe_context_record(session, obj)
+                    if obj.get("type") == "ERROR_MESSAGE":
+                        err_txt = str(obj.get("error") or obj.get("content") or "").strip() or "agy engine error"
+                        error_tail = (err_txt, time.monotonic())
+                        await self.record_worker_event(
+                            session.session_id,
+                            {"type": "error", "category": "progress", "status": "running", "content": err_txt},
+                        )
+                        continue
+                    error_tail = None  # any later row means agy recovered or moved on
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
@@ -9382,11 +9398,41 @@ class HubSessionManager:
                                     "content": final_text,
                                 },
                             )
+                if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
+                    err_txt = error_tail[0]
+                    error_tail = None
+                    await self._end_agy_error_turn(session, err_txt)
             except PersistenceUnavailable:
                 raise
             except Exception:
                 pass
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    async def _end_agy_error_turn(self, session: AgentSession, error: str) -> None:
+        """agy gave up on a model call (its last row is an ERROR_MESSAGE) and is idle at its prompt.
+
+        It ends the way a normal turn does (turn_completed, so the parent's wait URL returns done),
+        with data.outcome "error" and a final response that says so, not an answer. A turn that is
+        already over, or waits on the parent, is left alone.
+        """
+        if session.status not in ("starting", "running") or session.pending_interaction is not None:
+            return
+        session._inflight_transcript_tool = None
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": (
+                    f"agy turn ended on an engine error: {error} — agy stopped retrying and is idle at "
+                    f"its prompt; send a message to continue."
+                ),
+                "data": {"outcome": "error", "error": error},
+            },
+        )
+        session.current_activity = f"Turn ended on an engine error — idle at prompt: {error[:80]}"
+        await self.persist_session(session)
 
     @staticmethod
     def _agy_conversation_is_durable(brain_dir: Path) -> bool:
