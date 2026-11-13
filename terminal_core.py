@@ -25,7 +25,9 @@ except ImportError as exc:
     ) from exc
 
 Core = _core.Core
+# §6.4/§8: the browser-reply strip moves to the core in step 4; exported here so Python reaches it now.
+strip_osc_terminal_replies = _core.strip_osc_terminal_replies
 __version__ = _core.__version__
 ABI = _core.ABI
 
-__all__ = ["Core", "ABI", "__version__"]
+__all__ = ["Core", "strip_osc_terminal_replies", "ABI", "__version__"]

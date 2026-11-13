@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use conpty_session::conpty::{spawn, ConPtyProcess, SpawnSpec};
 use conpty_session::handles::OwnedPseudoConsole;
 use conpty_session::job_tree;
+use conpty_session::session::IO_CHUNK;
 
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
@@ -51,9 +52,6 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, WaitForSingleObject, INFINITE,
 };
 
-/// The core reader's read size (`session.rs::IO_CHUNK`), so a chunk boundary here is the boundary the
-/// core's reader would have produced for the same bytes.
-const READ_BUFFER: usize = 8192;
 /// `STILL_ACTIVE`: `GetExitCodeProcess`'s "has not exited" value.
 const STILL_ACTIVE: i32 = 259;
 /// The §12.7 deadline: closing a pseudoconsole with a read pending can hang, so it happens elsewhere.
@@ -262,13 +260,14 @@ fn run() -> i32 {
     let console = Arc::new(Mutex::new(Some(console)));
     let job = Arc::new(job);
 
-    // Reader: the core's own call shape (blocking ReadFile, 8 KiB) and nothing between it and a frame.
+    // Reader: the core's own call shape (blocking ReadFile at `session::IO_CHUNK`) and nothing between it
+    // and a frame.
     let reader_frames = Arc::clone(&frames);
     let (reader_done, reader_drained) = mpsc::channel();
     let reader = thread::Builder::new()
         .name("tap-read".to_string())
         .spawn(move || {
-            let mut buffer = [0u8; READ_BUFFER];
+            let mut buffer = [0u8; IO_CHUNK];
             loop {
                 let mut read = 0u32;
                 // SAFETY: the output pipe handle is open until this thread returns (the main thread

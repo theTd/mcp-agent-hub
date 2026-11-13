@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "a CSI cut by CAN (0x18), by SUB (0x1a) and by ESC: CAN/SUB cancel the sequence and draw nothing, and the ESC abandons the sequence and starts a new one, so ESC[1m applies (pyte drew '[1m' as text until the hub fixed it in fix/pyte-csi-esc-restart)",
+  "resume_count": 1
+}

@@ -1,8 +1,13 @@
 //! One console session: its pipes, its job, a reader thread, a writer thread and a reaper thread.
 //!
-//! Step 1 keeps the per-session work deliberately small: the reader appends the raw bytes to a bounded
-//! buffer, counts them and marks the session dirty. Parsing, the W9 ring, coalescing and the screen
-//! model arrive in step 2, so nothing here builds a `str` per chunk.
+//! The reader runs step 2's pipeline on every read (`terminal_stream`): decode, W8/OSC strips, the W9
+//! ring, the parse. One mutex (`Session::text`) covers the ring append, the parse and the coalescing
+//! batch, which is what makes Q11 hold: a sink that attaches sees every chunk exactly once, either in
+//! the replay snapshot it is handed or in the frames that follow (the pending batch is flushed to the
+//! sockets that existed before it registers).
+//!
+//! A text-only session (`attach_text`) has no pipes, no job and no threads: the same state, fed by
+//! `feed` instead of a reader, which is what the DSH virtual sessions need.
 //!
 //! Exit detection is the reaper's job. The reader's `ReadFile` cannot signal a natural exit: the write
 //! end of the output pipe belongs to conhost, which stays alive while we hold the HPCON, so the read
@@ -32,6 +37,10 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
 
+use terminal_stream::{
+    trim_history_text, Coalescer, FrameSink, StreamOptions, TerminalStream,
+};
+
 use crate::conpty::ConPtyProcess;
 use crate::handles::{OwnedHandle, OwnedPseudoConsole};
 use crate::job::JobObject;
@@ -42,8 +51,9 @@ pub const CONSOLE_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 /// `STILL_ACTIVE`: GetExitCodeProcess's "has not exited" value.
 const STILL_ACTIVE: i32 = 259;
 /// One ReadFile / WriteFile step. 8 KiB matches the hub's old `pty.read(4096)` order of magnitude
-/// while halving the number of syscalls for bulk output.
-const IO_CHUNK: usize = 8192;
+/// while halving the number of syscalls for bulk output. Public so the recorder tap reads with the size
+/// the core reads with: a chunk boundary in the corpus is a chunk boundary here (step 2a).
+pub const IO_CHUNK: usize = 8192;
 /// The reaper blocks in `WaitForSingleObject`, then runs the teardown and finally calls `log` — an
 /// arbitrary Python callback, not a bare wait — so it cannot stay on the 64 KiB a wait alone needed
 /// (nit 3). 512 KiB is reserved, not committed; the thread touches a few pages.
@@ -51,11 +61,34 @@ const REAPER_STACK: usize = 512 * 1024;
 /// The close helper only runs `ClosePseudoConsole` and the slot bookkeeping.
 const CLOSE_HELPER_STACK: usize = 64 * 1024;
 
+/// §5.2's `spawn`/`attach_text` flags, one struct because every call that starts a session takes them.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionFlags {
+    /// True when the session is a resume (`resume_count > 0`): W8's `ESC[3J` strip is on.
+    pub strip_esc3j_on_output: bool,
+    pub strip_osc_color_queries: bool,
+    pub history_rows: usize,
+    pub raw_cap_bytes: usize,
+    pub raw_slack_bytes: usize,
+}
+
+impl Default for SessionFlags {
+    fn default() -> Self {
+        Self {
+            strip_esc3j_on_output: false,
+            strip_osc_color_queries: true,
+            history_rows: 3000,
+            raw_cap_bytes: 512 * 1024,
+            raw_slack_bytes: 64 * 1024,
+        }
+    }
+}
+
 /// Tunables a session needs from the core.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionOptions {
-    pub raw_cap_bytes: usize,
     pub write_queue_bytes: usize,
+    pub flags: SessionFlags,
 }
 
 /// The core's ticker sees "something changed" through these two flags, never through a session lock.
@@ -65,7 +98,7 @@ pub struct TickFlags {
     pub urgent: AtomicBool,
 }
 
-/// What `drain` reports for one dirty session (§5.3's record minus the step-2 screen fields).
+/// What `drain` reports for one dirty session (§5.3).
 #[derive(Clone, Debug)]
 pub struct DrainRecord {
     pub session_id: String,
@@ -78,6 +111,10 @@ pub struct DrainRecord {
     pub dropped_bytes: u64,
     pub crashed: bool,
     pub degraded: bool,
+    /// Bumped once per read that reached the parser, so a reader can tell screens apart.
+    pub screen_rev: u64,
+    /// Only for a watched session whose `screen_rev` changed and whose interval is due.
+    pub screen_text: Option<String>,
 }
 
 /// The pseudoconsole's single close point. Three states, because "somebody took the handle" and "the
@@ -427,13 +464,110 @@ fn close_console_off_thread(
     }
 }
 
+/// How often a watched session hands its screen to `drain` (§5.2 `watch_screen`), and which render it
+/// last sent.
+struct Watch {
+    max_lines: usize,
+    interval: Duration,
+    last_sent: Option<Instant>,
+    last_rev: u64,
+}
+
+/// The output pipeline's state behind one mutex: ring, parser and coalescing batch. Q11 needs them under
+/// the same lock, because "what the replay holds" and "what the next frame holds" must not both include a
+/// chunk.
+struct TextState {
+    stream: TerminalStream,
+    batch: Coalescer,
+    watch: Option<Watch>,
+    /// The post-strip text of the read in flight, reused so a read does not allocate.
+    frame: Vec<u8>,
+}
+
+/// What one call feeds the pipeline: a pipe read, or text a virtual session was handed.
+enum Ingest<'a> {
+    Bytes(&'a [u8]),
+    Text(&'a str),
+}
+
+struct SinkEntry {
+    handle: u64,
+    sink: Arc<dyn FrameSink>,
+}
+
+/// `screen`'s reply (§5.2): the rendered rows, the cursor, the size and the revision.
+#[derive(Clone, Debug)]
+pub struct ScreenReply {
+    pub text: String,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cols: u16,
+    pub rows: u16,
+    pub rev: u64,
+}
+
+/// A rendered text reply with the revision it reflects (`scrollback`, `replay`'s caller).
+#[derive(Clone, Debug)]
+pub struct TextReply {
+    pub text: String,
+    pub rev: u64,
+}
+
+/// `raw`'s reply: the trimmed history, its byte count and its revision (`_scrollback_blob`'s inputs).
+#[derive(Clone, Debug)]
+pub struct RawReply {
+    pub text: String,
+    pub bytes: u64,
+    pub rev: u64,
+}
+
+/// One session in `snapshot_all`'s reply: what `persist_session` archives at shutdown (§6.6).
+#[derive(Clone, Debug)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    pub alive: bool,
+    pub exit_code: Option<i32>,
+    pub pid: u32,
+    pub crashed: bool,
+    pub degraded: bool,
+    pub screen_text: String,
+    pub scrollback_text: String,
+    pub raw_text: String,
+    pub raw_rev: u64,
+    pub raw_bytes: u64,
+}
+
+/// The last successful reply of each render call, returned when its lock misses the deadline (the call
+/// then marks the session `degraded`, §5.2).
+#[derive(Default)]
+struct CachedText {
+    screen: String,
+    screen_rev: u64,
+    scrollback: String,
+    raw: String,
+    raw_rev: u64,
+    raw_bytes: u64,
+    tail: String,
+}
+
 pub struct Session {
     pub id: String,
     pub pid: u32,
-    resources: Arc<Resources>,
-    buffer: Mutex<VecDeque<u8>>,
-    /// The last `raw_tail` reply, handed back when the buffer lock misses its deadline (§5.2).
-    last_tail: Mutex<Vec<u8>>,
+    /// Absent for a text-only session (`attach_text`): no pipes, no job, no threads.
+    resources: Option<Arc<Resources>>,
+    text: Mutex<TextState>,
+    cached: Mutex<CachedText>,
+    /// Frames reach the sinks one at a time, in stream order.
+    ///
+    /// Lock order is one-directional: `delivery` before `text`, and `sinks` only under `delivery`.
+    /// Nothing takes `delivery` while holding `text`, `sinks` or `cached`. A frame is taken out of the
+    /// batch and fanned out inside this lock, so the reader (`ingest`) and the ticker (`flush_frames`)
+    /// cannot deliver frame n+1 before frame n, and `attach_sink`'s snapshot and registration sit in one
+    /// gap between deliveries. `FrameSink::deliver` must not block, so holding it costs the reader no
+    /// more than the sink's own queue lock would.
+    delivery: Mutex<()>,
+    sinks: Mutex<Vec<SinkEntry>>,
+    next_sink: AtomicU64,
     writer: WriteQueue,
     alive: AtomicBool,
     exit_code: AtomicI32,
@@ -442,6 +576,8 @@ pub struct Session {
     output_ended: AtomicBool,
     bytes_total: AtomicU64,
     chunks_total: AtomicU64,
+    /// The stream's `screen_rev`, mirrored so `drain` reads atomics only (§5.3).
+    screen_rev: AtomicU64,
     dropped_bytes: AtomicU64,
     last_output_ms: AtomicU64,
     dirty: AtomicBool,
@@ -449,13 +585,75 @@ pub struct Session {
     degraded: AtomicBool,
     cols: AtomicU32,
     rows: AtomicU32,
-    options: SessionOptions,
     tick: Arc<TickFlags>,
     panics: Arc<AtomicU64>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Session {
+    /// The state both constructors share. `seed_history` is a resumed session's archived scrollback:
+    /// history, not output, so the byte counters stay at zero until the new process prints (A1).
+    #[allow(clippy::too_many_arguments)]
+    fn new_state(
+        id: String,
+        pid: u32,
+        resources: Option<Arc<Resources>>,
+        cols: u16,
+        rows: u16,
+        options: SessionOptions,
+        tick: Arc<TickFlags>,
+        panics: Arc<AtomicU64>,
+        log: Arc<dyn Fn(&str) + Send + Sync>,
+        seed_history: Option<&str>,
+    ) -> Arc<Self> {
+        let mut stream = TerminalStream::new(StreamOptions {
+            cols: cols as usize,
+            rows: rows as usize,
+            history_rows: options.flags.history_rows,
+            raw_cap_bytes: options.flags.raw_cap_bytes,
+            raw_slack_bytes: options.flags.raw_slack_bytes,
+            strip_esc3j_on_output: options.flags.strip_esc3j_on_output,
+            strip_osc_color_queries: options.flags.strip_osc_color_queries,
+        });
+        if let Some(seed) = seed_history {
+            if !seed.is_empty() {
+                stream.seed_history(seed);
+            }
+        }
+        Arc::new(Self {
+            id,
+            pid,
+            resources,
+            text: Mutex::new(TextState {
+                stream,
+                batch: Coalescer::new(),
+                watch: None,
+                frame: Vec::with_capacity(8192),
+            }),
+            cached: Mutex::new(CachedText::default()),
+            delivery: Mutex::new(()),
+            sinks: Mutex::new(Vec::new()),
+            next_sink: AtomicU64::new(1),
+            writer: WriteQueue::new(options.write_queue_bytes),
+            alive: AtomicBool::new(true),
+            exit_code: AtomicI32::new(-1),
+            output_ended: AtomicBool::new(false),
+            bytes_total: AtomicU64::new(0),
+            screen_rev: AtomicU64::new(0),
+            chunks_total: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
+            last_output_ms: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            crashed: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            cols: AtomicU32::new(cols as u32),
+            rows: AtomicU32::new(rows as u32),
+            tick,
+            panics,
+            log,
+        })
+    }
+
     /// Wraps a spawned process and starts its reader, writer and reaper threads. The returned lines are
     /// the spawn's log lines: the caller logs them after it re-attaches, because this runs with the GIL
     /// released (§5.2: no Python callback inside the detached spawn path).
@@ -468,7 +666,8 @@ impl Session {
         tick: Arc<TickFlags>,
         panics: Arc<AtomicU64>,
         log: Arc<dyn Fn(&str) + Send + Sync>,
-        seed_history: Option<Vec<u8>>,
+        seed_history: Option<String>,
+        ws_prefix: Option<String>,
     ) -> Result<(Arc<Self>, Vec<String>), String> {
         let ConPtyProcess {
             pid,
@@ -492,46 +691,30 @@ impl Session {
             if job_assigned { "assigned" } else { "not assigned" }
         ));
 
-        let session = Arc::new(Self {
+        let session = Self::new_state(
             id,
             pid,
-            resources: Arc::new(Resources {
+            Some(Arc::new(Resources {
                 process,
                 input,
                 output,
                 job,
                 job_assigned,
                 console: Arc::new(ConsoleSlot::new(console, Arc::clone(&panics))),
-            }),
-            buffer: Mutex::new(VecDeque::new()),
-            last_tail: Mutex::new(Vec::new()),
-            writer: WriteQueue::new(options.write_queue_bytes),
-            alive: AtomicBool::new(true),
-            exit_code: AtomicI32::new(-1),
-            output_ended: AtomicBool::new(false),
-            bytes_total: AtomicU64::new(0),
-            chunks_total: AtomicU64::new(0),
-            dropped_bytes: AtomicU64::new(0),
-            last_output_ms: AtomicU64::new(0),
-            dirty: AtomicBool::new(false),
-            crashed: AtomicBool::new(false),
-            degraded: AtomicBool::new(false),
-            cols: AtomicU32::new(cols as u32),
-            rows: AtomicU32::new(rows as u32),
+            })),
+            cols,
+            rows,
             options,
             tick,
             panics,
             log,
-        });
+            seed_history.as_deref(),
+        );
 
-        // A resumed session starts with the archived scrollback in its raw ring (A1); it is history,
-        // not output, so the byte counters stay at zero until the new process prints.
-        if let Some(seed) = seed_history {
-            if !seed.is_empty() {
-                let mut buffer = session.buffer.lock().unwrap_or_else(|e| e.into_inner());
-                buffer.extend(seed);
-                trim_buffer(&mut buffer, options.raw_cap_bytes, &session.dropped_bytes);
-            }
+        // A1: the resume separator reaches every socket already attached to this id before the first
+        // byte of the new process, which is why it goes out here rather than from Python's spawn path.
+        if let Some(prefix) = ws_prefix.as_deref() {
+            session.push_frame(prefix);
         }
 
         // Thread starts are the last step that can fail, and a failure here used to leave a live process
@@ -554,8 +737,9 @@ impl Session {
             Ok(())
         })();
         if let Err(error) = started {
-            let terminated = if session.resources.job_assigned {
-                session.resources.job.terminate(1)
+            let resources = session.resources.clone().expect("a spawned session has resources");
+            let terminated = if resources.job_assigned {
+                resources.job.terminate(1)
             } else {
                 job_tree::terminate_tree(session.pid);
                 Ok(())
@@ -576,13 +760,38 @@ impl Session {
         Ok((session, spawn_log))
     }
 
+    /// A session with no process (`attach_text`, §5.2): the DSH virtual sessions' screen and raw history,
+    /// fed through `feed`, alive for as long as the hub keeps it. `kill`/`resize` never touch a console
+    /// that does not exist.
+    pub fn start_text(
+        id: String,
+        cols: u16,
+        rows: u16,
+        options: SessionOptions,
+        tick: Arc<TickFlags>,
+        panics: Arc<AtomicU64>,
+        log: Arc<dyn Fn(&str) + Send + Sync>,
+        seed_history: Option<&str>,
+    ) -> Arc<Self> {
+        Self::new_state(id, 0, None, cols, rows, options, tick, panics, log, seed_history)
+    }
+
+
     /// One place that reaches the core's `log` callable, so every line goes through the same path.
     fn log(&self, message: &str) {
         (self.log)(message);
     }
 
+    /// The PTY half of a session; `None` for a text-only session.
+    fn resources(&self) -> Option<&Resources> {
+        self.resources.as_deref()
+    }
+
     /// ReadFile until the console's output pipe stops producing; a panic here crashes only this session.
     fn reader_body(self: Arc<Self>) {
+        let Some(resources) = self.resources.clone() else {
+            return;
+        };
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut chunk = [0u8; IO_CHUNK];
             loop {
@@ -591,7 +800,7 @@ impl Session {
                 // writable buffer; no overlapped I/O.
                 let status = unsafe {
                     ReadFile(
-                        self.resources.output.get(),
+                        resources.output.get(),
                         Some(&mut chunk),
                         Some(&mut read),
                         None,
@@ -600,7 +809,9 @@ impl Session {
                 if status.is_err() || read == 0 {
                     break;
                 }
-                self.record_output(&chunk[..read as usize]);
+                // The reader never gives up on the text lock: a missed byte here is a lost byte, and the
+                // exit ordering (death record after the last byte) depends on this append.
+                self.ingest(Ingest::Bytes(&chunk[..read as usize]), None);
             }
         }));
         if result.is_err() {
@@ -618,6 +829,9 @@ impl Session {
     /// WriteFile each queued chunk in arrival order; one writer thread per session is what keeps D7/D1
     /// byte order intact.
     fn writer_body(self: Arc<Self>) {
+        let Some(resources) = self.resources.clone() else {
+            return;
+        };
         let result = catch_unwind(AssertUnwindSafe(|| loop {
             let Some(mut chunk) = self.writer.pop() else {
                 return;
@@ -629,7 +843,7 @@ impl Session {
                 // valid for the call.
                 let status = unsafe {
                     WriteFile(
-                        self.resources.input.get(),
+                        resources.input.get(),
                         Some(&chunk[written_total..]),
                         Some(&mut written),
                         None,
@@ -657,9 +871,12 @@ impl Session {
     /// Waits on the process handle for the whole session's life: this is the only exit signal a natural
     /// end of the child has, because the output pipe stays open while conhost lives (review B1).
     fn reaper_body(self: Arc<Self>) {
+        let Some(resources) = self.resources.clone() else {
+            return;
+        };
         let result = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: the process handle is owned by the session and open for waiting.
-            let waited = unsafe { WaitForSingleObject(self.resources.process.get(), INFINITE) };
+            let waited = unsafe { WaitForSingleObject(resources.process.get(), INFINITE) };
             if waited == WAIT_OBJECT_0 {
                 self.on_process_exit();
             } else {
@@ -680,9 +897,12 @@ impl Session {
     /// The process is gone. Record its code, then run the one teardown `kill` runs too: close the console
     /// on a helper so the pending read returns, wait for the reader's last bytes, publish.
     fn on_process_exit(&self) {
+        let Some(resources) = self.resources() else {
+            return;
+        };
         let mut code = 0u32;
         // SAFETY: the process handle is owned by the session and open for query.
-        let recorded = match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+        let recorded = match unsafe { GetExitCodeProcess(resources.process.get(), &mut code) } {
             Ok(()) if code as i32 != STILL_ACTIVE => {
                 self.set_exit_code(code as i32);
                 Some(code as i32)
@@ -719,6 +939,11 @@ impl Session {
     /// reader's end of output inside `budget`, then publish the death; on the deadline publish anyway, so
     /// a wedged close costs the last bytes, never the record (§12.7).
     fn finish_exit(&self, budget: Duration) {
+        if self.resources().is_none() {
+            // A text-only session has no console and no reader: the record is the whole teardown.
+            self.publish_death();
+            return;
+        }
         let end = Instant::now() + budget;
         // `close_console` already logged the reason when it could not even start or wait for a close.
         let closed = self.close_console(end.saturating_duration_since(Instant::now()));
@@ -752,19 +977,51 @@ impl Session {
         true
     }
 
-    /// Append one read to the bounded buffer, count it and wake the ticker.
-    fn record_output(&self, chunk: &[u8]) {
-        {
-            let mut buffer = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buffer.extend(chunk);
-            trim_buffer(&mut buffer, self.options.raw_cap_bytes, &self.dropped_bytes);
+    /// The pipeline for one input (§5.2's order, `_on_pty_output`'s effect): decode, W8, OSC, ring,
+    /// parse, then the coalescing batch. The reader passes no deadline — it must never drop a byte —
+    /// while `feed` uses the call's deadline. Returns the new screen revision, or `None` when the deadline
+    /// passed with nothing done.
+    fn ingest(&self, input: Ingest<'_>, deadline: Option<Duration>) -> Option<u64> {
+        let now = Instant::now();
+        let mut guard = match deadline {
+            None => Some(self.text.lock().unwrap_or_else(|e| e.into_inner())),
+            Some(deadline) => lock_deadline(&self.text, deadline),
+        };
+        let state = guard.as_mut()?;
+        let ring_before = state.stream.ring_dropped_bytes();
+        let TextState {
+            stream,
+            batch,
+            frame,
+            ..
+        } = &mut **state;
+        frame.clear();
+        match input {
+            Ingest::Bytes(bytes) => stream.feed_bytes(bytes, frame),
+            Ingest::Text(text) => stream.feed_text(text, frame),
         }
-        self.bytes_total
-            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        if !frame.is_empty() {
+            batch.push(frame, now);
+        }
+        let rev = stream.screen_rev();
+        let processed = frame.len() as u64;
+        let ring_dropped = stream.ring_dropped_bytes();
+        drop(guard);
+        // §5.4's first trigger is the batch's own size: a 32 KiB frame does not wait for the 5 ms tick.
+        // The frame is taken and fanned out inside `pump`, i.e. under the delivery lock: taking it here
+        // would let two readers hand frames to the sinks in the wrong order.
+        self.pump(Some(now));
+        self.dropped_bytes.fetch_add(
+            ring_dropped.saturating_sub(ring_before),
+            Ordering::Relaxed,
+        );
+        self.screen_rev.store(rev, Ordering::Relaxed);
+        self.bytes_total.fetch_add(processed, Ordering::Relaxed);
         self.chunks_total.fetch_add(1, Ordering::Relaxed);
         self.last_output_ms.store(now_unix_ms(), Ordering::Relaxed);
         self.dirty.store(true, Ordering::Release);
         self.tick.pending.store(true, Ordering::Release);
+        Some(rev)
     }
 
     /// The output pipe stopped producing. Either the exit/kill teardown closed the console (then the
@@ -774,9 +1031,13 @@ impl Session {
             self.publish_death();
             return;
         }
+        let Some(resources) = self.resources() else {
+            self.publish_death();
+            return;
+        };
         let mut code = 0u32;
         // SAFETY: the process handle is owned by the session and open for query.
-        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+        match unsafe { GetExitCodeProcess(resources.process.get(), &mut code) } {
             Ok(()) if code as i32 != STILL_ACTIVE => {
                 self.set_exit_code(code as i32);
                 self.log(&format!(
@@ -820,6 +1081,9 @@ impl Session {
         if self.alive.swap(false, Ordering::AcqRel) {
             self.dirty.store(true, Ordering::Release);
             self.tick.urgent.store(true, Ordering::Release);
+            // The console's last bytes go out before the death record: a pane that sees the end must
+            // already have everything the process printed (§5.3).
+            self.flush_frames_all();
             // Nothing can reach a dead process: closing the queue ends its writer thread, so the
             // session's last `Arc` is released instead of being held by a thread parked on a condvar
             // (B1: the replaced session must release its handles, not leak a writer). The count is
@@ -869,8 +1133,13 @@ impl Session {
     /// the slot lock itself was busy, or no helper could start; the caller's deadline path publishes
     /// anyway. The slot lock is taken with the same deadline, so no call here can block unbounded (SF1).
     fn close_console(&self, deadline: Duration) -> bool {
+        let Some(resources) = self.resources() else {
+            // A text-only session has no console: the exit path's "console closed" answer is true by
+            // construction, so `finish_exit` publishes without waiting.
+            return true;
+        };
         let end = Instant::now() + deadline;
-        match self.resources.console.begin_close(deadline) {
+        match resources.console.begin_close(deadline) {
             Err(progress) => {
                 self.log(&format!(
                     "session {}: console slot busy ({progress:?}); treating the close as pending",
@@ -881,7 +1150,7 @@ impl Session {
             Ok(None) => {
                 // A peer is closing it (or it is already closed): wait for that completion, which is the
                 // difference B1 is about.
-                self.resources
+                resources
                     .console
                     .wait_closed(end.saturating_duration_since(Instant::now()))
             }
@@ -889,7 +1158,7 @@ impl Session {
                 let progress = close_console_off_thread(
                     console,
                     end.saturating_duration_since(Instant::now()),
-                    &self.resources.console,
+                    &resources.console,
                 );
                 match progress {
                     CloseProgress::Closed => true,
@@ -933,7 +1202,23 @@ impl Session {
     /// reaper and `kill` publish on their close deadline, and `kill_all`'s joins are bounded by each
     /// `kill`'s budget (`held_console_slot_does_not_stop_the_death_record`).
     pub fn resize(&self, cols: u16, rows: u16, deadline: Duration) -> Result<(u16, u16), ResizeError> {
-        let console = match lock_deadline(&self.resources.console.state, deadline) {
+        let Some(resources) = self.resources() else {
+            // A text-only session has no pseudoconsole; the screen is the whole size story.
+            if let Some(mut text) = lock_deadline(&self.text, deadline) {
+                text.stream.resize(cols as usize, rows as usize);
+            } else {
+                return Err(ResizeError::Deadline(format!(
+                    "session {}: resize missed its deadline",
+                    self.id
+                )));
+            }
+            self.cols.store(cols as u32, Ordering::Relaxed);
+            self.rows.store(rows as u32, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Release);
+            self.tick.pending.store(true, Ordering::Release);
+            return Ok((cols, rows));
+        };
+        let console = match lock_deadline(&resources.console.state, deadline) {
             Some(state) => state,
             None => {
                 return Err(ResizeError::Deadline(format!(
@@ -965,6 +1250,15 @@ impl Session {
                 error.message()
             )));
         }
+        // `resize` is PTY + screen (§4): the model follows the pseudoconsole so the rows match what the
+        // child sees. Lock order is console -> text, and nothing takes them the other way round.
+        if let Some(mut text) = lock_deadline(&self.text, deadline) {
+            text.stream.resize(cols as usize, rows as usize);
+            drop(text);
+            // A watched session must see the new geometry even when no byte follows (§5.2).
+            self.dirty.store(true, Ordering::Release);
+            self.tick.pending.store(true, Ordering::Release);
+        }
         self.cols.store(cols as u32, Ordering::Relaxed);
         self.rows.store(rows as u32, Ordering::Relaxed);
         Ok((cols, rows))
@@ -981,9 +1275,12 @@ impl Session {
         if self.exit_code().is_some() {
             return true;
         }
+        let Some(resources) = self.resources() else {
+            return false;
+        };
         let mut code = 0u32;
         // SAFETY: the process handle is owned by the session and open for query.
-        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+        match unsafe { GetExitCodeProcess(resources.process.get(), &mut code) } {
             Ok(()) if code as i32 != STILL_ACTIVE => {
                 self.set_exit_code(code as i32);
                 true
@@ -998,13 +1295,18 @@ impl Session {
     /// idempotent. `budget` bounds the whole call; a close helper that outlives it keeps running on its
     /// own thread (should-fix 3), and the death is published on the deadline instead of being lost (B1).
     pub fn kill(&self, budget: Duration) -> Result<Option<i32>, String> {
+        let Some(resources) = self.resources() else {
+            // A text-only session has no process: ending it is the record, with no exit code.
+            self.finish_exit(Duration::ZERO);
+            return Ok(self.exit_code());
+        };
         let end = Instant::now() + budget;
         // The code of a process that has already exited must be read before the job is terminated, or
         // the termination can overwrite it (see `record_exit_code_if_exited`).
         self.record_exit_code_if_exited();
         let mut method = "TerminateJobObject";
-        let result = if self.resources.job_assigned {
-            self.resources.job.terminate(1)
+        let result = if resources.job_assigned {
+            resources.job.terminate(1)
         } else {
             method = "ToolHelp tree kill";
             job_tree::terminate_tree(self.pid);
@@ -1025,13 +1327,13 @@ impl Session {
             // (nit 6).
             unsafe {
                 WaitForSingleObject(
-                    self.resources.process.get(),
+                    resources.process.get(),
                     wait_timeout(end.saturating_duration_since(Instant::now())),
                 );
             }
             let mut code = 0u32;
             // SAFETY: as above; a still-running process reports STILL_ACTIVE and has no code.
-            match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+            match unsafe { GetExitCodeProcess(resources.process.get(), &mut code) } {
                 Ok(()) if code as i32 != STILL_ACTIVE => {
                     self.set_exit_code(code as i32);
                     announcement = Some(format!(
@@ -1071,40 +1373,327 @@ impl Session {
         Ok(self.exit_code())
     }
 
-    /// Last `max_bytes` of the bounded raw buffer. On a missed deadline the previous reply is returned
-    /// and the session is marked `degraded`, which is itself a dirty flag so the hub's next drain sees
-    /// it without waiting for more output. A call that gets its lock again clears `degraded`, so one
-    /// deadline miss cannot pin the flag on the session for its lifetime (nit 7).
-    pub fn raw_tail(&self, max_bytes: usize, deadline: Duration) -> Vec<u8> {
-        let taken = match lock_deadline(&self.buffer, deadline) {
-            Some(buffer) => {
-                let start = buffer.len().saturating_sub(max_bytes);
-                let bytes: Vec<u8> = buffer.range(start..).copied().collect();
-                drop(buffer);
-                if let Ok(mut last) = self.last_tail.lock() {
-                    *last = bytes.clone();
+    /// `screen` (§5.2): the visible rows up to `max_lines`, the cursor, the size and the revision. On a
+    /// missed deadline the previous render is returned and the session is marked `degraded`, which is
+    /// itself a dirty flag so the hub's next drain sees it without waiting for more output; the next call
+    /// that gets its lock clears the flag (nit 7).
+    pub fn screen(&self, max_lines: usize, deadline: Duration) -> ScreenReply {
+        let rendered = lock_deadline(&self.text, deadline).map(|text| {
+            (
+                text.stream.screen_text(max_lines),
+                text.stream.cursor(),
+                text.stream.cols() as u16,
+                text.stream.rows() as u16,
+                text.stream.screen_rev(),
+            )
+        });
+        match rendered {
+            Some((text, (x, y), cols, rows, rev)) => {
+                if let Ok(mut cached) = self.cached.lock() {
+                    cached.screen = text.clone();
+                    cached.screen_rev = rev;
                 }
                 self.degraded.store(false, Ordering::Release);
-                Some(bytes)
+                ScreenReply {
+                    text,
+                    cursor_x: x as u16,
+                    cursor_y: y as u16,
+                    cols,
+                    rows,
+                    rev,
+                }
             }
-            None => None,
-        };
-        match taken {
-            Some(bytes) => bytes,
             None => {
-                self.degraded.store(true, Ordering::Release);
-                self.dirty.store(true, Ordering::Release);
-                self.tick.pending.store(true, Ordering::Release);
-                self.last_tail
+                self.note_degraded();
+                let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+                ScreenReply {
+                    text: cached.screen.clone(),
+                    cursor_x: 0,
+                    cursor_y: 0,
+                    cols: self.cols.load(Ordering::Relaxed) as u16,
+                    rows: self.rows.load(Ordering::Relaxed) as u16,
+                    rev: cached.screen_rev,
+                }
+            }
+        }
+    }
+
+    /// `scrollback` (§5.2): the history rows above the screen, newest first up to `max_lines`.
+    pub fn scrollback(&self, max_lines: usize, deadline: Duration) -> TextReply {
+        let rendered = lock_deadline(&self.text, deadline).map(|text| {
+            (
+                text.stream.scrollback_text(max_lines),
+                text.stream.raw_rev(),
+            )
+        });
+        match rendered {
+            Some((text, rev)) => {
+                if let Ok(mut cached) = self.cached.lock() {
+                    cached.scrollback = text.clone();
+                }
+                self.degraded.store(false, Ordering::Release);
+                TextReply { text, rev }
+            }
+            None => {
+                self.note_degraded();
+                TextReply {
+                    text: self
+                        .cached
+                        .lock()
+                        .map(|cached| cached.scrollback.clone())
+                        .unwrap_or_default(),
+                    rev: self.cached.lock().map(|cached| cached.raw_rev).unwrap_or(0),
+                }
+            }
+        }
+    }
+
+    /// `raw` (§5.2 / `_scrollback_blob`): the raw history trimmed to the 512 KiB cap, with the byte count
+    /// and the ring's revision, so the hub's "already written this rev" gate keeps working.
+    pub fn raw(&self, deadline: Duration) -> RawReply {
+        let rendered = lock_deadline(&self.text, deadline).map(|text| {
+            (
+                text.stream.raw_text(),
+                text.stream.raw_bytes(),
+                text.stream.raw_rev(),
+            )
+        });
+        match rendered {
+            Some((text, bytes, rev)) => {
+                if let Ok(mut cached) = self.cached.lock() {
+                    cached.raw = text.clone();
+                    cached.raw_rev = rev;
+                    cached.raw_bytes = bytes;
+                }
+                self.degraded.store(false, Ordering::Release);
+                RawReply { text, bytes, rev }
+            }
+            None => {
+                self.note_degraded();
+                let cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+                RawReply {
+                    text: cached.raw.clone(),
+                    bytes: cached.raw_bytes,
+                    rev: cached.raw_rev,
+                }
+            }
+        }
+    }
+
+    /// `raw_tail` (`raw_ansi_tail`): the last `max_chars` characters of the ring, cut on a character
+    /// boundary so a split CJK character or emoji stays whole (step 1 decoded lossily here).
+    pub fn raw_tail(&self, max_chars: usize, deadline: Duration) -> String {
+        let rendered = lock_deadline(&self.text, deadline).map(|text| text.stream.raw_tail(max_chars));
+        match rendered {
+            Some(text) => {
+                if let Ok(mut cached) = self.cached.lock() {
+                    cached.tail = text.clone();
+                }
+                self.degraded.store(false, Ordering::Release);
+                text
+            }
+            None => {
+                self.note_degraded();
+                self.cached
                     .lock()
-                    .map(|last| last.clone())
+                    .map(|cached| cached.tail.clone())
                     .unwrap_or_default()
             }
         }
     }
 
+    /// What `attach_ws_queue` sends a new console: the joined ring plus one more colour-query strip
+    /// (`replay-shape`), under the same lock as the ring append (Q11).
+    pub fn replay(&self, deadline: Duration) -> Option<String> {
+        lock_deadline(&self.text, deadline).map(|text| text.stream.replay_text())
+    }
+
+    /// `feed` (§5.2): text into a session with no process (the DSH virtual sessions). Returns the new
+    /// screen revision, or `None` when the deadline passed with nothing done.
+    pub fn feed(&self, text: &str, deadline: Duration) -> Option<u64> {
+        self.ingest(Ingest::Text(text), Some(deadline))
+    }
+
+    /// Registers a sink and hands back the replay that goes with the registration (Q11).
+    ///
+    /// Atomic against `pump`/`push_frame` for this session: the delivery lock is held from the pending
+    /// batch through the snapshot and the registration, so no frame can be taken and fanned out in
+    /// between (a chunk would otherwise be in neither the replay nor any frame). The pending batch is
+    /// fanned out to the sinks that existed before this one only, because the replay already carries
+    /// those bytes; the new sink gets them once, from the replay.
+    pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, u64) {
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = text.batch.take_all();
+        let replay = text.stream.replay_text();
+        drop(text);
+        let handle = self.next_sink.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::attach_delay();
+        if let Ok(mut sinks) = self.sinks.lock() {
+            sinks.push(SinkEntry { handle, sink });
+        }
+        if let Some(frame) = pending {
+            self.fan_out(&frame, Some(handle));
+        }
+        (replay, handle)
+    }
+
+    pub fn detach_sink(&self, handle: u64) -> bool {
+        let Ok(mut sinks) = self.sinks.lock() else {
+            return false;
+        };
+        let before = sinks.len();
+        sinks.retain(|entry| entry.handle != handle);
+        sinks.len() != before
+    }
+
+    /// One frame straight to the attached sinks, not through the batch: `spawn(ws_prefix=…)` and
+    /// `attach_text(seed=…)` (§5.2, A1). No sink is attached unless a socket already follows the id.
+    pub fn push_frame(&self, frame: &str) {
+        if frame.is_empty() {
+            return;
+        }
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        self.fan_out(frame.as_bytes(), None);
+    }
+
+    /// Takes the frame that is due (or whatever the batch holds, for the final flush) and fans it out —
+    /// both inside the delivery lock, which is what keeps frame order.
+    ///
+    /// Lock order here is delivery → text: `ingest` releases the text lock before calling this, so the
+    /// reader never holds `text` while waiting for a delivery that another thread is making.
+    fn pump(&self, now: Option<Instant>) {
+        let _delivery = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = {
+            let mut text = self.text.lock().unwrap_or_else(|e| e.into_inner());
+            match now {
+                Some(now) => text.batch.take_due(now),
+                None => text.batch.take_all(),
+            }
+        };
+        if let Some(frame) = frame {
+            self.fan_out(&frame, None);
+        }
+    }
+
+    /// Delivers one coalesced frame to every attached sink, skipping `skip` (the sink that is being
+    /// registered and already has these bytes in its replay); the drops each sink reports land in
+    /// `dropped_bytes` (§5.4). The caller holds the delivery lock, and `FrameSink::deliver` never blocks,
+    /// so a slow sink costs the reader its queue push, never its read.
+    fn fan_out(&self, frame: &[u8], skip: Option<u64>) {
+        let mut dropped = 0u64;
+        match self.sinks.lock() {
+            Ok(mut sinks) => {
+                for entry in sinks.iter_mut() {
+                    if Some(entry.handle) == skip {
+                        continue;
+                    }
+                    dropped += entry.sink.deliver(&self.id, frame);
+                }
+            }
+            Err(error) => {
+                let sinks = error.into_inner();
+                for entry in sinks.iter() {
+                    if Some(entry.handle) == skip {
+                        continue;
+                    }
+                    dropped += entry.sink.deliver(&self.id, frame);
+                }
+            }
+        }
+        if dropped > 0 {
+            self.dropped_bytes.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
+    /// The ticker's 5 ms pass: flush this session's batch when §5.4's window is over.
+    pub fn flush_frames(&self, now: Instant) {
+        self.pump(Some(now));
+    }
+
+    /// The session's last bytes before it dies: flush whatever the batch holds, due or not.
+    fn flush_frames_all(&self) {
+        self.pump(None);
+    }
+
+    /// `watch_screen`: at most one render per changed revision and per `interval`, carried by `drain`.
+    pub fn watch(&self, max_lines: usize, interval: Duration) {
+        if let Ok(mut text) = self.text.lock() {
+            text.watch = Some(Watch {
+                max_lines,
+                interval,
+                last_sent: None,
+                last_rev: 0,
+            });
+        }
+    }
+
+    pub fn unwatch(&self) {
+        if let Ok(mut text) = self.text.lock() {
+            text.watch = None;
+        }
+    }
+
+    /// The screen for this drain, when a watch is set, the revision changed and its interval is due.
+    fn watched_screen(&self, now: Instant) -> Option<String> {
+        let mut text = lock_deadline(&self.text, Duration::from_millis(5))?;
+        let TextState {
+            stream, watch, ..
+        } = &mut *text;
+        let watch = watch.as_mut()?;
+        let rev = stream.screen_rev();
+        if rev == watch.last_rev {
+            return None;
+        }
+        if let Some(last) = watch.last_sent {
+            if now.saturating_duration_since(last) < watch.interval {
+                return None;
+            }
+        }
+        let screen = stream.screen_text(watch.max_lines);
+        watch.last_rev = rev;
+        watch.last_sent = Some(now);
+        Some(screen)
+    }
+
+    /// `snapshot_all` (§5.2/§6.6): what `persist_session` archives, taken under the call's deadline.
+    pub fn snapshot(&self, max_lines: usize, max_bytes: usize, deadline: Duration) -> SessionSnapshot {
+        let mut snapshot = SessionSnapshot {
+            session_id: self.id.clone(),
+            alive: self.alive(),
+            exit_code: self.exit_code(),
+            pid: self.pid,
+            crashed: self.crashed(),
+            degraded: self.degraded.load(Ordering::Acquire),
+            screen_text: String::new(),
+            scrollback_text: String::new(),
+            raw_text: String::new(),
+            raw_rev: 0,
+            raw_bytes: 0,
+        };
+        if let Some(text) = lock_deadline(&self.text, deadline) {
+            snapshot.screen_text = text.stream.screen_text(max_lines);
+            snapshot.scrollback_text = text.stream.scrollback_text(max_lines);
+            snapshot.raw_text = trim_history_text(text.stream.raw_join(), max_bytes);
+            snapshot.raw_rev = text.stream.raw_rev();
+            snapshot.raw_bytes = text.stream.raw_bytes();
+        } else {
+            snapshot.degraded = true;
+        }
+        snapshot
+    }
+
+    /// Marks the session `degraded` for a missed deadline: the flag is itself dirty, so the hub's next
+    /// drain reports it without waiting for more output (nit 7).
+    fn note_degraded(&self) {
+        self.degraded.store(true, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
+        self.tick.pending.store(true, Ordering::Release);
+    }
+
     /// The dirty session's counters, or `None` when nothing changed since the last drain. Reading only
-    /// atomics is what makes the 50 ms drain cheap (§5.3).
+    /// atomics is what makes the 50 ms drain cheap (§5.3); a watched session adds one render.
     pub fn drain_record(&self) -> Option<DrainRecord> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return None;
@@ -1125,6 +1714,8 @@ impl Session {
             dropped_bytes: self.dropped_bytes.load(Ordering::Relaxed),
             crashed: self.crashed.load(Ordering::Acquire),
             degraded: self.degraded.load(Ordering::Acquire),
+            screen_rev: self.screen_rev.load(Ordering::Relaxed),
+            screen_text: self.watched_screen(Instant::now()),
         })
     }
 
@@ -1159,21 +1750,6 @@ impl Drop for Session {
         // Unblocks the writer thread and lets it exit; the pipes close with `Resources`. No `log` call
         // here: this can run on the Python GC thread during interpreter teardown.
         self.writer.close();
-    }
-}
-
-/// Keeps the raw buffer at `cap` bytes by dropping the oldest bytes and counting them.
-fn trim_buffer(buffer: &mut VecDeque<u8>, cap: usize, dropped: &AtomicU64) {
-    if cap == 0 {
-        let len = buffer.len();
-        buffer.clear();
-        dropped.fetch_add(len as u64, Ordering::Relaxed);
-        return;
-    }
-    if buffer.len() > cap {
-        let excess = buffer.len() - cap;
-        buffer.drain(..excess);
-        dropped.fetch_add(excess as u64, Ordering::Relaxed);
     }
 }
 

@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "zero-width characters: VS16 after an emoji, ZWSP and ZWJ, and a ZWSP arriving while a wrap is pending at the last column, so the text after it wraps to the next row instead of being lost or overwriting the last cell",
+  "resume_count": 1
+}

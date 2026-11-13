@@ -1,0 +1,3 @@
+{"delay_ms": 0, "chunk": "\u001b[1;1HA\u001b[1\u0018B\u001b[2;1HA\u001b[1\u001aB"}
+{"delay_ms": 10, "chunk": "\u001b[3;1HA\u001b[31"}
+{"delay_ms": 10, "chunk": "\u001b[1mB"}

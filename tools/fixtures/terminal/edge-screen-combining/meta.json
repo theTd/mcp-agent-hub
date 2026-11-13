@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "combining marks: a composable pair, two marks on one base and a mark at column 0 (which folds into the previous row's last cell); pyte NFC-composes, the core keeps the base and its marks",
+  "resume_count": 1
+}

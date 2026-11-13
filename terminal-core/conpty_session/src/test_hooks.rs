@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 /// How long the close helper sleeps before `ClosePseudoConsole`; 0 in every normal run.
 static CLOSE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// How long `attach_sink` sleeps after it drops the text lock and before it registers the sink; 0 in
+/// every normal run. Widens the Q11 window for the test that proves the delivery lock closes it.
+static ATTACH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// `true` while `resize` should keep the console slot after taking it.
 static HOLD_RESIZE: Mutex<bool> = Mutex::new(false);
 /// Wakes `resize` when the test releases the gate.
@@ -31,6 +35,20 @@ pub fn set_close_delay(delay: Duration) {
 /// Called by the close helper before it closes: the opening of the "closing" window.
 pub(crate) fn close_delay() {
     let millis = CLOSE_DELAY_MS.load(Ordering::Acquire);
+    if millis > 0 {
+        std::thread::sleep(Duration::from_millis(millis));
+    }
+}
+
+/// Delays the next `attach_sink` calls by `delay` between the snapshot and the registration (0 restores
+/// the normal path). Only a test that is proving the delivery lock ever sets this.
+pub fn set_attach_delay(delay: Duration) {
+    ATTACH_DELAY_MS.store(delay.as_millis() as u64, Ordering::Release);
+}
+
+/// Called by `attach_sink` between the replay snapshot and the sink registration.
+pub(crate) fn attach_delay() {
+    let millis = ATTACH_DELAY_MS.load(Ordering::Acquire);
     if millis > 0 {
         std::thread::sleep(Duration::from_millis(millis));
     }

@@ -116,5 +116,64 @@ class MarkerCsiTests(unittest.TestCase):
         self.assertEqual(_split_marker_csi("ab\x1b"), ("ab", "\x1b"))
 
 
+def feed_screen(chunks):
+    screen = HubTerminalScreen(COLS, ROWS)
+    stream = HubTerminalStream(screen)
+    for chunk in chunks:
+        stream.feed(chunk)
+    return screen
+
+
+class BytesInsideCsiTests(unittest.TestCase):
+    """An ESC, a C0 control or a DEL inside a CSI: pyte took each for the final byte."""
+
+    def test_an_esc_inside_a_csi_starts_the_next_sequence(self):
+        text = "A\x1b[31\x1b[1mB"
+        for parts in every_split(text):
+            with self.subTest(parts=parts):
+                screen = feed_screen(parts)
+                self.assertEqual(screen.display[0].rstrip(), "AB")
+                self.assertTrue(screen.buffer[0][1].bold)
+                self.assertEqual(screen.buffer[0][1].fg, "default")  # ESC[31 never ran
+
+    def test_an_esc_inside_a_marker_csi_starts_the_next_sequence(self):
+        for parts in every_split("A\x1b[<\x1b[2;1HB"):
+            with self.subTest(parts=parts):
+                self.assertEqual(render(parts), "A\nB")
+
+    def test_an_esc_inside_a_csi_can_start_a_non_csi_escape(self):
+        # ESC 7 saves the cursor at column 2, ESC 8 brings it back, so D overwrites C.
+        self.assertEqual(render(["AB\x1b[3\x1b7C\x1b8D"]), "ABD")
+
+    def test_a_control_inside_a_csi_runs_and_the_sequence_still_applies(self):
+        for parts in every_split("A\x1b[3\r1mB"):
+            with self.subTest(parts=parts):
+                screen = feed_screen(parts)
+                self.assertEqual(screen.display[0].rstrip(), "B")  # CR moved the cursor home
+                self.assertEqual(screen.buffer[0][0].fg, "red")
+
+    def test_a_control_pyte_ends_a_csi_at_no_longer_draws_the_rest(self):
+        # SO is ignored in UTF-8 mode; inside the CSI pyte took it for the final byte and drew ";1mB".
+        screen = feed_screen(["A\x1b[1\x0e;1mB"])
+        self.assertEqual(screen.display[0].rstrip(), "AB")
+        self.assertTrue(screen.buffer[0][1].bold)
+
+    def test_a_del_inside_a_csi_is_ignored(self):
+        screen = feed_screen(["A\x1b[3\x7f1mB"])
+        self.assertEqual(screen.display[0].rstrip(), "AB")
+        self.assertEqual(screen.buffer[0][1].fg, "red")
+
+    def test_a_control_inside_a_marker_csi_still_runs(self):
+        # BS steps back one column, the marker CSI draws nothing, Z lands on b.
+        for parts in every_split("ab\x1b[<\x08uZ"):
+            with self.subTest(parts=parts):
+                self.assertEqual(render(parts), "aZ")
+
+    def test_the_split_helper_moves_controls_in_front(self):
+        self.assertEqual(_split_marker_csi("\x1b[3\r1m"), ("\r\x1b[31m", ""))
+        self.assertEqual(_split_marker_csi("\x1b[3\r"), ("\r", "\x1b[3"))
+        self.assertEqual(_split_marker_csi("A\x1b[31\x1b[1mB"), ("A\x1b[1mB", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

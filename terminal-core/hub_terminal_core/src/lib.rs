@@ -21,11 +21,18 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTimeoutError, PyValueError}
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 
-use conpty_session::{CoreError, CoreOptions, SpawnRequest};
+use conpty_session::{CoreError, CoreOptions, SessionFlags, SpawnRequest, TextRequest};
+use terminal_stream::strip_terminal_replies;
 
 const DEFAULT_WRITE_DEADLINE_MS: u64 = 50;
 const DEFAULT_KILL_GRACE_MS: u64 = 2000;
-const DEFAULT_RAW_TAIL_BYTES: usize = 64 * 1024;
+/// `_capture_submit_diagnostic`'s `[-65536:]`: a character count, not a byte count.
+const DEFAULT_RAW_TAIL_CHARS: usize = 65536;
+/// `get_clean_screen_text`'s default (doc §4).
+const DEFAULT_SCREEN_LINES: usize = 80;
+/// `persist_session`/`snapshot_all` read 250 rows and at most the 512 KiB scrollback cap.
+const DEFAULT_SCROLLBACK_LINES: usize = 250;
+const DEFAULT_SCROLLBACK_BYTES: usize = 512 * 1024;
 /// §5.2's spawn bound: the whole call, process creation included.
 const SPAWN_DEADLINE: Duration = Duration::from_millis(2000);
 /// §5.2's `stats` bound; the table read it needs is contended only by a spawn insert.
@@ -68,7 +75,13 @@ fn options_from_dict(opts: Option<HashMap<String, u64>>) -> CoreOptions {
     let mut options = CoreOptions::default();
     if let Some(opts) = opts {
         if let Some(value) = opts.get("raw_cap_bytes") {
-            options.raw_cap_bytes = *value as usize;
+            options.flags.raw_cap_bytes = *value as usize;
+        }
+        if let Some(value) = opts.get("raw_slack_bytes") {
+            options.flags.raw_slack_bytes = *value as usize;
+        }
+        if let Some(value) = opts.get("history_rows") {
+            options.flags.history_rows = *value as usize;
         }
         if let Some(value) = opts.get("write_queue_bytes") {
             options.write_queue_bytes = *value as usize;
@@ -81,6 +94,33 @@ fn options_from_dict(opts: Option<HashMap<String, u64>>) -> CoreOptions {
         }
     }
     options
+}
+
+/// §5.2's `flags` dict, over the core's defaults: what the dict names wins, missing keys keep the default.
+fn flags_from_dict<'py>(
+    base: SessionFlags,
+    flags: Option<&Bound<'py, PyDict>>,
+) -> PyResult<SessionFlags> {
+    let mut out = base;
+    let Some(flags) = flags else {
+        return Ok(out);
+    };
+    if let Some(value) = flags.get_item("strip_esc3j_on_output")? {
+        out.strip_esc3j_on_output = value.extract()?;
+    }
+    if let Some(value) = flags.get_item("strip_osc_color_queries")? {
+        out.strip_osc_color_queries = value.extract()?;
+    }
+    if let Some(value) = flags.get_item("history_rows")? {
+        out.history_rows = value.extract()?;
+    }
+    if let Some(value) = flags.get_item("raw_cap_bytes")? {
+        out.raw_cap_bytes = value.extract()?;
+    }
+    if let Some(value) = flags.get_item("raw_slack_bytes")? {
+        out.raw_slack_bytes = value.extract()?;
+    }
+    Ok(out)
 }
 
 /// One object per hub (`Core(notify, log, opts)`), holding the session table for the process lifetime.
@@ -133,13 +173,14 @@ impl Core {
         })
     }
 
-    /// Starts one console session. `flags`/`seed_history` are the §5.2 shape: `seed_history` seeds the
-    /// raw buffer now; the strip flags arrive with the parser in step 2 and are accepted unused.
+    /// Starts one console session. `flags`/`seed_history`/`ws_prefix` are the §5.2 shape: the flags set
+    /// the strips and the caps, `seed_history` fills the raw ring before the first byte (A1), and
+    /// `ws_prefix` is one frame to the sinks already attached (the resume separator).
     ///
     /// The spawn is measured against §5.2's 2 s bound: `CreateProcessW`, the job assignment, the resume
     /// and the three thread starts are all inside it, and a spawn that misses the bound is logged (the
     /// session is kept, because killing a just-started console would be worse than a slow reply).
-    #[pyo3(signature = (session_id, argv, cwd=None, env=None, cols=80, rows=24, flags=None, seed_history=None))]
+    #[pyo3(signature = (session_id, argv, cwd=None, env=None, cols=80, rows=24, flags=None, seed_history=None, ws_prefix=None))]
     fn spawn<'py>(
         &self,
         py: Python<'py>,
@@ -151,8 +192,9 @@ impl Core {
         rows: u16,
         flags: Option<&Bound<'py, PyDict>>,
         seed_history: Option<String>,
+        ws_prefix: Option<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let _ = flags;
+        let session_flags = flags_from_dict(self.inner.default_flags(), flags)?;
         let measured = guarded(|| {
             let request = SpawnRequest {
                 session_id,
@@ -161,7 +203,9 @@ impl Core {
                 env: env.unwrap_or_else(|| std::env::vars().collect()),
                 cols,
                 rows,
-                seed_history: seed_history.map(|seed| seed.into_bytes()),
+                flags: session_flags,
+                seed_history,
+                ws_prefix,
             };
             // No Python callback inside the detached part: the spawn's log lines come back with the
             // reply and are logged below, with the GIL back (§5.2, SF3).
@@ -273,30 +317,242 @@ impl Core {
                 dict.set_item("dropped_bytes", record.dropped_bytes)?;
                 dict.set_item("crashed", record.crashed)?;
                 dict.set_item("degraded", record.degraded)?;
+                dict.set_item("screen_rev", record.screen_rev)?;
+                dict.set_item("screen_text", record.screen_text)?;
                 out.push(dict);
             }
             Ok(out)
         })
     }
 
-    /// The last `max_bytes` of the raw byte stream, decoded lossily (step 2 owns the UTF-8 carry).
-    #[pyo3(signature = (session_id, max_bytes=None, deadline_ms=None))]
+    /// `raw_ansi_tail`: the last `max_chars` characters of the decoded ring, cut on a character boundary
+    /// (the hub's own tail is `"".join(raw_history)[-65536:]`, a character count).
+    #[pyo3(signature = (session_id, max_chars=None, deadline_ms=None))]
     fn raw_tail(
         &self,
         py: Python<'_>,
         session_id: String,
-        max_bytes: Option<usize>,
+        max_chars: Option<usize>,
         deadline_ms: Option<u64>,
     ) -> PyResult<String> {
         guarded(|| {
             let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
-            let bytes = py
+            py.detach(|| {
+                self.inner
+                    .raw_tail(&session_id, max_chars.unwrap_or(DEFAULT_RAW_TAIL_CHARS), deadline)
+            })
+            .map_err(core_error)
+        })
+    }
+
+    /// `screen` (§5.2): the rendered rows, the cursor, the size and the revision.
+    #[pyo3(signature = (session_id, max_lines=None, deadline_ms=None))]
+    fn screen<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        max_lines: Option<usize>,
+        deadline_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guarded(|| {
+            let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
+            let reply = py
                 .detach(|| {
                     self.inner
-                        .raw_tail(&session_id, max_bytes.unwrap_or(DEFAULT_RAW_TAIL_BYTES), deadline)
+                        .screen(&session_id, max_lines.unwrap_or(DEFAULT_SCREEN_LINES), deadline)
                 })
                 .map_err(core_error)?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
+            let dict = PyDict::new(py);
+            dict.set_item("text", reply.text)?;
+            dict.set_item("cursor_x", reply.cursor_x)?;
+            dict.set_item("cursor_y", reply.cursor_y)?;
+            dict.set_item("cols", reply.cols)?;
+            dict.set_item("rows", reply.rows)?;
+            dict.set_item("rev", reply.rev)?;
+            Ok(dict)
+        })
+    }
+
+    /// `scrollback` (§5.2): the history rows above the screen.
+    #[pyo3(signature = (session_id, max_lines=None, deadline_ms=None))]
+    fn scrollback<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        max_lines: Option<usize>,
+        deadline_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guarded(|| {
+            let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
+            let reply = py
+                .detach(|| {
+                    self.inner
+                        .scrollback(&session_id, max_lines.unwrap_or(DEFAULT_SCROLLBACK_LINES), deadline)
+                })
+                .map_err(core_error)?;
+            let dict = PyDict::new(py);
+            dict.set_item("text", reply.text)?;
+            dict.set_item("rev", reply.rev)?;
+            Ok(dict)
+        })
+    }
+
+    /// `raw` (§5.2): the history trimmed to the session's cap, its byte count and its revision.
+    #[pyo3(signature = (session_id, deadline_ms=None))]
+    fn raw<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        deadline_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guarded(|| {
+            let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
+            let reply = py
+                .detach(|| self.inner.raw(&session_id, deadline))
+                .map_err(core_error)?;
+            let dict = PyDict::new(py);
+            dict.set_item("text", reply.text)?;
+            dict.set_item("bytes", reply.bytes)?;
+            dict.set_item("rev", reply.rev)?;
+            Ok(dict)
+        })
+    }
+
+    /// The replay a console socket gets on connect (`replay-shape`); the socket is step 4.
+    #[pyo3(signature = (session_id, deadline_ms=None))]
+    fn replay(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        deadline_ms: Option<u64>,
+    ) -> PyResult<String> {
+        guarded(|| {
+            let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
+            py.detach(|| self.inner.replay(&session_id, deadline))
+                .map_err(core_error)
+        })
+    }
+
+    /// `attach_text` (§5.2): a session with a screen and a raw ring but no process. `seed_history` is a
+    /// virtual resume's archived scrollback (A1); `seed` is its separator frame.
+    #[pyo3(signature = (session_id, cols=80, rows=24, flags=None, seed_history=None, seed=None))]
+    fn attach_text<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        flags: Option<&Bound<'py, PyDict>>,
+        seed_history: Option<String>,
+        seed: Option<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let session_flags = flags_from_dict(self.inner.default_flags(), flags)?;
+        let reply = guarded(|| {
+            py.detach(|| {
+                self.inner.attach_text(TextRequest {
+                    session_id,
+                    cols,
+                    rows,
+                    flags: session_flags,
+                    seed_history,
+                    seed,
+                })
+            })
+            .map_err(core_error)
+        })?;
+        for line in &reply.log_lines {
+            if let Some(log) = &self.log {
+                if let Err(error) = log.call1(py, (line.as_str(),)) {
+                    error.write_unraisable(py, None);
+                }
+            }
+        }
+        let dict = PyDict::new(py);
+        dict.set_item("pid", reply.pid)?;
+        dict.set_item("cols", reply.cols)?;
+        dict.set_item("rows", reply.rows)?;
+        Ok(dict)
+    }
+
+    /// `feed` (§5.2): text into a session with no process; returns the new screen revision.
+    #[pyo3(signature = (session_id, text, deadline_ms=None))]
+    fn feed(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        text: String,
+        deadline_ms: Option<u64>,
+    ) -> PyResult<u64> {
+        guarded(|| {
+            let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
+            py.detach(|| self.inner.feed(&session_id, &text, deadline))
+                .map_err(core_error)
+        })
+    }
+
+    /// `watch_screen` (§5.2): at most one render per changed revision and per `interval_ms`, carried by
+    /// `drain`'s `screen_text`.
+    #[pyo3(signature = (session_id, max_lines=None, interval_ms=250))]
+    fn watch_screen(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        max_lines: Option<usize>,
+        interval_ms: u64,
+    ) -> PyResult<()> {
+        guarded(|| {
+            py.detach(|| {
+                self.inner.watch(
+                    &session_id,
+                    max_lines.unwrap_or(DEFAULT_SCREEN_LINES),
+                    Duration::from_millis(interval_ms),
+                )
+            })
+            .map_err(core_error)
+        })
+    }
+
+    fn unwatch(&self, py: Python<'_>, session_id: String) -> PyResult<()> {
+        guarded(|| {
+            py.detach(|| self.inner.unwatch(&session_id))
+                .map_err(core_error)
+        })
+    }
+
+    /// `snapshot_all` (§5.2/§6.6): every session's archive-ready state inside one budget.
+    #[pyo3(signature = (max_lines=None, max_bytes=None, budget_ms=8000))]
+    fn snapshot_all<'py>(
+        &self,
+        py: Python<'py>,
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
+        budget_ms: u64,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        guarded(|| {
+            let snapshots = py.detach(|| {
+                self.inner.snapshot_all(
+                    max_lines.unwrap_or(DEFAULT_SCROLLBACK_LINES),
+                    max_bytes.unwrap_or(DEFAULT_SCROLLBACK_BYTES),
+                    Duration::from_millis(budget_ms),
+                )
+            });
+            let mut out = Vec::with_capacity(snapshots.len());
+            for snapshot in snapshots {
+                let dict = PyDict::new(py);
+                dict.set_item("session_id", snapshot.session_id)?;
+                dict.set_item("alive", snapshot.alive)?;
+                dict.set_item("exit_code", snapshot.exit_code)?;
+                dict.set_item("pid", snapshot.pid)?;
+                dict.set_item("crashed", snapshot.crashed)?;
+                dict.set_item("degraded", snapshot.degraded)?;
+                dict.set_item("screen_text", snapshot.screen_text)?;
+                dict.set_item("scrollback_text", snapshot.scrollback_text)?;
+                dict.set_item("raw_text", snapshot.raw_text)?;
+                dict.set_item("raw_rev", snapshot.raw_rev)?;
+                dict.set_item("raw_bytes", snapshot.raw_bytes)?;
+                out.push(dict);
+            }
+            Ok(out)
         })
     }
 
@@ -336,9 +592,18 @@ impl Drop for Core {
     }
 }
 
+/// `strip_osc_terminal_replies` (§6.4/§8): the xterm.js colour, clipboard and `1[01]\d` replies are
+/// removed from one browser message before it can reach a PTY. A function with its tests now; step 4
+/// wires it to the socket's input path.
+#[pyfunction]
+fn strip_osc_terminal_replies(text: &str) -> String {
+    strip_terminal_replies(text).into_owned()
+}
+
 #[pymodule]
 fn hub_terminal_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Core>()?;
+    module.add_function(wrap_pyfunction!(strip_osc_terminal_replies, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("ABI", "abi3-py311")?;
     Ok(())

@@ -6,6 +6,8 @@ description = "Windows ConPTY sessions: command line parity, spawn, pipe I/O, jo
 publish = false
 
 [dependencies]
+# Step 2's parser, screen, strips, ring and coalescing; the reader thread calls it per read.
+terminal_stream = { path = "../terminal_stream" }
 # Pinned to the exact version already resolved in desktop/src-tauri/Cargo.lock (0.62.2): the app and
 # the core then report the same Win32 binding generation, and a floating minor would drift silently.
 # ConPTY, pipes, jobs, ToolHelp and NeedCurrentDirectoryForExePath come from here.

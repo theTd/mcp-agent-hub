@@ -2062,10 +2062,26 @@ def _split_marker_csi(text: str) -> Tuple[str, str]:
     Every sequence pyte parses today is handed over unchanged - '?' private modes, '>' secondary
     parameters, '$', and CAN/SUB cancelling a sequence (the CAN/SUB itself stays in the text, so
     pyte's own cancel path still runs).
+
+    Three more bytes inside a CSI are read the way vte and a terminal read them. pyte took each of
+    them for the final byte and drew the rest of the sequence as text:
+    - an ESC abandons the sequence and starts the next one, so the partial CSI is dropped and the
+      ESC is handed on as the start of a new sequence;
+    - a C0 control runs where it arrives and the sequence goes on, so it is moved in front of the
+      sequence (pyte runs only BEL, BS, HT, LF, VT, FF and CR in place);
+    - DEL is ignored, so it is removed.
     """
     kept: List[str] = []
     pos = 0
     length = len(text)
+
+    def without_controls(start: int, head_end: int, end: int) -> str:
+        """``text[start:end]``, a CSI whose start ends at ``head_end``, without its C0 controls and DELs."""
+        body = text[head_end:end]
+        if all(" " <= char != "\x7f" for char in body):
+            return text[start:end]
+        return text[start:head_end] + "".join(char for char in body if " " <= char != "\x7f")
+
     while True:
         match = _CSI_START_RE.search(text, pos)
         if match is None:
@@ -2079,10 +2095,12 @@ def _split_marker_csi(text: str) -> Tuple[str, str]:
             return "".join(kept), ""
         start = match.start()
         kept.append(text[pos:start])
-        i = match.end()
+        head_end = i = match.end()
         marker = False
+        controls: List[str] = []  # C0 controls inside the sequence, in arrival order
         final_end = -1  # just past the final byte: where pyte itself ends the sequence
         cancel_at = -1  # the CAN/SUB that cancels the sequence
+        restart_at = -1  # an ESC inside the sequence: it abandons the sequence and starts the next
         while i < length:
             char = text[i]
             if "@" <= char <= "~":      # final byte: the CSI is complete
@@ -2093,28 +2111,39 @@ def _split_marker_csi(text: str) -> Tuple[str, str]:
                     marker = True
                 i += 1
             elif char == "\x7f":
-                i += 1                  # DEL is transparent inside a sequence
+                i += 1                  # DEL is ignored inside a sequence
             elif char in "\x18\x1a":
                 cancel_at = i
                 break
+            elif char == "\x1b":
+                restart_at = i
+                break
+            elif char < " ":
+                controls.append(char)   # runs now; the sequence goes on
+                i += 1
             else:
                 break                   # not a byte ECMA-48 allows inside a CSI
+        # The controls run before the sequence is dispatched, so they go in front of it.
+        kept.extend(controls)
+        if restart_at >= 0:
+            pos = restart_at            # the partial sequence draws nothing; the ESC starts the next
+            continue
         if final_end < 0 and cancel_at < 0:
             if i == length:
-                tail = text[start:]
-                if len(tail) <= _CSI_CARRY_MAX:
+                tail = without_controls(start, head_end, length)
+                if len(text) - start <= _CSI_CARRY_MAX:
                     return "".join(kept), tail
                 kept.append(tail)       # runaway sequence: pyte holds it in its own parser
                 return "".join(kept), ""
             # A byte pyte reads in its own way; keep the bytes and look for the next start behind it.
-            kept.append(text[start:i])
+            kept.append(without_controls(start, head_end, i))
             pos = i
             continue
         end = final_end if final_end >= 0 else cancel_at
         if marker:
             pos = end                   # consumed whole and drawing nothing, as vte does
         else:
-            kept.append(text[start:end])
+            kept.append(without_controls(start, head_end, end))
             pos = end
 
 

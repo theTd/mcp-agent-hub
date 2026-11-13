@@ -38,7 +38,9 @@ fn request(id: &str, argv: &[&str]) -> SpawnRequest {
         env: std::env::vars().collect(),
         cols: 80,
         rows: 24,
+        flags: conpty_session::SessionFlags::default(),
         seed_history: None,
+        ws_prefix: None,
     }
 }
 
@@ -72,8 +74,9 @@ fn natural_exit_is_reported_with_its_code_and_output() {
     assert_eq!(record.exit_code, Some(7), "record: {record:?}");
     assert!(!record.crashed, "record: {record:?}");
 
-    let tail = String::from_utf8_lossy(&core.raw_tail("natural", 4096, Duration::from_millis(50)).unwrap())
-        .to_string();
+    let tail = core
+        .raw_tail("natural", 4096, Duration::from_millis(50))
+        .unwrap();
     assert!(record.bytes_total > 0, "record: {record:?}");
     assert!(
         tail.contains("natural-exit"),
