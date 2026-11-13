@@ -7,6 +7,8 @@
 //!   with) over a stub layout of `.exe`/`.cmd`/`.bat`/no-extension files with a controlled `PATH` and
 //!   `PATHEXT`. The stub directory is stored as `<TOOLS>`, so no absolute path from the capture machine
 //!   is in the tree and the test recreates the same layout here.
+//! * `PATHEXT-DEFAULT <hex>` is `shutil._WIN_DEFAULT_PATHEXT`, the list `which` falls back to when the
+//!   process environment has no `PATHEXT`; the resolver's own fallback must match it exactly.
 //! * `CASE <name> <hex argv0> <hex resolved app> <hex arg>|... <hex command line>` are `GetCommandLineW`
 //!   captures from a real pywinpty child, with the probe directory stored as `<PLAIN>` / `<SPACED>`; the
 //!   test recreates both directories, so these rows are machine-independent as well.
@@ -108,6 +110,17 @@ fn resolves_commands_like_pywinpty_on_a_controlled_layout() {
         checked += 1;
     }
     assert!(checked >= 4, "only {checked} RESOLVE rows were checked");
+
+    // The fallback `which` uses when the process env has no PATHEXT: `shutil._WIN_DEFAULT_PATHEXT`. It
+    // has its own row because the resolver's rule is "the process env, else this exact list".
+    let default_row = fixture
+        .row("PATHEXT-DEFAULT")
+        .expect("the fixture has no PATHEXT-DEFAULT row");
+    assert_eq!(
+        conpty_session::command_line::DEFAULT_PATHEXT,
+        unhex(&default_row[1]),
+        "DEFAULT_PATHEXT must be exactly shutil._WIN_DEFAULT_PATHEXT"
+    );
 
     // A session env's PATH is the only input the caller controls; the resolver must not add this
     // process's PATH behind it.

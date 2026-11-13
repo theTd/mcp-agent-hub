@@ -20,7 +20,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 
 fn core() -> std::sync::Arc<Core> {
     Core::new(
-        Box::new(|| {}),
+        Box::new(|| true),
         Box::new(|_message: &str| {}),
         CoreOptions {
             drain_interval: Duration::from_millis(50),
@@ -86,7 +86,9 @@ fn natural_exit_is_reported_with_its_code_and_output() {
         .spawn(request("natural", &["cmd.exe", "/c", "exit", "0"]))
         .expect("respawn of a naturally exited id");
     assert!(again.pid != 0);
-    let record = wait_dead(&core, "natural", Duration::from_secs(1)).expect("second death");
+    // Under load the second spawn's teardown can take longer than the first; the assertion is about
+    // being reported at all, not about 1 s.
+    let record = wait_dead(&core, "natural", Duration::from_secs(3)).expect("second death");
     assert_eq!(record.exit_code, Some(0));
 
     // Both dead sessions' consoles must be gone; after a third spawn exactly one conhost belongs to this
@@ -160,6 +162,7 @@ fn failed_spawns_leak_no_handles_and_no_conhost() {
 
 /// Should-fix 2: a session marked dead by a thread panic still loses its tree when `kill` runs. On
 /// `0a4111a` `kill` returned the cached code and never touched the job.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn kill_still_terminates_a_tree_that_was_marked_dead() {
     let _serial = serialized();
@@ -171,7 +174,7 @@ fn kill_still_terminates_a_tree_that_was_marked_dead() {
     // The shape of a reader panic: crashed, alive = false, exit untouched, process still running.
     let session = {
         let core_session = session_of(&core, "dead-then-kill");
-        core_session.mark_crashed("reader thread panicked");
+        core_session.mark_crashed_for_test("reader thread panicked");
         core_session
     };
     assert!(!session.alive());
@@ -268,6 +271,7 @@ fn shutdown_does_not_wait_for_a_notify_in_flight() {
             if let Some(rx) = release_rx.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = rx.recv_timeout(Duration::from_secs(5));
             }
+            true
         }),
         Box::new(|_message: &str| {}),
         CoreOptions {
@@ -292,11 +296,227 @@ fn shutdown_does_not_wait_for_a_notify_in_flight() {
     core.kill_all(Duration::from_millis(2000)).expect("kill_all");
 }
 
+/// B1: the death record carries every byte the session ever produced, and no later record reports more.
+/// `stats` reads the live counters, so after the reader is done it is the settled total.
+fn assert_death_keeps_every_byte(core: &Core, id: &str) -> conpty_session::DrainRecord {
+    let record = wait_dead(core, id, Duration::from_secs(3)).expect("no death record");
+    assert!(!record.crashed, "record: {record:?}");
+    // A late flush would still raise the live counter; give the reader a moment before comparing.
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = core.stats(Duration::from_millis(50)).bytes_total;
+    assert_eq!(
+        record.bytes_total, settled,
+        "the death record was published before the reader filed its last bytes: {record:?}"
+    );
+    let end = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < end {
+        for later in core.drain() {
+            assert!(
+                later.bytes_total <= record.bytes_total,
+                "a record after the death grew: {later:?} after {record:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    record
+}
+
+/// B1: `kill` during a natural-exit teardown. The child exits on its own and the reaper is already
+/// closing the console when `kill` arrives, which is the interleaving that published an empty record on
+/// `1b593ba` (the reaper's empty slot answered "closed").
+#[test]
+fn kill_during_a_natural_exit_keeps_every_byte() {
+    let _serial = serialized();
+    let core = core();
+    // A delayed close helper holds the "closing" window open, so `kill` really races the teardown.
+    #[cfg(feature = "test-hooks")]
+    conpty_session::test_hooks::set_close_delay(Duration::from_millis(400));
+    let reply = core
+        .spawn(request(
+            "kill-at-exit",
+            &["cmd.exe", "/c", "echo sentinel & exit 3"],
+        ))
+        .expect("spawn");
+    let end = Instant::now() + Duration::from_secs(5);
+    while job_tree_alive(reply.pid) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!job_tree_alive(reply.pid), "cmd.exe {} never exited", reply.pid);
+    let code = core
+        .kill("kill-at-exit", Duration::from_millis(2000))
+        .expect("kill");
+    assert_eq!(code, Some(3), "kill reported {code:?}");
+    assert_death_keeps_every_byte(&core, "kill-at-exit");
+    #[cfg(feature = "test-hooks")]
+    conpty_session::test_hooks::set_close_delay(Duration::ZERO);
+    core.shutdown();
+}
+
+/// B1, with bytes in flight: an exit right after a ~64 KiB burst, `kill` racing the teardown. This is the
+/// case where publishing before the reader's last read loses a visible amount of output.
+#[test]
+fn an_exit_right_after_a_burst_keeps_every_byte() {
+    let _serial = serialized();
+    let core = core();
+    #[cfg(feature = "test-hooks")]
+    conpty_session::test_hooks::set_close_delay(Duration::from_millis(400));
+    let reply = core
+        .spawn(request(
+            "burst",
+            &[
+                "cmd.exe",
+                "/c",
+                "for /L %i in (1,1,2000) do @echo 0123456789012345678901234567890123456789",
+            ],
+        ))
+        .expect("spawn");
+    let end = Instant::now() + Duration::from_secs(20);
+    while job_tree_alive(reply.pid) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!job_tree_alive(reply.pid), "the burst child never exited");
+    let _ = core.kill("burst", Duration::from_millis(2000));
+    let record = assert_death_keeps_every_byte(&core, "burst");
+    assert!(
+        record.bytes_total >= 64 * 1024,
+        "the burst never reached 64 KiB: {record:?}"
+    );
+    #[cfg(feature = "test-hooks")]
+    conpty_session::test_hooks::set_close_delay(Duration::ZERO);
+    core.shutdown();
+}
+
+/// SF2: a single write larger than the queue cap (1 MiB by default) is accepted whole when nothing is
+/// queued — a paste behaves as it did under pywinpty — and a second one while the first is still queued
+/// is a `Timeout` with nothing queued. On `1b593ba` the first one could never succeed.
+#[test]
+fn an_oversize_write_is_accepted_on_an_idle_session() {
+    let _serial = serialized();
+    let core = core();
+    // `ping` never reads stdin, so the input pipe backs up and the chunk stays queued.
+    core.spawn(request("paste", &["cmd.exe", "/c", "ping", "-n", "60", "127.0.0.1"]))
+        .expect("spawn");
+    std::thread::sleep(Duration::from_millis(300));
+    let payload = vec![b'x'; 2 * 1024 * 1024];
+    match core.write("paste", &payload, Duration::from_millis(200)) {
+        Ok(queued) => assert_eq!(
+            queued,
+            payload.len(),
+            "a 2 MiB write into an idle queue must be accepted whole"
+        ),
+        Err(error) => panic!("a 2 MiB write into an idle queue was refused: {error}"),
+    }
+    match core.write("paste", &payload, Duration::from_millis(200)) {
+        Err(CoreError::Deadline(message)) => {
+            assert!(message.contains("nothing queued"), "{message}")
+        }
+        other => panic!("expected a deadline refusal while the first write is queued, got {other:?}"),
+    }
+    core.kill_all(Duration::from_millis(2000)).expect("kill_all");
+    core.shutdown();
+}
+
+/// SF1 + B1: one session whose console slot is held (a `resize` stalled inside the test hook) must not
+/// stop `kill_all` from returning inside its budget, and every session's death must still publish.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn kill_all_with_a_held_console_slot_still_returns_and_publishes() {
+    let _serial = serialized();
+    let core = core();
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let id = format!("held-kill-all-{index}");
+        core.spawn(request(&id, &["cmd.exe"])).expect("spawn");
+        ids.push(id);
+    }
+    conpty_session::test_hooks::hold_resize();
+    let resizing = std::sync::Arc::clone(&core);
+    let holder = std::thread::spawn(move || {
+        resizing.resize("held-kill-all-0", 90, 30, Duration::from_secs(20))
+    });
+    let entered = conpty_session::test_hooks::wait_until_resize_holds(Duration::from_secs(5));
+    let started = Instant::now();
+    core.kill_all(Duration::from_millis(500)).expect("kill_all");
+    let elapsed = started.elapsed();
+    conpty_session::test_hooks::release_resize();
+    let _ = holder.join();
+    assert!(entered, "the resize never took the console slot");
+    assert!(
+        elapsed <= Duration::from_millis(2500),
+        "kill_all of 3 sessions took {elapsed:?} with one console slot held"
+    );
+    // Every death must be in a drain by the time `kill_all` returned. Collected in one pass: a `drain`
+    // clears every session's record, so waiting per id would consume the others.
+    let mut records = HashMap::new();
+    let settle = Instant::now() + Duration::from_secs(2);
+    while records.len() < ids.len() && Instant::now() < settle {
+        for record in core.drain() {
+            if !record.alive {
+                records.insert(record.session_id.clone(), record);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for id in &ids {
+        assert!(records.contains_key(id), "{id} never published its death: {records:?}");
+    }
+    core.shutdown();
+}
+
+/// SF1: a held console slot does not stop the death record of a process that exits on its own. On
+/// `1b593ba` the reaper blocked on the console mutex before publishing anything.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_held_console_slot_does_not_stop_the_death_record() {
+    let _serial = serialized();
+    let core = core();
+    core.spawn(request("held-exit", &["cmd.exe"])).expect("spawn");
+    conpty_session::test_hooks::hold_resize();
+    let resizing = std::sync::Arc::clone(&core);
+    let holder = std::thread::spawn(move || resizing.resize("held-exit", 100, 30, Duration::from_secs(20)));
+    assert!(
+        conpty_session::test_hooks::wait_until_resize_holds(Duration::from_secs(5)),
+        "the resize never took the console slot"
+    );
+    // The child exits by itself while the slot is held: the reaper must publish on its close deadline.
+    core.write("held-exit", b"exit 5\r\n", Duration::from_millis(50))
+        .expect("write");
+    let dead = wait_dead(&core, "held-exit", Duration::from_secs(6))
+        .expect("the reaper never published under a held console slot");
+    assert_eq!(dead.exit_code, Some(5), "{dead:?}");
+    conpty_session::test_hooks::release_resize();
+    let _ = holder.join();
+    core.kill_all(Duration::from_millis(2000)).expect("kill_all");
+    core.shutdown();
+}
+
+/// SF3: an exit code learned after the death record went out must still reach the hub, whose only
+/// exit-code source is the next drain. On `1b593ba` the second drain returned nothing.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_late_exit_code_reaches_the_next_drain() {
+    let _serial = serialized();
+    let core = core();
+    core.spawn(request("late-code", &["cmd.exe"])).expect("spawn");
+    // The shape of a reader panic: crashed and dead, no code, process still alive.
+    session_of(&core, "late-code").mark_crashed_for_test("reader thread panicked");
+    let first = wait_dead(&core, "late-code", Duration::from_secs(3)).expect("no death record");
+    assert_eq!(first.exit_code, None, "{first:?}");
+    let code = core.kill("late-code", Duration::from_millis(2000)).expect("kill");
+    assert!(code.is_some(), "the kill learned no code: {code:?}");
+    let carried = wait_dead(&core, "late-code", Duration::from_secs(2))
+        .expect("the late exit code never reached a drain record");
+    assert_eq!(carried.exit_code, code, "{carried:?}");
+    core.shutdown();
+}
+
 fn job_tree_alive(pid: u32) -> bool {
     conpty_session::job_tree::process_alive(pid)
 }
 
-/// The session behind an id, for the tests that must put it in a state a real thread panic would.
+/// The session behind an id, for the tests that must put it in a state a real thread panic would. A
+/// `test-hooks` item: `session_for_test` only exists when the crate is built with that feature.
+#[cfg(feature = "test-hooks")]
 fn session_of(core: &Core, id: &str) -> std::sync::Arc<conpty_session::session::Session> {
     core.session_for_test(id).expect("session present")
 }

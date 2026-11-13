@@ -103,16 +103,18 @@ impl Core {
     ) -> PyResult<Self> {
         // `try_attach`, never `attach`: a Python thread that holds the GIL while calling into the core
         // must not be able to make the ticker wait for it forever (B2). A skipped callback only means
-        // the hub sees the next dirty record on the following tick.
-        let notify_fn: Box<dyn Fn() + Send + Sync> = match notify {
+        // the hub sees the next dirty record on the following tick — and it is not counted as a wakeup,
+        // which is why the closure reports whether it ran (nit 7).
+        let notify_fn: Box<dyn Fn() -> bool + Send + Sync> = match notify {
             Some(callback) => Box::new(move || {
                 Python::try_attach(|py| {
                     if let Err(error) = callback.call0(py) {
                         error.write_unraisable(py, None);
                     }
-                });
+                })
+                .is_some()
             }),
-            None => Box::new(|| {}),
+            None => Box::new(|| false),
         };
         let log_shared = log.map(Arc::new);
         let log_fn: Box<dyn Fn(&str) + Send + Sync> = match log_shared.clone() {

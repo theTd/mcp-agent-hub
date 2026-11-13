@@ -125,7 +125,12 @@ fn normcase(path: &str) -> String {
         .collect()
 }
 
-const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW";
+/// `shutil._WIN_DEFAULT_PATHEXT`, which is what `shutil.which` — pywinpty's `which` — uses when the
+/// process environment has no `PATHEXT` (`os.getenv("PATHEXT") or _WIN_DEFAULT_PATHEXT`; verified on the
+/// dev 3.15 and 3.14, and pinned by the fixture's `PATHEXT-DEFAULT` row). It must be **this** list, not
+/// the longer one winpty's Python docs quote: resolving `.PY`/`.VBE`/… here would find a command pywinpty
+/// would not.
+pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC";
 
 /// `shutil.which`'s `os.getenv("PATHEXT") or _WIN_DEFAULT_PATHEXT`: the **process** environment, not the
 /// session's. pywinpty passes only `PATH` to `which`, so a session that overrides `PATHEXT` does not

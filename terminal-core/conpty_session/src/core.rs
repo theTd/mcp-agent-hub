@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::conpty::{self, SpawnSpec};
-use crate::session::{DrainRecord, Session, SessionOptions, TickFlags};
+use crate::session::{DrainRecord, ResizeError, Session, SessionOptions, TickFlags};
 
 /// Calls this step's Python layer makes. `drain_interval` is the 50 ms notify window; `tick_interval`
 /// is how often the ticker looks (§5.3).
@@ -117,7 +117,9 @@ fn read_deadline<'a, T>(lock: &'a RwLock<T>, deadline: Duration) -> Option<RwLoc
 
 pub struct Core {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
-    notify: Box<dyn Fn() + Send + Sync>,
+    /// Returns whether the wakeup actually ran: the binding's `try_attach` skips it at interpreter
+    /// teardown, and a skipped call must not be counted as a notify (nit 7).
+    notify: Box<dyn Fn() -> bool + Send + Sync>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     opts: CoreOptions,
     tick: Arc<TickFlags>,
@@ -136,7 +138,7 @@ impl Core {
     /// Starts the ticker thread. `notify` is called at most every `drain_interval` and only when a
     /// session is dirty (§5.3); `log` is called on spawn, kill and panic only.
     pub fn new(
-        notify: Box<dyn Fn() + Send + Sync>,
+        notify: Box<dyn Fn() -> bool + Send + Sync>,
         log: Box<dyn Fn(&str) + Send + Sync>,
         opts: CoreOptions,
     ) -> Arc<Self> {
@@ -195,10 +197,12 @@ impl Core {
                     .unwrap_or(true);
                 if urgent || (pending && due) {
                     last_notify = Some(Instant::now());
-                    self.notify_calls.fetch_add(1, Ordering::Relaxed);
                     // No core lock is held here: Python may hold one and call back in (§6.5). The
-                    // callback itself skips its call when it cannot attach (no waiting for the GIL).
-                    (self.notify)();
+                    // callback itself skips its call when it cannot attach (no waiting for the GIL), and
+                    // only a call that ran is counted (nit 7).
+                    if (self.notify)() {
+                        self.notify_calls.fetch_add(1, Ordering::Relaxed);
+                    }
                 } else if pending {
                     self.tick.pending.store(true, Ordering::Release);
                 }
@@ -265,7 +269,10 @@ impl Core {
             Arc::clone(&self.panics),
             Arc::clone(&self.log),
             seed_history,
-        );
+        )
+        // A thread that cannot start leaves a live process with no table entry, so `Session::start`
+        // ends the tree and reports it here instead of returning a half-built session.
+        .map_err(CoreError::Spawn)?;
         let reply = SpawnReply {
             pid: session.pid,
             cols,
@@ -322,7 +329,15 @@ impl Core {
             )));
         }
         let session = self.session(id)?;
-        session.resize(cols, rows, deadline).map_err(CoreError::Internal)
+        session
+            .resize(cols, rows, deadline)
+            // §5.1's families: a closed console is a refused call (`ValueError`), a missed deadline a
+            // `TimeoutError`, a Win32 failure an internal error (`RuntimeError`).
+            .map_err(|error| match error {
+                ResizeError::Closed(message) => CoreError::Invalid(message),
+                ResizeError::Deadline(message) => CoreError::Deadline(message),
+                ResizeError::Failed(message) => CoreError::Internal(message),
+            })
     }
 
     pub fn kill(&self, id: &str, budget: Duration) -> Result<Option<i32>, CoreError> {
@@ -333,13 +348,17 @@ impl Core {
     /// `TerminateJobObject` for every session, in parallel, inside one `budget` (§5.2: 2 s for the whole
     /// call, not per session). Used by the selftest and by shutdown in step 5.
     pub fn kill_all(&self, budget: Duration) -> Result<(), CoreError> {
-        let sessions: Vec<Arc<Session>> = self
-            .sessions
-            .read()
-            .map_err(|_| CoreError::Internal("session table lock poisoned".into()))?
-            .values()
-            .cloned()
-            .collect();
+        // The snapshot is the one unbounded read this call used to have (rereview item 4): a spawn insert
+        // holds the write lock, and a wedged shutdown must not wait on it. A miss reports instead of
+        // pretending every session was killed; the jobs' kill-on-close still ends the trees (§6.6).
+        let sessions: Vec<Arc<Session>> = match read_deadline(&self.sessions, budget) {
+            Some(map) => map.values().cloned().collect(),
+            None => {
+                return Err(CoreError::Deadline(
+                    "session table busy; kill_all could not snapshot its sessions".into(),
+                ))
+            }
+        };
         let end = Instant::now() + budget;
         let failures: Vec<String> = thread::scope(|scope| {
             let mut handles = Vec::with_capacity(sessions.len());
@@ -390,6 +409,8 @@ impl Core {
 
     /// Test-only: the session behind an id. The integration tests put a session into the state a thread
     /// panic leaves it in (`crashed`, `alive = false`, process still running) without panicking a thread.
+    /// Compiled out unless the tests ask for it, so it cannot become part of the artifact's surface.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn session_for_test(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.read().ok()?.get(id).cloned()

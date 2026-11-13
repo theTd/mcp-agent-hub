@@ -12,5 +12,9 @@ pub mod job;
 pub mod job_tree;
 pub mod session;
 
+/// Test-only knobs the integration tests need; never part of a release build.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
+
 pub use core::{Core, CoreError, CoreOptions, SpawnReply, SpawnRequest, Stats};
 pub use session::DrainRecord;

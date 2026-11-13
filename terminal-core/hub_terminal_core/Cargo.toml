@@ -9,6 +9,11 @@ publish = false
 name = "hub_terminal_core"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Forwarded so `cargo test --features test-hooks` works from the workspace root and builds the same
+# test hooks in the plain crate.
+test-hooks = ["conpty_session/test-hooks"]
+
 [dependencies]
 conpty_session = { path = "../conpty_session" }
 # Pinned: 0.30.1 is the first release that knows CPython 3.15, and `abi3-py311` builds one artifact for

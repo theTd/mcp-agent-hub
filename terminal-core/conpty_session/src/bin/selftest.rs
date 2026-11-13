@@ -43,7 +43,7 @@ fn start_core(logs: Arc<Mutex<Vec<String>>>) -> Arc<Core> {
             lines.push(message.to_string());
         }
     };
-    let notify = || {};
+    let notify = || true;
     Core::new(
         Box::new(notify),
         Box::new(log),

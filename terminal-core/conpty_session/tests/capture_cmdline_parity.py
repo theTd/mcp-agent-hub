@@ -11,14 +11,18 @@ node installed there. This capture builds its own layout instead:
 * a stub directory holding `probe.exe`, `probe.cmd`, `probe.bat` and a no-extension `bare` file;
 * `PATH` set to that directory and `PATHEXT` set to a fixed list;
 * the expected rows come from `winpty.ptyprocess.which` — the function pywinpty's `PtyProcess.spawn`
-  calls — with the same `path = env.get("PATH", os.defpath)` it passes.
+  calls — with the same `path = env.get("PATH", os.defpath)` it passes;
+* one `PATHEXT-DEFAULT` row carries `shutil._WIN_DEFAULT_PATHEXT`, what `which` uses when the process
+  environment has no `PATHEXT` (pywinpty imports `shutil.which`, so that is its fallback exactly).
 
-Only `RESOLVE` rows and the `PATHEXT` header are rewritten; the `CASE` rows (what a real pywinpty child
-received as `GetCommandLineW`) are carried over unchanged. The directory is written as `<TOOLS>`, so no
-absolute path from this machine lands in the tree, and the Rust test builds the same layout itself.
+Only `RESOLVE` rows and the `PATHEXT`/`PATHEXT-DEFAULT` headers are rewritten; the `CASE` rows (what a
+real pywinpty child received as `GetCommandLineW`) are carried over unchanged. The directory is written
+as `<TOOLS>`, so no absolute path from this machine lands in the tree, and the Rust test builds the same
+layout itself.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -58,7 +62,12 @@ def main() -> int:
         # pywinpty's spawn: `which(command, path=env.get('PATH', os.defpath))`; `which` reads PATHEXT
         # from the process environment, so set it for the capture exactly as the test does.
         os.environ["PATHEXT"] = PATHEXT
-        rows = [f"PATHEXT\t{hexed(PATHEXT)}"]
+        rows = [
+            f"PATHEXT\t{hexed(PATHEXT)}",
+            # What `which` falls back to when the process env has no PATHEXT: pywinpty imports
+            # `shutil.which`, so this list is exactly `shutil._WIN_DEFAULT_PATHEXT`.
+            f"PATHEXT-DEFAULT\t{hexed(shutil._WIN_DEFAULT_PATHEXT)}",
+        ]
         for command in ("probe", "probe.cmd", "probe.bat", "bare"):
             resolved = which(command, path=env.get("PATH", os.defpath))
             expected = "" if resolved is None else hexed(resolved.replace(str(tools), TOOLS_TOKEN))

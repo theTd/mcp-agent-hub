@@ -22,6 +22,11 @@ windows = { version = "=0.62.2", features = [
     "Win32_System_Threading",
 ] }
 
+[features]
+# Test-only hooks (`test_hooks`): a controllable console close and a held resize slot, plus the
+# crashed-session setter. The integration tests ask for them; a release build never does.
+test-hooks = []
+
 [[bin]]
 name = "selftest"
 path = "src/bin/selftest.rs"

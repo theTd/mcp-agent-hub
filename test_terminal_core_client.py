@@ -171,6 +171,36 @@ class CoreClientTests(unittest.TestCase):
         dead = self.drain_until(lambda record: not record["alive"], timeout=1.0)
         self.assertEqual(dead["exit_code"], 0, dead)
 
+    def test_kill_during_a_burst_keeps_every_byte(self):
+        """B1: a `kill` that lands while the reader is still filing output must not publish a death record
+        that is missing bytes — the same ordering a natural-exit teardown needs (the Rust cases pin that
+        interleaving exactly)."""
+        burst = "for /L %i in (1,1,4000) do @echo 0123456789012345678901234567890123456789"
+        self.spawn(["cmd.exe", "/c", burst])
+        # As soon as bytes are being filed, kill: the record must wait for the reader's last byte.
+        first = self.drain_until(lambda record: record["bytes_total"] > 0, timeout=10.0)
+        self.assertGreater(first["bytes_total"], 0, first)
+        self.core.kill(self.session, 2000)
+        dead = self.drain_until(lambda record: not record["alive"], timeout=3.0)
+        # Nothing can arrive after the reader's last byte, so the record equals the settled total and no
+        # later record reports more.
+        time.sleep(0.3)
+        settled = self.core.stats()["bytes_total"]
+        self.assertEqual(dead["bytes_total"], settled, dead)
+        for record in self.core.drain():
+            self.assertLessEqual(record["bytes_total"], dead["bytes_total"], record)
+
+    def test_an_oversize_write_is_accepted_whole_then_times_out(self):
+        """SF2: a write larger than the queue cap (1 MiB) is accepted whole when nothing is queued — a
+        paste behaves as it did under pywinpty — and a second one while the first waits times out."""
+        self.spawn(["cmd.exe", "/c", "ping -n 60 127.0.0.1"])
+        time.sleep(0.5)
+        payload = "x" * (2 * 1024 * 1024)
+        self.assertEqual(self.core.write(self.session, payload, 200), len(payload))
+        with self.assertRaises(TimeoutError) as caught:
+            self.core.write(self.session, payload, 200)
+        self.assertIn("nothing queued", str(caught.exception))
+
     def test_unknown_session_raises_key_error(self):
         with self.assertRaises(KeyError):
             self.core.raw_tail("no-such-session", 16)

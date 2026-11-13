@@ -10,13 +10,19 @@
 //! exit code and closes the console on a helper thread so the pending read returns; the death record is
 //! published only after that read has ended, so the last bytes are in the buffer before `alive = false`.
 //!
+//! `kill` and the reaper share one teardown (`finish_exit`), so that ordering rule exists in one place:
+//! close the console, wait for the reader's end of output inside the remaining budget, then publish —
+//! or publish on the deadline, because a wedged close must cost the last bytes, never the record. The
+//! console slot is three-state (`Open`/`Closing`/`Closed`), never "taken ⇒ closed", so a second closer
+//! that finds a peer inside `ClosePseudoConsole` waits for that peer's completion instead of publishing
+//! early (B1).
+//!
 //! A panic anywhere in a thread body ends **that** session (`crashed`, `alive = false`, buffer kept) and
 //! nothing else (§6.3), and it is counted in `panics`.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,8 +44,12 @@ const STILL_ACTIVE: i32 = 259;
 /// One ReadFile / WriteFile step. 8 KiB matches the hub's old `pty.read(4096)` order of magnitude
 /// while halving the number of syscalls for bulk output.
 const IO_CHUNK: usize = 8192;
-/// The reaper only blocks in `WaitForSingleObject` (and the close helper), so it needs no real stack.
-const REAPER_STACK: usize = 64 * 1024;
+/// The reaper blocks in `WaitForSingleObject`, then runs the teardown and finally calls `log` — an
+/// arbitrary Python callback, not a bare wait — so it cannot stay on the 64 KiB a wait alone needed
+/// (nit 3). 512 KiB is reserved, not committed; the thread touches a few pages.
+const REAPER_STACK: usize = 512 * 1024;
+/// The close helper only runs `ClosePseudoConsole` and the slot bookkeeping.
+const CLOSE_HELPER_STACK: usize = 64 * 1024;
 
 /// Tunables a session needs from the core.
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +80,110 @@ pub struct DrainRecord {
     pub degraded: bool,
 }
 
+/// The pseudoconsole's single close point. Three states, because "somebody took the handle" and "the
+/// console is closed" are different answers (B1): the thread that takes the handle flips the slot to
+/// `Closing`, the helper that finishes `ClosePseudoConsole` flips it to `Closed` and wakes every waiter,
+/// so a second closer can wait for the completion instead of publishing a death over a live read.
+struct ConsoleSlot {
+    state: Mutex<ConsoleState>,
+    /// Signalled when `state` becomes `Closed`.
+    done: Condvar,
+    /// The core's panic counter, so a close-helper panic is counted like every other one (nit 1).
+    panics: Arc<AtomicU64>,
+}
+
+enum ConsoleState {
+    /// The handle is here; nobody has started the close.
+    Open(OwnedPseudoConsole),
+    /// A helper is inside `ClosePseudoConsole` (or the handle was leaked because that helper could not
+    /// start, in which case the state never leaves `Closing`).
+    Closing,
+    /// `ClosePseudoConsole` returned: the reader's pending read has been released.
+    Closed,
+}
+
+/// What closing the console did, so the callers can log the one case that needs a reason (nit 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseProgress {
+    /// `ClosePseudoConsole` returned — now or by a peer this call waited for.
+    Closed,
+    /// Still inside `ClosePseudoConsole` at the deadline (this call's helper, or a peer's).
+    Pending,
+    /// The slot lock itself was busy at the deadline, so nothing was attempted.
+    Busy,
+    /// The helper thread could not be spawned; the handle was leaked rather than closed on a thread
+    /// that may be the reader (§12.7).
+    NoHelper,
+}
+
+impl ConsoleSlot {
+    fn new(console: OwnedPseudoConsole, panics: Arc<AtomicU64>) -> Self {
+        Self {
+            state: Mutex::new(ConsoleState::Open(console)),
+            done: Condvar::new(),
+            panics,
+        }
+    }
+
+    /// Starts the close if nobody did: `Ok(Some(handle))` to close on a helper, `Ok(None)` when a peer
+    /// already owns it (or it is done), `Err(Busy)` when the slot lock missed `deadline` (SF1: never an
+    /// unbounded wait, so the caller's deadline path still publishes).
+    fn begin_close(&self, deadline: Duration) -> Result<Option<OwnedPseudoConsole>, CloseProgress> {
+        let mut state = match lock_deadline(&self.state, deadline) {
+            Some(state) => state,
+            None => return Err(CloseProgress::Busy),
+        };
+        match std::mem::replace(&mut *state, ConsoleState::Closed) {
+            ConsoleState::Open(console) => {
+                *state = ConsoleState::Closing;
+                Ok(Some(console))
+            }
+            // Put the state back: `Closed` stays closed, `Closing` stays closing.
+            other => {
+                *state = other;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Waits up to `deadline` for a `Closing` slot to reach `Closed`. `true` = closed.
+    fn wait_closed(&self, deadline: Duration) -> bool {
+        let end = Instant::now() + deadline;
+        let mut state = match lock_deadline(&self.state, deadline) {
+            Some(state) => state,
+            None => return false,
+        };
+        loop {
+            if matches!(*state, ConsoleState::Closed) {
+                return true;
+            }
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, _) = self
+                .done
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = guard;
+        }
+    }
+
+    /// Counts a close-helper panic (its payload is a bug in this crate, not a session condition).
+    fn note_panic(&self) {
+        self.panics.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `ClosePseudoConsole` returned (or the helper panicked unwinding through it): the read is released
+    /// and every waiter may proceed. Bounded, because a resize may hold the slot (§12.7).
+    fn mark_closed(&self) {
+        if let Some(mut state) = lock_deadline(&self.state, CONSOLE_CLOSE_DEADLINE) {
+            *state = ConsoleState::Closed;
+        }
+        self.done.notify_all();
+    }
+}
+
 /// Handles a session's threads use, shared by ownership rather than copied.
 struct Resources {
     process: OwnedHandle,
@@ -77,19 +191,27 @@ struct Resources {
     output: OwnedHandle,
     job: Arc<JobObject>,
     job_assigned: bool,
-    /// Taken exactly once, by whichever helper thread closes the pseudoconsole.
-    console: Mutex<Option<OwnedPseudoConsole>>,
+    console: Arc<ConsoleSlot>,
 }
 
 impl Drop for Resources {
     fn drop(&mut self) {
-        // Never close synchronously on the dropping thread: `del core` drops sessions on the Python GC
-        // thread, and closing a console with a read pending is the §12.7 hang. The slot is empty when
-        // the exit/kill teardown already closed it, so this only runs for a session that was abandoned.
-        if let Ok(mut slot) = self.console.lock() {
-            if let Some(console) = slot.take() {
-                close_console_off_thread(console, CONSOLE_CLOSE_DEADLINE);
-            }
+        // Never wait on the slot here: this can run on the Python GC thread, and a blocked drop stalls
+        // the interpreter. `try_lock` separates "nobody is closing it" from "a peer is"; the peer owns
+        // the close in that case, and on any other miss the HPCON is leaked instead of closed on this
+        // thread (§12.7, SF1).
+        let console = match self.console.state.try_lock() {
+            Ok(mut state) => match std::mem::replace(&mut *state, ConsoleState::Closing) {
+                ConsoleState::Open(console) => Some(console),
+                other => {
+                    *state = other;
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if let Some(console) = console {
+            let _ = close_console_off_thread(console, CONSOLE_CLOSE_DEADLINE, &self.console);
         }
     }
 }
@@ -102,6 +224,19 @@ pub enum WriteError {
     Timeout,
     /// The input pipe failed; the session's input is closed for good.
     Closed,
+}
+
+/// Why `resize` failed. `core.rs` maps these onto §5.1's families: a closed console is a refused call
+/// (`ValueError`, the family a dead session gets), a missed deadline is `TimeoutError`, and a Win32
+/// failure is `RuntimeError`.
+#[derive(Debug, Clone)]
+pub enum ResizeError {
+    /// The pseudoconsole is closing or closed, so there is nothing to resize.
+    Closed(String),
+    /// The console slot's lock missed its deadline.
+    Deadline(String),
+    /// `ResizePseudoConsole` itself failed.
+    Failed(String),
 }
 
 #[derive(Debug, Default)]
@@ -129,6 +264,14 @@ impl WriteQueue {
         }
     }
 
+    /// Whether a write of `len` bytes fits now. A text larger than the cap is accepted whole when the
+    /// queue is empty (SF2): the hub writes one WebSocket frame per call, un-chunked, so the fit test on
+    /// `pending + len <= cap` alone made a paste larger than the cap a permanent `Timeout`, while
+    /// pywinpty wrote it. The all-or-nothing contract and `TimeoutError` stay for everything else.
+    fn fits(&self, state: &WriterState, len: usize) -> bool {
+        state.pending + len <= self.cap || state.pending == 0
+    }
+
     /// Queues `text` as one chunk or nothing at all: empty text queues nothing (and returns 0), a queue
     /// that stays over its cap until `deadline` raises `Timeout` with nothing queued.
     fn push(&self, text: &[u8], deadline: Duration) -> Result<usize, WriteError> {
@@ -141,7 +284,7 @@ impl WriteQueue {
             if state.closed {
                 return Err(WriteError::Closed);
             }
-            if state.pending + text.len() <= self.cap {
+            if self.fits(&state, text.len()) {
                 state.pending += text.len();
                 state.chunks.push_back(text.to_vec());
                 self.ready.notify_all();
@@ -156,7 +299,7 @@ impl WriteQueue {
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|e| e.into_inner());
             state = guard;
-            if wait.timed_out() && state.pending + text.len() > self.cap {
+            if wait.timed_out() && !self.fits(&state, text.len()) {
                 return if state.closed {
                     Err(WriteError::Closed)
                 } else {
@@ -231,20 +374,56 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Closes a pseudoconsole on its own thread and waits at most `deadline`; `false` means the helper is
-/// still inside `ClosePseudoConsole` and will finish on its own (§12.7).
-fn close_console_off_thread(console: OwnedPseudoConsole, deadline: Duration) -> bool {
-    let (done, wait) = mpsc::channel();
+/// `WaitForSingleObject`'s timeout from a `Duration`, clamped below `INFINITE`: `grace_ms` comes from
+/// Python, and an unclamped `as u32` turns a large value into a tiny wait while exactly `u32::MAX`
+/// becomes an unbounded one (nit 6).
+fn wait_timeout(remaining: Duration) -> u32 {
+    const BELOW_INFINITE: u128 = INFINITE as u128 - 1;
+    remaining.as_millis().min(BELOW_INFINITE) as u32
+}
+
+/// Closes a pseudoconsole on its own thread and waits at most `deadline`; `Pending` means the helper is
+/// still inside `ClosePseudoConsole` and will finish on its own (§12.7). The slot is `Closing` while the
+/// helper runs and `Closed` once it returned, so a second caller waits on the slot's completion (B1)
+/// instead of mistaking "closing" for "closed".
+fn close_console_off_thread(
+    console: OwnedPseudoConsole,
+    deadline: Duration,
+    slot: &Arc<ConsoleSlot>,
+) -> CloseProgress {
+    // The handle travels through a shared slot rather than the closure's capture, so a failed spawn can
+    // still take it back and leak it instead of dropping it — a dropped value closes the console on the
+    // calling thread, which is the reader thread on the panic path (nit 2).
+    let holder = Arc::new(Mutex::new(Some(console)));
+    let helper_holder = Arc::clone(&holder);
+    let helper_slot = Arc::clone(slot);
     let spawned = thread::Builder::new()
         .name("core-close".to_string())
-        .stack_size(REAPER_STACK)
+        .stack_size(CLOSE_HELPER_STACK)
         .spawn(move || {
-            let _ = catch_unwind(AssertUnwindSafe(|| console.close()));
-            let _ = done.send(());
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::close_delay();
+            let console = helper_holder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let Some(console) = console else { return };
+            if catch_unwind(AssertUnwindSafe(|| console.close())).is_err() {
+                helper_slot.note_panic();
+            }
+            helper_slot.mark_closed();
         });
-    match spawned {
-        Ok(_) => matches!(wait.recv_timeout(deadline), Ok(())),
-        Err(_) => false,
+    if spawned.is_err() {
+        // No helper exists, so nobody will close the handle: leak it. Closing here would run
+        // `ClosePseudoConsole` on this thread, and this thread is the reader on the panic path.
+        let leaked = holder.lock().unwrap_or_else(|error| error.into_inner()).take();
+        std::mem::forget(leaked);
+        return CloseProgress::NoHelper;
+    }
+    if slot.wait_closed(deadline) {
+        CloseProgress::Closed
+    } else {
+        CloseProgress::Pending
     }
 }
 
@@ -290,7 +469,7 @@ impl Session {
         panics: Arc<AtomicU64>,
         log: Arc<dyn Fn(&str) + Send + Sync>,
         seed_history: Option<Vec<u8>>,
-    ) -> (Arc<Self>, Vec<String>) {
+    ) -> Result<(Arc<Self>, Vec<String>), String> {
         let ConPtyProcess {
             pid,
             command_line,
@@ -322,7 +501,7 @@ impl Session {
                 output,
                 job,
                 job_assigned,
-                console: Mutex::new(Some(console)),
+                console: Arc::new(ConsoleSlot::new(console, Arc::clone(&panics))),
             }),
             buffer: Mutex::new(VecDeque::new()),
             last_tail: Mutex::new(Vec::new()),
@@ -355,25 +534,46 @@ impl Session {
             }
         }
 
-        let reader = Arc::clone(&session);
-        let writer = Arc::clone(&session);
-        let reaper = Arc::clone(&session);
-        thread::Builder::new()
-            .name(format!("core-read-{}", session.id))
-            .spawn(move || reader.reader_body())
-            .expect("spawn reader thread");
-        thread::Builder::new()
-            .name(format!("core-write-{}", session.id))
-            .spawn(move || writer.writer_body())
-            .expect("spawn writer thread");
-        // 64 KiB is enough: the body only waits on the process handle.
-        thread::Builder::new()
-            .name(format!("core-reap-{}", session.id))
-            .stack_size(REAPER_STACK)
-            .spawn(move || reaper.reaper_body())
-            .expect("spawn reaper thread");
+        // Thread starts are the last step that can fail, and a failure here used to leave a live process
+        // with no table entry: unreachable, unreaped (rereview item 3). The error path ends the tree and
+        // closes the console, then reports the failure so `core.spawn` raises instead of hiding it.
+        let started = (|| -> std::io::Result<()> {
+            let reader = Arc::clone(&session);
+            thread::Builder::new()
+                .name(format!("core-read-{}", session.id))
+                .spawn(move || reader.reader_body())?;
+            let writer = Arc::clone(&session);
+            thread::Builder::new()
+                .name(format!("core-write-{}", session.id))
+                .spawn(move || writer.writer_body())?;
+            let reaper = Arc::clone(&session);
+            thread::Builder::new()
+                .name(format!("core-reap-{}", session.id))
+                .stack_size(REAPER_STACK)
+                .spawn(move || reaper.reaper_body())?;
+            Ok(())
+        })();
+        if let Err(error) = started {
+            let terminated = if session.resources.job_assigned {
+                session.resources.job.terminate(1)
+            } else {
+                job_tree::terminate_tree(session.pid);
+                Ok(())
+            };
+            // Close on a helper so a reader that did start leaves its `ReadFile`; no session-level wait,
+            // because the node is not in the table and nobody drains it.
+            let _ = session.close_console(CONSOLE_CLOSE_DEADLINE);
+            return Err(format!(
+                "session {}: could not start its threads ({error}); the tree was terminated{}",
+                session.id,
+                match terminated {
+                    Ok(()) => String::new(),
+                    Err(error) => format!(" (job terminate failed: {error})"),
+                }
+            ));
+        }
 
-        (session, spawn_log)
+        Ok((session, spawn_log))
     }
 
     /// One place that reaches the core's `log` callable, so every line goes through the same path.
@@ -462,6 +662,13 @@ impl Session {
             let waited = unsafe { WaitForSingleObject(self.resources.process.get(), INFINITE) };
             if waited == WAIT_OBJECT_0 {
                 self.on_process_exit();
+            } else {
+                // Not reachable with an infinite wait and a valid handle, but a silent return here would
+                // be a session that never dies and never publishes (rereview item 1, nit).
+                self.log(&format!(
+                    "session {}: reaper wait returned {waited:?}; no exit was recorded",
+                    self.id
+                ));
             }
         }));
         if result.is_err() {
@@ -470,20 +677,26 @@ impl Session {
         }
     }
 
-    /// The process is gone. Record its code, then run the same teardown `kill` runs after its
-    /// job-termination step: close the console on a helper thread so the pending read returns.
+    /// The process is gone. Record its code, then run the one teardown `kill` runs too: close the console
+    /// on a helper so the pending read returns, wait for the reader's last bytes, publish.
     fn on_process_exit(&self) {
         let mut code = 0u32;
         // SAFETY: the process handle is owned by the session and open for query.
-        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+        let recorded = match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
             Ok(()) if code as i32 != STILL_ACTIVE => {
                 self.set_exit_code(code as i32);
-                self.log(&format!(
-                    "session {}: exited with code {}",
-                    self.id, code as i32
-                ));
+                Some(code as i32)
             }
-            Ok(()) => return,
+            Ok(()) => {
+                // The wait was signalled, so the process is gone; a `STILL_ACTIVE` here would make a
+                // silent return a session that never publishes (nit: the two silent reaper returns).
+                self.log(&format!(
+                    "session {}: the reaper's wait was signalled but GetExitCodeProcess still reports \
+                     STILL_ACTIVE; no exit code was recorded",
+                    self.id
+                ));
+                None
+            }
             Err(error) => {
                 // Leave `exit_code` as None: a fake 0 would archive a crash as a clean exit.
                 self.log(&format!(
@@ -491,18 +704,52 @@ impl Session {
                     self.id,
                     error.message()
                 ));
+                None
             }
+        };
+        self.finish_exit(CONSOLE_CLOSE_DEADLINE);
+        // `log` reaches an arbitrary Python callback, so it runs after the record went out and cannot
+        // delay the death (nit 3).
+        if let Some(code) = recorded {
+            self.log(&format!("session {}: exited with code {code}", self.id));
         }
-        if !self.close_console(CONSOLE_CLOSE_DEADLINE) {
-            // The close deadline passed: the hub learns of the death without waiting for the read.
+    }
+
+    /// The one exit teardown, shared by `kill` and the reaper (B1): close the console, wait for the
+    /// reader's end of output inside `budget`, then publish the death; on the deadline publish anyway, so
+    /// a wedged close costs the last bytes, never the record (§12.7).
+    fn finish_exit(&self, budget: Duration) {
+        let end = Instant::now() + budget;
+        // `close_console` already logged the reason when it could not even start or wait for a close.
+        let closed = self.close_console(end.saturating_duration_since(Instant::now()));
+        if !closed {
+            self.log(&format!(
+                "session {}: publishing the death on the console-close deadline ({budget:?})",
+                self.id
+            ));
             self.publish_death();
             return;
         }
-        // The close returned, so the reader's read is ending; publish here only if it is already gone.
-        // Otherwise the reader publishes the record after its last bytes (the ordering §5.3 wants).
-        if self.output_ended.load(Ordering::Acquire) {
-            self.publish_death();
+        if !self.wait_output_ended(end) {
+            self.log(&format!(
+                "session {}: the reader did not file its last bytes within {:?}; publishing on the \
+                 deadline",
+                self.id, budget
+            ));
         }
+        self.publish_death();
+    }
+
+    /// Blocks up to `end` for the reader to file its last byte. Polling is enough: the flag is set once,
+    /// and the wait is bounded by the exit budget.
+    fn wait_output_ended(&self, end: Instant) -> bool {
+        while !self.output_ended.load(Ordering::Acquire) {
+            if Instant::now() >= end {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
     }
 
     /// Append one read to the bounded buffer, count it and wake the ticker.
@@ -551,10 +798,20 @@ impl Session {
 
     /// Records the exit code; the first caller wins, so `kill`, the reaper and the reader all observe the
     /// same code. The death record itself is published separately (see `publish_death`).
+    ///
+    /// A code learned *after* the death record went out — a crashed session the hub already drained, then
+    /// `kill`, or a late `GetExitCodeProcess` in `on_output_closed` — must reach the hub, whose only
+    /// exit-code source is the drain record (§5.3): the winner marks the session dirty and pending so the
+    /// next drain carries it (SF3).
     fn set_exit_code(&self, code: i32) {
-        let _ = self
+        if self
             .exit_code
-            .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed);
+            .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.dirty.store(true, Ordering::Release);
+            self.tick.pending.store(true, Ordering::Release);
+        }
     }
 
     /// Publishes the death record: `alive = false`, one dirty record and an urgent wakeup (§5.3). Called
@@ -565,8 +822,15 @@ impl Session {
             self.tick.urgent.store(true, Ordering::Release);
             // Nothing can reach a dead process: closing the queue ends its writer thread, so the
             // session's last `Arc` is released instead of being held by a thread parked on a condvar
-            // (B1: the replaced session must release its handles, not leak a writer).
-            self.writer.close();
+            // (B1: the replaced session must release its handles, not leak a writer). The count is
+            // logged: input typed just before the exit used to vanish silently (nit 4).
+            let dropped = self.writer.close();
+            if dropped > 0 {
+                self.log(&format!(
+                    "session {}: {} queued input bytes dropped at the exit",
+                    self.id, dropped
+                ));
+            }
         }
     }
 
@@ -575,11 +839,9 @@ impl Session {
         self.panics.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Marks the session crashed. The thread bodies call it when their own body panics; the tests call it
-    /// to reproduce "marked dead, tree still alive" without panicking a real thread (should-fix 2:
-    /// `kill` must still terminate the tree).
-    #[doc(hidden)]
-    pub fn mark_crashed(&self, reason: &str) {
+    /// Marks the session crashed; the thread bodies call it when their own body panics. Always compiled:
+    /// a panic must work in a release build.
+    fn mark_crashed(&self, reason: &str) {
         self.crashed.store(true, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         self.tick.urgent.store(true, Ordering::Release);
@@ -590,24 +852,70 @@ impl Session {
         self.close_console(CONSOLE_CLOSE_DEADLINE);
     }
 
+    /// The tests' way into `mark_crashed`: "marked dead, tree still alive" without panicking a real
+    /// thread (should-fix 2: `kill` must still terminate the tree). A test hook, not a contract —
+    /// compiled out unless the tests ask for it, so it cannot become part of the artifact's surface.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn mark_crashed_for_test(&self, reason: &str) {
+        self.mark_crashed(reason);
+    }
+
     /// Takes the pseudoconsole and closes it on a helper thread, waiting at most `deadline` (§12.7:
     /// closing a pseudoconsole with a pending read is a known hang, so the reader never does it).
+    ///
+    /// `true` means the console **is** closed — by this call when it took the handle, or by a peer whose
+    /// `Closing` slot it waited out (B1). `false` means the close was still pending at the deadline, or
+    /// the slot lock itself was busy, or no helper could start; the caller's deadline path publishes
+    /// anyway. The slot lock is taken with the same deadline, so no call here can block unbounded (SF1).
     fn close_console(&self, deadline: Duration) -> bool {
-        let console = match self.resources.console.lock() {
-            Ok(mut slot) => slot.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(console) = console else {
-            return true;
-        };
-        let closed = close_console_off_thread(console, deadline);
-        if !closed {
-            self.log(&format!(
-                "session {}: pseudoconsole close still pending after {:?}",
-                self.id, deadline
-            ));
+        let end = Instant::now() + deadline;
+        match self.resources.console.begin_close(deadline) {
+            Err(progress) => {
+                self.log(&format!(
+                    "session {}: console slot busy ({progress:?}); treating the close as pending",
+                    self.id
+                ));
+                false
+            }
+            Ok(None) => {
+                // A peer is closing it (or it is already closed): wait for that completion, which is the
+                // difference B1 is about.
+                self.resources
+                    .console
+                    .wait_closed(end.saturating_duration_since(Instant::now()))
+            }
+            Ok(Some(console)) => {
+                let progress = close_console_off_thread(
+                    console,
+                    end.saturating_duration_since(Instant::now()),
+                    &self.resources.console,
+                );
+                match progress {
+                    CloseProgress::Closed => true,
+                    CloseProgress::Pending => {
+                        self.log(&format!(
+                            "session {}: pseudoconsole close still pending after {:?}",
+                            self.id, deadline
+                        ));
+                        false
+                    }
+                    CloseProgress::Busy => false,
+                    CloseProgress::NoHelper => {
+                        // Closing on this thread would run `ClosePseudoConsole` where a read may be
+                        // pending — the reader thread, when the reader is the caller (nit 2). The handle
+                        // is leaked and the slot stays `Closing`; every later caller waits out its own
+                        // deadline and publishes on it.
+                        self.log(&format!(
+                            "session {}: no close helper could start; the pseudoconsole handle is leaked \
+                             and the reader stays blocked",
+                            self.id
+                        ));
+                        false
+                    }
+                }
+            }
         }
-        closed
     }
 
     /// Queues one write as a whole or not at all (SF4, §5.2): empty text returns 0 with nothing queued, a
@@ -617,33 +925,83 @@ impl Session {
     }
 
     /// `ResizePseudoConsole`. The core never propagates a size (that is hub policy); it only applies it.
-    pub fn resize(&self, cols: u16, rows: u16, deadline: Duration) -> Result<(u16, u16), String> {
-        let console = match lock_deadline(&self.resources.console, deadline) {
-            Some(slot) => slot,
-            None => return Err(format!("session {}: resize missed its deadline", self.id)),
+    ///
+    /// The slot lock stays held across the call on purpose: releasing it first would let a concurrent
+    /// close take the HPCON out and leave this call resizing a closed value. A resize that stalls inside
+    /// the FFI call can therefore hold the slot — and that is harmless, because nothing waits on that
+    /// slot without a deadline: `close_console` takes it with the close deadline and reports "busy", the
+    /// reaper and `kill` publish on their close deadline, and `kill_all`'s joins are bounded by each
+    /// `kill`'s budget (`held_console_slot_does_not_stop_the_death_record`).
+    pub fn resize(&self, cols: u16, rows: u16, deadline: Duration) -> Result<(u16, u16), ResizeError> {
+        let console = match lock_deadline(&self.resources.console.state, deadline) {
+            Some(state) => state,
+            None => {
+                return Err(ResizeError::Deadline(format!(
+                    "session {}: resize missed its deadline",
+                    self.id
+                )))
+            }
         };
-        let Some(console) = console.as_ref() else {
-            return Err(format!("session {}: pseudoconsole is closed", self.id));
+        let console = match &*console {
+            ConsoleState::Open(console) => console,
+            // A dead session's resize is a refused call, not an internal failure (nit 5, §5.1).
+            ConsoleState::Closing | ConsoleState::Closed => {
+                return Err(ResizeError::Closed(format!(
+                    "session {}: the pseudoconsole is closed, so it cannot be resized",
+                    self.id
+                )))
+            }
         };
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::hold_resize_slot();
         let size = COORD {
             X: cols as i16,
             Y: rows as i16,
         };
-        // SAFETY: the HPCON is owned and still open (the Option is None once closed).
-        unsafe { ResizePseudoConsole(console.get(), size) }
-            .map_err(|error| format!("ResizePseudoConsole: {}", error.message()))?;
+        // SAFETY: the HPCON is owned and still open: the slot lock is held, so no close can take it out.
+        if let Err(error) = unsafe { ResizePseudoConsole(console.get(), size) } {
+            return Err(ResizeError::Failed(format!(
+                "ResizePseudoConsole: {}",
+                error.message()
+            )));
+        }
         self.cols.store(cols as u32, Ordering::Relaxed);
         self.rows.store(rows as u32, Ordering::Relaxed);
         Ok((cols, rows))
     }
 
-    /// Terminates the session's tree and waits up to `budget` for the exit and the console close. The
-    /// tree is always terminated, even when the session is already marked dead: a reader panic leaves the
-    /// CLI running (should-fix 2), and `TerminateJobObject` is idempotent. Only the wait is skipped when
-    /// the exit is already confirmed. `budget` bounds the whole call; a close helper that outlives it
-    /// keeps running on its own thread (should-fix 3).
+    /// Reads and records the exit code when the process has already exited. `true` when a code is known
+    /// (already recorded, or read now).
+    ///
+    /// Read *before* `TerminateJobObject`: a process that has exited but is still terminating can have
+    /// its exit code replaced by the job's termination code (1), so a `kill` that arrives in that window
+    /// would otherwise record 1 for a child that exited with its own code (measured: `cmd /c "exit 3"`
+    /// reports 1 when the job is terminated inside that window).
+    fn record_exit_code_if_exited(&self) -> bool {
+        if self.exit_code().is_some() {
+            return true;
+        }
+        let mut code = 0u32;
+        // SAFETY: the process handle is owned by the session and open for query.
+        match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
+            Ok(()) if code as i32 != STILL_ACTIVE => {
+                self.set_exit_code(code as i32);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Terminates the session's tree and waits up to `budget` for the exit, then runs the one exit
+    /// teardown (`finish_exit`): the tree is always terminated, even when the session is already marked
+    /// dead, because a reader panic leaves the CLI running (should-fix 2) and `TerminateJobObject` is
+    /// idempotent. `budget` bounds the whole call; a close helper that outlives it keeps running on its
+    /// own thread (should-fix 3), and the death is published on the deadline instead of being lost (B1).
     pub fn kill(&self, budget: Duration) -> Result<Option<i32>, String> {
         let end = Instant::now() + budget;
+        // The code of a process that has already exited must be read before the job is terminated, or
+        // the termination can overwrite it (see `record_exit_code_if_exited`).
+        self.record_exit_code_if_exited();
         let mut method = "TerminateJobObject";
         let result = if self.resources.job_assigned {
             self.resources.job.terminate(1)
@@ -660,12 +1018,15 @@ impl Session {
             job_tree::terminate_tree(self.pid);
         }
 
+        let mut announcement = None;
         if self.exit_code().is_none() {
-            // SAFETY: the process handle is owned by the session.
+            // SAFETY: the process handle is owned by the session. The timeout is clamped below
+            // `INFINITE`, because `grace_ms` comes from Python and `u32::MAX` would mean "wait forever"
+            // (nit 6).
             unsafe {
                 WaitForSingleObject(
                     self.resources.process.get(),
-                    end.saturating_duration_since(Instant::now()).as_millis() as u32,
+                    wait_timeout(end.saturating_duration_since(Instant::now())),
                 );
             }
             let mut code = 0u32;
@@ -673,7 +1034,7 @@ impl Session {
             match unsafe { GetExitCodeProcess(self.resources.process.get(), &mut code) } {
                 Ok(()) if code as i32 != STILL_ACTIVE => {
                     self.set_exit_code(code as i32);
-                    self.log(&format!(
+                    announcement = Some(format!(
                         "session {}: killed pid {} ({}), exit code {}",
                         self.id,
                         self.pid,
@@ -691,24 +1052,29 @@ impl Session {
             }
         }
 
-        let remaining = end.saturating_duration_since(Instant::now());
-        self.close_console(remaining.min(CONSOLE_CLOSE_DEADLINE));
         if self.exit_code().is_some() {
-            // The exit is confirmed: the death record may go out, after the console was asked to close so
-            // the reader can file its last bytes (§5.3).
-            self.publish_death();
+            // The exit is confirmed: hand the rest of the budget to the teardown `kill` and the reaper
+            // share, so the record comes after the reader's last bytes (B1) or on the deadline.
+            let remaining = end.saturating_duration_since(Instant::now());
+            self.finish_exit(remaining.min(CONSOLE_CLOSE_DEADLINE));
         } else {
+            // The process outlived its budget. No close is attempted here: the job was already
+            // terminated, so the reaper owns the death and its teardown (§5.3).
             self.log(&format!(
                 "session {}: pid {} did not exit within {:?} after {}",
                 self.id, self.pid, budget, method
             ));
+        }
+        if let Some(line) = announcement {
+            self.log(&line);
         }
         Ok(self.exit_code())
     }
 
     /// Last `max_bytes` of the bounded raw buffer. On a missed deadline the previous reply is returned
     /// and the session is marked `degraded`, which is itself a dirty flag so the hub's next drain sees
-    /// it without waiting for more output.
+    /// it without waiting for more output. A call that gets its lock again clears `degraded`, so one
+    /// deadline miss cannot pin the flag on the session for its lifetime (nit 7).
     pub fn raw_tail(&self, max_bytes: usize, deadline: Duration) -> Vec<u8> {
         let taken = match lock_deadline(&self.buffer, deadline) {
             Some(buffer) => {
@@ -718,6 +1084,7 @@ impl Session {
                 if let Ok(mut last) = self.last_tail.lock() {
                     *last = bytes.clone();
                 }
+                self.degraded.store(false, Ordering::Release);
                 Some(bytes)
             }
             None => None,
@@ -820,7 +1187,7 @@ mod tests {
         assert_eq!(queue.push(b"", Duration::from_millis(5)), Ok(0));
         assert_eq!(queue.push(b"abc", Duration::from_millis(5)), Ok(3));
         assert_eq!(queue.pending(), 3);
-        // A text bigger than the cap can never fit: it is refused as a whole, not split.
+        // A text bigger than the cap while the queue holds bytes is refused as a whole, not split.
         assert_eq!(
             queue.push(&[b'x'; 32], Duration::from_millis(20)),
             Err(WriteError::Timeout)
@@ -831,6 +1198,40 @@ mod tests {
         assert_eq!(popped, b"abc");
         queue.complete(popped.len());
         assert_eq!(queue.push(&[b'y'; 16], Duration::from_millis(5)), Ok(16));
+    }
+
+    /// SF2: the cap bounds what waits in the queue, not what one call may hand it — a single call larger
+    /// than the cap is accepted whole when nothing is queued (the hub sends one frame per call, and a
+    /// paste larger than the cap used to be a permanent `Timeout`). A second one, while the first is
+    /// still queued, times out with nothing queued.
+    #[test]
+    fn an_oversize_write_is_accepted_on_an_empty_queue() {
+        let queue = WriteQueue::new(16);
+        let oversize = vec![b'z'; 2 * 1024 * 1024];
+        assert_eq!(
+            queue.push(&oversize, Duration::from_millis(5)),
+            Ok(oversize.len())
+        );
+        assert_eq!(queue.pending(), oversize.len());
+        // The writer has taken the chunk but not completed it (WriteFile is blocked): still not empty.
+        let popped = queue.pop().expect("the queued chunk");
+        assert_eq!(popped.len(), oversize.len());
+        let started = Instant::now();
+        assert_eq!(
+            queue.push(&oversize, Duration::from_millis(30)),
+            Err(WriteError::Timeout)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "the oversized push returned before its deadline"
+        );
+        // Once the chunk is in the pipe, the next oversized call fits again.
+        queue.complete(popped.len());
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(
+            queue.push(&oversize, Duration::from_millis(5)),
+            Ok(oversize.len())
+        );
     }
 
     #[test]
