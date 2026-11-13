@@ -13,7 +13,10 @@ from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES,
                              parse_codex_approval_prompt, resolve_session_approval,
                              bypass_launch_flags, normalize_auto_approval_rules,
                              apply_approval_flags, resolve_session_approval_fields,
-                             AUTO_ON_NOTE, AUTO_UNSUPPORTED_NOTE, CLAUDE_AUTO_SETTINGS_NAME)
+                             AUTO_ON_NOTE, AUTO_UNSUPPORTED_NOTE, CLAUDE_AUTO_SETTINGS_NAME,
+                             CLIPPED_COMMAND_NOTE, screen_command_clipped, tool_call_for_approval_box,
+                             OMP_APPROVAL_EXTENSION_NAME, OMP_APPROVAL_LOG_ENV, UNREAD_OMP_BOX_NOTE,
+                             omp_approval_request_id)
 from test_native_records import FakePty
 
 MODAL = '''Field 1/1
@@ -437,6 +440,272 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
                 result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "bypass_approvals": False, "wait_seconds": 0})
                 data = result.data if result.data is not None else json.loads(result.content[0].text)
                 self.assertEqual(data["approval"]["approval_source"], "session")
+
+
+# A real cut-off delete of 2026-11-13 (docs/omp-approval-prompts-handoff.md): the box shows the start of
+# the command, the transcript's tool call has all of it.
+FULL_DELETE = ("cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.py ../scratch/bitetest/ "
+               "&& cp -r tools ../scratch/bitetest/ && cd ../scratch/bitetest && py -3.15 -B -m unittest "
+               "test_terminal_fixtures 2>&1 | tail -5")
+
+
+def omp_box(*command_rows, reason="Prompt required by bash pattern: * rm -r*"):
+    rows = [f"│ Reason: {reason}"] + [f"│ {row}" for row in command_rows] + ["│ ❯ Approve", "│   Deny"]
+    return "\n".join(["Working...", "╭─ Allow tool: bash ─────────────╮", *rows, "╰─────────────────────────────────╯"])
+
+
+class _OmpSessionCase(unittest.IsolatedAsyncioTestCase):
+    """A live omp session whose screen is self.screen and whose open tool calls are set by hand."""
+
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().set_debug(False)
+        self.temp = tempfile.TemporaryDirectory(prefix="hub-omp-box-")
+        self.root = Path(self.temp.name)
+        profiles = self.root / "profiles.json"
+        profiles.write_text('{"profiles":{}}', encoding="utf-8")
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        await self.hub.start()
+        self.sess = AgentSession("omp-box", "omp", "OMP", "tui", "Test", str(self.root), "unused", [])
+        self.sess.engine = "omp"
+        self.sess.status = "running"
+        self.sess.pty = FakePty()
+        self.sess._loop = asyncio.get_running_loop()
+        self.screen = omp_box("Command: cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.p…")
+        self.sess.get_clean_screen_text = lambda **kw: self.screen
+        self.hub.sessions[self.sess.session_id] = self.sess
+
+    async def asyncTearDown(self):
+        await self.hub.archive_all_sessions_on_shutdown()
+        self.temp.cleanup()
+
+    def open_call(self, call_id, command, tool="bash"):
+        record = {"tool_name": tool, "command": command, "args": {"command": command}, "call_id": call_id}
+        self.sess._open_transcript_tools[call_id] = record
+        self.sess._inflight_transcript_tool = record
+        return record
+
+    def approval_events(self):
+        return [e for e in self.hub.get_worker_events(self.sess.session_id, 0) if e["type"] == "approval_request"]
+
+
+class OmpApprovalBoxTests(_OmpSessionCase):
+    """An omp approval box always reaches the parent with the full command, or says it is cut."""
+
+    async def test_the_full_command_comes_from_the_transcript(self):
+        self.open_call("c1", FULL_DELETE)
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        meta = pending["metadata"]
+        self.assertEqual(meta["command"], FULL_DELETE)
+        self.assertEqual(meta["command_source"], "transcript")
+        self.assertFalse(meta["command_truncated"])
+        self.assertEqual(meta["call_id"], "c1")
+        self.assertIn(f"Command: {FULL_DELETE}", pending["prompt"])
+        self.assertIn("Reason: Prompt required by bash pattern: * rm -r*", pending["prompt"])
+        self.assertNotIn("…", pending["prompt"])  # the box's cut copy is not repeated
+
+    async def test_a_call_read_after_the_box_is_still_used(self):
+        async def late():
+            await asyncio.sleep(0.2)
+            self.open_call("c1", FULL_DELETE)
+        task = asyncio.ensure_future(late())
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        await task
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+        self.assertEqual(pending["metadata"]["command_source"], "transcript")
+
+    async def test_side_by_side_calls_pair_by_command(self):
+        self.open_call("c1", FULL_DELETE)
+        self.open_call("c2", "cd wt && git status --short")
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["metadata"]["call_id"], "c1")
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+
+    async def test_a_cut_command_without_its_call_says_so(self):
+        self.open_call("c9", "cd elsewhere && rm -rf build")  # another command: never borrowed
+        with patch("session_manager.OMP_BOX_CALL_WAIT_SEC", 0.1):
+            pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        meta = pending["metadata"]
+        self.assertEqual(meta["command_source"], "screen")
+        self.assertTrue(meta["command_truncated"])
+        self.assertTrue(meta["command"].endswith("…"))
+        self.assertIsNone(meta["call_id"])
+        self.assertIn(CLIPPED_COMMAND_NOTE, pending["prompt"])
+        event = next(e for e in self.hub.get_worker_events(self.sess.session_id, 0) if e["type"] == "approval_request")
+        self.assertIn(CLIPPED_COMMAND_NOTE, event["content"])
+        info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
+        result = await self.hub.wait_inbox.wait(info["wait_handle"], 1)
+        self.assertEqual(result["state"], "ask")
+        self.assertIn(CLIPPED_COMMAND_NOTE, json.dumps(result["requests"][0], ensure_ascii=False))
+
+    async def test_a_whole_short_command_needs_no_transcript(self):
+        self.screen = omp_box("Command: rm -rf scratch/x")
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["metadata"]["command"], "rm -rf scratch/x")
+        self.assertEqual(pending["metadata"]["command_source"], "screen")
+        self.assertFalse(pending["metadata"]["command_truncated"])
+        self.assertNotIn(CLIPPED_COMMAND_NOTE, pending["prompt"])
+
+
+class OmpApprovalEventTests(_OmpSessionCase):
+    """omp's own approval events (engine_policies/omp_approval_event_log.ts) open and close a box."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.log_path = self.hub._omp_approval_log_path(self.sess)
+        self.env = {}
+        self.hub._prime_omp_approval_log(self.sess, self.env)
+
+    def log(self, *records):
+        with open(self.log_path, "a", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record) + "\n")
+
+    @staticmethod
+    def requested(call_id, reason="Prompt required by bash pattern: rm -r*"):
+        return {"event": "tool_approval_requested", "call_id": call_id, "tool_name": "bash",
+                "reason": reason, "approval_mode": "write"}
+
+    @staticmethod
+    def resolved(call_id, approved=True):
+        return {"event": "tool_approval_resolved", "call_id": call_id, "tool_name": "bash", "approved": approved}
+
+    def test_the_session_points_omp_at_its_log(self):
+        self.assertEqual(self.env[OMP_APPROVAL_LOG_ENV], str(self.log_path))
+
+    async def test_a_request_registers_its_box_with_the_full_command(self):
+        self.open_call("c1", FULL_DELETE)
+        self.log({"event": "extension_loaded"}, self.requested("c1"))
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["request_id"], omp_approval_request_id("c1"))
+        self.assertEqual(pending["source"], "omp_approval_event")
+        meta = pending["metadata"]
+        self.assertEqual((meta["call_id"], meta["command"], meta["command_source"]), ("c1", FULL_DELETE, "transcript"))
+        self.assertEqual(meta["omp_options"], ["Approve", "Deny"])  # read off the box, for the answer keys
+        self.assertEqual(meta["detected_by"], "omp_event")
+        self.assertIn(f"Command: {FULL_DELETE}", pending["prompt"])
+        await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(len(self.approval_events()), 1)
+
+    async def test_a_box_that_cannot_be_read_still_asks(self):
+        self.screen = "Working...\n(omp drew a box this hub cannot read)"
+        self.open_call("c1", FULL_DELETE)
+        self.log(self.requested("c1"))
+        with patch("session_manager.OMP_EVENT_BOX_WAIT_SEC", 0.1):
+            pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["options"], ["Approve", "Deny"])
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+        self.assertEqual(pending["metadata"]["omp_options"], [])
+
+    async def test_a_request_without_box_or_call_says_so(self):
+        self.screen = "Working..."
+        self.log(self.requested("c1"))
+        with patch("session_manager.OMP_EVENT_BOX_WAIT_SEC", 0.1):
+            pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["metadata"]["command_source"], "none")
+        self.assertIn("Reason: Prompt required by bash pattern: rm -r*", pending["prompt"])
+        self.assertIn(UNREAD_OMP_BOX_NOTE, pending["prompt"])
+
+    async def test_the_resolution_clears_the_request(self):
+        self.open_call("c1", FULL_DELETE)
+        self.log(self.requested("c1"))
+        self.assertIsNotNone(await self.hub.poll_tui_screen_interactions_once(self.sess))
+        self.log(self.resolved("c1"))
+        self.screen = "Working..."
+        self.assertIsNone(await self.hub.poll_tui_screen_interactions_once(self.sess))
+        self.assertIsNone(self.sess.pending_interaction)
+
+    async def test_a_box_answered_before_it_was_read_is_not_asked(self):
+        self.open_call("c1", FULL_DELETE)
+        self.log(self.requested("c1"), self.resolved("c1"))
+        self.assertIsNone(await self.hub.poll_tui_screen_interactions_once(self.sess))
+        self.assertEqual(self.approval_events(), [])
+
+    async def test_side_by_side_requests_ask_one_at_a_time(self):
+        self.open_call("c1", FULL_DELETE)
+        self.open_call("c2", "rm -r scratch/other")
+        self.log(self.requested("c1"), self.requested("c2"))
+        first = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(first["metadata"]["call_id"], "c1")
+        self.assertEqual(await self.hub.poll_tui_screen_interactions_once(self.sess), first)
+        self.log(self.resolved("c1"))
+        self.screen = omp_box("Command: rm -r scratch/other")
+        second = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual((second["metadata"]["call_id"], second["metadata"]["command"]), ("c2", "rm -r scratch/other"))
+        self.assertEqual(len(self.approval_events()), 2)
+
+    async def test_the_screen_stands_in_when_the_events_stop(self):
+        self.open_call("c1", FULL_DELETE)
+        self.log({"event": "extension_loaded"})
+        with patch("session_manager.OMP_SCREEN_FALLBACK_GRACE_SEC", 0.2):
+            self.assertIsNone(await self.hub.poll_tui_screen_interactions_once(self.sess))
+            await asyncio.sleep(0.25)
+            pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["source"], "omp_tui_screen_detector")
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+
+    async def test_old_records_are_not_asked_again(self):
+        self.open_call("c1", FULL_DELETE)
+        self.log(self.requested("c1"))
+        self.hub._prime_omp_approval_log(self.sess, {})  # the session is resumed
+        self.screen = "Working..."
+        self.assertIsNone(await self.hub.poll_tui_screen_interactions_once(self.sess))
+
+    async def test_a_box_the_screen_registered_first_is_adopted(self):
+        self.open_call("c1", FULL_DELETE)
+        by_screen = await self.hub.poll_tui_screen_interactions_once(self.sess)  # no events read yet
+        self.log({"event": "extension_loaded"}, self.requested("c1"))
+        adopted = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertIs(adopted, by_screen)
+        self.assertEqual(adopted["request_id"], omp_approval_request_id("c1"))
+        self.assertEqual(len(self.approval_events()), 1)
+
+
+class OmpApprovalExtensionTests(unittest.TestCase):
+    EXTENSION = Path(__file__).parent / "engine_policies" / OMP_APPROVAL_EXTENSION_NAME
+
+    def test_omp_loads_the_extension_once(self):
+        stale = f"--extension=C:/old/{OMP_APPROVAL_EXTENSION_NAME}"
+        args = apply_approval_flags("omp", [stale, "--model=x"], mode="ask")
+        self.assertEqual([a for a in args if a.startswith("--extension=")], [f"--extension={self.EXTENSION.resolve()}"])
+        self.assertIn("--model=x", args)
+        self.assertFalse(any("--extension" in a for a in apply_approval_flags("omp", [stale], mode="bypass")))
+
+    def test_the_extension_only_observes(self):
+        # A tool_call handler that throws blocks the call; the extension registers none.
+        text = self.EXTENSION.read_text(encoding="utf-8")
+        self.assertNotIn('"tool_call"', text)
+        for event in ("tool_approval_requested", "tool_approval_resolved"):
+            self.assertIn(f'api.on("{event}"', text)
+        self.assertIn(OMP_APPROVAL_LOG_ENV, text)
+
+    def test_the_portable_build_ships_the_extension(self):
+        payload = (Path(__file__).parent / "desktop/portable/payload.txt").read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"engine_policies/{OMP_APPROVAL_EXTENSION_NAME}", payload)
+
+
+class ApprovalBoxMatchingTests(unittest.TestCase):
+    def call(self, command, tool="bash", call_id="c"):
+        return {"tool_name": tool, "command": command, "call_id": call_id}
+
+    def test_box_prefix_matches_across_wraps_and_elisions(self):
+        full = self.call("cat > a.py <<'PY'\nprint('x')\nPY\npy -3 a.py && rm -rf build")
+        self.assertIs(tool_call_for_approval_box("bash", "cat > a.py <<'PY' print('x') PY py -3 a.…", [full]), full)
+        self.assertIs(tool_call_for_approval_box("bash", "cat > a.py <<'PY' pr[…40ch elided…]", [full]), full)
+        self.assertIsNone(tool_call_for_approval_box("bash", "cat > b.py…", [full]))
+        self.assertIsNone(tool_call_for_approval_box("edit", "cat > a.py…", [full]))
+
+    def test_unclear_boxes_match_nothing(self):
+        a, b = self.call("cd wt && rm -rf x", call_id="a"), self.call("cd wt && rm -rf y", call_id="b")
+        self.assertIsNone(tool_call_for_approval_box("bash", "cd wt && rm -rf …", [a, b]))
+        self.assertIs(tool_call_for_approval_box("bash", "cd wt && rm -rf y", [a, b]), b)
+        edit = self.call("src/x.py", tool="edit")
+        self.assertIs(tool_call_for_approval_box("edit", "", [a, edit]), edit)
+
+    def test_clipped_detection(self):
+        self.assertTrue(screen_command_clipped("rm -rf scratch/bi…"))
+        self.assertTrue(screen_command_clipped("cat x […120ch elided…]"))
+        self.assertFalse(screen_command_clipped("rm -rf scratch/bitetest"))
 
 
 if __name__ == "__main__":

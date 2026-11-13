@@ -181,9 +181,25 @@ bash:
       approval: prompt
     - match: "* diskpart*"
       approval: prompt
-    - match: "shutdown*"
+    # shutdown: omp's built-in critical rule already asks when "shutdown" (or poweroff / reboot /
+    # halt) stands as a word of its own in the whole command text: at the start or after a space,
+    # ; & | or "(", and followed by a space, ; & | or the end. The rules below add what it misses:
+    # the .exe name and the quoted argument of a shell wrapper (rules also see each simple command
+    # with its quotes removed, so bash -c "shutdown now" is tested as bash -c shutdown now).
+    # Do not add "* shutdown*" back: it matched prose (grep patterns, heredoc bodies, .shutdown()).
+    - match: "*shutdown.exe*"
       approval: prompt
-    - match: "* shutdown*"
+    - match: "* -c shutdown*"
+      approval: prompt
+    - match: "* -lc shutdown*"
+      approval: prompt
+    - match: "* -Command shutdown*"
+      approval: prompt
+    - match: "* -command shutdown*"
+      approval: prompt
+    - match: "* /c shutdown*"
+      approval: prompt
+    - match: "* /C shutdown*"
       approval: prompt
     - match: "*Restart-Computer*"
       approval: prompt
