@@ -13,7 +13,8 @@ from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES,
                              parse_codex_approval_prompt, resolve_session_approval,
                              bypass_launch_flags, normalize_auto_approval_rules,
                              apply_approval_flags, resolve_session_approval_fields,
-                             AUTO_ON_NOTE, AUTO_UNSUPPORTED_NOTE, CLAUDE_AUTO_SETTINGS_NAME)
+                             AUTO_ON_NOTE, AUTO_UNSUPPORTED_NOTE, CLAUDE_AUTO_SETTINGS_NAME,
+                             CLIPPED_COMMAND_NOTE, screen_command_clipped, tool_call_for_approval_box)
 from test_native_records import FakePty
 
 MODAL = '''Field 1/1
@@ -437,6 +438,128 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
                 result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "bypass_approvals": False, "wait_seconds": 0})
                 data = result.data if result.data is not None else json.loads(result.content[0].text)
                 self.assertEqual(data["approval"]["approval_source"], "session")
+
+
+# A real cut-off delete of 2026-11-13 (docs/omp-approval-prompts-handoff.md): the box shows the start of
+# the command, the transcript's tool call has all of it.
+FULL_DELETE = ("cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.py ../scratch/bitetest/ "
+               "&& cp -r tools ../scratch/bitetest/ && cd ../scratch/bitetest && py -3.15 -B -m unittest "
+               "test_terminal_fixtures 2>&1 | tail -5")
+
+
+def omp_box(*command_rows, reason="Prompt required by bash pattern: * rm -r*"):
+    rows = [f"│ Reason: {reason}"] + [f"│ {row}" for row in command_rows] + ["│ ❯ Approve", "│   Deny"]
+    return "\n".join(["Working...", "╭─ Allow tool: bash ─────────────╮", *rows, "╰─────────────────────────────────╯"])
+
+
+class OmpApprovalBoxTests(unittest.IsolatedAsyncioTestCase):
+    """An omp approval box always reaches the parent with the full command, or says it is cut."""
+
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().set_debug(False)
+        self.temp = tempfile.TemporaryDirectory(prefix="hub-omp-box-")
+        self.root = Path(self.temp.name)
+        profiles = self.root / "profiles.json"
+        profiles.write_text('{"profiles":{}}', encoding="utf-8")
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        await self.hub.start()
+        self.sess = AgentSession("omp-box", "omp", "OMP", "tui", "Test", str(self.root), "unused", [])
+        self.sess.engine = "omp"
+        self.sess.status = "running"
+        self.sess.pty = FakePty()
+        self.sess._loop = asyncio.get_running_loop()
+        self.screen = omp_box("Command: cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.p…")
+        self.sess.get_clean_screen_text = lambda **kw: self.screen
+        self.hub.sessions[self.sess.session_id] = self.sess
+
+    async def asyncTearDown(self):
+        await self.hub.archive_all_sessions_on_shutdown()
+        self.temp.cleanup()
+
+    def open_call(self, call_id, command, tool="bash"):
+        record = {"tool_name": tool, "command": command, "args": {"command": command}, "call_id": call_id}
+        self.sess._open_transcript_tools[call_id] = record
+        self.sess._inflight_transcript_tool = record
+        return record
+
+    async def test_the_full_command_comes_from_the_transcript(self):
+        self.open_call("c1", FULL_DELETE)
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        meta = pending["metadata"]
+        self.assertEqual(meta["command"], FULL_DELETE)
+        self.assertEqual(meta["command_source"], "transcript")
+        self.assertFalse(meta["command_truncated"])
+        self.assertEqual(meta["call_id"], "c1")
+        self.assertIn(f"Command: {FULL_DELETE}", pending["prompt"])
+        self.assertIn("Reason: Prompt required by bash pattern: * rm -r*", pending["prompt"])
+        self.assertNotIn("…", pending["prompt"])  # the box's cut copy is not repeated
+
+    async def test_a_call_read_after_the_box_is_still_used(self):
+        async def late():
+            await asyncio.sleep(0.2)
+            self.open_call("c1", FULL_DELETE)
+        task = asyncio.ensure_future(late())
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        await task
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+        self.assertEqual(pending["metadata"]["command_source"], "transcript")
+
+    async def test_side_by_side_calls_pair_by_command(self):
+        self.open_call("c1", FULL_DELETE)
+        self.open_call("c2", "cd wt && git status --short")
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["metadata"]["call_id"], "c1")
+        self.assertEqual(pending["metadata"]["command"], FULL_DELETE)
+
+    async def test_a_cut_command_without_its_call_says_so(self):
+        self.open_call("c9", "cd elsewhere && rm -rf build")  # another command: never borrowed
+        with patch("session_manager.OMP_BOX_CALL_WAIT_SEC", 0.1):
+            pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        meta = pending["metadata"]
+        self.assertEqual(meta["command_source"], "screen")
+        self.assertTrue(meta["command_truncated"])
+        self.assertTrue(meta["command"].endswith("…"))
+        self.assertIsNone(meta["call_id"])
+        self.assertIn(CLIPPED_COMMAND_NOTE, pending["prompt"])
+        event = next(e for e in self.hub.get_worker_events(self.sess.session_id, 0) if e["type"] == "approval_request")
+        self.assertIn(CLIPPED_COMMAND_NOTE, event["content"])
+        info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
+        result = await self.hub.wait_inbox.wait(info["wait_handle"], 1)
+        self.assertEqual(result["state"], "ask")
+        self.assertIn(CLIPPED_COMMAND_NOTE, json.dumps(result["requests"][0], ensure_ascii=False))
+
+    async def test_a_whole_short_command_needs_no_transcript(self):
+        self.screen = omp_box("Command: rm -rf scratch/x")
+        pending = await self.hub.poll_tui_screen_interactions_once(self.sess)
+        self.assertEqual(pending["metadata"]["command"], "rm -rf scratch/x")
+        self.assertEqual(pending["metadata"]["command_source"], "screen")
+        self.assertFalse(pending["metadata"]["command_truncated"])
+        self.assertNotIn(CLIPPED_COMMAND_NOTE, pending["prompt"])
+
+
+class ApprovalBoxMatchingTests(unittest.TestCase):
+    def call(self, command, tool="bash", call_id="c"):
+        return {"tool_name": tool, "command": command, "call_id": call_id}
+
+    def test_box_prefix_matches_across_wraps_and_elisions(self):
+        full = self.call("cat > a.py <<'PY'\nprint('x')\nPY\npy -3 a.py && rm -rf build")
+        self.assertIs(tool_call_for_approval_box("bash", "cat > a.py <<'PY' print('x') PY py -3 a.…", [full]), full)
+        self.assertIs(tool_call_for_approval_box("bash", "cat > a.py <<'PY' pr[…40ch elided…]", [full]), full)
+        self.assertIsNone(tool_call_for_approval_box("bash", "cat > b.py…", [full]))
+        self.assertIsNone(tool_call_for_approval_box("edit", "cat > a.py…", [full]))
+
+    def test_unclear_boxes_match_nothing(self):
+        a, b = self.call("cd wt && rm -rf x", call_id="a"), self.call("cd wt && rm -rf y", call_id="b")
+        self.assertIsNone(tool_call_for_approval_box("bash", "cd wt && rm -rf …", [a, b]))
+        self.assertIs(tool_call_for_approval_box("bash", "cd wt && rm -rf y", [a, b]), b)
+        edit = self.call("src/x.py", tool="edit")
+        self.assertIs(tool_call_for_approval_box("edit", "", [a, edit]), edit)
+
+    def test_clipped_detection(self):
+        self.assertTrue(screen_command_clipped("rm -rf scratch/bi…"))
+        self.assertTrue(screen_command_clipped("cat x […120ch elided…]"))
+        self.assertFalse(screen_command_clipped("rm -rf scratch/bitetest"))
 
 
 if __name__ == "__main__":

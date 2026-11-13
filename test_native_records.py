@@ -240,6 +240,54 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
     async def test_kimi_native_roundtrip(self):
         await self.exercise("kimi")
 
+    async def test_omp_cut_start_record_keeps_the_full_call(self):
+        """omp's tool_execution_start cuts string arguments to 200 chars + "…"; the tool call is whole.
+
+        Side-by-side calls are tracked by id: one call's result does not end another call's approval.
+        """
+        sess = self.session("omp", "-cut")
+        work = self.root / "omp-cut"
+        work.mkdir()
+        path = work / "native.jsonl"
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_file": str(path)}
+        full = "cd wt && rm -rf ../scratch/bitetest && " + "echo " + "y" * 300
+        other = "git status --short"
+        result = lambda call_id: {"type": "message", "message": {
+            "role": "toolResult", "toolCallId": call_id, "toolName": "bash", "content": [{"type": "text", "text": "ok"}]}}
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            self.append(
+                path,
+                {"type": "message", "message": {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": full, "i": "Clean up"}},
+                    {"type": "toolCall", "id": "c2", "name": "bash", "arguments": {"command": other}}]}},
+                {"type": "custom", "customType": "tool_execution_start",
+                 "data": {"toolName": "bash", "toolCallId": "c1", "args": {"command": full[:200] + "…"}}},
+                {"type": "custom", "customType": "tool_execution_start",
+                 "data": {"toolName": "bash", "toolCallId": "c2", "args": {"command": other}}},
+            )
+            await self.until(lambda: "c2" in sess._open_transcript_tools)
+            self.assertEqual(sess._open_transcript_tools["c1"]["command"], full)
+            self.assertEqual(sess._open_transcript_tools["c1"]["args"]["i"], "Clean up")
+            await self.hub.register_pending_interaction(
+                sess, kind="approval_request", title="OMP Tool Approval (bash)", prompt=full,
+                options=["Approve", "Deny"], source="omp_tui_screen_detector",
+                metadata={"command": full, "call_id": "c1"},
+            )
+            self.append(path, result("c2"))
+            await self.until(lambda: "c2" not in sess._open_transcript_tools)
+            self.assertIsNotNone(sess.pending_interaction)
+            self.assertEqual(sess._inflight_transcript_tool["call_id"], "c1")
+            self.append(path, result("c1"))
+            await self.until(lambda: sess.pending_interaction is None)
+            self.assertEqual(sess._open_transcript_tools, {})
+            self.assertIsNone(sess._inflight_transcript_tool)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def keep_thinking_out_of_messages(self, engine, streamed=False):
         """Thinking parts become console-only reasoning; parents and the final reply only get the text."""
         sess = self.session(engine, "-think")

@@ -1448,6 +1448,46 @@ def parse_omp_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# How long an omp approval box waits for its tool call to reach the transcript watcher before it is
+# registered with the box's own text. omp writes the call before it draws the box; the watcher reads
+# the transcript every TRANSCRIPT_TAIL_INTERVAL_SEC.
+OMP_BOX_CALL_WAIT_SEC = 1.0
+CLIPPED_COMMAND_NOTE = (
+    "The command is cut off on the worker's screen and its full text was not found in the "
+    "worker's transcript: inspect the session before approving."
+)
+
+
+def screen_command_clipped(command: str) -> bool:
+    """A command read off a TUI box that the box cut short (omp: `…` and `[…Nch elided…]`)."""
+    return "…" in str(command or "")
+
+
+def _without_whitespace(text: Any) -> str:
+    return "".join(str(text or "").split())
+
+
+def tool_call_for_approval_box(
+    tool: str, screen_command: str, calls: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """The open transcript tool call an approval box asks about, or None.
+
+    The box's command up to its first `…` must start the call's full command; whitespace is
+    ignored because the box wraps lines and the parser joins them. A box without a command (edit /
+    write boxes show `File:` rows) fits every call of its tool; a call of another tool never fits.
+    When the box fits calls with different commands, it is unclear which one asks: None.
+    """
+    prefix = _without_whitespace(str(screen_command or "").split("…", 1)[0]).removesuffix("[")
+    fits = [
+        call for call in calls
+        if not (tool and call.get("tool_name") and str(call.get("tool_name")) != tool)
+        and (not prefix or _without_whitespace(call.get("command")).startswith(prefix))
+    ]
+    if not fits or len({str(call.get("command") or "") for call in fits}) > 1:
+        return None
+    return fits[-1]
+
+
 def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
     """agy's permission prompt (`Run this command?` + numbered Yes/No options, digits act at once).
 
@@ -2149,6 +2189,8 @@ class AgentSession:
         self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
         self._prompt_quiet_until: float = 0.0
         self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
+        # omp runs tool calls side by side: every started call without a result yet, by call id.
+        self._open_transcript_tools: Dict[str, Dict[str, Any]] = {}
         self._claude_hook_offset: int = 0
         self._kimi_wire_interaction_offset: int = 0
 
@@ -8425,7 +8467,10 @@ class HubSessionManager:
                         raw_args = data.get("args")
                         cached_args = (cached_tc or {}).get("arguments")
                         if isinstance(cached_args, dict) and cached_args:
-                            targs = {**cached_args, **(raw_args if isinstance(raw_args, dict) else {})}
+                            # The start record is a display copy: omp cuts every string argument
+                            # longer than 200 characters to 200 + "…" and leaves some keys out. The
+                            # assistant message's tool call has the arguments in full, so it wins.
+                            targs = {**(raw_args if isinstance(raw_args, dict) else {}), **cached_args}
                         else:
                             targs = raw_args if raw_args is not None else {}
                         intent = str(
@@ -8452,6 +8497,8 @@ class HubSessionManager:
                             "args": targs,
                             "call_id": call_id,
                         }
+                        if call_id:
+                            session._open_transcript_tools[call_id] = session._inflight_transcript_tool
                         await self.record_telemetry(
                             session.session_id,
                             {
@@ -8504,21 +8551,30 @@ class HubSessionManager:
                             if user_txts:
                                 await self.note_native_user_prompt(session, " ".join(user_txts).strip())
                             session._inflight_transcript_tool = None
+                            session._open_transcript_tools.clear()
                             if session.pending_interaction:
                                 await self.clear_pending_interaction(session)
                             turn_has_step = False
                             if session.status == "completed":
                                 self.begin_new_turn(session, status="running")
                         elif role == "toolResult":
-                            session._inflight_transcript_tool = None
-                            if session.pending_interaction:
+                            result_call_id = str(msg.get("toolCallId") or "").strip()
+                            session._open_transcript_tools.pop(result_call_id, None)
+                            session._inflight_transcript_tool = next(
+                                reversed(session._open_transcript_tools.values()), None
+                            )
+                            pending = session.pending_interaction
+                            pending_call_id = str(((pending or {}).get("metadata") or {}).get("call_id") or "")
+                            # A side-by-side call's result does not answer the approval of another call.
+                            if pending and (not pending_call_id or not result_call_id
+                                            or pending_call_id == result_call_id):
                                 await self.clear_pending_interaction(session)
                             tr_payload: Dict[str, Any] = {
                                 "source": "omp_jsonl",
                                 "hook_event": "PostToolUse",
                                 "tool_name": msg.get("toolName"),
                                 "tool_response": content,
-                                "call_id": str(msg.get("toolCallId") or "").strip(),
+                                "call_id": result_call_id,
                             }
                             if "isError" in msg:
                                 tr_payload["tool_ok"] = not bool(msg.get("isError"))
@@ -11560,6 +11616,7 @@ class HubSessionManager:
         inflight_cmd = str(inflight.get("command") or "").strip()
         screen_cmd = str(parsed.get("command") or "").strip()
         best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
+        truncated = best_cmd != inflight_cmd and screen_command_clipped(best_cmd)
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
@@ -11569,6 +11626,8 @@ class HubSessionManager:
             lines.append(f"{what}: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
@@ -11580,24 +11639,61 @@ class HubSessionManager:
                 "agy_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
                 "command": best_cmd,
+                "command_truncated": truncated,
                 "transcript_tool": inflight.get("tool_name") if inflight else None,
             },
         )
 
+    async def _omp_tool_call_for_box(self, session: AgentSession, tool: str, screen_cmd: str) -> Optional[Dict[str, Any]]:
+        """The transcript tool call behind an omp approval box (see tool_call_for_approval_box).
+
+        omp writes the call to its transcript before it draws the box, but the box can be read
+        first; a box that shows no full command waits up to OMP_BOX_CALL_WAIT_SEC for the call.
+        """
+        deadline = time.monotonic() + OMP_BOX_CALL_WAIT_SEC
+        while True:
+            calls = list(getattr(session, "_open_transcript_tools", {}).values())
+            inflight = getattr(session, "_inflight_transcript_tool", None)
+            if not calls and inflight:
+                calls = [inflight]
+            call = tool_call_for_approval_box(tool, screen_cmd, calls)
+            if call is not None or (screen_cmd and not screen_command_clipped(screen_cmd)):
+                return call
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
+
     async def _register_omp_screen_approval(self, session: AgentSession, parsed: Dict[str, Any]):
-        """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered."""
+        """D7: omp's tool approval box; "Always Approve …" grants persist and are not offered.
+
+        omp cuts long commands on the box, so the parent gets the command from the box's tool call
+        in the transcript (command_source=transcript). Without that call the box text is used, and a
+        cut one is marked command_truncated with a note, so the parent never approves it blind.
+        """
         offered = [o for o in parsed.get("options") or [] if classify_approval_label(o) != "persist"]
-        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
-        inflight_cmd = str(inflight.get("command") or "").strip()
+        tool = str(parsed.get("tool") or "").strip()
         screen_cmd = str(parsed.get("command") or "").strip()
-        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
-        lines = [f"Allow tool: {parsed.get('tool') or inflight.get('tool_name') or '?'}"] + list(parsed.get("details") or [])
-        if best_cmd and best_cmd not in "\n".join(lines):
-            lines.append(f"Command: {best_cmd}")
+        call = await self._omp_tool_call_for_box(session, tool, screen_cmd)
+        details = list(parsed.get("details") or [])
+        full_cmd = str((call or {}).get("command") or "").strip()
+        if full_cmd:
+            command, source = full_cmd, "transcript"
+            # The box's own `Command:` rows (the last details) are the cut copy of the same text.
+            cut_at = next((i for i, row in enumerate(details) if row.startswith("Command:")), len(details))
+            details = details[:cut_at]
+        else:
+            command, source = screen_cmd, "screen"
+        truncated = source == "screen" and screen_command_clipped(command)
+        tool_label = tool or str((call or {}).get("tool_name") or "")
+        lines = [f"Allow tool: {tool_label or '?'}"] + details
+        if command and command not in "\n".join(lines):
+            lines.append(f"Command: {command}")
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
         return await self.register_pending_interaction(
             session=session,
             kind="approval_request",
-            title=f"OMP Tool Approval ({parsed.get('tool') or inflight.get('tool_name') or 'tool'})",
+            title=f"OMP Tool Approval ({tool_label or 'tool'})",
             prompt="\n".join(lines),
             options=offered,
             source="omp_tui_screen_detector",
@@ -11606,8 +11702,11 @@ class HubSessionManager:
                 "omp_options": list(parsed.get("options") or []),
                 "selected_index": int(parsed.get("selected_index") or 0),
                 "session_label": parsed.get("session_label"),
-                "command": best_cmd,
-                "transcript_tool": inflight.get("tool_name") if inflight else None,
+                "command": command,
+                "command_source": source,
+                "command_truncated": truncated,
+                "transcript_tool": (call or {}).get("tool_name"),
+                "call_id": (call or {}).get("call_id") or None,
             },
         )
 
@@ -11620,6 +11719,7 @@ class HubSessionManager:
         inflight_cmd = str(inflight.get("command") or "").strip()
         screen_cmd = str(parsed.get("command") or "").strip()
         best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
+        truncated = best_cmd != inflight_cmd and screen_command_clipped(best_cmd)
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
@@ -11627,6 +11727,8 @@ class HubSessionManager:
             lines.append(f"Command: {best_cmd}")
         if parsed.get("header"):
             lines.append(parsed["header"])
+        if truncated:
+            lines.append(CLIPPED_COMMAND_NOTE)
         persists_opt = next((o for o in offered_opts if o.get("action") == "approve_session" and o.get("persists")), None)
         has_session_opt = any(o.get("action") == "approve_session" for o in offered_opts)
         if persists_opt is not None:
@@ -11647,6 +11749,7 @@ class HubSessionManager:
                 "claude_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
                 "command": best_cmd,
+                "command_truncated": truncated,
             },
         )
 
