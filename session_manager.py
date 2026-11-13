@@ -3433,12 +3433,12 @@ class HubSessionManager:
         def _levels_for(mid: str) -> List[str]:
             d = detail_by_id.get(mid) or {}
             supported = d.get("supported_thinking_levels")
-            if supported:
-                return [str(x) for x in supported]
+            if isinstance(supported, list):
+                return [str(x) for x in supported if x]
             if eng == "omp":
                 omp_levels = d.get("omp_cli_thinking_levels")
-                if omp_levels:
-                    return [str(x) for x in omp_levels]
+                if isinstance(omp_levels, list):
+                    return [str(x) for x in omp_levels if x]
             return list(engine_levels)
 
         result: List[Dict[str, Any]] = []
@@ -3653,12 +3653,19 @@ class HubSessionManager:
         """Rebuilds the in-memory catalog and profiles from one file document and one discovery snapshot."""
         raw_engines = dict((discovery or {}).get("engines", {}) or {})
         file_profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
-        claude_prof = file_profiles.get("claude") if isinstance(file_profiles.get("claude"), dict) else None
-        if claude_prof is None:
-            for p_entry in file_profiles.values():
-                if isinstance(p_entry, dict) and str(p_entry.get("engine") or "").strip().lower() == "claude":
-                    claude_prof = p_entry
-                    break
+        named_claude = file_profiles.get("claude") if isinstance(file_profiles.get("claude"), dict) else None
+        claude_entries = [
+            p_entry
+            for p_entry in file_profiles.values()
+            if isinstance(p_entry, dict) and str(p_entry.get("engine") or "").strip().lower() == "claude"
+        ]
+        if named_claude is not None and named_claude.get("enabled", True) is not False:
+            claude_prof = named_claude
+        else:
+            claude_prof = next(
+                (p_entry for p_entry in claude_entries if p_entry.get("enabled", True) is not False),
+                named_claude or (claude_entries[0] if claude_entries else None),
+            )
         if isinstance(claude_prof, dict) and "claude" in raw_engines:
             claude_env = claude_prof.get("env") if isinstance(claude_prof.get("env"), dict) else {}
             claude_cfg_override = str(
@@ -12008,7 +12015,8 @@ class HubSessionManager:
                     )
 
             if option is not None:
-                levels = [str(x) for x in (option.get('thinking_levels') or [])]
+                raw_opt_levels = option.get('thinking_levels')
+                levels = [str(x) for x in (raw_opt_levels or [])]
                 levels = self._sorted_levels_by_engine_order(eng, levels)
                 if True:
                     if explicit_level:
@@ -12031,9 +12039,14 @@ class HubSessionManager:
                             else:
                                 resolved_level = self._middle_level(levels)
                                 thinking_source = 'model' if resolved_level else None
-                            notes.append(
-                                f"Profile 默认思考等级 {profile_level} 不被 {resolved_model} 支持，改用 {resolved_level}"
-                            )
+                            if resolved_level:
+                                notes.append(
+                                    f"Profile 默认思考等级 {profile_level} 不被 {resolved_model} 支持，改用 {resolved_level}"
+                                )
+                            else:
+                                notes.append(
+                                    f"Profile 默认思考等级 {profile_level} 不被 {resolved_model} 支持，该模型无思考等级"
+                                )
                         else:
                             model_default = option.get('default_thinking_level')
                             if model_default and str(model_default) in levels:
@@ -12042,6 +12055,9 @@ class HubSessionManager:
                             elif levels:
                                 resolved_level = self._middle_level(levels)
                                 thinking_source = 'model'
+                            elif isinstance(raw_opt_levels, list):
+                                resolved_level = None
+                                thinking_source = None
                             else:
                                 engine_levels = self._sorted_levels_by_engine_order(
                                     eng, [str(x) for x in ((self.engines_catalog.get(eng) or {}).get('available_thinking_levels') or [])]

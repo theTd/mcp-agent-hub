@@ -12,3 +12,4 @@ dsh_sec_test_dir/
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/dist/
+.worktrees/
