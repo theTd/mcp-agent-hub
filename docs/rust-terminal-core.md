@@ -134,7 +134,7 @@ its branch head: every read of `session.screen` (`display`, `cursor`, `history`,
 | `persist_session` scrollback text | `:4369` | scrollback 250 lines | `scrollback` |
 | `_last_screen_text` / archive `last_screen` | `:4382`, `:4526` | screen 80 lines → last 20 non-empty | `screen` |
 | `_scrollback_blob` | `:4437` | joined raw history, already trimmed, plus a revision | `raw` (trimmed core-side, `rev` from core) |
-| submit diagnostics | `:10193` | raw ANSI tail, 64 KB | `raw_tail` |
+| submit diagnostics | `:10193` | raw ANSI tail, 65536 characters | `raw_tail` |
 | readiness banner may have scrolled | `:10625` | scrollback N rows | `scrollback` |
 | "did the task echo / is it quiet" wait | `:12643`, `:12656` | `last_output_at`, screen 15 lines | the drain record's `last_output_at` + `watch_screen` |
 | `_crash_tail` | `:10861` | last screen | `screen` |
@@ -189,7 +189,7 @@ exceeds 2 s, a spawn over the bound is logged with its measured time, and the re
 | call | arguments | reply | deadline | replaces |
 |---|---|---|---|---|
 | `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows, elapsed_ms | 2 s, measured by the selftest (not interruptible) | `PtyProcess.spawn` (`:2262`), `push_ws_frame` of the resume banner (`:2271`) |
-| `attach_text` | session_id, cols, rows, flags, seed | ok | 50 ms | `HubTerminalScreen` for DSH virtual sessions |
+| `attach_text` | session_id, cols, rows, flags, seed_history, seed | ok | 50 ms | `HubTerminalScreen` for DSH virtual sessions (`seed_history` is A1's archived scrollback, `seed` the separator frame) |
 | `feed` | session_id, text | rev | 50 ms | `_on_pty_output` for virtual sessions |
 | `write` | session_id, text | bytes queued: the whole text or nothing; `0` for empty text; `TimeoutError` when the queue is still full at the deadline | 50 ms | `pty.write` (`:2465`) |
 | `resize` | session_id, cols, rows | cols, rows; `ValueError` when the pseudoconsole is already closing/closed, `TimeoutError` when the console is busy past the deadline | 50 ms | `pty.setwinsize` + `screen.resize` (`:2490`) |
@@ -197,7 +197,7 @@ exceeds 2 s, a spawn over the bound is logged with its measured time, and the re
 | `screen` | session_id, max_lines | text, cursor, cols, rows, rev | 50 ms | `get_clean_screen_text` (`:2499`) |
 | `scrollback` | session_id, max_lines | text, rev | 50 ms | `get_full_scrollback_text` (`:2516`) |
 | `raw` | session_id | text, bytes, rev | 50 ms | `"".join(raw_history)` (`:4454`) |
-| `raw_tail` | session_id, max_bytes | text | 50 ms | `raw_ansi_tail` (`:10194`) |
+| `raw_tail` | session_id, max_chars | text | 50 ms | `raw_ansi_tail` (`:10194`); a character count, because the hub's tail is `"".join(raw_history)[-65536:]`, and it is cut on a character boundary |
 | `watch_screen` / `unwatch` | session_id, max_lines, interval_ms | ok | 50 ms | generic-engine tool-line polling (`:2345`), now bounded by `interval_ms` |
 | `ws_ticket` | session_id, ttl_ms | url, expires_at | 1 ms | nothing (the ticket is new, §6.4) |
 | `close_sockets` | session_id | count | 50 ms | `close_ws_frontends` (`:2415`, W7: normal close, code 1000) |
@@ -281,6 +281,13 @@ any of: 32 KiB accumulated, 20 ms since the batch's first byte, or 5 ms of silen
 byte. That caps a session at 50 frames/s per socket while a busy session (≈72 chunks/s today) still
 delivers every byte in order, and it is the only batching in the system (owner decision 7: the
 Python-side batching unit does not land).
+
+Frames reach one socket in stream order: a per-session delivery lock is held from the moment a batch is
+taken to the moment every attached sink has it, so the reader's 32 KiB trigger and the ticker's 5 ms flush
+cannot hand frame *n+1* over before frame *n*. `attach_sink` holds the same lock across its replay snapshot
+and its registration, which is the whole of Q11's atomicity. Lock order is one-directional (delivery, then
+the text lock; the sink list only under delivery); `FrameSink::deliver` must not block, so a slow socket
+costs the reader its queue push and never its read.
 
 `output.text` is already W8-stripped, OSC-stripped and decoded before it enters a batch: the core owns a
 per-session UTF-8 decoder with up to 3 carried bytes, so a multi-byte character split across two ConPTY
@@ -529,7 +536,7 @@ pending is a known source of hangs (unverified specifics).
 
 | choice | why / why not |
 |---|---|
-| `alacritty_terminal` (its `vte` parser plus `Term`/`Grid`) | **recommended.** The `vte` state machine cannot raise on bad input — which is precisely the K4 failure (`HubTerminalStream`, `:1832`) and removes the need for the `HubTerminalScreen.report_device_status` guard (`:1792`): unhandled CSI, including `CSI ? 996 n`, is ignored and nothing is written back to the PTY. Wide-character and combining-mark handling is the reason the `display` workaround for orphaned CJK stubs exists; alacritty's grid stores cells by column with the wide flag, so the workaround disappears. Cost: a larger dependency set and a manual line renderer (§8). |
+| `alacritty_terminal` (its `vte` parser plus `Term`/`Grid`) | **not used for the screen; its parser is.** Step 2 measured it and `Term` cannot reproduce two behaviours the hub's screens depend on: `Term::resize` reflows the grid while pyte's `Screen.resize` anchors content top-left, pads and drops the top rows on a shrink — the live cases resize 120x36 -> 140x44 mid-stream and `screen_at_resize.txt` is the screen right after it — and `Term` keeps a separate inactive grid for the alternate screen while pyte has one buffer (`?1049` only sets a mode bit), which four of the five live recordings switch to. The core therefore takes the crate's parser, `vte` 0.15.0 (pinned in `terminal_stream/Cargo.toml`, the version `alacritty_terminal` 0.26.0 builds on), and models pyte's screen itself. |
 | `vt100` | smaller, screen + scrollback + cursor; (unverified, from memory) fewer tested sequences and a screen model that has lost content under rapid resize/alt-screen switching. Acceptable fallback if `Term`'s API fights the history-row semantics; then the parser is `vte` + our own screen model. |
 | `termwiz` | correct and rich, used by WezTerm; its `Surface`/`Scrollback` model is display-oriented, so reproducing `history.top` row semantics is more code, and the dependency tree is the heaviest of the three. |
 
@@ -606,7 +613,7 @@ are new downloads.
 | `sha2` 0.10.9 | hash primitive under `hmac` | yes |
 | `base64` 0.21.7 | ticket encoding | yes |
 | `windows` 0.62.2 (`Win32_System_Console`, `Win32_System_JobObjects`, `Win32_System_Pipes`, `Win32_Storage_FileSystem`, `Win32_Security_Cryptography`) | ConPTY, job objects, pipes, `BCryptGenRandom` | yes (crate present; those features are not enabled in the app's manifest yet) |
-| `alacritty_terminal` + `vte` (versions pinned at step 1) | VT parse and screen model (§7.2); the alternative is `vt100` alone | no |
+| `vte` 0.15.0 (`alacritty_terminal` was approved with it but is not used, §7.2) | VT parsing; the screen model is the core's own copy of pyte's | no |
 | `crossbeam-channel` 0.5.17 | bounded writer queue and ticker notifications | yes |
 | `regex` 1.13.1 | the two OSC patterns, only run when the buffer contains `\x1b]` | yes |
 | `flate2` 1.1.11 | only if §11 makes permessage-deflate worth enabling | yes |
@@ -628,7 +635,11 @@ widths), `winpty-rs` and `portable-pty` (§7.1).
 | W9: the raw ring is trimmed to ≤ 512 KiB when it passes 512 KiB + 64 KiB of slack, and `_scrollback_blob` trims the same way on read: cut at a line break, `[较早的输出已截断]` prefix; the newest `── 已恢复（第 N 次）──` banner line is kept whole, with its leading `\r\n`, whenever the budget's own cut (before the move to a line break) falls before the end of that line; a cut inside the line therefore leaves the history over the cap by less than the line (`HISTORY_BANNER_LINE_MAX_BYTES` = 128 bounds what counts as the banner line), and a banner that ends before the cut is dropped. Fixed in Python before the port (`oracle-bugs`, owner, 2026-11-13); until then a cut inside the banner line dropped it | `trim_history_text` `:633`, `_on_pty_output` `:2358-2370`, `_scrollback_blob` `:4437` | byte-identical Rust implementation; the in-loop collapse, the prefix and all three banner outcomes are golden fixtures (§10) |
 | history sizes: screen `history=3000`, `snapshot_all`/`scrollback` caps | `:2157`, `:4369`, `:2516` | `spawn.flags.history_rows` |
 | K4: one unparseable sequence costs only itself | `HubTerminalStream` `:1832`, `HubTerminalScreen` `:1792` | `vte` cannot fail; `catch_unwind` around the feed so a handler bug costs one chunk, not the session |
-| A CSI whose parameter bytes include `:`, `<` or `=` is consumed whole and draws nothing. pyte 0.8.2 ends a CSI at the first byte that is not a digit, `;`, `?`, a space or `>`, so kimi's and omp's `ESC[<u` and agy's `ESC[=5;1u` used to draw `u` and `5;1u` as text; fixed in Python before the port (`csi-residue-fix`), with a carry for a sequence split across chunks. Raw history and frames keep the bytes | `HubTerminalStream.feed`, `_split_marker_csi` | `vte` reads these bytes as one sequence already; the screen ignores CSIs with a `<` or `=` marker, so no rewrite of the stream is needed |
+| A CSI whose parameter bytes include `:`, `<` or `=` is consumed whole and draws nothing. pyte 0.8.2 ends a CSI at the first byte that is not a digit, `;`, `?`, a space or `>`, so kimi's and omp's `ESC[<u` and agy's `ESC[=5;1u` used to draw `u` and `5;1u` as text; fixed in Python before the port (`csi-residue-fix`), with a carry for a sequence split across chunks. `ESC[?2026$p` is consumed whole too, `$` and the byte after it | `HubTerminalStream.feed`, `_split_marker_csi` | `vte` reads these bytes as one sequence already, so the core needs no rewrite of the stream (step 2's `csi_marker.rs` is deleted in step 2c); raw history and frames keep the bytes |
+| Inside a CSI, an ESC abandons the sequence and starts the next one, a C0 control runs where it arrives and the sequence goes on, and DEL is ignored. pyte took each of the three for the final byte and drew the rest as text (`A ESC[31 ESC[1m B` showed `A[1mB`); fixed in Python before the port (`csi-esc-restart`) | `_split_marker_csi` | `vte` reads them this way already; `edge-screen-csi-cancel` and `edge-screen-csi-controls` pin it |
+| A zero-width character that is not combining (ZWSP, ZWJ, VS16) takes no cell, starts no pending wrap, and the text after it is drawn; pyte dropped the rest of the run. Fixed in Python before the port (`zero-width-skip`) | `HubTerminalScreen.draw` | `screen.rs` skips it before the wrap check (step 2c); `edge-screen-zero-width*` pin it |
+| The four screen behaviours step 2 got wrong (DECSTBM off by one and its one-parameter form, DECOM not homing, restore clearing modes set after the save, a combining mark repeating its base) | pyte 0.8.2 `screens.py` `set_margins`, `set_mode`/`reset_mode`, `restore_cursor`, `draw` | pyte is right here; the core copies it row for row since step 2c, and `edge-screen-*` cases pin each one |
+| pyte NFC-composes a cell (`unicodedata.normalize("NFC", base + mark)`); the core stores the base plus its marks unnormalised, because exact NFC needs `unicode-normalization`, a dependency the owner has not approved | `HubTerminalScreen.draw` vs pyte's `draw` | `terminal_stream/tests/fixture_corpus/screen_exceptions.jsonl` carries exactly those 8 rows and a stale row fails the gate; drop them when the crate is approved or pyte goes at step 6 |
 | B9: liveness is the process, never the status string | `is_process_alive` `:2562` | `alive` in the drain record, set false by the reader thread; no syscall and no round trip, and `to_dict["idle_seconds"]` reads the same record |
 | D7/D1–D13: approval keys are byte-faithful | `write_input` `:2463`, call sites `:6718-7276` | `write` preserves arrival order per session through one writer thread; no interpretation, no translation |
 | graceful shutdown ends every CLI and captures its scrollback inside the 8 s budget | `graceful-budget`, `:5671`, `:5082` | `snapshot_all` then `kill_all`, both with deadlines; on timeout the hub logs and archives what it has |
@@ -653,6 +664,7 @@ before each step starts and again before step 6, so the Python suites of these f
 | `4e693ce` | pyte drew the residue of a CSI with a `:`, `<` or `=` marker as text | §8 row; `vte` reads the sequence whole, `csi_marker.rs` (step 2's copy of the bug) is deleted in step 2c | 12 re-rendered screen goldens; `edge-screen-*` marker cases |
 | `ee943e3` | a trim cut inside the newest resume banner dropped it | §8 W9 row; `history.rs` carries `BANNER_LINE_MAX_BYTES` | `edge-w9-*` goldens |
 | `defa26b` (on master via `5abe2db`) | pyte dropped the rest of a text run after a zero-width character (ZWSP, ZWJ, VS16 in `⚠️`) | a zero-width character that is not combining takes no cell, starts no pending wrap, and the text after it is drawn | `edge-screen-*` zero-width cases; `test_terminal_screen_zero_width` |
+| `a3dce22` (branch `fix/pyte-csi-esc-restart`, not on master yet) | pyte drew the rest of a CSI cut by an ESC, a C0 control or a DEL as text | §8 row; `vte` already reads them as a terminal does, no core change | `edge-screen-csi-cancel`, `edge-screen-csi-controls`; `test_terminal_stream_csi` |
 | `4b06139` | one failed accept closed the hub's listener for good | §6.4: the core's accept loop survives every accept error; `ws_listening()` in the health check | step 4 test with injected accept failures |
 | `3874299` | one oversized record ended a long-lived watcher loop | §6.3: an error costs its item, never the loop, in every native thread and in the step 3 drain handler | step 2c/3 review checks every `?` and `break` in the native loops; a step 3 test makes one session's scrollback write fail and sees the next session drained |
 | `0e17c54` | a scrolled or slowly typed Codex paste never settled, so no Enter was sent | new consumer (§4): the settle loop reads the composer every 0.1 s and must see the scroll mark `↑` and each new frame as pyte does | step 3 live capture `live-codex-scrolled-paste` (§10) |
@@ -677,7 +689,7 @@ imported by the hub after step 3, and it is deleted with its `requirements.in` e
 |---|---|---|---|---|
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
-| 2. Parse, history, coalescing | `alacritty_terminal`/`vte` grid, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain` | Rust fixture tests byte-identical to step 0, including the UTF-8 split, the banner rule and the trim prefix; coalescing preserves bytes and order | branch only | M, 5–7 d |
+| 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs` | `cargo test` in `terminal-core/`: `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach | branch only | M, 5-7 d |
 | 3. PTY ownership in Python | `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
 | 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
 | 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
@@ -712,6 +724,13 @@ New tests, none run by this unit:
   `raw.txt`, and the 64 KiB tail unchanged); the W8 carry for all three splits; the per-chunk OSC query
   strip and the per-stream replay strip (`replay.txt`); the OSC reply strip including the `52` and
   `1[01]\d` branches; UTF-8 carry across reads.
+  The 13 `edge-screen-*` cases pin DECSTBM (full height, partial, one parameter and `n;`), DECOM (set, reset,
+  inside a region), save/restore with DECAWM and DECOM toggled after the save, zero-width characters
+  (VS16/ZWSP/ZWJ, at the right edge, split across reads), combining marks, a CSI cut by CAN/SUB/ESC, C0
+  controls and DEL inside a CSI, and the CSI forms pyte's `Stream` ends early (`?2026$p`, `<` `=` `:`, an
+  SGR with subparameters). The harness also prints the parse throughput of the largest live case (20+
+  passes on one thread), and a golden that a case's kind and `meta.json` call for must exist: a missing one
+  fails, it is not skipped.
 - Rust, mechanics: coalescing (bytes preserved and order kept, frame cap honoured), Q11 (a socket that
   connects during a write storm sees every chunk exactly once, checked by a monotone counter in the
   stream), `catch_unwind` per reader thread (a panic marks one session `crashed` and leaves the others
