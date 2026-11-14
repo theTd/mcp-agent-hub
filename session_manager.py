@@ -6327,6 +6327,16 @@ class HubSessionManager:
                 ws_prefix=resume_banner(sess.resume_count) if old is not None else None,
             )
         except Exception as e:
+            # r5 #2: the id's entry goes back before this path awaits anything. What the queue
+            # still holds is applied by the consumer (its at-end drain) through the object the id
+            # lists, and the worker guard accepts any of them: left as the failed object, a request
+            # queued while the spawn was in flight would land on an incarnation that never
+            # started. Restored, it reaches the incarnation that owns the id again, or, with no
+            # predecessor left, nothing at all.
+            if old is not None:
+                self.sessions[session_id] = old
+            else:
+                self.sessions.pop(session_id, None)
             # R9: a spawn that raised after the PTY had already started must not leave that process
             # behind while the old (archived) object is put back in the live list. The core's kill
             # blocks its caller for its grace, so it runs off the loop; the id then leaves the core.
@@ -6345,10 +6355,6 @@ class HubSessionManager:
             # spawn that never got that far leaves only a pending drop behind.
             await self._retire_ended_session(
                 session_id, previous_incarnation if previous_tombstone is not None else None)
-            if old is not None:
-                self.sessions[session_id] = old
-            else:
-                self.sessions.pop(session_id, None)
             raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
         if old is not None:
             self._release_transcripts(session_id)

@@ -1028,6 +1028,101 @@ class LifecycleClaimTests(_ManagerCase):
         self.assertNotIn(("failed-requests", 70, 20), applied,
                          "a request of the failed incarnation reached the successor")
 
+    async def test_a_failed_pty_resume_applies_no_queued_request_to_its_failed_object(self):
+        # review round 5, finding 2 (narrowed): `sessions[id]` is the object being installed before
+        # the spawn (A7), and the failure path ended the id's queue while that object was still
+        # listed, so the consumer applied what was queued to an incarnation that never started. The
+        # id's entry goes back before that path awaits anything, so the request reaches the
+        # incarnation that owns the id again. A request applied *during* the spawn is the same pane
+        # and stays the installing object's (this test does not forbid it).
+        await _resumable(self.hub, self.root, "failed-pty")
+        self.hub.core.spawn("failed-pty", ["cmd.exe"])
+        self.hub._on_core_tick()
+        self.hub.core.set_exit("failed-pty", 0)
+        self.hub.core.die("failed-pty")
+        self.hub._on_core_tick()
+        await _settle(self.hub)  # ended and still listed: this is where a resume starts
+        old = self.hub.sessions["failed-pty"]
+
+        core = self.hub.core
+        spawn_failed = threading.Event()
+        applied = []  # (the object `sessions[id]` held, cols, rows, whether the spawn had failed)
+
+        original_resize = self.hub.resize_session_from_client
+
+        async def recording_resize(session_id, cols, rows, propagate_background=True, guard=None):
+            applied.append((self.hub.sessions.get(session_id), int(cols), int(rows),
+                            spawn_failed.is_set()))
+            return await original_resize(session_id, cols, rows, propagate_background, guard)
+
+        # One request parked in its worker keeps the consumer from taking the next one, so the
+        # request below is still queued when the spawn fails.
+        entered, release = threading.Event(), threading.Event()
+        resize = core.resize
+
+        def slow_resize(session_id, cols, rows, deadline_ms=None):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError("the probe never released its resize")
+            return resize(session_id, cols, rows, deadline_ms)
+
+        core.resize = slow_resize
+        self.hub.resize_session_from_client = recording_resize
+        core.request_resize("failed-pty", 100, 30, propagate=False)
+        self.hub._on_core_tick()
+        for _ in range(400):
+            await asyncio.sleep(0.005)
+            if entered.is_set():
+                break
+        self.assertTrue(entered.is_set(), "the queued request never reached its worker")
+
+        installed = []
+        attempts = []
+
+        def spawn(session_id, argv, **kwargs):
+            attempts.append(session_id)
+            installed.append(self.hub.sessions.get(session_id))
+            if len(attempts) <= 2:
+                # The core's own retryable refusal: the hub waits it out, which is the window the
+                # console's next request arrives in.
+                raise ValueError(
+                    f"session {session_id}: another spawn, attach_text or retire is in flight; "
+                    "retry")
+            spawn_failed.set()
+            release.set()  # the parked request may finish: only after this spawn has raised
+            raise OSError("the PTY could not start (simulated)")
+
+        core.spawn = spawn
+        # The two retry delays are the probe's window: a loaded machine must not close it first.
+        with patch.object(session_manager, "LIFECYCLE_CLAIM_RETRY_DELAYS_SEC", (0.3, 0.3)):
+            resume = asyncio.create_task(self.hub.resume_subagent("failed-pty", source="console"))
+            for _ in range(400):
+                await asyncio.sleep(0.005)
+                if attempts:
+                    break
+            self.assertEqual(len(attempts), 1, "the resume never reached its first spawn attempt")
+            # The console's next size, recorded while the spawn is still in flight.
+            core.request_resize("failed-pty", 70, 20, propagate=False)
+            self.hub._on_core_tick()
+            with self.assertRaises(ValueError) as raised:
+                await resume
+        self.assertIn("恢复失败", str(raised.exception))
+        release.set()
+        await _requests_applied(self.hub, "failed-pty")
+
+        self.assertEqual(len(installed), 3, installed)
+        failed = installed[0]
+        self.assertIsNotNone(failed, "the failed object was never installed for its spawn")
+        self.assertIsNot(failed, old, "the probe's spawn saw the predecessor, not the new object")
+        self.assertIs(self.hub.sessions.get("failed-pty"), old,
+                      "the failed resume did not put the archived object back")
+        late = [(cols, rows, obj is failed) for obj, cols, rows, after in applied if after]
+        self.assertTrue(late, "the request queued during the spawn was never applied at all")
+        self.assertEqual([cols for cols, _, on_failed in late if on_failed], [],
+                         f"a request of the failed incarnation was applied to it: {applied}")
+        self.assertIn(70, [cols for cols, _, _ in late],
+                      f"the queued request reached no incarnation that owns the id: {applied}")
+
 
 class DshResumeTests(_ManagerCase):
     async def test_a_completed_text_predecessor_is_not_a_crash(self):

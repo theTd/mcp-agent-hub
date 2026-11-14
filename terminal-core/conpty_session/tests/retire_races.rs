@@ -64,6 +64,24 @@ fn wait_dead(core: &Core, id: &str, within: Duration) -> bool {
     false
 }
 
+/// Takes records until the core has had nothing to give for 80 ms, or 2 s passes (ported with the
+/// owner-Arc case from `queue_bridge.rs`): a death left in a queue would be the next case's.
+fn drain_until_quiet(core: &Core) {
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut quiet_since = Instant::now();
+    while Instant::now() < end {
+        if core.drain().is_empty() {
+            if quiet_since.elapsed() >= Duration::from_millis(80) {
+                return;
+            }
+        } else {
+            quiet_since = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the core never went quiet");
+}
+
 /// Takes everything queued on `queue` until a quiet window of 40 ms follows at least one frame, or
 /// `within` passes. The quiet window only means "nothing more is coming" after something came: the
 /// ticker's flush is scheduled, so a loaded machine can spend 40 ms before the first frame lands
@@ -265,5 +283,63 @@ fn a_resume_after_a_completed_retire_builds_a_fresh_fanout() {
     );
     assert!(core.detach_sink("fresh", handle).expect("detach_sink"));
     core.kill("fresh", Duration::from_millis(200)).expect("kill 2");
+    core.shutdown();
+}
+
+/// The owner `Arc<Session>` an `attach_sink` takes for the replay is released **after** the id's
+/// delivery lock: with `retire` dropping the table's reference first, that Arc can be the last one,
+/// and dropping a session inside the lock closes its pipes and may wait for a console helper while
+/// every delivery waits. `Session::drop` asserts the invariant in debug builds; this case reaches the
+/// interleaving (review round 5, finding 4: the deleted `queue_bridge.rs` case is back, unchanged in
+/// what it asserts).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_owner_arc_is_released_after_the_delivery_lock() {
+    use conpty_session::test_hooks::set_attach_delay;
+
+    let _serial = serialized();
+    // No tick during the case: a tick's session snapshot holds a reference of its own while it waits
+    // for the delivery lock, which would hide the interleaving this test exists to reach.
+    let core = Core::new(
+        Box::new(|| false),
+        Box::new(|_line: &str| {}),
+        CoreOptions {
+            tick_interval: Duration::from_secs(10),
+            ..CoreOptions::default()
+        },
+    )
+    .expect("core");
+    core.attach_text(text_request("owner", None)).expect("incarnation 1");
+    let old = core.session_for_test("owner").expect("incarnation 1 in the table");
+    core.kill("owner", Duration::from_millis(100)).expect("kill 1");
+    drain_until_quiet(&core);
+    core.attach_text(text_request("owner", Some("SEED")))
+        .expect("incarnation 2");
+    core.kill("owner", Duration::from_millis(100)).expect("kill 2");
+    assert!(
+        wait_dead(&core, "owner", Duration::from_secs(2)),
+        "the exit record"
+    );
+
+    // The attach through the predecessor takes its replay from incarnation 2 (the fan-out's owner) and
+    // parks in the hook while holding the delivery lock.
+    set_attach_delay(Duration::from_millis(300));
+    let attacher = {
+        let old = Arc::clone(&old);
+        thread::spawn(move || {
+            let sink: Arc<dyn FrameSink> = Arc::new(FrameQueue::new(1024));
+            old.attach_sink(sink)
+        })
+    };
+    thread::sleep(Duration::from_millis(120));
+    // The table's reference goes first, so the attacher's owner Arc is the last one when the hook ends.
+    assert!(core.retire("owner").expect("retire incarnation 2"));
+    let joined = attacher.join();
+    set_attach_delay(Duration::ZERO);
+    assert!(
+        joined.is_ok(),
+        "the owner session was dropped while the delivery lock was held"
+    );
+    assert!(core.session_for_test("owner").is_none());
     core.shutdown();
 }
