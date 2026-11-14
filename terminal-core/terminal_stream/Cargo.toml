@@ -12,6 +12,9 @@ publish = false
 vte = "=0.15.0"
 # §7.4: the two OSC patterns. Compiled once; the strip only runs when the text holds "\x1b]".
 regex = "1.13.1"
+# pyte NFC-composes every combined cell (`unicodedata.normalize("NFC", base + mark)`); this crate supplies
+# the same tables (owner, decision `nfc-compose`, 0.1.x).
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 # §7.4: a system-ConPTY recording stores each `ReadFile` result as base64 (one chunk per read).
