@@ -1,7 +1,10 @@
-"""HubTerminalScreen.draw skips zero-width and unprintable characters instead of dropping the rest of the run."""
+"""HubTerminalScreen.draw skips zero-width and unprintable characters instead of dropping the rest of the run.
+
+Step 3b moved the screen into ``tools/pyte_oracle.py``; the hub's screen is the core's.
+"""
 import unittest
 
-from session_manager import HubTerminalScreen, HubTerminalStream
+from tools.pyte_oracle import HubTerminalScreen, HubTerminalStream
 
 
 def render(*chunks: str, columns: int = 20, lines: int = 3) -> list:

@@ -12,7 +12,8 @@ import unittest
 import server
 import session_manager
 
-FIELDS = ("screen", "stream", "raw_history", "raw_history_bytes", "raw_history_rev", "pty")
+FIELDS = ("screen", "stream", "raw_history", "raw_history_bytes", "raw_history_rev", "pty",
+          "ws_queues", "ws_handles")
 OLD_READERS = ("get_clean_screen_text", "get_full_scrollback_text")
 OWNER = "AgentSession"
 HUB_FILES = ("session_manager.py", "server.py")
@@ -65,7 +66,7 @@ class TerminalSeamScanTests(unittest.TestCase):
         source = (
             "class AgentSession:\n"
             "    def read_screen(self):\n"
-            "        return self.screen.display\n"
+            "        return self.core.screen(self.session_id)\n"
             "class HubSessionManager:\n"
             "    def peek(self, session):\n"
             "        return session.raw_history\n"
@@ -78,12 +79,15 @@ class TerminalSeamScanTests(unittest.TestCase):
         self.assertEqual(offenders(source),
                          [("retired reader", "get_clean_screen_text", "peek", 2)])
 
-    def test_the_seam_is_what_the_producers_still_carry(self):
-        # 3b deletes both; until then they are the only writers of the screen and the raw ring.
-        for name in ("_on_pty_output", "_read_loop"):
-            self.assertTrue(hasattr(session_manager.AgentSession, name), name)
+    def test_the_producers_are_gone_and_the_seam_is_what_calls_the_core(self):
+        # 3b deleted the reader thread, the chunk handler and the pyte state behind the seam: the
+        # core's reader owns the screen and the raw ring, and Python only applies drain records.
+        for name in ("_on_pty_output", "_read_loop", "_strip_saved_lines_erase",
+                     "adopt_ws_frontends", "push_ws_frame", "_push_ws_safe"):
+            self.assertFalse(hasattr(session_manager.AgentSession, name), name)
         for name in ("read_screen", "read_scrollback", "read_raw", "read_raw_tail", "seed_history",
-                     "write_input", "resize", "kill", "is_process_alive", "last_output_time"):
+                     "write_input", "resize", "kill", "is_process_alive", "last_output_time",
+                     "apply_core_record", "drain_ws_frames", "start_pty", "start_virtual"):
             self.assertTrue(callable(getattr(session_manager.AgentSession, name, None)), name)
         for name in ("has_process", "pid", "raw_revision"):
             self.assertIsInstance(getattr(session_manager.AgentSession, name, None), property, name)

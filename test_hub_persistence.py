@@ -221,22 +221,6 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads((await tail.read_batch())[0][1]), {"kind": "text"})
 
 
-class _TestPty:
-    pid = None
-    exitstatus = 0
-    def __init__(self):
-        self.alive = True
-        self.inputs = []
-    def isalive(self):
-        return self.alive
-    def write(self, text):
-        self.inputs.append(text)
-    def setwinsize(self, rows, cols):
-        pass
-    def terminate(self, force=False):
-        self.alive = False
-
-
 class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Match the production loop; debug traceback capture distorts socket latency.
@@ -272,10 +256,24 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             on_exit_cb=self.module.hub._exit_callback,
         )
         self.session.engine = "codex"
-        self.session.pty = _TestPty()
         self.session._loop = asyncio.get_running_loop()
         self.session.status = "running"
         self.module.hub.sessions[self.session.session_id] = self.session
+        # The terminal is the hub's real core (step 3b): a live cmd.exe behind this session, so the
+        # `/ws/pty` bridge, the input path and the archive read the same core the hub runs on.
+        # F14: `start()` builds the Core lazily now, so a harness that wants a real terminal asks
+        # for the hub's one Core here.
+        self.session.core = self.module.hub._ensure_core()
+        self.module.hub.core.spawn(self.session.session_id, ["cmd.exe"],
+                                   cwd=str(self.directory), cols=120, rows=36)
+        # The core publishes the spawn's first record from its own ticker, so one tick straight
+        # after `spawn` may see nothing and leave the session without pid or liveness. Wait for the
+        # record instead: a test that reads `is_process_alive` must not race the core's thread.
+        deadline = time.monotonic() + 3.0
+        while not self.session.has_process and time.monotonic() < deadline:
+            self.module.hub._on_core_tick()
+            await asyncio.sleep(0.02)
+        self.assertTrue(self.session.has_process, "the core never published the spawn record")
         await self.module.hub.persist_session(self.session)
         await self.module.hub.db.flush()
 
@@ -345,10 +343,13 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.1)
             self.assertLess(worst, 0.5)
             await websocket.send(json.dumps({"type": "input", "data": "terminal-input-probe"}))
-            deadline = time.monotonic() + 0.5
-            while not self.session.pty.inputs and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-            self.assertIn("terminal-input-probe", self.session.pty.inputs)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if "terminal-input-probe" in self.session.read_raw().text:
+                    break
+                await asyncio.sleep(0.01)
+            # The console's keystrokes reached the terminal core: conhost echoed them back.
+            self.assertIn("terminal-input-probe", self.session.read_raw().text)
             print(f"\nHTTP + WebSocket under 5s SQLite lock: {probes} rounds, worst={worst*1000:.1f} ms", flush=True)
         finally:
             lock.rollback()
@@ -377,6 +378,8 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session.status = "running"
         session.dsh_job_id = job_id
         session._loop = asyncio.get_running_loop()
+        session.core = self.module.hub._ensure_core()
+        self.module.hub.core.attach_text(session.session_id, cols=120, rows=36)
         self.module.hub.sessions[session.session_id] = session
         websocket = await self.connect_terminal()
         with patch.object(session_manager, "dsh_url", lambda path: f"http://127.0.0.1:{self.port}" + path.replace("/_dsh/dsh-crew", "/_test_dsh")):
@@ -409,17 +412,28 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         print(f"\n1000 DSH log lines: {rounds} HTTP/WebSocket rounds, worst={worst*1000:.1f} ms", flush=True)
 
     async def test_scrollback_marks_commit_not_admission(self):
+        # The shell's own prompt must already be in the ring: after this, only this test's bytes
+        # move the revision, which is what the two assertions compare.
+        previous = None
+        for _ in range(200):
+            text = self.session.read_raw().text
+            if text == previous:
+                break
+            previous = text
+            await asyncio.sleep(0.05)
         lock = sqlite3.connect(self.directory / "hub_state.db", timeout=0.1)
         lock.execute("BEGIN IMMEDIATE")
-        self.session._on_pty_output("persist-after-commit\r\n")
+        # The seam's byte path into the core (`feed`) moves the ring's revision.
+        self.session.emit_virtual_ansi("persist-after-commit\r\n")
+        self.module.hub._on_core_tick()
         old_rev = self.session._scrollback_rev_written
         await self.module.hub.persist_session(self.session, force_scrollback=True)
         self.assertEqual(self.session._scrollback_rev_written, old_rev)
-        self.assertNotEqual(self.session.raw_history_rev, old_rev)
+        self.assertNotEqual(self.session.raw_revision, old_rev)
         lock.rollback()
         lock.close()
         await self.module.hub.db.flush()
-        self.assertEqual(self.session._scrollback_rev_written, self.session.raw_history_rev)
+        self.assertEqual(self.session._scrollback_rev_written, self.session.raw_revision)
         self.assertGreater(self.session._scrollback_written_at, 0)
 
     async def test_overload_returns_503_without_publishing_or_changing_state(self):
@@ -585,6 +599,30 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m["content"] for m in record["parent_messages"] if m["direction"] == "parent"], ["accepted answer"])
         finally:
             lock.close()
+
+    async def test_a_session_without_a_core_entry_closes_the_socket_normally(self):
+        # F6: an attach raises when the core never had the id (a failed spawn still listed, a
+        # desktop window, a retired id). Uncaught, uvicorn closes with 1011 and the browser
+        # reconnects in a loop; an ended id closes 1000, one the core never had 1008.
+        import session_manager
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+        hub = self.module.hub
+        ghost = session_manager.AgentSession(
+            session_id="ws-nocore", profile_id="pwsh", profile_name="Ghost", kind="tui",
+            title="Ghost", cwd=str(self.directory), command="cmd.exe", args=[],
+        )
+        ghost.core = hub.core
+        ghost.status = "running"
+        hub.sessions["ws-nocore"] = ghost
+        for status, ended_at, expected in (("running", None, 1008), ("exited", 1.0, 1000)):
+            ghost.status = status
+            ghost.ended_at = ended_at
+            websocket = await connect(f"ws://127.0.0.1:{self.port}/ws/pty/ws-nocore", proxy=None)
+            with self.assertRaises(ConnectionClosed) as ctx:
+                await asyncio.wait_for(websocket.recv(), timeout=3)
+            self.assertEqual(ctx.exception.rcvd.code, expected, status)
+            await websocket.close()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ import unittest
 from pathlib import Path
 
 import session_manager
+from tools import pyte_oracle
 from tools import render_terminal_fixtures as renderer
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "tools" / "fixtures" / "terminal"
@@ -190,20 +191,26 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
 
 
 class TerminalFixtureOracleTests(unittest.TestCase):
-    def test_the_renderer_uses_the_hubs_objects(self):
-        self.assertIs(renderer.AgentSession, session_manager.AgentSession)
-        self.assertIs(renderer.trim_history_text, session_manager.trim_history_text)
+    def test_the_renderer_uses_the_oracles_objects(self):
+        # `oracle-to-tools`: the pyte model left the hub in step 3b, so the renderer's objects are the
+        # oracle module's own, imported (never copied) by the renderer and the recorder alike.
+        self.assertIs(renderer.PyteOracleSession, pyte_oracle.PyteOracleSession)
+        self.assertIs(renderer.trim_history_text, pyte_oracle.trim_history_text)
+        self.assertIs(renderer.OSC_COLOR_QUERY_RE, pyte_oracle.OSC_COLOR_QUERY_RE)
         self.assertIs(renderer.resume_banner, session_manager.resume_banner)
         self.assertIs(renderer.strip_osc_terminal_replies, session_manager.strip_osc_terminal_replies)
         self.assertIs(renderer.OSC_TERMINAL_REPLY_RE, session_manager.OSC_TERMINAL_REPLY_RE)
         self.assertIs(renderer.HISTORY_TRIM_SLACK_BYTES, session_manager.HISTORY_TRIM_SLACK_BYTES)
         self.assertIs(renderer.RESUME_SCROLLBACK_MAX_BYTES,
                       session_manager.RESUME_SCROLLBACK_MAX_BYTES)
-        self.assertEqual(session_manager.AgentSession._on_pty_output.__module__, "session_manager")
-        # The screen and stream the goldens are rendered on are the hub's, not look-alikes.
+        self.assertEqual(pyte_oracle.PyteOracleSession.feed_output.__module__, "tools.pyte_oracle")
+        # The screen and stream the goldens are rendered on are the oracle's, not look-alikes.
         session = renderer.new_session("generic", 60, 12)
-        self.assertIsInstance(session.screen, session_manager.HubTerminalScreen)
-        self.assertIsInstance(session.stream, session_manager.HubTerminalStream)
+        self.assertIsInstance(session.screen, pyte_oracle.HubTerminalScreen)
+        self.assertIsInstance(session.stream, pyte_oracle.HubTerminalStream)
+        # ... and the hub itself carries no pyte state any more: the terminal is the core's.
+        for name in ("HubTerminalScreen", "HubTerminalStream", "trim_history_text", "OSC_COLOR_QUERY_RE"):
+            self.assertFalse(hasattr(session_manager, name), name)
 
     def test_the_replay_golden_is_the_hubs_own_attach_frame(self):
         session = renderer.new_session("generic", 60, 12)
@@ -253,7 +260,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         self.assertNotEqual(raw, replay)
         self.assertIn("\x1b]1", raw)
         self.assertNotIn("\x1b]1", replay)
-        self.assertEqual(replay, session_manager.OSC_COLOR_QUERY_RE.sub("", raw))
+        self.assertEqual(replay, pyte_oracle.OSC_COLOR_QUERY_RE.sub("", raw))
 
     def test_the_in_loop_trigger_collapses_the_ring_and_keeps_the_tail(self):
         name = "edge-w9-inloop-trigger"
@@ -274,7 +281,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         # The in-loop result: the ring is trim(seed + chunks up to the trigger) plus what followed.
         seed = renderer.trigger_seed(text)
         joined = seed + "".join(chunks)
-        expected = (session_manager.trim_history_text(seed + "".join(chunks[:index + 1]), max_bytes)
+        expected = (pyte_oracle.trim_history_text(seed + "".join(chunks[:index + 1]), max_bytes)
                     + "".join(chunks[index + 1:]))
         self.assertEqual(golden(name, "raw.txt"), expected)
         # The collapse cuts the front only, so the submit-diagnostic tail is unchanged.
@@ -293,7 +300,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         self.assertLessEqual(total, 640 * 1024)
 
     def test_the_w9_banner_cases_pin_the_hub_rule(self):
-        prefix = session_manager.HISTORY_TRUNCATED_PREFIX
+        prefix = pyte_oracle.HISTORY_TRUNCATED_PREFIX
         # The banner's own opening, including the two leading bytes the block may restore; built from
         # the hub's separator so the corpus' resume count (1 or 2) does not matter.
         banner = session_manager.resume_banner(1).split("第")[0]
@@ -329,7 +336,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
                 # The cut is inside the banner line, so keeping it goes over the cap by less than it.
                 self.assertGreater(raw_cut, banner_start, name)
                 self.assertGreater(over, 0, name)
-                self.assertLess(over, session_manager.HISTORY_BANNER_LINE_MAX_BYTES, name)
+                self.assertLess(over, pyte_oracle.HISTORY_BANNER_LINE_MAX_BYTES, name)
             else:
                 self.assertLessEqual(over, 0, name)
             if name == "edge-w9-banner-lead-crlf":
@@ -337,7 +344,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
 
     def test_a_budget_below_the_prefix_returns_the_prefix(self):
         name = "edge-w9-trim-budget-zero"
-        self.assertEqual(golden(name, "trimmed.txt"), session_manager.HISTORY_TRUNCATED_PREFIX)
+        self.assertEqual(golden(name, "trimmed.txt"), pyte_oracle.HISTORY_TRUNCATED_PREFIX)
 
 
 class TerminalFixturePrivacyTests(unittest.TestCase):

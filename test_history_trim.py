@@ -1,10 +1,14 @@
-"""W9: trim_history_text caps the raw terminal history and keeps the newest resume banner whole."""
+"""W9: trim_history_text caps the raw terminal history and keeps the newest resume banner whole.
+
+Step 3b moved the mirrored expression into ``tools/pyte_oracle.py`` (the hub's ring is the core's,
+``terminal_stream/history.rs``); this test keeps the Python oracle honest for the fixtures.
+"""
 import unittest
 
-from session_manager import (
+from session_manager import resume_banner
+from tools.pyte_oracle import (
     HISTORY_BANNER_LINE_MAX_BYTES,
     HISTORY_TRUNCATED_PREFIX,
-    resume_banner,
     trim_history_text,
 )
 

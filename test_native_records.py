@@ -12,19 +12,7 @@ from hub_persistence import PersistenceRecordTooLarge
 from session_manager import AgentSession, HubSessionManager, approval_launch_flags
 from transcript_summarizer import KimiTranscriptSummarizer
 from transcript_tail import read_complete_lines
-
-
-class FakePty:
-    pid = 999999
-    def __init__(self):
-        self.inputs = []
-        self.alive = True
-    def isalive(self):
-        return self.alive
-    def write(self, text):
-        self.inputs.append(text)
-    def terminate(self, force=True):
-        pass
+from fake_terminal_core import FakeTerminal
 
 
 class LaunchTests(unittest.TestCase):
@@ -81,6 +69,10 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         profiles.write_text('{"profiles":{}}', encoding="utf-8")
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        # The terminal is the fake core: these tests never spawn a process, but the sessions' seam
+        # calls and the manager's drain tick still run through it.
+        self.fake = FakeTerminal()
+        self.hub.core = self.fake
         await self.hub.start()
 
     async def asyncTearDown(self):
@@ -117,14 +109,20 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         sess = await self.hub.create_session("desktop-gui", hwnd=123)
         self.assertEqual(sess.launch_source, "user")
 
-    def session(self, engine, suffix=""):
+    def session(self, engine, suffix="", virtual=False):
         sid = f"{engine}-native{suffix}"
-        sess = AgentSession(sid, engine, engine, "tui", "Native fixture", str(self.root), "unused", [])
+        sess = AgentSession(sid, engine, engine, "tui", "Native fixture", str(self.root), "unused", [],
+                            core=self.fake)
         sess.engine = engine
         sess.status = "running"
-        sess.pty = FakePty()
+        if virtual:
+            self.fake.attach_text(sid, cols=120, rows=36)
+        else:
+            self.fake.spawn(sid, ["fixture"])
         sess._loop = asyncio.get_running_loop()
         self.hub.sessions[sid] = sess
+        # The spawn's first record is what makes the session live for the seam (`alive`, `pid`).
+        self.hub._on_core_tick()
         return sess
 
     async def until(self, condition):
@@ -190,7 +188,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sess.status, "waiting_parent")
             self.assertEqual(sess.pending_interaction["prompt"], "选择哪个分支？")
             await self.hub.respond_to_interaction(sess.session_id, option_index=1)
-            await self.until(lambda: bool(sess.pty.inputs))
+            await self.until(lambda: bool(self.fake.inputs_of(sess.session_id)))
             self.assertIsNone(sess.pending_interaction)
             # Re-reading a native question after it was answered must not register it again.
             self.append(path, ask)
@@ -634,7 +632,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                 def schedule(coro):
                     pending.append(coro.cr_frame.f_locals.copy())
                     coro.close()
-                with patch.object(self.hub, "resolve_launch", return_value=launch), patch.object(self.hub, "_schedule", side_effect=schedule), patch.object(AgentSession, "start_pty", lambda s, *a, **k: setattr(s, "pty", FakePty())):
+                with patch.object(self.hub, "resolve_launch", return_value=launch), patch.object(self.hub, "_schedule", side_effect=schedule), patch.object(AgentSession, "start_pty", lambda s, *a, **k: None):
                     sess = await self.hub.create_session(engine, task="test task")
                 text = " ".join(sess.args) + " ".join(str(p.get("task_to_inject") or "") for p in pending)
                 self.assertIn("[Hub Session: session_id=", text)
@@ -686,8 +684,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dsh_native_message_question_and_result(self):
         import httpx
-        sess = self.session("dsh")
-        sess.pty = None
+        sess = self.session("dsh", virtual=True)
         sess.dsh_spec = {"tier": "flash"}
         sess.dsh_job_id = "native-job"
         log = self.root / "dsh.jsonl"
@@ -874,7 +871,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                                                             "command": ["rm", "-r", "out"]}})
         await self.until(lambda: sess.pending_interaction is not None)
         await self.hub.respond_to_interaction(sess.session_id, decision="deny", custom_input=feedback)
-        await self.until(lambda: "n" in sess.pty.inputs)
+        await self.until(lambda: "n" in self.fake.inputs_of(sess.session_id))
         # Real order (rollout of codex-1146485d): the developer marker, then the abort event.
         self.append(path, self.codex_message("developer", "<turn_aborted>\nThe previous turn was interrupted on purpose.</turn_aborted>"),
                     {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}})
@@ -886,7 +883,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         try:
             handle = await self.wait_handle(sess)
             await self.deny_codex_approval(sess, path)
-            self.assertEqual(sess.pty.inputs, ["n"])
+            self.assertEqual(self.fake.inputs_of(sess.session_id), ["n"])
             done = await self.hub.wait_inbox.wait(handle, 3)
             self.assertEqual(done["state"], "done")
             self.assertTrue(done["final_response"].startswith("Codex turn aborted (interrupted): the turn ended"))
@@ -918,7 +915,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                 await self.deny_codex_approval(sess, path, feedback="Rename it instead.")
                 await self.until(lambda: bool(sent))
             self.assertEqual(sent, [(sess.session_id, "Rename it instead.")])
-            self.assertEqual(sess.pty.inputs, ["n"])
+            self.assertEqual(self.fake.inputs_of(sess.session_id), ["n"])
             self.assertEqual((await self.hub.wait_inbox.wait(handle, 0.6))["state"], "waiting")
             self.assertEqual(sess.status, "running")
             self.append(path, self.codex_message("user", "Rename it instead."),
@@ -980,7 +977,10 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         task = self.hub._schedule(self.hub._watch_codex_rollout(sess, self.root))
         try:
             await self.until(lambda: sess.transcript_path is not None)
-            sess.pty.alive = False
+            # The cached liveness as a drain record would leave it; the exit path itself is driven
+            # by hand below, so the death does not go through the tick.
+            sess._alive = False
+            self.fake.session(sess.session_id).alive = False
             sess._finish_read(0)
             exiting = asyncio.create_task(self.hub._on_session_exit(sess, 0))
             row = (json.dumps({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "delayed answer"}}) + "\n").encode()

@@ -142,5 +142,70 @@ class FastmcpLoggingTests(unittest.TestCase):
         self.assertIn("RuntimeError: boom", text)
 
 
+class TerminalDrainTickTests(unittest.IsolatedAsyncioTestCase):
+    async def _shut_down(self, hub):
+        await hub.archive_all_sessions_on_shutdown()
+        hub.core.shutdown()
+        self.temporary.cleanup()
+
+    async def test_twenty_ticks_of_fifty_sessions_keep_the_loop_responsive(self):
+        # Design §5.3: one wakeup per drain interval however much output arrived, so one tick with
+        # 50 sessions' records must stay far below that interval and let the loop run between ticks.
+        import time
+
+        import session_manager
+        from fake_terminal_core import FakeTerminal
+        from session_manager import AgentSession, HubSessionManager
+
+        self.temporary = tempfile.TemporaryDirectory(prefix="hub-tick-")
+        root = Path(self.temporary.name)
+        profiles = root / "profiles.json"
+        profiles.write_text('{"profiles":{}}', encoding="utf-8")
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            hub = HubSessionManager(profiles, base_dir=HUB_DIR, data_dir=root)
+        hub.core = FakeTerminal()
+        await hub.start()
+        self.addAsyncCleanup(self._shut_down, hub)
+
+        sessions = []
+        for index in range(50):
+            session_id = f"tick-{index}"
+            sess = AgentSession(session_id, "pwsh", "Pwsh", "tui", "tick", str(root), "cmd.exe", [],
+                                core=hub.core, sockets=hub._terminal_sockets(session_id))
+            sess.engine = "pwsh"
+            sess.status = "running"
+            hub.sessions[session_id] = sess
+            hub.core.spawn(session_id, ["cmd.exe"])
+            sessions.append(sess)
+
+        turns, done = [], asyncio.Event()
+
+        async def ticker():
+            while not done.is_set():
+                turns.append(len(turns))
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(ticker())
+        apply_seconds = []
+        started = time.perf_counter()
+        for round_index in range(20):
+            for session_id in hub.sessions:
+                hub.core.output(session_id, f"行{round_index}\r\n")
+            tick_started = time.perf_counter()
+            hub._on_core_tick()
+            apply_seconds.append(time.perf_counter() - tick_started)
+            await asyncio.sleep(0)
+        total = time.perf_counter() - started
+        done.set()
+        await task
+
+        self.assertEqual(sessions[0].read_raw().text.count("\r\n"), 20)
+        self.assertEqual(sessions[-1].raw_revision, hub.core.session("tick-49").rev)
+        self.assertTrue(turns, "the tick never let another task run")
+        self.assertLess(max(apply_seconds), 0.25,
+                        f"one tick of 50 records took {max(apply_seconds):.3f}s")
+        self.assertLess(total, 2.0, f"20 ticks took {total:.3f}s")
+
+
 if __name__ == "__main__":
     unittest.main()

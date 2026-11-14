@@ -17,7 +17,7 @@ from session_manager import (AgentSession, HubSessionManager, APPROVAL_ENGINES, 
                              CLIPPED_COMMAND_NOTE, screen_command_clipped, tool_call_for_approval_box,
                              OMP_APPROVAL_EXTENSION_NAME, OMP_APPROVAL_LOG_ENV, UNREAD_OMP_BOX_NOTE,
                              omp_approval_request_id)
-from test_native_records import FakePty
+from fake_terminal_core import FakeTerminal
 
 MODAL = '''Field 1/1
 Allow the approval_probe MCP server to run tool "emit_marker"?
@@ -127,19 +127,26 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         profiles.write_text('{"profiles":{}}', encoding="utf-8")
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        self.fake = FakeTerminal()
+        self.hub.core = self.fake
         await self.hub.start()
         with patch("session_manager.HubSessionManager", return_value=self.hub):
             self.server = importlib.import_module("server")
         self.hub_patch = patch.object(self.server, "hub", self.hub)
         self.hub_patch.start()
         self.screen = MODAL
-        self.sess = AgentSession("codex-test", "codex", "Codex", "tui", "Test", str(self.root), "unused", [])
+        self.sess = AgentSession("codex-test", "codex", "Codex", "tui", "Test", str(self.root), "unused", [],
+                                 core=self.fake)
         self.sess.engine = "codex"
         self.sess.status = "running"
-        self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
-        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
+        self.fake.spawn(self.sess.session_id, ["fixture"])
+        self.hub._on_core_tick()
+        # The keystrokes the seam's `write` queued, in order (what the old FakePty recorded).
+        self.pty_inputs = self.fake.inputs_of(self.sess.session_id)
+        # §10: the screen is the core's `screen` reply; the approval parsers read text only.
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, 0, 0, 120, 36, 0)
 
     async def asyncTearDown(self):
         self.hub_patch.stop()
@@ -208,7 +215,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def answer(self, decision="approve"):
         pending = await self.pending()
         def write(text):
-            self.sess.pty.inputs.append(text)
+            self.pty_inputs.append(text)
             self.screen = "Working..."
         with patch.object(self.sess, "write_input", write):
             return await self.hub.respond_to_interaction(self.sess.session_id, decision=decision,
@@ -217,7 +224,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def test_allow_and_identical_following_call(self):
         result = await self.answer()
         self.assertEqual(result["response_state"], "unconfirmed")
-        self.assertEqual(self.sess.pty.inputs, ["\x1b[A\x1b[A\r"])
+        self.assertEqual(self.pty_inputs, ["\x1b[A\x1b[A\r"])
         self.assertIsNotNone(self.sess.pending_interaction)
         await asyncio.sleep(.12)
         self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
@@ -229,7 +236,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_and_session_downgrade(self):
         result = await self.answer("deny")
         self.assertEqual(result["approval_action"], "deny")
-        self.assertEqual(self.sess.pty.inputs[-1], "\x1b[A\x1b[A\x1b[B\r")
+        self.assertEqual(self.pty_inputs[-1], "\x1b[A\x1b[A\x1b[B\r")
         await asyncio.sleep(.12)
         self.assertEqual(await self.hub.get_pending_interactions(self.sess.session_id), [])
         self.screen = MODAL
@@ -246,14 +253,14 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         for kwargs in ({"decision": "approve", "request_id": "stale"}, {}):
             with self.assertRaises(ValueError):
                 await self.hub.respond_to_interaction(self.sess.session_id, **kwargs)
-        self.assertEqual(self.sess.pty.inputs, [])
+        self.assertEqual(self.pty_inputs, [])
 
     async def test_changed_modal_never_uses_old_request(self):
         pending = await self.pending()
         self.screen = MODAL.replace("phase-one", "different")
         with self.assertRaises(ValueError):
             await self.hub.respond_to_interaction(self.sess.session_id, decision="approve", request_id=pending["request_id"])
-        self.assertEqual(self.sess.pty.inputs, [])
+        self.assertEqual(self.pty_inputs, [])
 
     async def test_unconfirmed_keeps_pending_and_refuses_duplicate(self):
         pending = await self.pending()
@@ -263,7 +270,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.sess.pending_interaction, pending)
         with self.assertRaises(ValueError):
             await self.hub.respond_to_interaction(self.sess.session_id, decision="approve")
-        self.assertEqual(len(self.sess.pty.inputs), 1)
+        self.assertEqual(len(self.pty_inputs), 1)
         self.screen = "Working..."
         await self.hub.get_pending_interactions(self.sess.session_id)
         await asyncio.sleep(.12)
@@ -274,7 +281,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
         # 2026-11-12 regression (codex-97e45358): an approval answered with send_to_subagent(text="y")
         # stayed on the wait URL, which then hid the second approval and the turn's end.
         def write(text):
-            self.sess.pty.inputs.append(text)
+            self.pty_inputs.append(text)
             self.screen = "Working..."
         # The handle exists before the first approval, as after a spawn, so every ask enters its inbox.
         info = await self.hub.wait_inbox.ensure_for_sessions([self.sess.session_id], {self.sess.session_id: self.sess.turn_id})
@@ -465,15 +472,20 @@ class _OmpSessionCase(unittest.IsolatedAsyncioTestCase):
         profiles.write_text('{"profiles":{}}', encoding="utf-8")
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        self.fake = FakeTerminal()
+        self.hub.core = self.fake
         await self.hub.start()
-        self.sess = AgentSession("omp-box", "omp", "OMP", "tui", "Test", str(self.root), "unused", [])
+        self.sess = AgentSession("omp-box", "omp", "OMP", "tui", "Test", str(self.root), "unused", [],
+                                 core=self.fake)
         self.sess.engine = "omp"
         self.sess.status = "running"
-        self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
         self.screen = omp_box("Command: cd wt && rm -rf ../scratch/bitetest && mkdir -p ../scratch/bitetest && cp *.p…")
-        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, 0, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
+        self.fake.spawn(self.sess.session_id, ["fixture"])
+        self.hub._on_core_tick()
+        self.pty_inputs = self.fake.inputs_of(self.sess.session_id)
 
     async def asyncTearDown(self):
         await self.hub.archive_all_sessions_on_shutdown()

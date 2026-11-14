@@ -92,11 +92,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from session_manager import (  # noqa: E402
-    HubTerminalScreen,
-    HubTerminalStream,
     HubSessionManager,
     unwrap_windows_cmd_shim,
 )
+# `oracle-to-tools`: the pyte screen and stream left the hub in step 3b and live with the fixture
+# renderer, which is the only other thing that renders a recorded stream through them.
+from tools.pyte_oracle import HubTerminalScreen, HubTerminalStream  # noqa: E402
 from winpty import PtyProcess  # noqa: E402
 
 # The default backend: the core's own spawn/read code as a headless tap (conpty_record_tap.rs).

@@ -1,7 +1,11 @@
-"""pyte ends a CSI at ':' '<' '='; the hub consumes such a sequence whole, whole or split."""
+"""pyte ends a CSI at ':' '<' '='; the screen consumes such a sequence whole, whole or split.
+
+Step 3b moved the screen and the splitter into ``tools/pyte_oracle.py``; the hub's stream is the
+core's (``terminal_stream``), whose own tests carry the same cases.
+"""
 import unittest
 
-from session_manager import HubTerminalScreen, HubTerminalStream, _split_marker_csi
+from tools.pyte_oracle import HubTerminalScreen, HubTerminalStream, _split_marker_csi
 
 COLS, ROWS = 40, 6
 # The forms the CLIs send: kimi and omp pop their kitty-keyboard flags with ESC[<u, agy sets them
