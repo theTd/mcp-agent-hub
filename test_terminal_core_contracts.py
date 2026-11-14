@@ -24,10 +24,17 @@ from test_terminal_core_hub import _ManagerCase, _session
 
 
 async def _settle(hub, times: int = 40) -> None:
-    """Lets the hub's scheduled tasks (exit callbacks, retries) run."""
+    """Lets the hub's scheduled tasks (exit callbacks, rewrites, retries) run.
+
+    A plain `sleep(0)` is not enough for a task that awaits a worker thread (the final rows read
+    the core off the loop since r3-kimi 4/7), so each pass gives the loop real time and the whole
+    wait ends as soon as the hub has no task of its own left.
+    """
     for _ in range(times):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.002)
         await hub.db.flush()
+        if not hub._background_tasks:
+            return
 
 
 async def _live(hub, session_id, engine="pwsh"):
@@ -147,6 +154,84 @@ class ExitCodeTests(_ManagerCase):
         self.assertEqual(len(events), 1, f"a second lifecycle event was emitted: {events}")
 
 
+class ClosedTombstoneTests(_ManagerCase):
+    """r3-kimi 2: a death the core withheld until after a permanent close still reaches its row."""
+
+    async def test_a_close_applies_a_withheld_death_record(self):
+        # The close kills a live process and archives it, leaving the object as the id's tombstone
+        # because the core refuses to retire an id whose death no drain carried. That death lands
+        # on the next drain. It used to be ignored (the tombstone branch wanted `_alive` already
+        # false), and the same drain retired the id: the tombstone stayed alive and the code the
+        # record carried was gone with the core entry.
+        sess = await _live(self.hub, "closed-withheld")
+        self.hub.core.withhold_death_records = 1
+        await self.hub.close_session("closed-withheld", source="console")
+        self.assertIn("closed-withheld", self.hub._retire_pending,
+                      "the close retired an id whose death no drain carried")
+        self.hub._on_core_tick()
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if "closed-withheld" in self.hub.core.retired:
+                break
+        await _settle(self.hub)
+        row = await self.hub.db.get_session_record("closed-withheld")
+        events = [e for e in self.hub.get_worker_events("closed-withheld")
+                  if e["category"] == "lifecycle"]
+        self.assertFalse(sess._alive, "the tombstone never applied the delayed death")
+        self.assertEqual(row["exit_code"], 1, "the delayed death's code was retired unread")
+        self.assertIn("closed-withheld", self.hub.core.retired, "the id never left the core")
+        self.assertEqual([e["type"] for e in events], ["terminated"],
+                         f"the close's own event is the id's only one: {events}")
+
+    async def test_a_withheld_no_code_death_still_reaches_the_tombstone(self):
+        # The second variant r3-kimi 2 asks for: the withheld death carries no code. It must still
+        # mark the tombstone dead (that is what turns its `_alive` off and lets the retire accept
+        # the id), must not invent a code, and must not replace the end state the close earned. The
+        # code-less record used to be dropped there too, leaving a tombstone that looked alive.
+        sess = await _live(self.hub, "closed-nocode")
+        self.hub.core.set_exit("closed-nocode", None, crashed=True)
+        self.hub.core.withhold_death_records = 1
+        self.hub.core.die("closed-nocode")
+        # One refusal: the close's own retire, because no drain carried the death yet.
+        self.hub.core.block_retire = 1
+        await self.hub.close_session("closed-nocode", source="console")
+        self.hub._on_core_tick()
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if "closed-nocode" in self.hub.core.retired:
+                break
+        await _settle(self.hub)
+        row = await self.hub.db.get_session_record("closed-nocode")
+        events = [e for e in self.hub.get_worker_events("closed-nocode")
+                  if e["category"] == "lifecycle"]
+        self.assertTrue(sess._died_crashed, "the withheld crash flag never reached the tombstone")
+        self.assertIsNone(row["exit_code"], "a death with no code must not invent one")
+        self.assertEqual((row["status"], row["end_reason"]), ("terminated", "terminated"),
+                         "the close's own end state was overwritten")
+        self.assertIn("closed-nocode", self.hub.core.retired, "the id never left the core")
+        self.assertEqual([e["type"] for e in events], ["terminated"],
+                         f"the tombstone emitted a second lifecycle event: {events}")
+
+
+class RetiredIdTests(_ManagerCase):
+    """r3-kimi 5: what the hub relies on once an id left the core's table -- the fake must model it."""
+
+    async def test_a_retired_id_has_no_ticket_and_no_sockets(self):
+        # The core's `retire` removes the id (§5.2), so the table no longer answers for it: the
+        # ticket route's `KeyError` branch and `close_sockets`' unknown-id answer are reachable only
+        # after a retire, and those are what the hub's 404 and its idempotent close rest on.
+        await _live(self.hub, "retired-id")
+        self.hub.core.open_socket("retired-id", 2)
+        await self.hub.close_session("retired-id", source="console")
+        self.assertIn("retired-id", self.hub.core.retired)
+        with self.assertRaises(KeyError):
+            self.hub.core.ws_ticket("retired-id")
+        self.assertEqual(self.hub.core.close_sockets("retired-id"), 0,
+                         "a retired id reported sockets it does not have")
+        self.assertEqual(self.hub._terminal_request_consumers, {})
+        self.assertEqual(self.hub._terminal_request_queues, {})
+
+
 class DeathSnapshotFailureTests(_ManagerCase):
     async def test_a_failed_death_snapshot_is_logged_with_its_session(self):
         # F15/kimi 9: the drain handler's own try cannot see a failed 80-row read, so the exit path
@@ -161,8 +246,36 @@ class DeathSnapshotFailureTests(_ManagerCase):
         self.hub.core.die("snapshot-fails")
         with self.assertLogs("mcp-agent-hub.session_manager", level="ERROR") as logs:
             self.hub._on_core_tick()
+            # r3-kimi 4/7: the 80-row read is the exit callback's now and runs in a worker, so the
+            # log follows the tick by a loop turn instead of arriving inside it.
+            for _ in range(300):
+                await asyncio.sleep(0.01)
+                if any("snapshot-fails" in line for line in logs.output):
+                    break
         self.assertTrue(any("snapshot-fails" in line for line in logs.output), logs.output)
         self.assertEqual(sess.end_reason, "crashed", "the exit path must still classify the death")
+
+    async def test_a_death_snapshot_never_reads_the_core_on_the_loop(self):
+        # r3-kimi 4/7: the 80-row read sat in `_finish_read`, which the drain record runs on the
+        # loop, so a busy core held the loop for the read's deadline whenever a session died.
+        await _live(self.hub, "death-lag")
+        core = self.hub.core
+        scrollback = core.scrollback
+
+        def slow_scrollback(*args, **kwargs):
+            time.sleep(0.12)
+            return scrollback(*args, **kwargs)
+
+        core.scrollback = slow_scrollback
+        core.set_exit("death-lag", 0)
+
+        async def die():
+            core.die("death-lag")
+            self.hub._on_core_tick()
+            await _settle(self.hub)
+
+        worst = await _worst_loop_lag(die)
+        self.assertLess(worst, 0.08, f"the death's snapshot held the loop for {worst:.3f}s")
 
 
 class SeamDeadlineTests(_ManagerCase):
@@ -204,6 +317,25 @@ class WatchGeometryTests(_ManagerCase):
         self.assertEqual(self.hub.core.session("watch-rows").watch_calls, [36])
         sess.resize(120, 60)
         self.assertEqual(self.hub.core.session("watch-rows").watch_calls, [36, 60])
+
+
+async def _requests_applied(hub, *session_ids, timeout: float = 2.0) -> None:
+    """Waits until each id's request consumer has applied what its drain record queued (r4b #2).
+
+    The consumer runs on its own task, so a test that asserts on an applied resize or echo must let
+    the loop run the consumer: `drain()` only queues.
+    """
+    deadline = time.monotonic() + timeout
+    for session_id in session_ids:
+        queue = hub._terminal_request_queues.get(session_id)
+        task = hub._terminal_request_consumers.get(session_id)
+        while queue is not None and queue._unfinished_tasks:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"{session_id}'s queued requests were never applied")
+            await asyncio.sleep(0.005)
+            queue = hub._terminal_request_queues.get(session_id)
+        if task is not None:
+            await asyncio.wait([task], timeout=max(0.0, deadline - time.monotonic()))
 
 
 async def _worst_loop_lag(action) -> float:
@@ -375,6 +507,52 @@ class ShutdownTests(_ManagerCase):
         self.assertIn("ARCHIVED-BLOB", zlib.decompress(bytes(row[1])).decode("utf-8"),
                       "the fallback snapshot lost the raw ring the archive stores")
 
+    async def test_the_forced_final_row_reads_no_core_when_the_snapshot_missed(self):
+        # r3-kimi 1/4: with `snapshot_all` and the per-id reads both missed, the archive body and
+        # the last-resort fallback each read the core for their own snapshot -- on the loop, after
+        # the stop's budget was already spent -- so the fallback overran and wrote no row at all.
+        ids = [f"forced-{index}" for index in range(3)]
+        for session_id in ids:
+            await _live(self.hub, session_id)
+            self.hub.core.set_exit(session_id, 0)
+            self.hub.core.die(session_id)
+            self.hub._on_core_tick()
+        await _settle(self.hub)
+        core = self.hub.core
+        screen, scrollback = core.screen, core.scrollback
+        reads = []
+
+        def slow_screen(*args, **kwargs):
+            reads.append("screen")
+            time.sleep(0.12)
+            return screen(*args, **kwargs)
+
+        def slow_scrollback(*args, **kwargs):
+            reads.append("scrollback")
+            time.sleep(0.12)
+            return scrollback(*args, **kwargs)
+
+        async def stalled(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        with patch.object(self.hub, "_archive_session", new=stalled), \
+                patch.object(self.hub, "_read_session_snapshot", side_effect=OSError("missed")), \
+                patch.object(core, "snapshot_all", return_value=[]), \
+                patch.object(core, "screen", slow_screen), \
+                patch.object(core, "scrollback", slow_scrollback), \
+                patch.multiple(session_manager, SHUTDOWN_MAX_SEC=1.0,
+                               SHUTDOWN_SNAPSHOT_MAX_SEC=0.0, SHUTDOWN_KILL_MAX_SEC=0.05,
+                               SHUTDOWN_CORE_STOP_MAX_SEC=0.05):
+            worst = await _worst_loop_lag(self.hub.archive_all_sessions_on_shutdown)
+        self.assertLess(worst, 0.08, f"the stop read the core on the loop for {worst:.3f}s")
+        with closing(sqlite3.connect(self.root / "hub_state.db")) as conn:
+            rows = [conn.execute(
+                "SELECT archived_at FROM sessions WHERE session_id=?", (session_id,),
+            ).fetchone() for session_id in ids]
+        self.assertTrue(all(row and row[0] for row in rows),
+                        f"the no-snapshot fallback left final rows unwritten: {rows}")
+        self.assertEqual(reads, [], "a stop with no snapshot still read the core")
+
 
 class RetireIncarnationTests(_ManagerCase):
     async def test_a_refused_retire_is_retried_without_a_new_record(self):
@@ -429,6 +607,68 @@ class RetireIncarnationTests(_ManagerCase):
         self.assertIn("retire-resume", self.hub.sessions)
         self.assertIn("STILL-LIVE", resumed.read_raw().text,
                       "the retried retire removed the resumed incarnation from the core")
+
+    async def test_an_in_flight_retire_cannot_commit_inside_a_resume(self):
+        # r3-kimi 3: the resume-lock guard was read once, so a retire already inside `core.retire`
+        # committed while the resume was between its incarnation bump and its spawn: the core
+        # removed the predecessor after the resume had claimed the id, the spawn then built a fresh
+        # fan-out, and the console's sockets closed by that retire were never handed over. A
+        # deferred retire now holds the resume lock across its core call, so it commits before the
+        # resume starts or not at all. The incarnation at its commit is the discriminator: equal to
+        # what the retire saw means no resume ran inside it.
+        await _resumable(self.hub, self.root, "inflight-retire")
+        self.hub.core.spawn("inflight-retire", ["cmd.exe"])
+        self.hub._on_core_tick()
+        self.hub.core.kill("inflight-retire", 200)
+        self.hub._on_core_tick()
+        await _settle(self.hub)
+
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        seen = {}
+        original_retire = self.hub.core.retire
+        original_bump = self.hub._next_incarnation
+
+        def slow_retire(session_id):
+            seen["inc_in_core"] = self.hub._incarnations.get(session_id, 0)
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2):
+                raise AssertionError("the probe never released retire")
+            answer = original_retire(session_id)
+            seen["inc_at_commit"] = self.hub._incarnations.get(session_id, 0)
+            return answer
+
+        def watched_bump(session_id):
+            generation = original_bump(session_id)
+            seen.setdefault("bumped_during_retire", "inc_at_commit" not in seen)
+            return generation
+
+        self.hub.core.retire = slow_retire
+        self.hub._next_incarnation = watched_bump
+        try:
+            retiring = asyncio.create_task(self.hub._retire_ended_session(
+                "inflight-retire", self.hub._incarnations.get("inflight-retire", 0), retry="record"))
+            await asyncio.wait_for(entered.wait(), 1)
+            resuming = asyncio.create_task(
+                self.hub.resume_subagent("inflight-retire", source="console"))
+            await asyncio.sleep(0.05)  # a resume that does not wait reaches its bump here
+            release.set()
+            await retiring
+            result = await resuming
+        finally:
+            self.hub.core.retire = original_retire
+            self.hub._next_incarnation = original_bump
+            release.set()
+        self.assertTrue(result["resumed"], result)
+        self.assertFalse(seen.get("bumped_during_retire"),
+                         "a resume bumped the id's incarnation inside the retire's core call")
+        self.assertEqual(seen["inc_at_commit"], seen["inc_in_core"],
+                         "the retire committed after a resume had replaced the incarnation")
+        successor = self.hub.sessions["inflight-retire"]
+        self.assertTrue(successor.is_process_alive(), "the successor is not live")
+        self.assertIsNone(self.hub.core.session("inflight-retire").exit_code,
+                          "the predecessor's death reached the successor's entry")
 
     async def test_a_refused_drop_keeps_retrying_past_the_cap(self):
         # r2-kimi 6: the cap cleared the pending drop and armed nothing, so a core entry the table
@@ -743,6 +983,7 @@ class DrainRequestTests(_ManagerCase):
         self.hub.core.request_resize("resize-target", 100, 30, propagate=False)
         self.hub.core.request_resize("resize-target", 140, 44, propagate=False)
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "resize-target")
         self.assertEqual((target.cols, target.rows), (140, 44), "the last request in order did not win")
         self.assertEqual((self.hub.core.session("resize-target").cols,
                           self.hub.core.session("resize-target").rows), (140, 44),
@@ -752,6 +993,7 @@ class DrainRequestTests(_ManagerCase):
         # A single-window request propagates; an earlier `false` must not survive it.
         self.hub.core.request_resize("resize-target", 96, 24, propagate=True)
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "resize-target")
         self.assertEqual((background.cols, background.rows), (96, 24),
                          "the propagated request never reached the background session")
         self.assertEqual((self.hub.default_cols, self.hub.default_rows), (96, 24))
@@ -760,8 +1002,10 @@ class DrainRequestTests(_ManagerCase):
         target = await _live(self.hub, "resize-clamp")
         self.hub.core.request_resize("resize-clamp", 4, 2, propagate=False)
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "resize-clamp")
         self.assertEqual((target.cols, target.rows), (20, 5), "the 20x5 clamp is missing")
         self.hub._on_core_tick()  # nothing was recorded again: the request is consumed
+        await _requests_applied(self.hub, "resize-clamp")
         self.assertEqual((target.cols, target.rows), (20, 5))
         self.assertEqual(self.hub.core.session("resize-clamp").resize_requests, [])
 
@@ -778,11 +1022,13 @@ class DrainRequestTests(_ManagerCase):
         self.hub.core.request_input("text-input", "hi")
         self.hub.core.request_input("text-input", "there\r")
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "text-input")
         self.assertEqual(lines, [("text-input", "hithere")], "the line callback missed the typed text")
         self.assertIn("hithere", sess.read_raw().text, "the echo never reached the text screen")
         self.assertEqual(self.hub.core.inputs_of("text-input"), [],
                          "text-session input was written to the core")
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "text-input")
         self.assertEqual(lines, [("text-input", "hithere")], "the request was delivered twice")
 
     async def test_a_text_session_echoes_a_backspace_and_delivers_one_line(self):
@@ -793,6 +1039,7 @@ class DrainRequestTests(_ManagerCase):
                            on_virtual_line_cb=lambda sid, line: lines.append(line))
         self.hub.core.request_input("text-edit", "ab\x7f\r")
         self.hub._on_core_tick()
+        await _requests_applied(self.hub, "text-edit")
         self.assertEqual(lines, ["a"], "backspace did not edit the virtual line")
 
     async def test_a_bad_request_costs_that_request_only(self):
@@ -805,6 +1052,7 @@ class DrainRequestTests(_ManagerCase):
         self.hub.core.request_resize("request-bad-2", 88, 22, propagate=False)
         with self.assertLogs("mcp-agent-hub.session_manager", level="ERROR") as logs:
             self.hub._on_core_tick()
+            await _requests_applied(self.hub, "request-bad", "request-bad-2")
         self.assertTrue(any("resize request for request-bad failed" in line for line in logs.output),
                         logs.output)
         self.assertEqual((target.cols, target.rows), (120, 36), "the bad request was applied")
@@ -841,6 +1089,138 @@ class DrainRequestTests(_ManagerCase):
         self.hub.core.note_socket_drops("drops-grow", 3, 9)
         self.hub._on_core_tick()
         self.assertEqual(self.hub._socket_drops[("drops-grow", 3)], 9)
+
+    async def test_the_drain_never_blocks_the_loop_and_applies_in_order(self):
+        # kimi 4b #2: a drain record's requests are applied by a consumer that awaits the core off
+        # the loop. 40 ms per `resize` and per `feed`, two `propagate` requests (four resizes), and
+        # a heartbeat that must keep beating; the applied order is the console's arrival order.
+        target = await _live(self.hub, "consumer-target")
+        background = await _live(self.hub, "consumer-background")
+        core = self.hub.core
+        applied = []
+        resize, feed = core.resize, core.feed
+
+        def slow_resize(session_id, cols, rows, deadline_ms=None):
+            time.sleep(0.04)
+            applied.append(("resize", session_id, int(cols), int(rows)))
+            return resize(session_id, cols, rows, deadline_ms)
+
+        def slow_feed(session_id, text, deadline_ms=None):
+            time.sleep(0.04)
+            return feed(session_id, text, deadline_ms)
+
+        core.resize = slow_resize
+        core.feed = slow_feed
+        text = _session(self.hub, "consumer-text", command="", args=[])
+        text.kind = "virtual"
+        lines = []
+        text.start_virtual(asyncio.get_running_loop(),
+                           on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        core.request_resize("consumer-target", 100, 30, propagate=True)
+        core.request_resize("consumer-target", 90, 28, propagate=True)
+        core.request_input("consumer-text", "typed\r")
+
+        worst = await _worst_loop_lag(lambda: self._drain_and_apply(
+            "consumer-target", "consumer-background", "consumer-text"))
+        self.assertLess(worst, 0.08, f"the drain held the loop for {worst:.3f}s")
+        self.assertEqual(applied, [
+            ("resize", "consumer-target", 100, 30),
+            ("resize", "consumer-background", 100, 30),
+            ("resize", "consumer-target", 90, 28),
+            ("resize", "consumer-background", 90, 28),
+        ], "the console's requests were not applied once and in order")
+        self.assertEqual((target.cols, target.rows), (90, 28))
+        self.assertEqual((background.cols, background.rows), (90, 28))
+        self.assertEqual(lines, [("consumer-text", "typed")], "the text input was applied")
+
+    async def _drain_and_apply(self, *session_ids):
+        self.hub._on_core_tick()
+        await _requests_applied(self.hub, *session_ids)
+
+    async def test_a_close_ends_the_consumer_and_its_queued_requests_do_nothing(self):
+        # r4b #2 + omp 4b F4: the close ends the id's consumer before `close_sockets`/`retire`, and
+        # what that consumer still held belongs to a pane the hub no longer lists, so it neither
+        # resizes another pane nor reaches the core. The consumer is wedged on its first request, so
+        # the queue below is genuinely unapplied when the close takes over.
+        background = await _live(self.hub, "close-consumer-bg")
+        target = await _live(self.hub, "close-requests")
+        self.hub.default_cols, self.hub.default_rows = 120, 36
+        wedged = asyncio.Event()
+
+        async def wedged_resize(_session_id, _request):
+            await wedged.wait()
+            return False
+
+        with patch.object(session_manager.HubSessionManager, "_apply_resize_request", wedged_resize), \
+                patch.object(session_manager, "REQUEST_CONSUMER_DRAIN_SEC", 0.15):
+            self.hub.core.request_resize("close-requests", 100, 30, propagate=True)
+            self.hub._on_core_tick()
+            consumer = self.hub._terminal_request_consumers.get("close-requests")
+            self.assertIsNotNone(consumer, "the tick did not start a consumer")
+            await asyncio.sleep(0.01)  # the consumer is inside the wedged request now
+            await self.hub.close_session("close-requests", source="console")
+            await asyncio.wait([consumer], timeout=1.0)
+        wedged.set()
+        self.assertTrue(consumer.cancelled() or consumer.done(), "the close left its consumer running")
+        self.assertIsNone(self.hub._terminal_request_consumers.get("close-requests"))
+        self.assertIsNone(self.hub._terminal_request_queues.get("close-requests"))
+        self.assertEqual((target.cols, target.rows), (120, 36),
+                         "a closing pane's resize reached its own gone session")
+        self.assertEqual((background.cols, background.rows), (120, 36),
+                         "a closing pane's resize propagated to a listed pane")
+        self.assertEqual((self.hub.default_cols, self.hub.default_rows), (120, 36))
+
+    async def test_a_request_for_an_unlisted_id_resizes_no_other_pane(self):
+        # omp 4b F4: a resize frame for an id the hub no longer lists is that pane's intent, and it
+        # must not update the defaults or propagate to the visible panes.
+        background = await _live(self.hub, "unlisted-background")
+        self.hub.default_cols, self.hub.default_rows = 120, 36
+        self.hub.core.attach_text("unlisted-gone", cols=120, rows=36)
+        self.hub.core.request_resize("unlisted-gone", 90, 20, propagate=True)
+        self.hub._on_core_tick()
+        await _requests_applied(self.hub, "unlisted-gone")
+        self.assertEqual((background.cols, background.rows), (120, 36),
+                         "a gone pane's resize reached a listed session")
+        self.assertEqual((self.hub.default_cols, self.hub.default_rows), (120, 36),
+                         "a gone pane's resize changed the console defaults")
+        # The input half of the same rule.
+        self.hub.core.request_input("unlisted-gone", "typed\r")
+        self.hub._on_core_tick()
+        await _requests_applied(self.hub, "unlisted-gone")
+        self.assertEqual(self.hub.core.inputs_of("unlisted-gone"), [],
+                         "typed input for a gone pane reached the core")
+
+    async def test_a_drain_tick_and_concurrent_closers_share_the_socket_diagnostics(self):
+        # omp 4b F5: `_socket_drops` is written by the tick and read by every close, so the close's
+        # forget runs on the loop instead of in its worker (a dict mutated during iteration).
+        ids = [f"drops-race-{index}" for index in range(3)]
+        for session_id in ids:
+            await _live(self.hub, session_id)
+            self.hub.core.open_socket(session_id, 1)
+            self.hub.core.note_socket_drops(session_id, 1, 5)
+        self.hub._on_core_tick()
+        self.assertEqual(set(self.hub._socket_drops), {(sid, 1) for sid in ids})
+        with patch.object(session_manager, "SHUTDOWN_CLOSE_SOCKETS_MAX_SEC", 0.5):
+            self.hub.core.snapshot_delay = 0.05
+            await self.hub.archive_all_sessions_on_shutdown()
+        self.assertEqual(self.hub._socket_drops, {}, "a closed id's diagnostics stayed")
+
+    async def test_the_stop_closes_every_listed_pane_before_the_core_stops(self):
+        # omp 4b F2: gap 11 wants every open pane told its socket ended, off the loop, before
+        # `core.shutdown` ends the listener.
+        first = await _live(self.hub, "stop-sockets-a")
+        second = await _live(self.hub, "stop-sockets-b")
+        for session_id in ("stop-sockets-a", "stop-sockets-b"):
+            self.hub.core.open_socket(session_id, 1)
+        before = len(self.hub.core.close_socket_calls)
+        worst = await _worst_loop_lag(self.hub.archive_all_sessions_on_shutdown)
+        closes = self.hub.core.close_socket_calls[before:]
+        self.assertEqual(sorted(closes), ["stop-sockets-a", "stop-sockets-b"],
+                         f"the stop did not close every listed pane's sockets: {closes}")
+        self.assertEqual(self.hub.core.socket_count(), 0, "a console socket outlived the stop")
+        self.assertEqual(self.hub.core.calls, ["snapshot_all", "kill_all", "shutdown"])
+        self.assertLess(worst, 0.08, f"a close held the loop for {worst:.3f}s")
+        self.assertEqual((first.session_id, second.session_id), ("stop-sockets-a", "stop-sockets-b"))
 
     async def test_closing_a_session_closes_its_sockets_and_forgets_them(self):
         await _live(self.hub, "close-sockets")

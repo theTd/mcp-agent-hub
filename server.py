@@ -1319,6 +1319,11 @@ async def api_terminal_ticket(session_id: str):
     still exists does get a ticket: its pane attaches the terminal and shows the final replay, as
     the socket always allowed (`mountPaneBody`). A starting session (no first alive record yet) and
     a DSH text session do too.
+
+    r4b #2/kimi 4b #3: the mint reads the core's session table, which can miss its 50 ms deadline
+    while a spawn, a retire or a snapshot holds it; the call and its ticket store run in a worker so
+    this route never holds the loop, and a deadline answers the retryable 503 the console's backoff
+    already waits out. Only a genuine core fault is a 500.
     """
     if hub.sessions.get(session_id) is None:
         return not_found(f"找不到会话 {session_id}")
@@ -1328,10 +1333,15 @@ async def api_terminal_ticket(session_id: str):
         # terminal to serve. Answering 404 keeps the console's not-found path; no core is built here.
         return not_found(f"找不到会话 {session_id}")
     try:
-        ticket = core.ws_ticket(session_id)
+        ticket = await asyncio.to_thread(core.ws_ticket, session_id)
     except KeyError:
         # The hub still lists the id, but the core's entry is gone: a closed pane, not a retry.
         return not_found(f"找不到会话 {session_id}")
+    except TimeoutError:
+        # Gaps 8: the table missed its read deadline, which the old `/ws/pty` answered as 1013.
+        # The console retries any non-404 answer on its backoff, so say "busy", never 500.
+        return JSONResponse({"detail": "终端服务忙，请稍后重试"}, status_code=503,
+                            headers={"Retry-After": "1"})
     expires_at = float(ticket.get("expires_at") or 0.0)
     return {
         "url": str(ticket.get("url") or ""),

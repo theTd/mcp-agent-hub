@@ -360,7 +360,12 @@ class FakeTerminal:
         return bool(self.listening)
 
     def ws_ticket(self, session_id: str, ttl_ms: Optional[int] = None) -> Dict[str, Any]:
-        """One single-use ticket per call; `KeyError` for an id this core does not have."""
+        """One single-use ticket per call; `KeyError` for an id this core does not have.
+
+        The mint reads the id's table entry, so it takes the table's read deadline like every other
+        read: a table held by a spawn insert or a snapshot raises `TimeoutError` (design §6.4).
+        """
+        self._check_read()
         if session_id not in self.sessions:
             raise KeyError(session_id)
         self.ticket_calls.append(session_id)
