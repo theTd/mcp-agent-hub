@@ -59,8 +59,9 @@ class _ManagerCase(unittest.IsolatedAsyncioTestCase):
         if self.hub.core is not None:
             self.hub.core.kill_all(500)
             self.hub._on_core_tick()
+        # The stop ends the core itself (off the loop, design §6.6); calling it again here would
+        # join a stopped ticker.
         await self.hub.archive_all_sessions_on_shutdown()
-        self.hub.core.shutdown()
         self.temporary.cleanup()
 
 
@@ -188,6 +189,65 @@ class HubOnCoreTests(_ManagerCase):
         self.assertEqual(self.hub.core.stats()["sessions"], 0, "retire left the id in the core's table")
         self.assertNotIn("hub-core-probe", self.hub.sessions)
         self.assertNotIn("hub-core-probe", self.hub.terminal_sockets)
+
+
+class FakeCoreFidelityTests(unittest.TestCase):
+    """T1-T3: the fake must be able to script what the real core reports."""
+
+    def test_a_text_session_has_no_process(self):
+        # T1: `attach_text` reports pid 0, so the hub takes the no-process branch.
+        core = FakeTerminal()
+        reply = core.attach_text("text-probe", cols=120, rows=36)
+        self.assertEqual(reply["pid"], 0)
+        record = core.drain()[0]
+        self.assertEqual(record["pid"], 0)
+        self.assertFalse(bool(record["pid"]))
+
+    def test_a_predecessor_s_record_is_dropped_by_the_same_id_spawn(self):
+        # T2: the core's table insert drops a death that was not drained before the reattach.
+        core = FakeTerminal()
+        core.spawn("dropped", ["cmd.exe"])
+        core.kill("dropped", 200)
+        core.spawn("dropped", ["cmd.exe"])  # the resume replaces the entry
+        records = core.drain()
+        self.assertEqual([r["alive"] for r in records], [True], records)
+        self.assertFalse(core.session("dropped").death_drained)
+        with self.assertRaises(ValueError):
+            core.retire("dropped")
+
+    def test_the_fake_scripts_a_cleanless_death_a_write_deadline_and_idle_time(self):
+        # T3: the cases F1/F2/F9 need: no exit code, a full write queue, a real timestamp.
+        core = FakeTerminal()
+        core.spawn("scripted", ["cmd.exe"])
+        core.drain()  # the spawn's own record; the death is what this test scripts
+        core.set_exit("scripted", None, crashed=True)
+        core.set_last_output_at("scripted", 1234.5)
+        core.set_write_timeouts("scripted", 1)
+        with self.assertRaises(TimeoutError):
+            core.write("scripted", "x")
+        core.die("scripted")
+        record = core.drain()[0]
+        self.assertEqual((record["alive"], record["exit_code"], record["crashed"]), (False, None, True))
+        self.assertEqual(record["last_output_at"], 1234.5)
+
+
+class CoreLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_builds_no_core_and_the_first_session_builds_one(self):
+        # F14: `start()` must not load the extension, so a hub (or a test) that never opens a
+        # terminal never starts the core's ticker.
+        temporary = tempfile.TemporaryDirectory(prefix="hub-lazy-core-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        profiles = root / "profiles.json"
+        profiles.write_text('{"profiles":{}}', encoding="utf-8")
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            hub = HubSessionManager(profiles, base_dir=Path(session_manager.__file__).parent,
+                                    data_dir=root)
+        self.addAsyncCleanup(hub.archive_all_sessions_on_shutdown)
+        await hub.start()
+        self.assertIsNone(hub.core, "start() built the terminal core")
+        core = hub._ensure_core()
+        self.assertIs(hub._ensure_core(), core, "a second core was built")
 
 
 if __name__ == "__main__":

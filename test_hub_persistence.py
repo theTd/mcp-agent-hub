@@ -261,10 +261,19 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.module.hub.sessions[self.session.session_id] = self.session
         # The terminal is the hub's real core (step 3b): a live cmd.exe behind this session, so the
         # `/ws/pty` bridge, the input path and the archive read the same core the hub runs on.
-        self.session.core = self.module.hub.core
+        # F14: `start()` builds the Core lazily now, so a harness that wants a real terminal asks
+        # for the hub's one Core here.
+        self.session.core = self.module.hub._ensure_core()
         self.module.hub.core.spawn(self.session.session_id, ["cmd.exe"],
                                    cwd=str(self.directory), cols=120, rows=36)
-        self.module.hub._on_core_tick()
+        # The core publishes the spawn's first record from its own ticker, so one tick straight
+        # after `spawn` may see nothing and leave the session without pid or liveness. Wait for the
+        # record instead: a test that reads `is_process_alive` must not race the core's thread.
+        deadline = time.monotonic() + 3.0
+        while not self.session.has_process and time.monotonic() < deadline:
+            self.module.hub._on_core_tick()
+            await asyncio.sleep(0.02)
+        self.assertTrue(self.session.has_process, "the core never published the spawn record")
         await self.module.hub.persist_session(self.session)
         await self.module.hub.db.flush()
 
@@ -369,7 +378,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session.status = "running"
         session.dsh_job_id = job_id
         session._loop = asyncio.get_running_loop()
-        session.core = self.module.hub.core
+        session.core = self.module.hub._ensure_core()
         self.module.hub.core.attach_text(session.session_id, cols=120, rows=36)
         self.module.hub.sessions[session.session_id] = session
         websocket = await self.connect_terminal()
@@ -590,6 +599,30 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m["content"] for m in record["parent_messages"] if m["direction"] == "parent"], ["accepted answer"])
         finally:
             lock.close()
+
+    async def test_a_session_without_a_core_entry_closes_the_socket_normally(self):
+        # F6: an attach raises when the core never had the id (a failed spawn still listed, a
+        # desktop window, a retired id). Uncaught, uvicorn closes with 1011 and the browser
+        # reconnects in a loop; an ended id closes 1000, one the core never had 1008.
+        import session_manager
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+        hub = self.module.hub
+        ghost = session_manager.AgentSession(
+            session_id="ws-nocore", profile_id="pwsh", profile_name="Ghost", kind="tui",
+            title="Ghost", cwd=str(self.directory), command="cmd.exe", args=[],
+        )
+        ghost.core = hub.core
+        ghost.status = "running"
+        hub.sessions["ws-nocore"] = ghost
+        for status, ended_at, expected in (("running", None, 1008), ("exited", 1.0, 1000)):
+            ghost.status = status
+            ghost.ended_at = ended_at
+            websocket = await connect(f"ws://127.0.0.1:{self.port}/ws/pty/ws-nocore", proxy=None)
+            with self.assertRaises(ConnectionClosed) as ctx:
+                await asyncio.wait_for(websocket.recv(), timeout=3)
+            self.assertEqual(ctx.exception.rcvd.code, expected, status)
+            await websocket.close()
 
 
 if __name__ == "__main__":

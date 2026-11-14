@@ -408,6 +408,18 @@ RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
 # takes its time; each session is bounded and so is the whole loop.
 SHUTDOWN_MAX_SEC = 8.0
 SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC = 2.0
+# How long the shutdown gives the core to snapshot the screens and to stop itself, both off the loop;
+# the rest of the shared budget is left for `kill_all` and the archive.
+SHUTDOWN_SNAPSHOT_MAX_SEC = 2.0
+SHUTDOWN_CORE_STOP_MAX_SEC = 1.5
+# The kill's own cap, and the share of the budget kept for writing the final rows: every core call
+# of the stop is bounded by what is left of the one 8 s budget, never by a fresh timeout.
+SHUTDOWN_KILL_MAX_SEC = 2.0
+SHUTDOWN_ARCHIVE_RESERVE_SEC = 1.0
+# rtc-retire: a refused retire is retried on this timer, so a quiet id (no first-class DSH session
+# ever publishes a record) is not stranded in the core's table for the hub's life.
+RETIRE_RETRY_INTERVAL_SEC = 0.25
+RETIRE_RETRY_MAX_ATTEMPTS = 40
 AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
 CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
 KIMI_LOCKED_MESSAGE = "该 Kimi 会话正被另一个进程使用"
@@ -2134,13 +2146,46 @@ class TerminalSockets:
     Step 4 deletes the whole structure with the core's own socket.
     """
 
-    __slots__ = ("handles", "closers", "dropped")
+    __slots__ = ("handles", "closers", "dropped", "overflow", "pending", "orphans", "slow",
+                 "detach_inflight")
 
     def __init__(self) -> None:
         self.handles: Dict[asyncio.Queue, int] = {}
         self.closers: Dict[asyncio.Queue, Callable[[], Any]] = {}
-        # `take_frames`' cumulative drop count per handle, to log a slow client once.
+        # `take_frames`' cumulative drop count per handle (bytes the core's own queue lost), to log
+        # a slow client once.
         self.dropped: Dict[int, int] = {}
+        # Frames this side had to drop because they exceeded the socket's window (F13), per handle;
+        # kept apart from `dropped`, whose unit is bytes and whose source is the core.
+        self.overflow: Dict[int, int] = {}
+        # Frames taken from a handle whose Python queue was full, by handle, in arrival order: the
+        # next tick offers them again instead of silently dropping the rest of the batch (F13).
+        self.pending: Dict[int, List[str]] = {}
+        # Handles whose `detach_queue` has to be retried off the loop (F7/F8): a closed fan-out and
+        # a busy registry both leave the core's sink registered until the detach succeeds.
+        self.orphans: Set[int] = set()
+        self.detach_inflight: Set[int] = set()
+        # Handles whose slow-client warning was already logged.
+        self.slow: Set[int] = set()
+
+
+def release_terminal_handle(core: Core, handle: int) -> bool:
+    """`detach_queue(handle)` once; True when the handle is gone from the core or need not be.
+
+    The coming core raises `TimeoutError` on a busy registry and keeps the sink registered, so a
+    miss is retried later (F8); `KeyError`/`False` mean never issued or already detached, which is
+    normal teardown. Blocking (registry deadline): the retries run off the loop.
+    """
+    try:
+        core.detach_queue(handle)
+    except KeyError:
+        return True
+    except TimeoutError:
+        return False
+    except Exception:
+        logger.debug("detach_queue(%s) failed", handle, exc_info=True)
+        return True
+    return True
 
 
 def drain_terminal_frames(core: Core, session_id: str, sockets: TerminalSockets) -> None:
@@ -2148,8 +2193,19 @@ def drain_terminal_frames(core: Core, session_id: str, sockets: TerminalSockets)
 
     `take_frames` is non-blocking and reports the queue's cumulative drop count and whether the id
     was retired; a closed queue closes its socket with code 1000, which is what the hub's own
-    `close_ws_frontends` does when it drops the session.
+    `close_ws_frontends` does when it drops the session, and the handle is then detached exactly
+    once (F7).
     """
+    for handle, backlog in list(sockets.pending.items()):
+        q = next((q for q, h in sockets.handles.items() if h == handle), None)
+        if q is None:
+            sockets.pending.pop(handle, None)
+            continue
+        rest = _offer_frames(sockets, session_id, handle, q, backlog)
+        if rest:
+            sockets.pending[handle] = rest
+        else:
+            sockets.pending.pop(handle, None)
     for q, handle in list(sockets.handles.items()):
         try:
             frames, dropped, closed = core.take_frames(handle)
@@ -2158,26 +2214,56 @@ def drain_terminal_frames(core: Core, session_id: str, sockets: TerminalSockets)
             sockets.handles.pop(q, None)
             sockets.closers.pop(q, None)
             sockets.dropped.pop(handle, None)
+            sockets.overflow.pop(handle, None)
+            sockets.pending.pop(handle, None)
             continue
         if dropped > sockets.dropped.get(handle, 0):
             sockets.dropped[handle] = dropped
             logger.warning("terminal socket of %s dropped %d bytes (slow client)", session_id, dropped)
-        for frame in frames:
-            try:
-                q.put_nowait(frame.decode("utf-8", "replace"))
-            except asyncio.QueueFull:
-                # The core already bounds its own queue; a full Python queue means the sender is
-                # behind, and the oldest frame goes exactly as `put_nowait` did before the swap.
-                break
+        rest = _offer_frames(sockets, session_id, handle,
+                             q, [frame.decode("utf-8", "replace") for frame in frames])
+        if rest:
+            sockets.pending[handle] = rest
         if closed:
             sockets.handles.pop(q, None)
             sockets.dropped.pop(handle, None)
+            sockets.overflow.pop(handle, None)
+            sockets.pending.pop(handle, None)
+            # The core keeps a retired id's handle until it is detached (§5.2), so the closed sink
+            # is released here, once; a busy registry leaves it to the manager's off-loop retry.
+            if not release_terminal_handle(core, handle):
+                sockets.orphans.add(handle)
             closer = sockets.closers.pop(q, None)
             if closer is not None:
                 try:
                     closer()
                 except Exception:
                     logger.debug("closing the socket of %s failed", session_id, exc_info=True)
+
+
+def _offer_frames(sockets: TerminalSockets, session_id: str, handle: int, q: asyncio.Queue,
+                  frames: List[str]) -> List[str]:
+    """Puts what fits on the socket's queue and returns the rest, counting what cannot be kept (F13).
+
+    A full queue is the sender falling behind, not a reason to lose bytes silently: the remainder
+    waits for the next tick, and only a backlog past the socket's own window is dropped. That loss is
+    counted per handle in `overflow` (frames, kept apart from the core's byte count) and logged once.
+    """
+    for index, frame in enumerate(frames):
+        try:
+            q.put_nowait(frame)
+        except asyncio.QueueFull:
+            rest = frames[index:]
+            if len(rest) > WS_QUEUE_MAX_FRAMES:
+                overflow = len(rest) - WS_QUEUE_MAX_FRAMES
+                rest = rest[-WS_QUEUE_MAX_FRAMES:]
+                sockets.overflow[handle] = sockets.overflow.get(handle, 0) + overflow
+                if handle not in sockets.slow:
+                    sockets.slow.add(handle)
+                    logger.warning("terminal socket of %s dropped %d frames (client too far behind)",
+                                   session_id, sockets.overflow[handle])
+            return rest
+    return []
 
 
 class AgentSession:
@@ -2201,7 +2287,7 @@ class AgentSession:
         core: Optional[Core] = None,
         # A7: the callback carries the session object, so an exit of an object a resume already
         # replaced can never be mistaken for the live session's own exit.
-        on_exit_cb: Optional[Callable[["AgentSession", int], None]] = None,
+        on_exit_cb: Optional[Callable[["AgentSession", Optional[int]], None]] = None,
         on_tui_tool_cb: Optional[Callable[[str, str, str], None]] = None,
         # The id's socket registry (§6.4 A1): the manager shares one per session id, so a resume
         # keeps the sockets the previous incarnation served; standalone tests get their own.
@@ -2317,6 +2403,10 @@ class AgentSession:
         self._virtual: bool = False
         self._raw_rev: int = 0
         self._screen_rev: int = 0
+        # The row count the generic watch was registered with, so a resize can refresh it (F12).
+        self._watched_rows: Optional[int] = None
+        # The death record's `crashed` (a reader panic): a crash even when no code came with it (F1).
+        self._died_crashed: bool = False
         # The seed the next spawn/attach_text starts its ring with (A1), consumed once.
         self._seed_history: Optional[str] = None
 
@@ -2480,34 +2570,53 @@ class AgentSession:
         self.status = "running"
         self.current_activity = "Interactive session running"
         self.last_output_at = time.time()
-        if self._wants_tool_line_scan():
-            # §5.6: the generic tool-line scan is a watched snapshot, bounded by its interval.
-            try:
-                self._core().watch_screen(
-                    self.session_id,
-                    max_lines=max(5, int(self.rows)),
-                    interval_ms=TOOL_LINE_SCAN_INTERVAL_MS,
-                )
-            except Exception:
-                pass
+        self._watch_rows()
 
-    def _finish_read(self, exit_code: Optional[int]) -> None:
+    def _watch_rows(self) -> None:
+        """§5.6: the generic tool-line scan is a watched snapshot, bounded by its interval.
+
+        The row count is the one the pane shows now, so a resize re-watches with it (F12): rows
+        that only became visible after the pane grew are part of the next `screen_text`.
+        """
+        if not self._wants_tool_line_scan():
+            self._watched_rows = None
+            return
+        rows = max(5, int(self.rows))
+        try:
+            self._core().watch_screen(
+                self.session_id,
+                max_lines=rows,
+                interval_ms=TOOL_LINE_SCAN_INTERVAL_MS,
+            )
+            self._watched_rows = rows
+        except Exception:
+            self._watched_rows = None
+
+    def _finish_read(self, exit_code: Optional[int], crashed: bool = False,
+                     scan: bool = True) -> None:
         """The exit path, run from the drain handler that saw the death record (§5.3).
 
         It is `_finish_read`'s body unchanged: the scrollback snapshot into `final_response`, the
         named end reason, and the one lifecycle callback. The core publishes the death record after
         the session's last byte, so this runs exactly where the reader thread used to run it.
+
+        `exit_code` is kept as the core reported it: a failed `GetExitCodeProcess` leaves `None`,
+        and `crashed` marks a reader panic. Neither may become a clean 0 for any engine (F1).
         """
         self.ended_at = time.time()
         self.exit_code = exit_code
+        self._died_crashed = bool(crashed)
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
-        try:
-            scrollback = self.read_scrollback(max_lines=80).text
-            clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-            if clean_lines and not self.final_response_from_previous_turn:
-                self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
-        except Exception:
-            pass
+        if scan:
+            try:
+                scrollback = self.read_scrollback(max_lines=80).text
+                clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
+                if clean_lines and not self.final_response_from_previous_turn:
+                    self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
+            except Exception:
+                # F15: a failed death snapshot is a diagnostic, not a silence: the drain handler's
+                # own try cannot see it, so the session id goes to the log here.
+                logger.exception("terminal core: exit snapshot of %s failed", self.session_id)
 
         # Archive spec §1.4/§2: the process's end gets a named reason. A user termination already
         # decided its status in terminate(); the death record must not overwrite it.
@@ -2521,10 +2630,14 @@ class AgentSession:
         if self.on_exit_cb and self._loop and not self.terminated_by_user:
             # V-5: a user termination already has its one lifecycle event; do not queue a second one.
             # A7: carry this object, so the manager can tell it apart from a later resume's object.
-            self.on_exit_cb(self, self.exit_code or 0)
+            self.on_exit_cb(self, self.exit_code)
 
-    def apply_core_record(self, record: Dict[str, Any]) -> None:
-        """Applies one `drain()` record's counters (§5.3), and the exit path when it reports a death.
+    def apply_core_record(self, record: Dict[str, Any]) -> str:
+        """Applies one `drain()` record's counters (§5.3); names what the record did.
+
+        "death" is the record that reported this session's death, "late_code" one that carried a
+        code the death record lacked (SF3), and "" an ordinary record. The caller uses it to run
+        the exit path once and to rewrite the archived row when the code finally arrives.
 
         Nothing here blocks: the record's text is the core's own, its `screen_text` only arrives for
         a watched session whose screen revision changed.
@@ -2541,10 +2654,22 @@ class AgentSession:
         was_alive = self._alive
         self._alive = bool(record.get("alive"))
         if not self._alive and was_alive:
-            self._finish_read(record.get("exit_code"))
-        elif not self._alive and record.get("exit_code") is not None and self.exit_code is None:
-            # SF3: a code learned after the death record is still the hub's exit-code source.
+            self._finish_read(record.get("exit_code"), crashed=bool(record.get("crashed")))
+            return "death"
+        if not self._alive and record.get("exit_code") is not None and self.exit_code is None:
+            # SF3: a code learned after the death record is still the hub's exit-code source. It
+            # rewrites the row (the death write already ran) without a second death transition.
             self.exit_code = record.get("exit_code")
+            if self.ended_at is not None:
+                self.end_reason = self.classify_end_reason(self.exit_code)
+                self.status = self.end_reason
+                return "late_code"
+        return ""
+
+    @property
+    def late_exit_code_pending(self) -> bool:
+        """SF3: the session died without a code and the core may still learn one."""
+        return self.exit_code is None and self._alive is False and self.ended_at is not None
 
     def scan_tool_lines(self, screen_text: str) -> None:
         """The generic-engine tool-line scan, on the watched snapshot instead of every chunk."""
@@ -2592,20 +2717,32 @@ class AgentSession:
         self.sockets.handles[q] = handle
         return replay, q
 
-    def detach_ws_queue(self, q: asyncio.Queue) -> None:
-        """`detach_queue(handle)`: the socket is gone, so the core drops its queue too."""
+    def detach_ws_queue(self, q: asyncio.Queue) -> bool:
+        """`detach_queue(handle)`: the socket is gone, so the core drops its queue too.
+
+        The handle is forgotten only once the call succeeded or the core says it never had it; a
+        busy registry (`TimeoutError`) keeps it in `orphans`, which the manager drains off the loop
+        on its next tick (F8). Already-detached is normal teardown, not a failure.
+        """
         handle = self.sockets.handles.pop(q, None)
         self.sockets.closers.pop(q, None)
         if handle is None:
-            return
+            return True
         self.sockets.dropped.pop(handle, None)
-        try:
-            self._core().detach_queue(handle)
-        except Exception:
-            logger.debug("detach_queue(%s) failed for %s", handle, self.session_id, exc_info=True)
+        self.sockets.overflow.pop(handle, None)
+        self.sockets.pending.pop(handle, None)
+        if release_terminal_handle(self._core(), handle):
+            self.sockets.orphans.discard(handle)
+            return True
+        self.sockets.orphans.add(handle)
+        return False
 
     def drain_ws_frames(self) -> None:
-        """The bridge's consumer for a standalone session; the manager drains by id instead."""
+        """The bridge's consumer for a standalone session; the manager drains by id instead.
+
+        An attach can carry a fan-out that is already closed (a retired id), and only a take says
+        so: the first drain right after an attach closes that socket and detaches its handle.
+        """
         if not self.sockets.handles:
             return
         drain_terminal_frames(self._core(), self.session_id, self.sockets)
@@ -2613,22 +2750,21 @@ class AgentSession:
     def write_input(self, text: str):
         """`write` (§5.2): the whole text or nothing, then the DSH echo for a process-less session.
 
-        A full queue past the core's deadline raises `TimeoutError` with nothing queued, so one retry
-        cannot duplicate a keystroke; a second failure is logged and reported as not written (D7's
-        keys are never silently reordered by a partial write).
+        One attempt. A full queue past the core's deadline raises `TimeoutError` with nothing
+        queued; the call is reported as not written and the caller surfaces it (F9). A second
+        blocking attempt would hold the loop for another deadline and is as likely to fail.
         """
         if self.has_process and self._alive:
-            for attempt in (1, 2):
-                try:
-                    self._core().write(self.session_id, text)
-                    return True
-                except TimeoutError:
-                    logger.warning("write to %s timed out (queue full), attempt %d",
-                                   self.session_id, attempt)
-                except (KeyError, RuntimeError):
-                    logger.exception("write to %s failed", self.session_id)
-                    return False
-            return False
+            try:
+                self._core().write(self.session_id, text)
+                return True
+            except TimeoutError:
+                logger.warning("write to %s timed out (queue full); input not delivered",
+                               self.session_id)
+                return False
+            except (KeyError, RuntimeError):
+                logger.exception("write to %s failed", self.session_id)
+                return False
         if self.on_virtual_line_cb is not None:
             for ch in text:
                 if ch in ("\r", "\n"):
@@ -2669,7 +2805,12 @@ class AgentSession:
         with self._lock:
             self.cols = target_cols
             self.rows = target_rows
-            return self.cols, self.rows
+            rows_changed = self._watched_rows is not None and self._watched_rows != target_rows
+        if rows_changed:
+            # F12: the watched snapshot must cover the rows the pane shows now, or a tool line that
+            # only became visible after the pane grew never reaches `_on_tui_tool_detected`.
+            self._watch_rows()
+        return self.cols, self.rows
 
     # ---- The terminal seam (design §5.2) ------------------------------------------------
     # Every read and write of terminal state in the hub goes through these. Step 3b swapped what is
@@ -2688,7 +2829,9 @@ class AgentSession:
             return ScreenRead("", cursor_x, cursor_y, cols, rows, self._screen_rev)
         try:
             reply = self.core.screen(self.session_id, max_lines)
-        except KeyError:
+        except (KeyError, TimeoutError):
+            # F11: a busy core table is a deadline, not an unknown id; the seam never raises into a
+            # status poll, whichever of the two the core answers.
             cursor_x, cursor_y, cols, rows = self._empty_read()
             return ScreenRead("", cursor_x, cursor_y, cols, rows, self._screen_rev)
         return ScreenRead(
@@ -2706,7 +2849,7 @@ class AgentSession:
             return ScrollbackRead("", self._raw_rev)
         try:
             reply = self.core.scrollback(self.session_id, max_lines)
-        except KeyError:
+        except (KeyError, TimeoutError):
             return ScrollbackRead("", self._raw_rev)
         return ScrollbackRead(str(reply.get("text") or ""), int(reply.get("rev") or 0))
 
@@ -2716,7 +2859,7 @@ class AgentSession:
             return RawRead("", 0, self._raw_rev)
         try:
             reply = self.core.raw(self.session_id)
-        except KeyError:
+        except (KeyError, TimeoutError):
             return RawRead("", 0, self._raw_rev)
         return RawRead(str(reply.get("text") or ""), int(reply.get("bytes") or 0),
                        int(reply.get("rev") or 0))
@@ -2727,7 +2870,7 @@ class AgentSession:
             return ""
         try:
             return self.core.raw_tail(self.session_id, max_chars)
-        except KeyError:
+        except (KeyError, TimeoutError):
             return ""
 
     @property
@@ -2785,13 +2928,19 @@ class AgentSession:
     def classify_end_reason(self, exit_code: Optional[int]) -> str:
         """Spec §1.4/§2: name an abnormal end instead of calling everything "exited".
 
-        A non-zero code is always a crash. Code 0 after the agent reported completion is a clean exit;
-        a plain shell's 0 is a clean quit; an agent TUI that dies with 0 before ever reporting
+        A non-zero code is always a crash. Code 0 after the agent reported completion is a clean
+        exit; a plain shell's 0 is a clean quit; an agent TUI that dies with 0 before ever reporting
         completion is the "exit before completion" case the spec calls 异常退出.
+
+        A death the core could not give a code for (`None`: a failed `GetExitCodeProcess`) or one
+        it reported as a crash (a reader panic) is a crash for every engine, generic and pwsh
+        included (F1): only a real 0 is a clean end.
         """
         if self.terminated_by_user:
             return "terminated"
-        if exit_code is not None and int(exit_code) != 0:
+        if exit_code is None or self._died_crashed:
+            return "crashed"
+        if int(exit_code) != 0:
             return "crashed"
         if self.completion_reported:
             return "exited"
@@ -3141,8 +3290,23 @@ class HubSessionManager:
         self._loop = None
         # §5.3/§6.6: one Core for the hub's lifetime, created by `start()`.
         self.core: Optional[Core] = None
-        # rtc-retire: ids whose session left the live list and whose exit record was not drained yet.
-        self._retire_pending: Set[str] = set()
+        # rtc-retire: ids whose session left the live list and whose exit record was not drained
+        # yet, mapped to the incarnation the drop belongs to. A resume bumps the id's incarnation
+        # and drops the entry, so a retry can never retire the successor (F3, kimi 6).
+        self._retire_pending: Dict[str, int] = {}
+        self._incarnations: Dict[str, int] = {}
+        self._retire_inflight: Set[str] = set()
+        # A refused retire has no record to wait for when the id never publishes one again (a
+        # first-class DSH session), so it is retried on its own timer: due time, attempts left.
+        self._retire_retry_at: Dict[str, float] = {}
+        self._retire_attempts: Dict[str, int] = {}
+        self._retry_timer: Optional[asyncio.TimerHandle] = None
+        # The scheduled ordinary-exit finalizations, by session id, so the shutdown can wait for
+        # the ones a death started before it instead of cancelling them away (kimi 4).
+        self._exit_tasks: Dict[str, asyncio.Task] = {}
+        # Set for the exit task a death record started before `_shutting_down`; the shutdown drains
+        # them first, so a natural exit keeps its native final answer and its one lifecycle event.
+        self._pre_shutdown_exits: Set[str] = set()
         self._background_tasks = set()
         self._shutdown_task = None
         self.summarizer_registry = TranscriptSummarizerRegistry()
@@ -3215,7 +3379,8 @@ class HubSessionManager:
         if self._loop is not None:
             return
         self._loop = asyncio.get_running_loop()
-        self._ensure_core()
+        # §5.1: the one Core is built on the first session that needs it, so a hub that never opens
+        # a terminal (and every test that injects a fake) never loads the extension (F14).
         try:
             await self.db.start()
             self.global_seq = await self.db.get_max_seq()
@@ -3381,7 +3546,18 @@ class HubSessionManager:
         return task
 
     def _exit_callback(self, session, exit_code):
-        self._schedule(self._on_session_exit(session, exit_code))
+        sid = session.session_id if isinstance(session, AgentSession) else str(session)
+        task = self._schedule(self._on_session_exit(session, exit_code))
+        if task is None:
+            return
+        # kimi 4: a shutdown that starts while this finalization runs waits for it instead of
+        # cancelling it, so a natural exit keeps its native drain, final row and one event.
+        self._exit_tasks[sid] = task
+
+        def finished(_done, key=sid, tracked=task):
+            if self._exit_tasks.get(key) is tracked:
+                self._exit_tasks.pop(key, None)
+        task.add_done_callback(finished)
 
     def _tool_callback(self, session_id, tool_name, tool_arg):
         self._schedule(self._on_tui_tool_detected(session_id, tool_name, tool_arg))
@@ -3445,43 +3621,191 @@ class HubSessionManager:
             session_id = str(record.get("session_id") or "")
             try:
                 sess = self.sessions.get(session_id)
+                outcome = ""
                 if sess is not None:
-                    sess.apply_core_record(record)
+                    outcome = sess.apply_core_record(record)
+                    if outcome == "late_code":
+                        # F2: the code the death record lacked arrived after the final row was
+                        # written; rewrite that row once, with no second lifecycle event.
+                        self._schedule(self._rewrite_late_exit_code(sess))
                 if session_id in self._retire_pending:
                     # Its exit record is in hand now, so `retire` will accept the id.
-                    self._schedule(self._retire_ended_session(session_id))
+                    self._schedule(self._retire_ended_session(
+                        session_id, self._retire_pending.get(session_id)))
             except Exception:
                 logger.exception("terminal core: drain record for %s failed", session_id)
         for session_id, sockets in list(self.terminal_sockets.items()):
+            if sockets.orphans:
+                # F8: a handle whose `detach_queue` missed its deadline is retried off the loop.
+                self._schedule(self._release_orphan_handles(session_id, sockets))
+            if not sockets.handles and not sockets.orphans and session_id not in self.sessions:
+                # F7: the id is gone and no socket of it is left; its registry entry goes with it.
+                self.terminal_sockets.pop(session_id, None)
+                continue
             if not sockets.handles:
                 continue
             try:
                 drain_terminal_frames(core, session_id, sockets)
             except Exception:
                 logger.exception("terminal core: socket drain for %s failed", session_id)
+        if any(sockets.orphans for sockets in self.terminal_sockets.values()):
+            # This tick's drain may have left an orphan; a closed sink publishes no further notify,
+            # so the retry has to come from the timer.
+            self._arm_retry_timer()
 
-    async def _retire_ended_session(self, session_id: str) -> None:
+    def _next_incarnation(self, session_id: str) -> int:
+        """Bumps and returns an id's incarnation; installing one cancels a pending retire (F3).
+
+        The generation is what a pending drop is about: a resume's new object is a new incarnation,
+        so a retire queued for the predecessor must never be retried against it (kimi 6).
+        """
+        generation = self._incarnations.get(session_id, 0) + 1
+        self._incarnations[session_id] = generation
+        self._clear_retire(session_id)
+        return generation
+
+    def _clear_retire(self, session_id: str) -> None:
+        self._retire_pending.pop(session_id, None)
+        self._retire_retry_at.pop(session_id, None)
+        self._retire_attempts.pop(session_id, None)
+
+    async def _retire_ended_session(self, session_id: str, incarnation: Optional[int] = None) -> None:
         """`retire` (rtc-retire): an ended session leaves the core's table for good.
 
         Called where the hub drops a session (`_close_session`, the failed resume). The core refuses
-        an id whose exit record no drain has carried yet (`ValueError`) or whose table is busy
-        (`TimeoutError`); the id stays pending and the record's arrival retries it.
+        an id whose exit record no drain has carried yet (`ValueError`), one whose resume is in
+        flight, or a table that is busy (`TimeoutError`); the id stays pending, bound to the
+        incarnation it was dropped for, and its arrival or the retry timer tries again.
         """
+        if incarnation is not None and self._incarnations.get(session_id) not in (None, incarnation):
+            # A resume installed a successor while this retry waited: the drop is history.
+            return
+        if incarnation is None:
+            incarnation = self._incarnations.get(session_id, 0)
+        if session_id in self._retire_inflight:
+            return
         core = self.core
         if core is None:
-            self._retire_pending.discard(session_id)
+            self._clear_retire(session_id)
             return
+        self._retire_inflight.add(session_id)
         try:
             retired = await asyncio.to_thread(core.retire, session_id)
         except (ValueError, TimeoutError):
-            self._retire_pending.add(session_id)
+            self._retire_pending[session_id] = incarnation
+            self._retire_attempts[session_id] = self._retire_attempts.get(session_id, 0) + 1
+            if self._retire_attempts[session_id] <= RETIRE_RETRY_MAX_ATTEMPTS:
+                self._arm_retry_timer()
+            else:
+                logger.warning("terminal core: retire(%s) refused %d times; giving up",
+                               session_id, RETIRE_RETRY_MAX_ATTEMPTS)
+                self._clear_retire(session_id)
             return
         except Exception:
             logger.exception("terminal core: retire(%s) failed", session_id)
+            self._clear_retire(session_id)
             return
-        self._retire_pending.discard(session_id)
+        finally:
+            self._retire_inflight.discard(session_id)
+        self._clear_retire(session_id)
         if retired:
             logger.debug("terminal core: retired %s", session_id)
+
+    def _arm_retry_timer(self) -> None:
+        """Arms the one background retry timer (a refused retire, an orphaned handle).
+
+        Both wait on a core call that missed its deadline, not on a new drain record: a quiet id
+        publishes none, and a retired sink's notify may never come.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._shutting_down or self._retry_timer is not None:
+            return
+        self._retry_timer = loop.call_later(RETIRE_RETRY_INTERVAL_SEC, self._retry_timer_fire)
+
+    def _retry_timer_fire(self) -> None:
+        self._retry_timer = None
+        pending = list(self._retire_pending.items())
+        for session_id, incarnation in pending:
+            self._schedule(self._retire_ended_session(session_id, incarnation))
+        orphans = [(sid, sockets) for sid, sockets in list(self.terminal_sockets.items())
+                   if sockets.orphans]
+        for session_id, sockets in orphans:
+            self._schedule(self._release_orphan_handles(session_id, sockets))
+        if pending or orphans:
+            self._arm_retry_timer()
+
+    async def _release_orphan_handles(self, session_id: str, sockets: "TerminalSockets") -> None:
+        """Detaches handles whose `detach_queue` missed the registry deadline (F8), off the loop."""
+        core = self.core
+        if core is None:
+            sockets.orphans.clear()
+            return
+        for handle in list(sockets.orphans):
+            if handle in sockets.detach_inflight:
+                continue
+            sockets.detach_inflight.add(handle)
+            try:
+                ok = await asyncio.to_thread(release_terminal_handle, core, handle)
+            finally:
+                sockets.detach_inflight.discard(handle)
+            if ok:
+                sockets.orphans.discard(handle)
+        if sockets.orphans:
+            self._arm_retry_timer()
+
+    async def _rewrite_late_exit_code(self, session: AgentSession) -> None:
+        """SF3/F2: the code the death record lacked arrived after the final row was written.
+
+        The row is rewritten from the object (the late record already updated its code and end
+        reason) and no second lifecycle event is emitted: the death path already emitted that one.
+        """
+        if self.sessions.get(session.session_id) is not session:
+            return
+        self._finalize_session(session)
+        await self.persist_session(session, final=True)
+
+    async def _end_predecessor(self, session_id: str, old: Optional[AgentSession]) -> None:
+        """kimi 5: an incarnation a resume is about to replace gets its own ending, once.
+
+        The core's table insert drops a death record that was never drained, so the predecessor's
+        records are drained while `sessions[id]` still maps to the old object; its exit path then
+        writes the old final row and its one lifecycle event, and the successor starts clean.
+        """
+        if old is None or self.core is None:
+            return
+        try:
+            if old._virtual or old.is_process_alive():
+                # A text entry is ended unconditionally; a process that already died is left to
+                # the drain, which still has its death record queued.
+                if old._virtual or old.has_process:
+                    await asyncio.to_thread(old.kill, KILL_GRACE_MS)
+        except Exception:
+            logger.debug("terminal core: ending the predecessor of %s failed", session_id, exc_info=True)
+        try:
+            self._on_core_tick()
+        except Exception:
+            logger.exception("terminal core: drain of %s's predecessor failed", session_id)
+        task = self._exit_tasks.get(session_id)
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait([task], timeout=NATIVE_TRANSCRIPT_DRAIN_SEC + 0.5)
+            except Exception:
+                pass
+
+    def pump_terminal_frames(self, session_id: str) -> None:
+        """One bridge drain for an id, run right after an attach (F6).
+
+        A fan-out that was already closed reports `closed` only at its first take, and a retired
+        id publishes no further notify; taking now closes that socket with 1000 at once.
+        """
+        core = self.core
+        sockets = self.terminal_sockets.get(session_id)
+        if core is None or sockets is None or not sockets.handles:
+            return
+        try:
+            drain_terminal_frames(core, session_id, sockets)
+        except Exception:
+            logger.exception("terminal core: attach pump for %s failed", session_id)
 
     def resize_session_from_client(
         self,
@@ -5398,6 +5722,13 @@ class HubSessionManager:
         # A1: browser sockets opened on the old object keep streaming without any Python step: the
         # handle belongs to the session id and the core's spawn carries the sink fan-out over, so
         # `ws_prefix` reaches them after the predecessor's last bytes.
+        # kimi 5: the predecessor is ended and finalized now, while the id still maps to it: after
+        # the spawn replaces the table entry its undrained death would be gone for good.
+        await self._end_predecessor(session_id, old)
+        if self.sessions.get(session_id) is not old and old is not None:
+            # The predecessor's exit path ran and dropped the object; nothing else owns the id.
+            old = None
+        self._next_incarnation(session_id)
         # A7: install the new object before the spawn. A resume that dies immediately then reports
         # its own exit (the callback carries the object), never the old dead object's.
         self.sessions[session_id] = sess
@@ -5654,6 +5985,11 @@ class HubSessionManager:
             sess.on_virtual_line_cb = lambda sid, line: self._schedule(self.deliver_parent_message(
                 sid, line, also_write_pty=False
             ))
+        # kimi 5: the predecessor is ended and finalized before the attach replaces the table entry.
+        await self._end_predecessor(session_id, old)
+        if self.sessions.get(session_id) is not old and old is not None:
+            old = None
+        self._next_incarnation(session_id)
         try:
             # `attach_text`: the ring starts from the archived scrollback plus the separator, and the
             # separator goes to the sockets already attached to the id before any `feed` can land.
@@ -5980,13 +6316,27 @@ class HubSessionManager:
         await self._archive_session(sess)
         if self.sessions.get(session_id) is sess:
             del self.sessions[session_id]
+        # F4: a DSH session has no process, so `terminate` never ends its core text entry, and the
+        # core refuses to retire a live one (it would block every later resume of the id). A killed
+        # text entry publishes its death record, drained just below; `terminate` already killed the
+        # live case, so only an ended one is ended here.
+        if self.core is not None and sess._virtual and not terminated:
+            try:
+                await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
+            except Exception:
+                logger.exception("terminal core: ending %s failed", session_id)
+        # The death record this kill published is drained now, while the id still has its object,
+        # so the exit path and the retire that follows see it (the core refuses an undrained id).
+        if self.core is not None:
+            try:
+                self._on_core_tick()
+            except Exception:
+                logger.exception("terminal core: drain after closing %s failed", session_id)
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
         # of leaving the server side open and silent for the rest of the hub's life.
         sess.close_ws_frontends()
-        # The bridge's queues belonged to the id; the sockets are closing, so nothing serves them.
-        self.terminal_sockets.pop(session_id, None)
         # rtc-retire: the session is gone for good, so its ring and screen leave the core's table.
-        await self._retire_ended_session(session_id)
+        await self._retire_ended_session(session_id, self._incarnations.get(session_id, 0))
         if terminated:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
@@ -6032,12 +6382,38 @@ class HubSessionManager:
         The snapshot is taken before the kill, so the archived rows carry the last screen and
         scrollback even when a kill costs a session its last bytes; `kill_all` ends every process
         tree in parallel inside the recorded 2 s, and `shutdown` stops the core's ticker last, while
-        everything still runs inside the shared 8 s budget.
+        everything still runs inside the shared 8 s budget. Every blocking core call runs off the
+        loop (F5): `/health`, the console socket and the stop ack must stay answered while nine
+        readers are being snapshotted.
         """
+        # One drain before the decision below: a record still buffered from just before the stop
+        # (a death that already happened, or a spawn's first `alive`) is applied while the ordinary
+        # exit path can still take it, so the reasons and `is_process_alive` read the core's truth
+        # instead of a stale object, and a death the hub did not cause keeps its normal ending.
+        try:
+            self._on_core_tick()
+        except Exception:
+            logger.exception("Shutdown could not drain the terminal core before stopping")
         self._shutting_down = True
         self.db.stop_accepting()
         deadline = time.monotonic() + SHUTDOWN_MAX_SEC
-        tasks = list(self._background_tasks)
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        # kimi 4: a death that happened just before this shutdown already scheduled its
+        # finalization (native transcript drain, final row, one lifecycle event). Those tasks run
+        # their body instead of being cancelled and meeting a `_shutting_down` early return; only
+        # the deaths `kill_all` is about to cause are the shutdown's own.
+        self._pre_shutdown_exits = {sid for sid, task in self._exit_tasks.items() if not task.done()}
+        pre = [task for sid, task in self._exit_tasks.items()
+               if sid in self._pre_shutdown_exits and not task.done()]
+        if pre:
+            try:
+                await asyncio.wait(pre, timeout=max(
+                    0.0, min(deadline - time.monotonic() - 0.5, NATIVE_TRANSCRIPT_DRAIN_SEC + 1.0)))
+            except Exception:
+                logger.exception("Shutdown could not wait for the exits that were already running")
+        tasks = [task for task in self._background_tasks if task not in pre]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -6057,25 +6433,36 @@ class HubSessionManager:
         snapshots: Dict[str, Dict[str, Any]] = {}
         core = self.core
         if core is not None:
-            # §6.6: snapshot_all first, so the archive keeps what the kill can take away.
+            # §6.6: snapshot_all first, so the archive keeps what the kill can take away. It gets
+            # its own sub-budget (a slow reader must not eat the kill's and the archive's share).
+            budget_ms = int(max(1.0, min(SHUTDOWN_SNAPSHOT_MAX_SEC,
+                                         deadline - time.monotonic()
+                                         - SHUTDOWN_ARCHIVE_RESERVE_SEC)) * 1000)
             try:
-                budget_ms = max(1, int((deadline - time.monotonic()) * 1000))
-                for snapshot in core.snapshot_all(
-                    max_lines=250, max_bytes=RESUME_SCROLLBACK_MAX_BYTES, budget_ms=budget_ms
-                ):
+                taken = await asyncio.wait_for(
+                    asyncio.to_thread(core.snapshot_all, 250, RESUME_SCROLLBACK_MAX_BYTES, budget_ms),
+                    timeout=min(SHUTDOWN_SNAPSHOT_MAX_SEC + 0.5,
+                                max(0.05, budget_ms / 1000.0 + 0.25)),
+                )
+                for snapshot in taken or ():
                     snapshots[str(snapshot.get("session_id") or "")] = snapshot
             except Exception:
                 logger.exception("Shutdown could not snapshot the terminal core")
+        # F5: the kill is bounded by what is left of the one budget, not by a fresh 2 s; the
+        # core's own grace and the wait share it, so the archive still gets its share.
+        kill_left = max(0.05, deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)
+        kill_wait = min(SHUTDOWN_KILL_MAX_SEC, kill_left)
         stops = [
-            asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=2.0)
+            asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=kill_wait)
             for sess in sessions
             if sess.dsh_job_id and sess.is_process_alive()
         ]
         if core is not None:
-            stops.append(asyncio.to_thread(core.kill_all, 2000))
+            stops.append(asyncio.to_thread(core.kill_all, int(max(1.0, kill_wait) * 1000)))
         if stops:
             try:
-                await asyncio.wait_for(asyncio.gather(*stops, return_exceptions=True), timeout=2.0)
+                await asyncio.wait_for(asyncio.gather(*stops, return_exceptions=True),
+                                       timeout=kill_wait)
             except asyncio.TimeoutError:
                 logger.error("Timed out stopping session processes")
         if core is not None and sessions:
@@ -6084,6 +6471,7 @@ class HubSessionManager:
             except Exception:
                 logger.exception("Shutdown could not drain the terminal core's exit records")
         archived = 0
+        remaining = list(sessions)
         try:
             async with asyncio.timeout(max(0.001, deadline - time.monotonic() - 0.25)):
                 for sess in sessions:
@@ -6093,10 +6481,28 @@ class HubSessionManager:
                         snapshot=snapshots.get(sess.session_id),
                     ))
                     sess.close_ws_frontends()
+                    remaining.remove(sess)
                     archived += 1
         except (asyncio.TimeoutError, PersistenceUnavailable):
             logger.exception("Shutdown archived only %d/%d sessions", archived, len(sessions))
         finally:
+            if remaining:
+                # kimi 4: no session may leave without a final row, even when the budget ran out
+                # inside its own scrollback read. The writes are launched together and `db.close`
+                # flushes what the queue accepted before the loop ends.
+                final = []
+                for sess in remaining:
+                    session_snapshot = snapshots.get(sess.session_id)
+                    self._finalize_session(sess, end_reason=reasons[sess.session_id],
+                                           snapshot=session_snapshot)
+                    final.append(self.db.run_internal(self._archive_session(
+                        sess, end_reason=reasons[sess.session_id], snapshot=session_snapshot)))
+                if final:
+                    try:
+                        await asyncio.wait(final, timeout=max(
+                            0.05, deadline - time.monotonic()))
+                    except Exception:
+                        logger.exception("Shutdown could not finish the remaining final rows")
             self.sessions.clear()
             self.terminal_sockets.clear()
             with self._transcript_lock:
@@ -6115,7 +6521,16 @@ class HubSessionManager:
                     event.set()
             if core is not None:
                 # §6.6: the ticker stops last; the sessions' job objects already ended their trees.
-                core.shutdown()
+                # F5: stopping it joins the ticker thread, so it runs off the loop inside what is
+                # left of the one shared budget; its failure must not skip the database flush.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(core.shutdown),
+                        timeout=max(0.05, min(SHUTDOWN_CORE_STOP_MAX_SEC,
+                                              deadline - time.monotonic())),
+                    )
+                except Exception:
+                    logger.exception("Shutdown could not stop the terminal core")
             try:
                 await self.db.close(timeout=max(0.001, deadline - time.monotonic()))
             except PersistenceUnavailable:
@@ -11398,7 +11813,7 @@ class HubSessionManager:
             return f"Session crashed (exit_code={exit_code}). Last output:\n{self._crash_tail(sess)}\n{hint}"
         return f"Session exited (exit_code={exit_code}). {hint}"
 
-    async def _on_session_exit(self, session: Any, exit_code: int):
+    async def _on_session_exit(self, session: Any, exit_code: Optional[int]):
         """One exited process → at most one lifecycle event for its session id (A7).
 
         The callback carries the session object: after a resume replaced it, the old object's exit
@@ -11407,10 +11822,11 @@ class HubSessionManager:
         """
         obj = session if isinstance(session, AgentSession) else None
         session_id = obj.session_id if obj is not None else str(session)
-        if self._shutting_down:
+        if self._shutting_down and session_id not in self._pre_shutdown_exits:
             # §6.6: the shutdown archives every session itself. The death record of its own kill
             # arrives while it runs, and this callback must not write a competing final status or a
-            # second lifecycle event under the archived one.
+            # second lifecycle event under the archived one. A death that was already being
+            # finalized when the shutdown began is the ordinary exit path, not the shutdown's kill.
             return
         sess = self.sessions.get(session_id)
         if obj is not None and sess is not obj:
@@ -11448,7 +11864,10 @@ class HubSessionManager:
                 return
         end_reason = "exited"
         if sess is not None:
-            sess.exit_code = exit_code
+            if exit_code is not None:
+                # F1/F2: a death the core gave no code for stays None; a code the death record
+                # lacked was already written by the late record, and never becomes a clean 0 here.
+                sess.exit_code = exit_code
             self._finalize_session(sess)
             # A7: the object is the live one, so its status follows its own end state (the PTY reader
             # normally did this already; doing it here keeps the callback self-contained).

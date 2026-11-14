@@ -28,9 +28,9 @@ from session_manager import (
     default_profiles_path,
     hub_api_base_url,
     hub_port,
-    strip_osc_terminal_replies,
     resolve_session_approval_fields,
 )
+from terminal_core import strip_osc_terminal_replies
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
 from agent_guidance import SERVER_INSTRUCTIONS
@@ -1317,7 +1317,19 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
     # Q11: the core registers this socket's queue on the session id's fan-out in the same step it
     # takes the replay, so a chunk is either inside the replay or in the queue — never lost, never
     # sent twice. The drain tick moves `take_frames` into the queue in order.
-    replay, q = sess.attach_ws_queue()
+    try:
+        replay, q = sess.attach_ws_queue()
+    except KeyError:
+        # F6: the id has no core entry (a failed spawn still listed, a desktop-GUI session, an id
+        # a retire removed). An unhandled raise here is uvicorn's 1011 and the browser reconnects in
+        # a loop; an ended id closes normally, one the core never had is "unknown".
+        ended = sess.ended_at is not None or not sess.is_process_alive()
+        await websocket.close(code=1000 if ended else 1008)
+        return
+    except TimeoutError:
+        # The registry was busy past its deadline: "try again later", never an abnormal close.
+        await websocket.close(code=1013)
+        return
 
     # W7: removing a session from the live list closes its sockets with a normal code instead of
     # leaving the server side open and silent. The handle belongs to the session id, so a resume
@@ -1329,6 +1341,10 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
             pass
 
     sess.register_ws_closer(q, _close_on_archive)
+    # An attach can land on a fan-out that is already closed (a retired id), and only a take says
+    # so: `pump_terminal_frames` takes once now, so such a socket closes with 1000 immediately
+    # instead of waiting for a core notify that may never come.
+    hub.pump_terminal_frames(session_id)
     if replay:
         await websocket.send_text(replay)
     # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal
