@@ -2,6 +2,7 @@ server.py
 loopback_request_guard.py
 agent_guidance.py
 terminal_core.py
+desktop/portable/hub_terminal_core.pyd
 parent_waiting.py
 session_manager.py
 hub_database.py

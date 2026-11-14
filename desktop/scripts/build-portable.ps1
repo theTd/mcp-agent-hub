@@ -30,13 +30,11 @@ try {
         throw "Expected a literal semantic version in tauri.conf.json."
     }
 
+    $repoDir = Split-Path -Parent $desktopDir
     # Keep the output deterministic even when the caller has a different Cargo target directory.
     $env:CARGO_TARGET_DIR = Join-Path $desktopDir "src-tauri/target"
     # Release linking can be expensive; default to a single Cargo job on this workstation.
     if (-not $env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS = "1" }
-    & node.exe scripts/check-portable-privacy.mjs
-    if ($LASTEXITCODE -ne 0) { throw 'Source privacy gate failed. No release was published.' }
-    $repoDir = Split-Path -Parent $desktopDir
     $sysroot = (& rustc --print sysroot).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot locate compiler sysroot.' }
     $cargoRoot = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
@@ -45,6 +43,11 @@ try {
         "--remap-path-prefix=$sysroot=/toolchain", "--remap-path-prefix=$env:USERPROFILE=/build-user")
     $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]31
     $env:CARGO_PROFILE_RELEASE_DEBUG = '0'
+    & cargo build --release --manifest-path (Join-Path $repoDir 'terminal-core/Cargo.toml') --target-dir (Join-Path $repoDir 'terminal-core/target') --locked
+    if ($LASTEXITCODE -ne 0) { throw 'Terminal core build failed.' }
+    Copy-Item -LiteralPath (Join-Path $repoDir 'terminal-core/target/release/hub_terminal_core.dll') -Destination 'portable/hub_terminal_core.pyd' -Force
+    & node.exe scripts/check-portable-privacy.mjs
+    if ($LASTEXITCODE -ne 0) { throw 'Source privacy gate failed. No release was published.' }
     & pnpm.cmd exec tauri build --no-bundle --target $target --features portable --config src-tauri/tauri.portable.conf.json -- --locked
     if ($LASTEXITCODE -ne 0) { throw "Tauri build failed (exit $LASTEXITCODE)." }
 
