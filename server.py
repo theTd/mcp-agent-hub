@@ -1314,15 +1314,14 @@ async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
         await websocket.close(code=1008)
         return
 
-    # Q11: snapshot the replay and register this socket's live queue in one atomic step, with the
-    # same lock the PTY reader uses for "append to history + snapshot the fan-out targets". A chunk
-    # is therefore either inside this replay or in the queue — never lost, never sent twice. The
-    # queue is registered first, so output produced while the replay is on the wire waits in order.
+    # Q11: the core registers this socket's queue on the session id's fan-out in the same step it
+    # takes the replay, so a chunk is either inside the replay or in the queue — never lost, never
+    # sent twice. The drain tick moves `take_frames` into the queue in order.
     replay, q = sess.attach_ws_queue()
 
     # W7: removing a session from the live list closes its sockets with a normal code instead of
-    # leaving the server side open and silent. The hook travels with the queue when a resume
-    # replaces the session object (AgentSession.adopt_ws_frontends).
+    # leaving the server side open and silent. The handle belongs to the session id, so a resume
+    # never re-registers anything here.
     def _close_on_archive() -> None:
         try:
             asyncio.create_task(websocket.close(code=1000))

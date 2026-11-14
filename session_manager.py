@@ -12,25 +12,21 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-import unicodedata
 import uuid
 import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 import httpx
-import pyte
 from PIL import Image
-from winpty import PtyProcess
 
-# R6: the real class is kept apart from the module-level name so a test can replace
-# session_manager.PtyProcess with a fake without making the shutdown tree-kill touch a fake PID.
-REAL_PTY_PROCESS = PtyProcess
+# §5.1: the hub's one terminal core. The wrapper turns a missing build into the build command, and
+# there is no Python PTY or parser behind it after step 3b.
+from terminal_core import Core
 
 from transcript_tail import TranscriptTail, read_complete_lines
 from transcript_feed import (
@@ -680,10 +676,6 @@ TUI_SUBMIT_EVIDENCE_SEC = 15.0
 # W9: the raw history is a bounded 512 KB window. Trimming rebuilds the joined text, so it runs
 # with a little slack instead of on every 4 KB PTY chunk (the cap is still enforced on the tail).
 HISTORY_TRIM_SLACK_BYTES = 64 * 1024
-HISTORY_TRUNCATED_PREFIX = "\x1b[90m[较早的输出已截断]\x1b[0m\r\n"
-# W9: the longest line trim_history_text treats as the newest resume banner (the banner is ~50 bytes);
-# it bounds how far the trimmed history may exceed its cap to keep that banner whole.
-HISTORY_BANNER_LINE_MAX_BYTES = 128
 # R7: an agy resume whose archived transcript is still locked by another watcher gets this long
 # to become claimable, then the watcher stops instead of spinning for the session's lifetime.
 AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
@@ -692,6 +684,12 @@ AGY_RESUME_TRANSCRIPT_WAIT_SEC = 120.0
 # a user terminate gives a kill KILL_GRACE_MS to report an exit code (shutdown passes its budget).
 SUBMIT_DIAGNOSTIC_TAIL_CHARS = 65536
 KILL_GRACE_MS = 1500
+# The screen's history rows every spawn asks the core for (`history=3000`, design §8), and how often
+# a generic engine's watched screen may be rendered for the tool-line scan (§5.6).
+TERMINAL_HISTORY_ROWS = 3000
+TOOL_LINE_SCAN_INTERVAL_MS = 250
+# `/ws/pty`'s queue held 500 frames under asyncio before the swap; the core bounds the bytes.
+WS_QUEUE_MAX_FRAMES = 500
 
 
 class ScreenRead(NamedTuple):
@@ -727,47 +725,6 @@ class RawRead(NamedTuple):
 def resume_banner(resume_count: int) -> str:
     """The separator a revived pane shows between the archived output and the new one (spec §5.3)."""
     return f"\r\n\x1b[90m── 已恢复（第 {int(resume_count)} 次）──\x1b[0m\r\n"
-
-
-def trim_history_text(text: str, max_bytes: int) -> str:
-    """W9: cap a raw terminal history at max_bytes without cutting a line or the newest banner.
-
-    The old buffer dropped whole PTY chunks, so the archived scrollback and every resume banner
-    left in one step. This cuts bytes from the front, moves to the next line break and prefixes a
-    grey notice. The newest "── 已恢复（第 N 次）──" line is kept whole, with its leading line
-    break, whenever the cut falls before its end: a cut inside the banner line keeps the banner and
-    everything after it, so the result may exceed max_bytes by less than that line
-    (HISTORY_BANNER_LINE_MAX_BYTES). A banner that ends before the cut is older than the budget and
-    goes with the rest.
-    """
-    if max_bytes <= 0:
-        return ""
-    raw = text.encode("utf-8", "replace")
-    if len(raw) <= max_bytes:
-        return text
-    prefix = HISTORY_TRUNCATED_PREFIX
-    budget = max_bytes - len(prefix.encode("utf-8"))
-    if budget <= 0:
-        return prefix
-    cut = len(raw) - budget
-    start = cut
-    next_break = raw.find(b"\n", cut)
-    if next_break >= 0:
-        start = next_break + 1
-    marker = "\x1b[90m── 已恢复（"
-    idx = text.rfind(marker)
-    if idx >= 0:
-        marker_start = len(text[:idx].encode("utf-8", "replace"))
-        banner_start = marker_start
-        if banner_start >= 2 and text[:idx].endswith("\r\n"):
-            banner_start -= 2
-        line_break = raw.find(b"\n", marker_start)
-        banner_end = line_break + 1 if line_break >= 0 else len(raw)
-        if (banner_start < start and cut < banner_end
-                and banner_end - banner_start <= HISTORY_BANNER_LINE_MAX_BYTES):
-            start = banner_start
-    body = raw[start:].decode("utf-8", "replace")
-    return prefix + body
 
 
 def _store_root(env_name: str, default: Path) -> Path:
@@ -1979,217 +1936,6 @@ def _one_line(text: Optional[str]) -> str:
     return re.sub(r"[\r\n]+", " ", str(text or "")).strip()
 
 
-class HubTerminalScreen(pyte.HistoryScreen):
-    """K4 (fix 9): the hub's screen model of a PTY.
-
-    kimi sends a private status query (CSI ? 996 n). pyte dispatches every private CSI with
-    private=True, but its report_device_status takes no such flag, so the query raised a TypeError
-    in the middle of the PTY chunk. A private DSR asks the terminal something and draws nothing, so
-    the whole CSI ? … n family is ignored here.
-    """
-
-    def report_device_status(self, mode: int, **kwargs: Any) -> None:
-        if kwargs.get("private"):
-            return
-        super().report_device_status(mode)
-
-    def draw(self, data: str) -> None:
-        """Skips a zero-width or unprintable character instead of dropping the rest of the text.
-
-        pyte's draw stops at the first character that is zero-width and not combining (ZWSP, ZWJ, the
-        emoji selector VS16 in "⚠️") or unprintable, so everything after it in the same run of plain
-        text never reached the screen. Here pyte draws the runs around such a character; the character
-        itself changes nothing, as in a real terminal (it does not even trigger a pending wrap).
-        """
-        if data.isascii() and data.isprintable():
-            super().draw(data)
-            return
-        width_of = pyte.screens.wcwidth
-        run_start = 0
-        for index, char in enumerate(data):
-            width = width_of(char)
-            if width > 0 or (width == 0 and unicodedata.combining(char)):
-                continue
-            if index > run_start:
-                super().draw(data[run_start:index])
-            run_start = index + 1
-        if run_start < len(data):
-            super().draw(data[run_start:])
-
-    @property
-    def display(self) -> List[str]:
-        """Safe display renderer that tolerates orphaned wide-char stubs (Char.data == '').
-
-        When a TUI cursor-positions over the first cell of a 2-column CJK character without writing
-        the second cell, pyte leaves Char(data='') in the second cell while is_wide_char is False.
-        Stock pyte.Screen.display indexes char[0] unconditionally and raises IndexError.
-        """
-        wcwidth = pyte.screens.wcwidth
-
-        def render(line):
-            is_wide_char = False
-            for x in range(self.columns):
-                if is_wide_char:
-                    is_wide_char = False
-                    continue
-                char = line[x].data
-                if not char:
-                    yield " "
-                    continue
-                is_wide_char = wcwidth(char[0]) == 2
-                yield char
-
-        return ["".join(render(self.buffer[y])) for y in range(self.lines)]
-
-
-class HubTerminalStream(pyte.Stream):
-    """K4 (fix 9): one escape sequence pyte cannot handle costs only itself, not the rest of the chunk.
-
-    pyte resets its parser when a handler raises but re-raises, and Stream.feed then abandons every
-    byte after it (the raw scrollback kept them, the screen model did not). Here the failed
-    character is dropped and the next one is parsed by the fresh parser.
-
-    Also drops the CSIs pyte ends early (``_split_marker_csi``): a kitty-keyboard marker such as
-    kimi's ``ESC[<u`` used to reach the screen as the text ``u``.
-    """
-
-    def __init__(self, screen: Optional[pyte.Screen] = None, strict: bool = True) -> None:
-        super().__init__(screen, strict)
-        self._marker_csi_carry = ""
-
-    def feed(self, data: str) -> None:
-        if not self._marker_csi_carry and "\x1b" not in data and "\x9b" not in data:
-            # No escape byte and nothing held over: the filter could not change this text, and the
-            # per-call cost matters because virtual sessions feed one character at a time.
-            super().feed(data)
-            return
-        # A PTY chunk can split any sequence; the kept tail goes in front of the next chunk, so the
-        # filter always sees whole sequences.
-        text = self._marker_csi_carry + data
-        self._marker_csi_carry = ""
-        filtered, self._marker_csi_carry = _split_marker_csi(text)
-        if filtered:
-            super().feed(filtered)
-
-    def _send_to_parser(self, data: str) -> Optional[bool]:
-        try:
-            return super()._send_to_parser(data)
-        except Exception:
-            # pyte's own handler already re-initialised the parser; report its plain-text state.
-            return self._taking_plain_text
-
-
-# pyte 0.8.2 ends a CSI at the first byte that is not a digit, ';', '?', a space or '>', and
-# dispatches that byte as the final character. ECMA-48, and the vte parser of the coming Rust core,
-# read 0x30-0x3F as parameter bytes instead. The three bytes where the two readings differ are the
-# ones the CLIs send: ':' (SGR subparameters) and the '<' '=' private markers of the kitty keyboard
-# protocol (kimi and omp send ESC[<u, agy ESC[=5;1u and ESC[<1u).
-_CSI_MARKER_CHARS = ":<="
-# pyte's two CSI starts: ESC [ and the 8-bit CSI, which pyte accepts as one.
-_CSI_START_RE = re.compile("\x1b\\[|\x9b")
-# A real CSI is a few dozen bytes. A longer unterminated run can only be junk, and pyte holds such a
-# run in its own parser anyway, so the filter stops carrying it rather than buffering without bound.
-_CSI_CARRY_MAX = 512
-
-
-def _split_marker_csi(text: str) -> Tuple[str, str]:
-    """Splits PTY text into ``(what pyte must parse, a trailing partial CSI for the next chunk)``.
-
-    A CSI whose parameter bytes include ':' '<' or '=' is removed whole: vte reads the same bytes as
-    one sequence and draws nothing for it, while pyte would draw the rest of the sequence as text.
-    Every sequence pyte parses today is handed over unchanged - '?' private modes, '>' secondary
-    parameters, '$', and CAN/SUB cancelling a sequence (the CAN/SUB itself stays in the text, so
-    pyte's own cancel path still runs).
-
-    Three more bytes inside a CSI are read the way vte and a terminal read them. pyte took each of
-    them for the final byte and drew the rest of the sequence as text:
-    - an ESC abandons the sequence and starts the next one, so the partial CSI is dropped and the
-      ESC is handed on as the start of a new sequence;
-    - a C0 control runs where it arrives and the sequence goes on, so it is moved in front of the
-      sequence (pyte runs only BEL, BS, HT, LF, VT, FF and CR in place);
-    - DEL is ignored, so it is removed.
-    """
-    kept: List[str] = []
-    pos = 0
-    length = len(text)
-
-    def without_controls(start: int, head_end: int, end: int) -> str:
-        """``text[start:end]``, a CSI whose start ends at ``head_end``, without its C0 controls and DELs."""
-        body = text[head_end:end]
-        if all(" " <= char != "\x7f" for char in body):
-            return text[start:end]
-        return text[start:head_end] + "".join(char for char in body if " " <= char != "\x7f")
-
-    while True:
-        match = _CSI_START_RE.search(text, pos)
-        if match is None:
-            tail = text[pos:]
-            if tail.endswith("\x1b"):
-                # An ESC at the very end: the next chunk decides what it starts, and pyte holds it
-                # in its own parser meanwhile, so nothing is drawn either way.
-                kept.append(tail[:-1])
-                return "".join(kept), "\x1b"
-            kept.append(tail)
-            return "".join(kept), ""
-        start = match.start()
-        kept.append(text[pos:start])
-        head_end = i = match.end()
-        marker = False
-        controls: List[str] = []  # C0 controls inside the sequence, in arrival order
-        final_end = -1  # just past the final byte: where pyte itself ends the sequence
-        cancel_at = -1  # the CAN/SUB that cancels the sequence
-        restart_at = -1  # an ESC inside the sequence: it abandons the sequence and starts the next
-        while i < length:
-            char = text[i]
-            if "@" <= char <= "~":      # final byte: the CSI is complete
-                final_end = i + 1
-                break
-            if " " <= char <= "?":      # parameter and intermediate bytes
-                if char in _CSI_MARKER_CHARS:
-                    marker = True
-                i += 1
-            elif char == "\x7f":
-                i += 1                  # DEL is ignored inside a sequence
-            elif char in "\x18\x1a":
-                cancel_at = i
-                break
-            elif char == "\x1b":
-                restart_at = i
-                break
-            elif char < " ":
-                controls.append(char)   # runs now; the sequence goes on
-                i += 1
-            else:
-                break                   # not a byte ECMA-48 allows inside a CSI
-        # The controls run before the sequence is dispatched, so they go in front of it.
-        kept.extend(controls)
-        if restart_at >= 0:
-            pos = restart_at            # the partial sequence draws nothing; the ESC starts the next
-            continue
-        if final_end < 0 and cancel_at < 0:
-            if i == length:
-                tail = without_controls(start, head_end, length)
-                if len(text) - start <= _CSI_CARRY_MAX:
-                    return "".join(kept), tail
-                kept.append(tail)       # runaway sequence: pyte holds it in its own parser
-                return "".join(kept), ""
-            # A byte pyte reads in its own way; keep the bytes and look for the next start behind it.
-            kept.append(without_controls(start, head_end, i))
-            pos = i
-            continue
-        end = final_end if final_end >= 0 else cancel_at
-        if marker:
-            pos = end                   # consumed whole and drawing nothing, as vte does
-        else:
-            kept.append(without_controls(start, head_end, end))
-            pos = end
-
-
-# OSC 10/11/12/4 color queries emitted by TUI apps (e.g. Codex CLI) at startup, and the OSC
-# replies xterm.js generates when it parses them. Forwarding late OSC replies into a ConPTY
-# session triggers TUI "esc to interrupt" via the leading ESC and types "]10;rgb:..." into the
-# prompt composer.
-OSC_COLOR_QUERY_RE = re.compile(r"\x1b\](?:4;\d+|1[0-9]);\?(?:\x07|\x1b\\)")
 OSC_TERMINAL_REPLY_RE = re.compile(r"\x1b\](?:4;\d+|1[0-9]|52|1[01]\d);[^\x07\x1b]*(?:\x07|\x1b\\)")
 NPM_CMD_SHIM_JS_RE = re.compile(r'"%(?:~dp0|dp0%)\\([^"]+?\.m?c?js)"\s+%\*', re.IGNORECASE)
 
@@ -2208,7 +1954,7 @@ def unwrap_windows_cmd_shim(
 ) -> List[str]:
     """Unwraps Windows npm .cmd/.bat shims (e.g. codex.cmd) into direct [node.exe, script.js, *args].
 
-    When winpty spawns a .cmd/.bat file, Windows wraps it in `cmd.exe /c ...`, whose `%*` batch
+    When a .cmd/.bat file is spawned, Windows wraps it in `cmd.exe /c ...`, whose `%*` batch
     expansion truncates multiline arguments at the first `\\n` (losing everything after line 1 of a
     multiline task and its passive Hub session marker). Launching `node.exe` directly
     bypasses `cmd.exe /c` so `CreateProcessW` preserves newlines verbatim. For non-npm .cmd/.bat
@@ -2379,6 +2125,61 @@ def _dsh_end_unrecorded(job: Dict[str, Any], last_turn_completed_at: Optional[fl
     return float(last_turn_completed_at) < ended_at - DSH_END_RECORD_SLACK_SEC
 
 
+class TerminalSockets:
+    """The console sockets attached to one session id: the `/ws/pty` bridge of step 3b.
+
+    They belong to the id, never to one incarnation (`rtc-sinks-per-id`): the core's handle, the
+    Python queue and the closer stay in this one structure while a resume replaces the session
+    object behind them, so a socket that connected before the resume keeps receiving (§6.4 A1).
+    Step 4 deletes the whole structure with the core's own socket.
+    """
+
+    __slots__ = ("handles", "closers", "dropped")
+
+    def __init__(self) -> None:
+        self.handles: Dict[asyncio.Queue, int] = {}
+        self.closers: Dict[asyncio.Queue, Callable[[], Any]] = {}
+        # `take_frames`' cumulative drop count per handle, to log a slow client once.
+        self.dropped: Dict[int, int] = {}
+
+
+def drain_terminal_frames(core: Core, session_id: str, sockets: TerminalSockets) -> None:
+    """The bridge's consumer: move each attached socket's frames onto its queue (§5.2, step 4 removes it).
+
+    `take_frames` is non-blocking and reports the queue's cumulative drop count and whether the id
+    was retired; a closed queue closes its socket with code 1000, which is what the hub's own
+    `close_ws_frontends` does when it drops the session.
+    """
+    for q, handle in list(sockets.handles.items()):
+        try:
+            frames, dropped, closed = core.take_frames(handle)
+        except KeyError:
+            # Detached between the snapshot and this call: the socket is already gone.
+            sockets.handles.pop(q, None)
+            sockets.closers.pop(q, None)
+            sockets.dropped.pop(handle, None)
+            continue
+        if dropped > sockets.dropped.get(handle, 0):
+            sockets.dropped[handle] = dropped
+            logger.warning("terminal socket of %s dropped %d bytes (slow client)", session_id, dropped)
+        for frame in frames:
+            try:
+                q.put_nowait(frame.decode("utf-8", "replace"))
+            except asyncio.QueueFull:
+                # The core already bounds its own queue; a full Python queue means the sender is
+                # behind, and the oldest frame goes exactly as `put_nowait` did before the swap.
+                break
+        if closed:
+            sockets.handles.pop(q, None)
+            sockets.dropped.pop(handle, None)
+            closer = sockets.closers.pop(q, None)
+            if closer is not None:
+                try:
+                    closer()
+                except Exception:
+                    logger.debug("closing the socket of %s failed", session_id, exc_info=True)
+
+
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -2396,12 +2197,18 @@ class AgentSession:
         hwnd: Optional[int] = None,
         cols: int = 120,
         rows: int = 36,
+        # The hub's one Core (§5.1); tests pass a fake of its calls instead.
+        core: Optional[Core] = None,
         # A7: the callback carries the session object, so an exit of an object a resume already
         # replaced can never be mistaken for the live session's own exit.
         on_exit_cb: Optional[Callable[["AgentSession", int], None]] = None,
         on_tui_tool_cb: Optional[Callable[[str, str, str], None]] = None,
+        # The id's socket registry (§6.4 A1): the manager shares one per session id, so a resume
+        # keeps the sockets the previous incarnation served; standalone tests get their own.
+        sockets: Optional[TerminalSockets] = None,
     ):
         self.session_id = session_id
+        self.core = core
         # Parent-facing protocol identity.  It is opaque to callers except as a correlation value.
         self.turn_id = f"turn-{uuid.uuid4().hex[:12]}"
         self.wait_handle: Optional[str] = None
@@ -2500,28 +2307,22 @@ class AgentSession:
         self._claude_hook_offset: int = 0
         self._kimi_wire_interaction_offset: int = 0
 
-        # Headless VT100 terminal screen buffer WITH 3,000-line scrollback history!
-        # K4 (fix 9): the hub's subclasses keep one bad escape sequence from losing the rest of a chunk.
-        self.screen = HubTerminalScreen(cols, rows, history=3000)
-        self.stream = HubTerminalStream(self.screen)
+        # The terminal core owns the PTY, the parser, the screen and the raw ring (§5.2). What the
+        # hub keeps is the last drain record's counters: liveness, the exit code, when the last byte
+        # arrived and the two revisions, so a seam read that only asks "did it change" costs no call.
+        self._pid: Optional[int] = None
+        self._alive: bool = False
+        # A text session (`attach_text`) has no process, but the core still owns its id: `kill`
+        # must end it there too, or `retire` refuses the id forever.
+        self._virtual: bool = False
+        self._raw_rev: int = 0
+        self._screen_rev: int = 0
+        # The seed the next spawn/attach_text starts its ring with (A1), consumed once.
+        self._seed_history: Optional[str] = None
 
-        # Raw ANSI history buffer for Web Console xterm.js replay
-        self.raw_history: List[str] = []
-        self.raw_history_bytes = 0
-        # Archive spec §3: bumped on every append, so the 60 s scrollback write can tell "changed"
-        # even when the capped buffer's byte count happens to be the same.
-        self.raw_history_rev = 0
-        self.max_history_bytes = RESUME_SCROLLBACK_MAX_BYTES
-
-        # Connected WebSocket queues for live browser xterm.js streaming
-        self.ws_queues: Set[asyncio.Queue] = set()
-        # W7: one closer per browser socket, so removing the session from the live list also ends
-        # the sockets with a normal close code instead of leaving them open and silent forever.
-        self.ws_close_hooks: Dict[asyncio.Queue, Callable[[], Any]] = {}
-        # W8: a resumed omp session clears saved lines with ESC[3J; a split sequence must not slip
-        # through between two PTY chunks.
-        self._esc3j_carry: str = ""
-        self.pty: Optional[PtyProcess] = None
+        # One handle, one queue and one closer per open browser socket (W7): the whole bridge state
+        # lives on the id (§6.4 A1), so a resume leaves the sockets of the replaced object working.
+        self.sockets = sockets if sockets is not None else TerminalSockets()
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -2553,15 +2354,41 @@ class AgentSession:
         self,
         loop: asyncio.AbstractEventLoop,
         on_virtual_line_cb: Optional[Callable[[str, str], Any]] = None,
+        seed: Optional[str] = None,
     ):
+        """`attach_text` (§5.2): a screen and a raw ring without a process (DSH virtual sessions).
+
+        `seed` is the resume separator for sockets already attached to the id; a resume passes it so
+        the banner lands after the predecessor's last bytes and before the first `feed`.
+        """
         self._loop = loop
         self.on_virtual_line_cb = on_virtual_line_cb
+        reply = self._core().attach_text(
+            self.session_id,
+            cols=max(20, int(self.cols)),
+            rows=max(5, int(self.rows)),
+            flags=self._spawn_flags(),
+            seed_history=self._seed_history,
+            seed=seed,
+        )
+        self._seed_history = None
+        self._pid = int(reply.get("pid") or 0) or None
+        self._virtual = True
+        self._alive = True
         self.status = "running"
         self.current_activity = "Connected to DeepSeek Harness Host"
         self.last_output_at = time.time()
 
     def emit_virtual_ansi(self, data: str):
-        self._on_pty_output(data)
+        """`feed` (§5.2): text into a session with no process.
+
+        The DSH echo emulation stays here (`write_input`); this is only the byte path into the
+        core's screen and ring, so the drain record carries the new revision on the next tick.
+        """
+        if not data:
+            return
+        self._core().feed(self.session_id, data)
+        self.last_output_at = time.time()
 
     def set_final_response(self, text: Optional[str], source: str):
         text = (text or "").strip()
@@ -2585,12 +2412,42 @@ class AgentSession:
         if str(source) in ("report_complete_mcp", "codex_task_complete", "dsh_hub_completion"):
             self.completion_reported = True
 
+    def _core(self) -> Core:
+        """The hub's one Core (§5.1). A session without one is a bug: there is no PTY fallback."""
+        if self.core is None:
+            raise RuntimeError(f"session {self.session_id} has no terminal core")
+        return self.core
+
+    def _spawn_flags(self) -> Dict[str, Any]:
+        """§5.2's `flags`: the strips, the ring's caps and the screen's 3000 history rows.
+
+        W8's ESC[3J strip is on only for a resumed session (omp repaints on start and would erase the
+        archived lines the pane is meant to keep); the OSC colour-query strip is always on.
+        """
+        return {
+            "strip_esc3j_on_output": self.resume_count > 0,
+            "strip_osc_color_queries": True,
+            "history_rows": TERMINAL_HISTORY_ROWS,
+            "raw_cap_bytes": RESUME_SCROLLBACK_MAX_BYTES,
+            "raw_slack_bytes": HISTORY_TRIM_SLACK_BYTES,
+        }
+
+    def _wants_tool_line_scan(self) -> bool:
+        """Only a generic terminal has no native transcript watcher (design §4, §5.6)."""
+        return (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy", "dsh")
+
     def start_pty(
         self,
         loop: asyncio.AbstractEventLoop,
         env_overrides: Optional[Dict[str, str]] = None,
         ws_prefix: Optional[str] = None,
     ):
+        """`spawn` (§5.2): the hub assembles argv and env, the core owns the process from here.
+
+        `seed_history` is the archived scrollback a resume replays before the first byte and
+        `ws_prefix` is the resume separator for the sockets already attached to the id; both land
+        inside the core's spawn, so neither depends on Python's timing after it.
+        """
         self._loop = loop
         env = os.environ.copy()
         # Prevent broken host PYTHONHOME from poisoning child agent shells (e.g. `py -3` inside Codex).
@@ -2600,52 +2457,47 @@ class AgentSession:
         if env_overrides:
             env.update(env_overrides)
 
-        if PtyProcess is REAL_PTY_PROCESS:
-            cmd_list = unwrap_windows_cmd_shim(self.command, list(self.args), env=env)
-        else:
-            cmd_list = [self.command] + list(self.args)
+        # `cmd-shim-stays-python`: argv preparation is the hub's, once per spawn, off the output path.
+        cmd_list = unwrap_windows_cmd_shim(self.command, list(self.args), env=env)
         # Q2: immediately before the process is spawned, so a transcript created at (or after) this
         # instant can be this session's and nothing older can.
         self.spawned_at = time.time()
-        self.pty = PtyProcess.spawn(
+        reply = self._core().spawn(
+            self.session_id,
             cmd_list,
             cwd=self.cwd,
             env=env,
-            dimensions=(self.rows, self.cols),
+            cols=max(20, int(self.cols)),
+            rows=max(5, int(self.rows)),
+            flags=self._spawn_flags(),
+            seed_history=self._seed_history,
+            ws_prefix=ws_prefix,
         )
-        # A1: a resumed object may inherit sockets attached to the object it replaced. The separator
-        # goes out between the spawn and the reader thread, so it can never land after the new
-        # process's first output, and a failed spawn (which raised above) pushed nothing.
-        if ws_prefix:
-            self.push_ws_frame(ws_prefix)
+        self._seed_history = None
+        self._pid = int(reply.get("pid") or 0) or None
+        self._virtual = False
+        self._alive = True
         self.status = "running"
         self.current_activity = "Interactive session running"
         self.last_output_at = time.time()
-
-        reader_thread = threading.Thread(target=self._read_loop, daemon=True)
-        reader_thread.start()
-
-    def _read_loop(self):
-        while self.pty and self.pty.isalive():
+        if self._wants_tool_line_scan():
+            # §5.6: the generic tool-line scan is a watched snapshot, bounded by its interval.
             try:
-                data = self.pty.read(4096)
-                if not data:
-                    time.sleep(0.02)
-                    continue
-                self._on_pty_output(data)
-            except EOFError:
-                break
+                self._core().watch_screen(
+                    self.session_id,
+                    max_lines=max(5, int(self.rows)),
+                    interval_ms=TOOL_LINE_SCAN_INTERVAL_MS,
+                )
             except Exception:
-                break
+                pass
 
-        try:
-            exit_code = self.pty.exitstatus if self.pty else 0
-        except Exception:
-            exit_code = 0
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._finish_read, exit_code)
+    def _finish_read(self, exit_code: Optional[int]) -> None:
+        """The exit path, run from the drain handler that saw the death record (§5.3).
 
-    def _finish_read(self, exit_code):
+        It is `_finish_read`'s body unchanged: the scrollback snapshot into `final_response`, the
+        named end reason, and the one lifecycle callback. The core publishes the death record after
+        the session's last byte, so this runs exactly where the reader thread used to run it.
+        """
         self.ended_at = time.time()
         self.exit_code = exit_code
         # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
@@ -2658,7 +2510,7 @@ class AgentSession:
             pass
 
         # Archive spec §1.4/§2: the process's end gets a named reason. A user termination already
-        # decided its status in terminate(); the reader thread must not overwrite it.
+        # decided its status in terminate(); the death record must not overwrite it.
         if self.terminated_by_user:
             self.end_reason = "terminated"
         else:
@@ -2671,100 +2523,56 @@ class AgentSession:
             # A7: carry this object, so the manager can tell it apart from a later resume's object.
             self.on_exit_cb(self, self.exit_code or 0)
 
-    def _on_pty_output(self, data: str):
-        detected_tools = []
-        # W8: omp clears the screen AND its saved lines when it starts (ESC[2J + ESC[3J). On a
-        # resumed session the saved lines are the archived output and the resume banner, so the
-        # erase-saved-lines half never reaches the history or a client.
-        if self.resume_count:
-            data = self._strip_saved_lines_erase(data)
-        if "\x1b]" in data:
-            data = OSC_COLOR_QUERY_RE.sub("", data)
-        with self._lock:
-            self.last_output_at = time.time()
-            try:
-                self.stream.feed(data)
-            except Exception:
-                pass
+    def apply_core_record(self, record: Dict[str, Any]) -> None:
+        """Applies one `drain()` record's counters (§5.3), and the exit path when it reports a death.
 
-            # Heuristic detection of TUI tool lines only for generic terminals without native transcript watchers
-            if (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy", "dsh"):
-                try:
-                    for line in self.screen.display:
-                        clean = line.strip()
-                        if not clean or clean in self._seen_tui_tool_lines:
-                            continue
-                        m = TUI_TOOL_PATTERN.match(clean)
-                        if m:
-                            self._seen_tui_tool_lines.add(clean)
-                            t_name = m.group(1)
-                            t_arg = (m.group(2) or m.group(3) or "").strip()
-                            detected_tools.append((t_name, t_arg))
-                except Exception:
-                    pass
-
-            self.raw_history.append(data)
-            # W9: count UTF-8 bytes (the cap is 512 KB, not 512k characters) and trim the JOINED
-            # history at a line break instead of dropping whole chunks; the slack keeps the
-            # 512 KB rebuild off every PTY read once the buffer is full.
-            self.raw_history_bytes += len(data.encode("utf-8", "replace"))
-            self.raw_history_rev += 1
-            if self.raw_history_bytes > self.max_history_bytes + HISTORY_TRIM_SLACK_BYTES:
-                joined = "".join(self.raw_history)
-                trimmed = trim_history_text(joined, self.max_history_bytes)
-                if trimmed != joined:
-                    self.raw_history = [trimmed]
-                    self.raw_history_bytes = len(trimmed.encode("utf-8", "replace"))
-            # Q11: the fan-out targets belong to the same critical section as the history append.
-            # A WebSocket registered afterwards gets this chunk inside its replay snapshot, never
-            # twice (append + live frame) and never zero times (the old snapshot/register gap).
-            ws_targets = list(self.ws_queues)
-
-        if detected_tools and self.on_tui_tool_cb and self._loop:
-            for t_name, t_arg in detected_tools:
-                self._loop.call_soon_threadsafe(self.on_tui_tool_cb, self.session_id, t_name, t_arg)
-
-        if self._loop and ws_targets:
-            for q in ws_targets:
-                self._loop.call_soon_threadsafe(self._push_ws_safe, q, data)
-
-    @staticmethod
-    def _push_ws_safe(q: asyncio.Queue, data: str):
-        try:
-            q.put_nowait(data)
-        except Exception:
-            pass
-
-    def _strip_saved_lines_erase(self, data: str) -> str:
-        """W8: removes ESC[3J (erase saved lines) from a resumed session's output.
-
-        The sequence can be split across two PTY reads, so up to three trailing bytes are carried
-        into the next call. ESC[2J (erase display) is deliberately left alone: it only clears the
-        viewport, and the bundled xterm.js 5.5.0 has no scrollOnEraseInDisplay option.
+        Nothing here blocks: the record's text is the core's own, its `screen_text` only arrives for
+        a watched session whose screen revision changed.
         """
-        if not data:
-            return data
-        buf = self._esc3j_carry + data
-        self._esc3j_carry = ""
-        out = buf.replace("\x1b[3J", "")
-        for size in (3, 2, 1):
-            suffix = "\x1b[3J"[:size]
-            if out.endswith(suffix):
-                self._esc3j_carry = suffix
-                out = out[:-size]
-                break
-        return out
+        self._pid = int(record.get("pid") or 0) or self._pid
+        self._raw_rev = int(record.get("raw_rev") or 0)
+        self._screen_rev = int(record.get("screen_rev") or 0)
+        last_output_at = record.get("last_output_at")
+        if last_output_at is not None:
+            self.last_output_at = float(last_output_at)
+        screen_text = record.get("screen_text")
+        if screen_text and self._wants_tool_line_scan():
+            self.scan_tool_lines(str(screen_text))
+        was_alive = self._alive
+        self._alive = bool(record.get("alive"))
+        if not self._alive and was_alive:
+            self._finish_read(record.get("exit_code"))
+        elif not self._alive and record.get("exit_code") is not None and self.exit_code is None:
+            # SF3: a code learned after the death record is still the hub's exit-code source.
+            self.exit_code = record.get("exit_code")
+
+    def scan_tool_lines(self, screen_text: str) -> None:
+        """The generic-engine tool-line scan, on the watched snapshot instead of every chunk."""
+        detected = []
+        for line in screen_text.splitlines():
+            clean = line.strip()
+            if not clean or clean in self._seen_tui_tool_lines:
+                continue
+            match = TUI_TOOL_PATTERN.match(clean)
+            if match:
+                self._seen_tui_tool_lines.add(clean)
+                detected.append((match.group(1), (match.group(2) or match.group(3) or "").strip()))
+        if not detected or self.on_tui_tool_cb is None:
+            return
+        for tool_name, tool_arg in detected:
+            try:
+                self.on_tui_tool_cb(self.session_id, tool_name, tool_arg)
+            except Exception:
+                logger.exception("tui tool-line callback failed for %s", self.session_id)
 
     def register_ws_closer(self, q: asyncio.Queue, closer: Callable[[], Any]) -> None:
         """W7: the server registers how to close the browser socket that owns this queue."""
-        with self._lock:
-            self.ws_close_hooks[q] = closer
+        self.sockets.closers[q] = closer
 
     def close_ws_frontends(self) -> None:
         """W7: normal-close every browser socket still attached to this session (normal code 1000)."""
-        with self._lock:
-            hooks = list(self.ws_close_hooks.values())
-            self.ws_close_hooks.clear()
+        hooks = list(self.sockets.closers.values())
+        self.sockets.closers.clear()
         for closer in hooks:
             try:
                 closer()
@@ -2772,46 +2580,55 @@ class AgentSession:
                 pass
 
     def attach_ws_queue(self) -> tuple:
-        """Q11: snapshot the replay and register the live queue in one atomic step.
+        """Q11: the replay and the live queue of one console socket, from `attach_queue`.
 
-        The PTY reader appends to `raw_history` and snapshots its fan-out targets under the same
-        lock, so every output chunk is either inside the replay this socket receives or in its
-        queue — never both, never neither.
+        The core registers the socket's bounded queue on the id's fan-out in the same step it takes
+        the replay, so a chunk is either inside the replay or in the queue — never both, never
+        neither. The handle belongs to the session id, so a resume needs no re-attachment; the drain
+        tick moves what is queued into this `asyncio.Queue`, which the `/ws/pty` sender writes.
         """
-        q: asyncio.Queue = asyncio.Queue(maxsize=500)
-        with self._lock:
-            replay = "".join(self.raw_history)
-            if "\x1b]" in replay:
-                replay = OSC_COLOR_QUERY_RE.sub("", replay)
-            self.ws_queues.add(q)
+        replay, handle = self._core().attach_queue(self.session_id)
+        q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX_FRAMES)
+        self.sockets.handles[q] = handle
         return replay, q
 
     def detach_ws_queue(self, q: asyncio.Queue) -> None:
-        with self._lock:
-            self.ws_queues.discard(q)
-            self.ws_close_hooks.pop(q, None)
+        """`detach_queue(handle)`: the socket is gone, so the core drops its queue too."""
+        handle = self.sockets.handles.pop(q, None)
+        self.sockets.closers.pop(q, None)
+        if handle is None:
+            return
+        self.sockets.dropped.pop(handle, None)
+        try:
+            self._core().detach_queue(handle)
+        except Exception:
+            logger.debug("detach_queue(%s) failed for %s", handle, self.session_id, exc_info=True)
 
-    def adopt_ws_frontends(self, previous: "AgentSession") -> None:
-        """A1: an open browser socket keeps streaming after a resume replaces the session object.
-
-        The queue set is handed over by identity, so the server's disconnect path — which still holds
-        the old object — detaches from the very set the new session fans out to. The resume separator
-        is pushed separately (push_ws_frame) because the seed in raw_history is replay-only.
-        """
-        self.ws_queues = previous.ws_queues
-        # W7: the closers travel with the sockets, or a terminate after the resume could no longer
-        # close them.
-        self.ws_close_hooks = previous.ws_close_hooks
-
-    def push_ws_frame(self, frame: str) -> None:
-        """A1: writes one frame to every browser socket already attached to this session id."""
-        for q in list(self.ws_queues):
-            self._push_ws_safe(q, frame)
+    def drain_ws_frames(self) -> None:
+        """The bridge's consumer for a standalone session; the manager drains by id instead."""
+        if not self.sockets.handles:
+            return
+        drain_terminal_frames(self._core(), self.session_id, self.sockets)
 
     def write_input(self, text: str):
-        if self.pty and self.pty.isalive():
-            self.pty.write(text)
-            return True
+        """`write` (§5.2): the whole text or nothing, then the DSH echo for a process-less session.
+
+        A full queue past the core's deadline raises `TimeoutError` with nothing queued, so one retry
+        cannot duplicate a keystroke; a second failure is logged and reported as not written (D7's
+        keys are never silently reordered by a partial write).
+        """
+        if self.has_process and self._alive:
+            for attempt in (1, 2):
+                try:
+                    self._core().write(self.session_id, text)
+                    return True
+                except TimeoutError:
+                    logger.warning("write to %s timed out (queue full), attempt %d",
+                                   self.session_id, attempt)
+                except (KeyError, RuntimeError):
+                    logger.exception("write to %s failed", self.session_id)
+                    return False
+            return False
         if self.on_virtual_line_cb is not None:
             for ch in text:
                 if ch in ("\r", "\n"):
@@ -2831,158 +2648,133 @@ class AgentSession:
         return False
 
     def resize(self, cols: int, rows: int) -> Tuple[int, int]:
-        """`resize`: applies the 20/5 clamp, then the PTY's own size; returns the applied cols/rows.
+        """`resize`: applies the 20/5 clamp, then the core's PTY and screen; returns the applied size.
 
-        The clamp stays here because it is hub policy (design §6.4): the core reports the request
-        and the hub decides what a pane gets.
+        The clamp stays here because it is hub policy (design §6.4): the core refuses below 20x5
+        defensively and never propagates a size. A console that is closing or closed refuses
+        (`ValueError`) and a busy one misses its deadline (`TimeoutError`); either way the hub keeps
+        the size it decided, which is the size a refit would ask for again.
         """
         with self._lock:
-            self.cols = max(20, int(cols))
-            self.rows = max(5, int(rows))
+            target_cols = max(20, int(cols))
+            target_rows = max(5, int(rows))
+        if self.core is not None and (self.has_process or self.dsh_job_id or self.dsh_spec):
             try:
-                self.screen.resize(self.rows, self.cols)
-            except Exception:
+                applied = self.core.resize(self.session_id, target_cols, target_rows)
+                target_cols, target_rows = int(applied[0]), int(applied[1])
+            except (KeyError, ValueError):
                 pass
-            if self.pty and self.pty.isalive():
-                try:
-                    self.pty.setwinsize(self.rows, self.cols)
-                except Exception:
-                    pass
+            except TimeoutError:
+                logger.debug("resize of %s missed its deadline", self.session_id)
+        with self._lock:
+            self.cols = target_cols
+            self.rows = target_rows
             return self.cols, self.rows
 
     # ---- The terminal seam (design §5.2) ------------------------------------------------
-    # Every read and write of terminal state in the hub goes through these. Step 3b swaps what is
-    # behind each body for a core call; the names and reply shapes are the core's, so no caller
-    # changes then. The bodies below read today's pyte screen and raw_history.
+    # Every read and write of terminal state in the hub goes through these. Step 3b swapped what is
+    # behind each body for a core call (seam-coverage.md names each one); the names and reply shapes
+    # stayed, so no caller changed. A reply the core cannot render inside its deadline is its cached
+    # snapshot, never an exception, and a session that has left the core's table (retired after its
+    # archive) answers with an empty read rather than raising into a status poll.
+
+    def _empty_read(self) -> Tuple[int, int, int, int]:
+        return 0, 0, max(20, int(self.cols)), max(5, int(self.rows))
 
     def read_screen(self, max_lines: int = 80) -> ScreenRead:
         """`screen`: the visible text, the cursor, the grid size and the revision of this read."""
-        with self._lock:
-            try:
-                lines = [line.rstrip() for line in self.screen.display]
-            except Exception:
-                lines = []
-            while lines and not lines[-1]:
-                lines.pop()
-            if max_lines and len(lines) > max_lines:
-                lines = lines[-max_lines:]
-            try:
-                cursor_x, cursor_y = int(self.screen.cursor.x), int(self.screen.cursor.y)
-            except Exception:
-                cursor_x, cursor_y = 0, 0
-            return ScreenRead("\n".join(lines), cursor_x, cursor_y,
-                              int(self.screen.columns), int(self.screen.lines), self.raw_history_rev)
+        if self.core is None:
+            cursor_x, cursor_y, cols, rows = self._empty_read()
+            return ScreenRead("", cursor_x, cursor_y, cols, rows, self._screen_rev)
+        try:
+            reply = self.core.screen(self.session_id, max_lines)
+        except KeyError:
+            cursor_x, cursor_y, cols, rows = self._empty_read()
+            return ScreenRead("", cursor_x, cursor_y, cols, rows, self._screen_rev)
+        return ScreenRead(
+            str(reply.get("text") or ""),
+            int(reply.get("cursor_x") or 0),
+            int(reply.get("cursor_y") or 0),
+            int(reply.get("cols") or self.cols),
+            int(reply.get("rows") or self.rows),
+            int(reply.get("rev") or 0),
+        )
 
     def read_scrollback(self, max_lines: int = 300) -> ScrollbackRead:
         """`scrollback`: the visible screen followed by the newest history rows above it."""
-        with self._lock:
-            try:
-                curr_lines = [line.rstrip() for line in self.screen.display]
-            except Exception:
-                curr_lines = []
-            # Render only the requested tail. Rebuilding all 10,000 history rows for
-            # every accepted tool record used to starve HTTP and terminal heartbeats.
-            all_lines = curr_lines
-            while all_lines and not all_lines[-1]:
-                all_lines.pop()
-            newest_history = []
-            try:
-                for row in reversed(self.screen.history.top):
-                    if max_lines and len(newest_history) + len(all_lines) >= max_lines:
-                        break
-                    text = "".join(row[col].data if col in row else " " for col in range(self.cols)).rstrip()
-                    if text or all_lines or newest_history:
-                        newest_history.append(text)
-            except Exception:
-                pass
-            all_lines = list(reversed(newest_history)) + all_lines
-            if max_lines:
-                all_lines = all_lines[-max_lines:]
-            return ScrollbackRead("\n".join(all_lines), self.raw_history_rev)
+        if self.core is None:
+            return ScrollbackRead("", self._raw_rev)
+        try:
+            reply = self.core.scrollback(self.session_id, max_lines)
+        except KeyError:
+            return ScrollbackRead("", self._raw_rev)
+        return ScrollbackRead(str(reply.get("text") or ""), int(reply.get("rev") or 0))
 
     def read_raw(self) -> RawRead:
-        """`raw`: the whole raw stream as it stands, already inside the archive cap (W9).
-
-        The ring trims itself in `_on_pty_output` once it passes cap + slack, so what this returns
-        is the same text `_scrollback_blob` trims for archiving — only the blob's own cut differs.
-        """
-        with self._lock:
-            # raw_history_bytes is kept beside every ring write, so no second encode under the lock.
-            return RawRead("".join(self.raw_history), self.raw_history_bytes, self.raw_history_rev)
+        """`raw`: the whole raw stream, already trimmed to the archive cap by the core's ring (W9)."""
+        if self.core is None:
+            return RawRead("", 0, self._raw_rev)
+        try:
+            reply = self.core.raw(self.session_id)
+        except KeyError:
+            return RawRead("", 0, self._raw_rev)
+        return RawRead(str(reply.get("text") or ""), int(reply.get("bytes") or 0),
+                       int(reply.get("rev") or 0))
 
     def read_raw_tail(self, max_chars: int = SUBMIT_DIAGNOSTIC_TAIL_CHARS) -> str:
         """`raw_tail`: the newest max_chars characters, cut on a character boundary."""
-        with self._lock:
-            text = "".join(self.raw_history)
-        if max_chars <= 0:
+        if max_chars <= 0 or self.core is None:
             return ""
-        return text[-max_chars:]
+        try:
+            return self.core.raw_tail(self.session_id, max_chars)
+        except KeyError:
+            return ""
 
     @property
     def raw_revision(self) -> int:
         """`raw`'s rev without the join: the change gate `_scrollback_blob` runs before reading.
 
-        Today it is the counter `_on_pty_output` bumps per chunk; after step 3b it is the rev the
-        core's drain record carries, so the 60 s scrollback write keeps its "changed?" gate.
+        The number is the ring's revision as the last drain record carried it (`raw_rev`, the same
+        number `raw`'s reply has), so the 60 s scrollback write keeps its "changed?" gate for free.
         """
-        return self.raw_history_rev
+        return self._raw_rev
 
     def seed_history(self, text: str) -> None:
-        """`spawn.seed_history`: the archived scrollback a resumed pane replays before its first byte.
+        """`spawn.seed_history`: hands the archived scrollback to the spawn that follows (A1).
 
-        One ring entry and rev 1, the state `_make_resumed_session` used to write by hand; the
-        ESC[3J carry is cleared because no sequence is half-seen across the boundary.
+        The core writes it as one ring entry at revision 1 before the first byte and clears the
+        ESC[3J carry, which is what the hub wrote by hand before the swap.
         """
-        with self._lock:
-            self.raw_history = [text]
-            self.raw_history_bytes = len(text.encode("utf-8", "replace"))
-            self.raw_history_rev = 1
-        self._esc3j_carry = ""
+        self._seed_history = text
 
     def last_output_time(self) -> float:
         """`drain`'s last_output_at: unix seconds of the last byte, for idle and quiet waits."""
-        return self.last_output_at
+        return float(self.last_output_at or 0.0)
 
     @property
     def has_process(self) -> bool:
-        """Whether this session still holds a live PTY object (never a status guess)."""
-        return self.pty is not None
+        """Whether a process is behind this session (the core's pid; `attach_text` reports 0)."""
+        return bool(self._pid)
 
     @property
     def pid(self) -> Optional[int]:
-        """`spawn`'s reply pid, while the PTY object is still there."""
-        pty = self.pty
-        if pty is None:
-            return None
-        return getattr(pty, "pid", None)
+        """`spawn`'s reply pid; a killed session keeps it, as it kept its PTY object before."""
+        return self._pid or None
 
     def kill(self, grace_ms: int = KILL_GRACE_MS) -> Optional[int]:
-        """`kill`: taskkill the session's process tree on a real winpty process, then terminate.
+        """`kill` (§5.2): the job object ends the tree and the reply carries the code, if any.
 
-        Returns the exit code when it is already known; today `pty.terminate(force=True)` does not
-        wait for the process, so a live session reports None (design §5.2: None when the process
-        outlived the budget). The core's reply will carry the code it learned before terminating.
+        The core reads `GetExitCodeProcess` before `TerminateJobObject`, so `cmd /c "exit 3"`
+        reports 3; a process that outlived the budget answers None and the death record that
+        follows on the drain carries the code. A text session has no process to end, but the core
+        still owns its id: the call ends it there so `retire` can accept the id afterwards.
+        Blocking: callers on the loop go through `asyncio.to_thread`.
         """
-        pty = self.pty
-        if pty is None:
-            return None
-        pid = getattr(pty, "pid", None)
-        if pid and isinstance(pty, REAL_PTY_PROCESS):
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=max(0.2, min(2.0, grace_ms / 1000.0)),
-                )
-            except Exception:
-                pass
-        try:
-            pty.terminate(force=True)
-        except Exception:
+        if not (self.has_process or self._virtual):
             return None
         try:
-            return pty.exitstatus
-        except Exception:
+            return self._core().kill(self.session_id, grace_ms)
+        except KeyError:
             return None
 
     def note_transcript_user_message(self, text: str) -> None:
@@ -3008,20 +2800,23 @@ class AgentSession:
         return "crashed"
 
     def is_process_alive(self) -> bool:
-        """B9: "live" means the process is alive (PTY alive; dsh virtual sessions by status), never the status alone."""
-        if self.pty is not None:
-            try:
-                return bool(self.pty.isalive())
-            except Exception:
-                return False
+        """B9: "live" is the process the core saw, never the status string.
+
+        A dsh virtual session has no core process (`attach_text` reports pid 0), so that branch keeps
+        the status check the seam always had; anything else with a pid reads the drain record's
+        `alive`, which costs no syscall and never disagrees with the exit code that follows it.
+        """
+        if self.has_process:
+            return bool(self._alive)
         if self.dsh_job_id or self.dsh_spec:
             return self.status in ("starting", "running", "waiting_parent")
         return self.status in ("running", "waiting_parent")
 
-    def terminate(self) -> bool:
+    async def terminate(self) -> bool:
         """Closes the session. An ended session keeps its own final status (B9); only a live one becomes terminated.
 
-        Returns True when this call really terminated a live process.
+        Returns True when this call really terminated a live process. The core's `kill` blocks its
+        caller for its grace (up to `KILL_GRACE_MS`), so it runs off the loop.
         """
         was_alive = self.is_process_alive()
         self.ended_at = time.time()
@@ -3034,13 +2829,13 @@ class AgentSession:
             pass
         if was_alive:
             # R14: a live process always ends as terminated, even when telemetry had already marked it
-            # completed. V-5: remember the cause so the PTY reader does not also emit an `exited` event.
+            # completed. V-5: remember the cause so the death record does not also emit an `exited` event.
             self.terminated_by_user = True
             self.status = "terminated"
             self.end_reason = "terminated"
             self.current_activity = "Terminated by parent/user"
-        if was_alive and self.pty:
-            self.kill(KILL_GRACE_MS)
+        if was_alive and (self.has_process or self._virtual):
+            await asyncio.to_thread(self.kill, KILL_GRACE_MS)
         if self.dsh_job_id and was_alive:
             job_id = self.dsh_job_id
             threading.Thread(
@@ -3344,6 +3139,10 @@ class HubSessionManager:
         self.db = HubPersistence(self.data_dir / "hub_state.db")
         self.wait_inbox = WaitInbox(self.data_dir / "wait_inbox.db")
         self._loop = None
+        # §5.3/§6.6: one Core for the hub's lifetime, created by `start()`.
+        self.core: Optional[Core] = None
+        # rtc-retire: ids whose session left the live list and whose exit record was not drained yet.
+        self._retire_pending: Set[str] = set()
         self._background_tasks = set()
         self._shutdown_task = None
         self.summarizer_registry = TranscriptSummarizerRegistry()
@@ -3356,6 +3155,9 @@ class HubSessionManager:
         self.global_routing_instructions: str = ""
         self.subagent_idle_timeout_minutes = DEFAULT_SUBAGENT_IDLE_TIMEOUT_MINUTES
         self.sessions: Dict[str, AgentSession] = {}
+        # The `/ws/pty` bridge's queues per session id (§6.4 A1, step 4 deletes the bridge): a socket
+        # attached before a resume keeps its handle and queue, so only the id can own them.
+        self.terminal_sockets: Dict[str, TerminalSockets] = {}
         self.default_cols: int = 120
         self.default_rows: int = 36
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
@@ -3413,6 +3215,7 @@ class HubSessionManager:
         if self._loop is not None:
             return
         self._loop = asyncio.get_running_loop()
+        self._ensure_core()
         try:
             await self.db.start()
             self.global_seq = await self.db.get_max_seq()
@@ -3594,6 +3397,91 @@ class HubSessionManager:
     def wait_for_discovery(self, timeout: float = 60.0) -> bool:
         """Blocks until the startup discovery thread finished (used by scripts and tests)."""
         return self._discovery_ready.wait(timeout)
+
+    # ---- The terminal core (§5.1, §5.3, §6.6) -------------------------------------------
+
+    def _ensure_core(self) -> Core:
+        """The hub's one Core, created on first use and held for the hub's lifetime (§5.1)."""
+        if self.core is None:
+            self.core = Core(notify=self._notify_core_tick, log=self._log_core_line)
+        return self.core
+
+    def _terminal_sockets(self, session_id: str) -> TerminalSockets:
+        """The bridge registry of one id, shared by every incarnation a resume builds (§6.4 A1)."""
+        sockets = self.terminal_sockets.get(session_id)
+        if sockets is None:
+            sockets = self.terminal_sockets[session_id] = TerminalSockets()
+        return sockets
+
+    @staticmethod
+    def _log_core_line(line: str) -> None:
+        """`log`: spawn, kill and panic lines the core hands over, so hub.log holds their trace."""
+        logger.info("%s", line)
+
+    def _notify_core_tick(self) -> None:
+        """The core's ticker calls this from its own thread: one loop wake for all sessions (§5.3).
+
+        `call_soon_threadsafe` is the only way to wake a Proactor loop; a closed loop just means the
+        hub is going away, and the next tick is dropped with it.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self._on_core_tick)
+        except RuntimeError:
+            pass
+
+    def _on_core_tick(self) -> None:
+        """One `drain()`, applied record by record, then the bridge's frames and pending retires.
+
+        Each record costs its own session and nothing else (§6.3, master `3874299`): an exception
+        while applying one is logged against that session and the next record still applies.
+        """
+        core = self.core
+        if core is None:
+            return
+        for record in core.drain():
+            session_id = str(record.get("session_id") or "")
+            try:
+                sess = self.sessions.get(session_id)
+                if sess is not None:
+                    sess.apply_core_record(record)
+                if session_id in self._retire_pending:
+                    # Its exit record is in hand now, so `retire` will accept the id.
+                    self._schedule(self._retire_ended_session(session_id))
+            except Exception:
+                logger.exception("terminal core: drain record for %s failed", session_id)
+        for session_id, sockets in list(self.terminal_sockets.items()):
+            if not sockets.handles:
+                continue
+            try:
+                drain_terminal_frames(core, session_id, sockets)
+            except Exception:
+                logger.exception("terminal core: socket drain for %s failed", session_id)
+
+    async def _retire_ended_session(self, session_id: str) -> None:
+        """`retire` (rtc-retire): an ended session leaves the core's table for good.
+
+        Called where the hub drops a session (`_close_session`, the failed resume). The core refuses
+        an id whose exit record no drain has carried yet (`ValueError`) or whose table is busy
+        (`TimeoutError`); the id stays pending and the record's arrival retries it.
+        """
+        core = self.core
+        if core is None:
+            self._retire_pending.discard(session_id)
+            return
+        try:
+            retired = await asyncio.to_thread(core.retire, session_id)
+        except (ValueError, TimeoutError):
+            self._retire_pending.add(session_id)
+            return
+        except Exception:
+            logger.exception("terminal core: retire(%s) failed", session_id)
+            return
+        self._retire_pending.discard(session_id)
+        if retired:
+            logger.debug("terminal core: retired %s", session_id)
 
     def resize_session_from_client(
         self,
@@ -4799,24 +4687,33 @@ class HubSessionManager:
 
     @logical_write
     async def persist_session(
-        self, session: AgentSession, force_scrollback: bool = False, final: bool = False
+        self, session: AgentSession, force_scrollback: bool = False, final: bool = False,
+        snapshot: Optional[Dict[str, Any]] = None,
     ):
         """Writes the row. `final` marks the exit/archive write, the only one that rebuilds the
-        mailbox thread (A11) instead of leaving the stored one alone."""
-        scrollback = session.read_scrollback(max_lines=250).text
+        mailbox thread (A11) instead of leaving the stored one alone. `snapshot` is `snapshot_all`'s
+        reply for a session the shutdown archives after its process ended (§6.6)."""
+        scrollback = None if snapshot is None else str(snapshot.get("scrollback_text") or "")
+        if scrollback is None:
+            scrollback = session.read_scrollback(max_lines=250).text
         await self.db.upsert_session(
             session.to_dict(),
             scrollback_text=scrollback,
-            archive=self._archive_payload(session, force_scrollback=force_scrollback, final=final),
+            archive=self._archive_payload(session, force_scrollback=force_scrollback, final=final,
+                                          snapshot=snapshot),
         )
 
     # ---- Archive & resume (spec archive-spec.md §2-§5) --------------------------------------
 
-    @staticmethod
-    def _last_screen_text(session: AgentSession) -> str:
+    @classmethod
+    def _last_screen_text(cls, session: AgentSession,
+                          snapshot: Optional[Dict[str, Any]] = None) -> str:
         """The last 20 non-empty screen lines, as the final record keeps them (spec §3)."""
         try:
-            lines = [ln for ln in session.read_screen(max_lines=80).text.splitlines() if ln.strip()]
+            text = None if snapshot is None else snapshot.get("screen_text")
+            if text is None:
+                text = session.read_screen(max_lines=80).text
+            lines = [ln for ln in str(text).splitlines() if ln.strip()]
         except Exception:
             lines = []
         return "\n".join(lines[-20:])
@@ -4871,25 +4768,31 @@ class HubSessionManager:
         if len(entries) > WORKER_MESSAGE_LOG_CAP:
             del entries[: len(entries) - WORKER_MESSAGE_LOG_CAP]
 
-    def _scrollback_blob(self, session: AgentSession, force: bool = False) -> Optional[bytes]:
+    def _scrollback_blob(self, session: AgentSession, force: bool = False,
+                         snapshot: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
         """zlib-compressed newest ≤512 KB of the raw terminal stream (spec §1.6/§3).
 
         While the session is live it is written at most once every 60 s and only when the stream
-        changed; the final record always writes it.
+        changed; the final record always writes it. `snapshot` (`snapshot_all`, §6.6) is the text
+        the shutdown captured before it killed the processes.
         """
         now = time.time()
-        if not force:
+        if not force and snapshot is None:
             if now - session._scrollback_written_at < RESUME_SCROLLBACK_INTERVAL_SEC:
                 return None
             if session.raw_revision == session._scrollback_rev_written:
                 return None
             if session.raw_revision == getattr(session, "_scrollback_pending_rev", -1):
                 return None
-        # W9: cut at a line break and keep the newest resume banner (a raw byte slice can split an
-        # escape sequence or drop the banner the pane is supposed to show above the new output).
-        raw_read = session.read_raw()
-        text = trim_history_text(raw_read.text, RESUME_SCROLLBACK_MAX_BYTES)
-        revision = raw_read.rev
+        # W9: the core's ring is already cut at a line break, inside the cap, with the newest resume
+        # banner kept whole, so the blob stores that text as it stands (design §4, §8 W9).
+        if snapshot is not None:
+            text = str(snapshot.get("raw_text") or "")
+            revision = int(snapshot.get("raw_rev") or 0)
+        else:
+            raw_read = session.read_raw()
+            text = raw_read.text
+            revision = raw_read.rev
         raw = text.encode("utf-8", "replace")
         self.db.on_accept(lambda: setattr(session, "_scrollback_pending_rev", revision))
         def committed():
@@ -4901,7 +4804,8 @@ class HubSessionManager:
         return zlib.compress(raw, 6)
 
     def _archive_payload(
-        self, session: AgentSession, force_scrollback: bool = False, final: bool = False
+        self, session: AgentSession, force_scrollback: bool = False, final: bool = False,
+        snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # A11: the thread is built on the exit/archive write only; every other persist passes "" and
         # the COALESCE upsert keeps what the final record already stored.
@@ -4917,7 +4821,7 @@ class HubSessionManager:
             "conversation_ref": (
                 json.dumps(session.conversation_ref, ensure_ascii=False) if session.conversation_ref else ""
             ),
-            "scrollback": self._scrollback_blob(session, force=force_scrollback),
+            "scrollback": self._scrollback_blob(session, force=force_scrollback, snapshot=snapshot),
             "last_screen": session.last_screen or "",
             "parent_messages": json.dumps(thread, ensure_ascii=False) if thread else "",
             "resume_count": session.resume_count,
@@ -4952,7 +4856,8 @@ class HubSessionManager:
                 return reason
         return ""
 
-    def _finalize_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
+    def _finalize_session(self, session: AgentSession, end_reason: Optional[str] = None,
+                          snapshot: Optional[Dict[str, Any]] = None) -> AgentSession:
         """Writes the parts of the final record that only exist once the session has stopped."""
         if end_reason:
             session.end_reason = end_reason
@@ -4960,7 +4865,7 @@ class HubSessionManager:
             session.ended_at = time.time()
         if not session.end_reason:
             session.end_reason = session.classify_end_reason(session.exit_code)
-        session.last_screen = self._last_screen_text(session)
+        session.last_screen = self._last_screen_text(session, snapshot)
         sticky = self._sticky_resume_block(self._record_from_session(session))
         if sticky:
             # A4: never recompute a sticky failure into "resumable".
@@ -4973,14 +4878,15 @@ class HubSessionManager:
         return session
 
     @logical_write
-    async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None) -> AgentSession:
+    async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None,
+                               snapshot: Optional[Dict[str, Any]] = None) -> AgentSession:
         """The final record, written when a session leaves the live list or at hub shutdown/start."""
         session.archived_at = time.time()
-        self._finalize_session(session, end_reason=end_reason)
+        self._finalize_session(session, end_reason=end_reason, snapshot=snapshot)
         # V5: an archived record must never report a live status; its end state is the truth.
         if session.end_reason:
             session.status = session.end_reason
-        await self.persist_session(session, force_scrollback=True, final=True)
+        await self.persist_session(session, force_scrollback=True, final=True, snapshot=snapshot)
         return session
 
     def _resume_check_context(self):
@@ -5251,8 +5157,10 @@ class HubSessionManager:
             gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
+            core=self._ensure_core(),
             on_exit_cb=self._exit_callback,
             on_tui_tool_cb=self._tool_callback,
+            sockets=self._terminal_sockets(session_id),
         )
         sess.engine = engine
         sess.turn_id = str(record.get("turn_id") or sess.turn_id)
@@ -5487,10 +5395,9 @@ class HubSessionManager:
         submit_key = str(snapshot.get("submit_key") or "\r")
 
         old = self.sessions.get(session_id)
-        if old is not None and old is not sess:
-            # A1: browser sockets opened on the old object keep streaming — the queue set is handed
-            # over by identity, and start_pty pushes the separator to them before any new output.
-            sess.adopt_ws_frontends(old)
+        # A1: browser sockets opened on the old object keep streaming without any Python step: the
+        # handle belongs to the session id and the core's spawn carries the sink fan-out over, so
+        # `ws_prefix` reaches them after the predecessor's last bytes.
         # A7: install the new object before the spawn. A resume that dies immediately then reports
         # its own exit (the callback carries the object), never the old dead object's.
         self.sessions[session_id] = sess
@@ -5515,9 +5422,11 @@ class HubSessionManager:
             )
         except Exception as e:
             # R9: a spawn that raised after the PTY had already started must not leave that process
-            # behind while the old (archived) object is put back in the live list.
+            # behind while the old (archived) object is put back in the live list. The core's kill
+            # blocks its caller for its grace, so it runs off the loop; the id then leaves the core.
             if sess.has_process:
-                sess.kill(KILL_GRACE_MS)
+                await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
+                await self._retire_ended_session(session_id)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -5741,14 +5650,25 @@ class HubSessionManager:
         old = self.sessions.get(session_id)
         # A1: a dsh pane's open socket survives the object replacement too, and typed input has to
         # reach the virtual terminal — which needs the loop and the parent-delivery callback.
-        sess._loop = loop
         if sess.on_virtual_line_cb is None:
             sess.on_virtual_line_cb = lambda sid, line: self._schedule(self.deliver_parent_message(
                 sid, line, also_write_pty=False
             ))
-        if old is not None and old is not sess:
-            sess.adopt_ws_frontends(old)
-            sess.push_ws_frame(resume_banner(sess.resume_count))
+        try:
+            # `attach_text`: the ring starts from the archived scrollback plus the separator, and the
+            # separator goes to the sockets already attached to the id before any `feed` can land.
+            sess.start_virtual(
+                loop,
+                on_virtual_line_cb=sess.on_virtual_line_cb,
+                seed=resume_banner(sess.resume_count) if old is not None else None,
+            )
+        except Exception as e:
+            # A9: a failed attach leaves the archived record exactly as it was.
+            if old is not None:
+                self.sessions[session_id] = old
+            else:
+                self.sessions.pop(session_id, None)
+            raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
         self.sessions[session_id] = sess
         if old is not None:
             self._release_transcripts(session_id)
@@ -6052,7 +5972,7 @@ class HubSessionManager:
         if not sess:
             return {"found": False, "was_alive": False, "status": None}
         was_alive = sess.is_process_alive()
-        terminated = sess.terminate()
+        terminated = await sess.terminate()
         if terminated:
             sess.end_reason = "terminated"
         if source == "auto_cleanup":
@@ -6063,6 +5983,10 @@ class HubSessionManager:
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
         # of leaving the server side open and silent for the rest of the hub's life.
         sess.close_ws_frontends()
+        # The bridge's queues belonged to the id; the sockets are closing, so nothing serves them.
+        self.terminal_sockets.pop(session_id, None)
+        # rtc-retire: the session is gone for good, so its ring and screen leave the core's table.
+        await self._retire_ended_session(session_id)
         if terminated:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
@@ -6096,16 +6020,6 @@ class HubSessionManager:
         except Exception:
             return False
 
-    @staticmethod
-    def _terminate_pty_tree(sess: AgentSession, budget: float = 2.0) -> None:
-        """R6: kills a live PTY's process tree (not just the root) within a bounded time.
-
-        A Windows PTY's children (MCP servers, shells) survive a plain terminate of the root; a
-        surviving kimi keeps its per-session lock, which makes the archived row refuse to resume.
-        The seam's `kill` owns both steps; `budget` is in seconds (the design's `grace_ms`).
-        """
-        sess.kill(int(max(0.2 * 1000, min(2.0, float(budget)) * 1000)))
-
     async def archive_all_sessions_on_shutdown(self) -> int:
         """Share one shutdown operation between the HTTP stop and lifespan exit."""
         if self._shutdown_task is None:
@@ -6113,6 +6027,13 @@ class HubSessionManager:
         return await asyncio.shield(self._shutdown_task)
 
     async def _shutdown(self) -> int:
+        """graceful-budget, in §6.6's order: snapshot the screens, then kill, then archive and drain.
+
+        The snapshot is taken before the kill, so the archived rows carry the last screen and
+        scrollback even when a kill costs a session its last bytes; `kill_all` ends every process
+        tree in parallel inside the recorded 2 s, and `shutdown` stops the core's ticker last, while
+        everything still runs inside the shared 8 s budget.
+        """
         self._shutting_down = True
         self.db.stop_accepting()
         deadline = time.monotonic() + SHUTDOWN_MAX_SEC
@@ -6126,34 +6047,58 @@ class HubSessionManager:
                 logger.error("Timed out cancelling hub producers")
         sessions = list(self.sessions.values())
         reasons = {}
-        stops = []
         for sess in sessions:
             if sess.is_process_alive():
                 reasons[sess.session_id] = "interrupted"
                 sess.status = "interrupted"
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
-                if sess.dsh_job_id:
-                    stops.append(asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=2.0))
-                elif sess.has_process:
-                    stops.append(asyncio.to_thread(self._terminate_pty_tree, sess, budget=2.0))
             else:
                 reasons[sess.session_id] = sess.end_reason or sess.classify_end_reason(sess.exit_code)
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        core = self.core
+        if core is not None:
+            # §6.6: snapshot_all first, so the archive keeps what the kill can take away.
+            try:
+                budget_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                for snapshot in core.snapshot_all(
+                    max_lines=250, max_bytes=RESUME_SCROLLBACK_MAX_BYTES, budget_ms=budget_ms
+                ):
+                    snapshots[str(snapshot.get("session_id") or "")] = snapshot
+            except Exception:
+                logger.exception("Shutdown could not snapshot the terminal core")
+        stops = [
+            asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=2.0)
+            for sess in sessions
+            if sess.dsh_job_id and sess.is_process_alive()
+        ]
+        if core is not None:
+            stops.append(asyncio.to_thread(core.kill_all, 2000))
         if stops:
             try:
                 await asyncio.wait_for(asyncio.gather(*stops, return_exceptions=True), timeout=2.0)
             except asyncio.TimeoutError:
                 logger.error("Timed out stopping session processes")
+        if core is not None and sessions:
+            try:
+                self._on_core_tick()
+            except Exception:
+                logger.exception("Shutdown could not drain the terminal core's exit records")
         archived = 0
         try:
             async with asyncio.timeout(max(0.001, deadline - time.monotonic() - 0.25)):
                 for sess in sessions:
-                    await self.db.run_internal(self._archive_session(sess, end_reason=reasons[sess.session_id]))
+                    await self.db.run_internal(self._archive_session(
+                        sess,
+                        end_reason=reasons[sess.session_id],
+                        snapshot=snapshots.get(sess.session_id),
+                    ))
                     sess.close_ws_frontends()
                     archived += 1
         except (asyncio.TimeoutError, PersistenceUnavailable):
             logger.exception("Shutdown archived only %d/%d sessions", archived, len(sessions))
         finally:
             self.sessions.clear()
+            self.terminal_sockets.clear()
             with self._transcript_lock:
                 self._claimed_transcripts.clear()
             self._notify_waiters()
@@ -6168,6 +6113,9 @@ class HubSessionManager:
                 event = entry.get("event")
                 if isinstance(event, asyncio.Event):
                     event.set()
+            if core is not None:
+                # §6.6: the ticker stops last; the sessions' job objects already ended their trees.
+                core.shutdown()
             try:
                 await self.db.close(timeout=max(0.001, deadline - time.monotonic()))
             except PersistenceUnavailable:
@@ -11459,6 +11407,11 @@ class HubSessionManager:
         """
         obj = session if isinstance(session, AgentSession) else None
         session_id = obj.session_id if obj is not None else str(session)
+        if self._shutting_down:
+            # §6.6: the shutdown archives every session itself. The death record of its own kill
+            # arrives while it runs, and this callback must not write a competing final status or a
+            # second lifecycle event under the archived one.
+            return
         sess = self.sessions.get(session_id)
         if obj is not None and sess is not obj:
             if sess is None:
@@ -11854,7 +11807,7 @@ class HubSessionManager:
                 elif kind == "error" and summary:
                     session.emit_virtual_ansi(f"\x1b[1;31m  ✖ {summary}\x1b[0m\r\n")
                 tail.acknowledge(next_offset)
-                # A single pyte/history snapshot can be costly. Let socket I/O run
+                # A screen/history snapshot is a core call with its own deadline. Let socket I/O run
                 # between records as well as between the bounded file-read batches.
                 await asyncio.sleep(0.001)
             await asyncio.sleep(0)
@@ -12652,7 +12605,7 @@ class HubSessionManager:
                     m_opt = re.match(r"^[>\s]*(\d+)\.\s+(.+)$", sclean)
                     if m_opt:
                         opt_lbl = m_opt.group(2).strip()
-                        # Clean any pyte line-overlap artifacts from long prompt lines
+                        # Clean the line-overlap artifacts a wrapped prompt leaves behind
                         for noise_tok in ("mini/antigravity", "complete:", "hub_worker.py"):
                             if noise_tok in opt_lbl:
                                 opt_lbl = opt_lbl.split(noise_tok)[0].strip()
@@ -13307,8 +13260,10 @@ class HubSessionManager:
             gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
+            core=self._ensure_core(),
             on_exit_cb=self._exit_callback,
             on_tui_tool_cb=self._tool_callback,
+            sockets=self._terminal_sockets(session_id),
         )
         sess.effective_model = effective_model
         sess.effective_thinking_level = effective_thinking

@@ -7,7 +7,8 @@ a recorded stream through a screen model.  The recorded decision `live-capture-n
 that: two live cases were recorded with `tools/record_terminal_corpus.py`, each stopping at the
 screen its consumer reads (`meta.json`'s `consumer.reads_at_chunk`), and this file replays those
 chunks through the core (`attach_text` + `feed`, as a DSH virtual session does) and through the pyte
-oracle (the hub's own reader path, `renderer.new_session` + `_on_pty_output`) and runs the real
+oracle (the hub's pre-step-3b reader path, `renderer.new_session` + `feed_output`, now in
+`tools/pyte_oracle.py`) and runs the real
 consumers on both screens.
 
 What each case pins:
@@ -62,7 +63,7 @@ class StopPointReplay:
         # pyte: the hub's own reader path, the one the goldens are rendered with.
         self.session = renderer.new_session(self.case.engine, self.case.cols, self.case.rows)
         for chunk in self.chunks:
-            self.session._on_pty_output(chunk)
+            self.session.feed_output(chunk)
 
         # The core: a text session without a process, fed the same chunk texts.
         self.core_id = f"live-consumer-{name}"

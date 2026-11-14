@@ -1,16 +1,21 @@
 """Render the frozen terminal corpus into golden outputs with today's Python code (§9 step 0).
 
 This is the oracle side of the migration: the Rust parser and history ring (step 2) must reproduce
-these files byte for byte.  Nothing here reimplements the hub's behaviour — it imports it:
+these files byte for byte.  Nothing here reimplements the hub's behaviour — it imports it.  After
+step 3b that behaviour lives in the offline oracle (decision `oracle-to-tools`,
+``tools/pyte_oracle.py``), because the hub's terminal is the Rust core and it no longer imports
+``pyte``:
 
-- ``AgentSession._on_pty_output`` (:2326): W8 strip on resumed sessions, OSC colour-query strip,
-  the raw-history append and the W9 trim with its slack, all in the order the PTY reader uses;
-- ``HubTerminalScreen``/``HubTerminalStream`` (:1792/:1832) through the session's ``stream.feed``;
-- ``AgentSession.read_screen``/``read_scrollback``/``read_raw``/``read_raw_tail``/``seed_history``
-  (the seam, design §5.2), ``trim_history_text`` (:630) and ``resume_banner`` (:625);
-- ``AgentSession.attach_ws_queue`` (:2426) for the replay frame, so the golden is the frame the hub
-  hands a newly attached console rather than a second copy of that expression;
-- ``OSC_TERMINAL_REPLY_RE``/``strip_osc_terminal_replies`` (:1853) for the browser→PTY input cases.
+- ``PyteOracleSession.feed_output``: W8 strip on resumed sessions, OSC colour-query strip, the
+  raw-history append and the W9 trim with its slack, all in the order the PTY reader used to run
+  them;
+- ``HubTerminalScreen``/``HubTerminalStream`` through the session's ``stream.feed``;
+- ``read_screen``/``read_scrollback``/``read_raw``/``read_raw_tail``/``seed_history`` (the seam's
+  reply shapes, design §5.2), ``trim_history_text`` and ``resume_banner``;
+- ``attach_ws_queue`` for the replay frame, so the golden is the frame the hub handed a newly
+  attached console rather than a second copy of that expression;
+- ``OSC_TERMINAL_REPLY_RE``/``strip_osc_terminal_replies`` (the hub's, still in ``server.py``'s input
+  path) for the browser→PTY input cases, and the oracle's ``OSC_COLOR_QUERY_RE`` for the ring.
 
 The submit-diagnostic tail and the resumed seed are no longer mirrored expressions: both are seam
 calls (``read_raw_tail``, ``seed_history``) and the tail's bound is the imported
@@ -57,14 +62,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from session_manager import (  # noqa: E402  (the oracle: import it, never copy it)
-    AgentSession,
+from session_manager import (  # noqa: E402  (the hub's own constants, never copied)
     HISTORY_TRIM_SLACK_BYTES,
     OSC_TERMINAL_REPLY_RE,
     RESUME_SCROLLBACK_MAX_BYTES,
     SUBMIT_DIAGNOSTIC_TAIL_CHARS,
     resume_banner,
     strip_osc_terminal_replies,
+)
+from tools.pyte_oracle import (  # noqa: E402  (the pyte oracle, `oracle-to-tools`)
+    OSC_COLOR_QUERY_RE,
+    PyteOracleSession,
     trim_history_text,
 )
 
@@ -148,41 +156,29 @@ def resume_seed(archived: str, resume_count: int) -> str:
     return f"{archived}{resume_banner(resume_count)}" if archived else resume_banner(resume_count)
 
 
-def new_session(engine: str, cols: int, rows: int, resume_count: int = 0, seed: str = "") -> AgentSession:
-    """An AgentSession with no PTY, fed the way ``_read_loop`` feeds a live one."""
-    session = AgentSession(
-        session_id="fixture",
-        profile_id="fixture",
-        profile_name="fixture",
-        kind="tui",
-        title="fixture",
-        cwd=str(Path(".").resolve()),
-        command="fixture.exe",
-        args=[],
-        cols=cols,
-        rows=rows,
-    )
-    session.engine = engine
-    session.resume_count = int(resume_count)
+def new_session(engine: str, cols: int, rows: int, resume_count: int = 0,
+                seed: str = "") -> PyteOracleSession:
+    """The oracle terminal of one session: a pyte screen and a raw ring, fed chunk by chunk."""
+    session = PyteOracleSession(engine, cols, rows, resume_count=resume_count)
     if seed:
         # the seam's spawn.seed_history: archived output plus separator, one entry, rev 1.
         session.seed_history(seed)
     return session
 
 
-def screen_text(session: AgentSession) -> str:
+def screen_text(session: PyteOracleSession) -> str:
     return session.read_screen(SCREEN_LINES).text
 
 
-def joined_raw(session: AgentSession) -> str:
+def joined_raw(session: PyteOracleSession) -> str:
     return session.read_raw().text
 
 
-def trimmed_raw(session: AgentSession) -> str:
+def trimmed_raw(session: PyteOracleSession) -> str:
     return trim_history_text(joined_raw(session), RESUME_SCROLLBACK_MAX_BYTES)
 
 
-def replay_frame(session: AgentSession) -> str:
+def replay_frame(session: PyteOracleSession) -> str:
     """The replay the hub sends a newly attached console: ``attach_ws_queue``'s own snapshot.
 
     It is the join of ``raw_history`` and *then* one more ``OSC_COLOR_QUERY_RE`` pass, which is not
@@ -194,7 +190,7 @@ def replay_frame(session: AgentSession) -> str:
     return replay
 
 
-def feed_session(session: AgentSession, case: Case) -> Optional[str]:
+def feed_session(session: PyteOracleSession, case: Case) -> Optional[str]:
     """Feeds every chunk; returns the screen right after the resize, when the corpus has one."""
     resize = case.resize
     at_resize: Optional[str] = None
@@ -203,7 +199,7 @@ def feed_session(session: AgentSession, case: Case) -> Optional[str]:
         if resize and index == index_at_resize:
             session.resize(int(resize["to"][0]), int(resize["to"][1]))  # type: ignore[index]
             at_resize = screen_text(session)
-        session._on_pty_output(chunk)
+        session.feed_output(chunk)
     if resize and at_resize is None:
         session.resize(int(resize["to"][0]), int(resize["to"][1]))  # type: ignore[index]
         at_resize = screen_text(session)
@@ -268,7 +264,7 @@ def render_trigger(case: Case) -> Dict[str, str]:
     for index, chunk in enumerate(case.chunks):
         entries_before = len(session.raw_history)
         bytes_before = session.raw_history_bytes
-        session._on_pty_output(chunk)
+        session.feed_output(chunk)
         collapsed = fired_at is None and len(session.raw_history) < entries_before
         if collapsed:
             fired_at = index

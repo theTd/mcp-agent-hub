@@ -8,8 +8,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fake_terminal_core import FakeTerminal
 from session_manager import AgentSession, HubSessionManager, ScreenRead
-from test_native_records import FakePty
 
 
 class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -19,17 +19,25 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         profiles = self.root / "profiles.json"
         profiles.write_text('{"profiles":{}}', encoding="utf-8")
+        self.fake = FakeTerminal()
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        self.hub.core = self.fake
         await self.hub.start()
-        self.sess = AgentSession("codex-delivery", "codex", "Codex", "tui", "Test", str(self.root), "unused", [])
+        self.sess = AgentSession("codex-delivery", "codex", "Codex", "tui", "Test", str(self.root), "unused", [],
+                                 core=self.fake)
         self.sess.engine = "codex"
         self.sess.status = "completed"
-        self.sess.pty = FakePty()
         self.sess._loop = asyncio.get_running_loop()
-        self.screen = "› \n\n  ? for shortcuts"
-        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.sess.screen.cursor.x, 0, 120, 36, 0)
         self.hub.sessions[self.sess.session_id] = self.sess
+        self.fake.spawn(self.sess.session_id, ["fixture"])
+        self.hub._on_core_tick()
+        # The keystrokes the seam's `write` queued, in order (what the old FakePty recorded).
+        self.pty_inputs = self.fake.inputs_of(self.sess.session_id)
+        self.screen = "› \n\n  ? for shortcuts"
+        self.cursor_x = 0
+        # §10: the screen is the core's `screen` reply (the fake's), not a pyte object's display.
+        self.sess.read_screen = lambda **kw: ScreenRead(self.screen, self.cursor_x, 0, 120, 36, 0)
         self.path = self.root / "rollout.jsonl"
         self.path.write_text("", encoding="utf-8")
         self.sess.transcript_path = self.path
@@ -58,14 +66,14 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_enter_and_exact_multiline_proof(self):
         text = "Long canary 中文\n" + "ordinary prose with spaces " * 100 + "END"
         def write(data):
-            self.sess.pty.inputs.append(data)
+            self.pty_inputs.append(data)
             if data == "\r": self.append_user(text)
             return True
         with patch.object(self.sess, "write_input", write), patch.object(self.hub, "_await_typed_text_settled",
                 AsyncMock(return_value=("› draft", True, True, 1))):
             result = await self.hub._submit_text_to_tui(self.sess, text, "\r")
         self.assertTrue(result["ok"])
-        self.assertEqual(self.sess.pty.inputs, ["\x1b[200~" + text + "\x1b[201~", "\r"])
+        self.assertEqual(self.pty_inputs, ["\x1b[200~" + text + "\x1b[201~", "\r"])
         self.assertIsNone(self.sess._tui_draft_pending)
 
     async def test_unsettled_text_never_presses_enter_and_blocks_next_send(self):
@@ -73,20 +81,20 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
             result = await self.hub._submit_text_to_tui(self.sess, "long original message", "\r")
         self.assertFalse(result["ok"])
         self.assertEqual(result["attempts"], 0)
-        self.assertNotIn("\r", self.sess.pty.inputs)
+        self.assertNotIn("\r", self.pty_inputs)
         self.assertTrue(Path(result["diagnostic_path"]).exists())
-        before = list(self.sess.pty.inputs)
+        before = list(self.pty_inputs)
         response = await self.hub.deliver_parent_message(self.sess.session_id, "do not concatenate")
         self.assertFalse(response["delivered"])
         self.assertEqual(response["reason"], "input_recovery_required")
-        self.assertEqual(self.sess.pty.inputs, before)
+        self.assertEqual(self.pty_inputs, before)
 
     async def test_unconfirmed_has_no_retry_even_when_composer_clears(self):
         with patch.object(self.hub, "_await_typed_text_settled", AsyncMock(return_value=(self.screen, True, True, 1))), \
              patch("session_manager.TUI_SUBMIT_EVIDENCE_SEC", .02):
             result = await self.hub._submit_text_to_tui(self.sess, "unconfirmed canary", "\r")
         self.assertIsNone(result["ok"])
-        self.assertEqual(self.sess.pty.inputs.count("\r"), 1)
+        self.assertEqual(self.pty_inputs.count("\r"), 1)
         self.append_user("unconfirmed canary")
         self.assertTrue(self.hub._reconcile_codex_submit(self.sess))
 
@@ -97,7 +105,7 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.sess.last_injection = {"ok": False, "reason": "previous_failure"}
         result = await self.hub.deliver_parent_message(self.sess.session_id, "", press_enter=False)
         self.assertEqual(result["reason"], "empty_text")
-        self.assertFalse(self.sess.pty.inputs)
+        self.assertFalse(self.pty_inputs)
 
     async def test_clear_is_guarded_and_confirmed_without_submitting_draft(self):
         result = await self.hub._clear_tui_draft(self.sess)
@@ -106,16 +114,16 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.sess._tui_draft_pending = {"reason": "failure"}
         self.sess.status = "running"
         with self.assertRaises(ValueError): await self.hub._clear_tui_draft(self.sess)
-        self.assertFalse(self.sess.pty.inputs)
+        self.assertFalse(self.pty_inputs)
         self.sess.status = "completed"
         def write(data):
-            self.sess.pty.inputs.append(data)
+            self.pty_inputs.append(data)
             self.screen = "› \n\n  ? for shortcuts"
             return True
         with patch.object(self.sess, "write_input", write):
             result = await self.hub.deliver_parent_message(self.sess.session_id, "", clear_input=True)
         self.assertTrue(result["input_cleared"])
-        self.assertEqual(self.sess.pty.inputs, ["\x03"])
+        self.assertEqual(self.pty_inputs, ["\x03"])
         self.assertIsNone(self.sess._tui_draft_pending)
 
     async def test_request_report_never_uses_another_injection(self):
@@ -238,15 +246,16 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(result[3], 1)
 
     def test_placeholder_is_empty_only_with_native_cursor_at_start(self):
-        self.sess.screen.cursor.x = 2
+        self.cursor_x = 2
         self.assertTrue(self.hub._codex_composer_empty(self.sess, "Ask Codex to do anything"))
-        self.sess.screen.cursor.x = 26
+        self.cursor_x = 26
         self.assertFalse(self.hub._codex_composer_empty(self.sess, "Ask Codex to do anything"))
 
     async def test_failure_event_does_not_mutate_native_terminal(self):
-        before = list(self.sess.raw_history)
+        # The terminal the seam would read: a failure record must not write to it.
+        before = self.fake.session(self.sess.session_id).ring
         await self.hub._record_tui_injection(self.sess, {"ok": False, "reason": "unsettled", "attempts": 0})
-        self.assertEqual(self.sess.raw_history, before)
+        self.assertEqual(self.fake.session(self.sess.session_id).ring, before)
         self.assertTrue(any(e["type"] == "input_delivery" for e in self.hub.get_worker_events(self.sess.session_id)))
 
     async def test_draft_only_write_does_not_start_a_turn(self):
@@ -261,7 +270,7 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         result = await self.hub._submit_text_to_tui(self.sess, "canary", "\r")
         self.assertEqual(result["reason"], "native_transcript_unavailable")
         self.assertFalse(result["ok"])
-        self.assertFalse(self.sess.pty.inputs)
+        self.assertFalse(self.pty_inputs)
 
     async def test_five_engines_confirm_from_native_records_without_reading_screen(self):
         text = "Native exact message 中文"

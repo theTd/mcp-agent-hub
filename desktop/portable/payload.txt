@@ -1,5 +1,6 @@
 server.py
 agent_guidance.py
+terminal_core.py
 parent_waiting.py
 session_manager.py
 hub_database.py
