@@ -416,10 +416,36 @@ SHUTDOWN_CORE_STOP_MAX_SEC = 1.5
 # of the stop is bounded by what is left of the one 8 s budget, never by a fresh timeout.
 SHUTDOWN_KILL_MAX_SEC = 2.0
 SHUTDOWN_ARCHIVE_RESERVE_SEC = 1.0
+# r2-kimi 2: a death that preceded the stop can be published one drain later (core contract 5). The stop
+# drains this many times, one drain interval apart, before it decides any reason, so such a death still
+# takes the ordinary exit path instead of being archived as an interruption.
+SHUTDOWN_RECONCILE_DRAINS = 2
+SHUTDOWN_RECONCILE_GAP_SEC = 0.05
+# A last row exists only if the store can flush it: the archive loop and the forced final write stop
+# this far before the deadline, so `db.close` still gets one commit batch (it keeps 0.2 s of its own).
+SHUTDOWN_FINAL_ROW_RESERVE_SEC = 0.6
+SHUTDOWN_STORE_RESERVE_SEC = 0.3
 # rtc-retire: a refused retire is retried on this timer, so a quiet id (no first-class DSH session
-# ever publishes a record) is not stranded in the core's table for the hub's life.
+# ever publishes a record) is not stranded in the core's table for the hub's life. The attempt cap
+# counts the timer's own attempts only: a busy drain publishes records of its own, and counting those
+# would reach the cap in about a second instead of the nominal ten.
 RETIRE_RETRY_INTERVAL_SEC = 0.25
 RETIRE_RETRY_MAX_ATTEMPTS = 40
+# r2-kimi 6: a drop the core keeps refusing is still the truth; the cap only slows it down. The fast
+# attempts are logged once and the retries continue on this interval until the entry is gone.
+RETIRE_RETRY_SLOW_SEC = 5.0
+# A retire goes after the row write it may be waiting for (r2-kimi 5): the code the core learned late
+# belongs to that row, and after `retire` there is nothing left to read it from.
+LATE_CODE_WRITE_WAIT_SEC = 1.0
+# The core may withhold a death record for one tick (contract 5), and a resume's spawn drops whatever
+# record the table still holds for the id: `_end_predecessor` drains again, one drain interval apart,
+# until the predecessor's death has been applied, then proceeds without it.
+PREDECESSOR_DEATH_WAIT_SEC = 0.25
+PREDECESSOR_DEATH_POLL_SEC = 0.05
+# Core contract 1: a spawn/attach_text that overlapped another lifecycle call of the same id is
+# refused with `ValueError("... in flight; retry")`. The hub causes that overlap itself (a retried
+# retire), so a resume waits the claim out instead of turning a transient collision into 恢复失败.
+LIFECYCLE_CLAIM_RETRY_DELAYS_SEC = (0.05, 0.1)
 AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
 CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
 KIMI_LOCKED_MESSAGE = "该 Kimi 会话正被另一个进程使用"
@@ -2324,6 +2350,9 @@ class AgentSession:
         self.exit_code: Optional[int] = None
         # V-5: set by terminate(); the PTY reader must not report a second lifecycle event for it.
         self.terminated_by_user: bool = False
+        # R2: set by a resume's `_end_predecessor`. The death it causes is a hand-over, so an
+        # object that already ended keeps that end state and is not announced as crashed.
+        self.superseded: bool = False
         # B9: the initial task, never overwritten by follow-up messages or by status text.
         self.last_task: str = ""
 
@@ -2603,6 +2632,12 @@ class AgentSession:
         `exit_code` is kept as the core reported it: a failed `GetExitCodeProcess` leaves `None`,
         and `crashed` marks a reader panic. Neither may become a clean 0 for any engine (F1).
         """
+        if self.superseded and self.ended_at is not None:
+            # R2: a resume replaced this object and `_end_predecessor` ended the entry it owned. The
+            # death record of that kill is a hand-over, not an ending: the end state the object
+            # already earned (a completed DSH job, a user termination) stays, and the parent is not
+            # told a session it is resuming crashed.
+            return
         self.ended_at = time.time()
         self.exit_code = exit_code
         self._died_crashed = bool(crashed)
@@ -2665,11 +2700,6 @@ class AgentSession:
                 self.status = self.end_reason
                 return "late_code"
         return ""
-
-    @property
-    def late_exit_code_pending(self) -> bool:
-        """SF3: the session died without a code and the core may still learn one."""
-        return self.exit_code is None and self._alive is False and self.ended_at is not None
 
     def scan_tool_lines(self, screen_text: str) -> None:
         """The generic-engine tool-line scan, on the watched snapshot instead of every chunk."""
@@ -2935,11 +2965,17 @@ class AgentSession:
         A death the core could not give a code for (`None`: a failed `GetExitCodeProcess`) or one
         it reported as a crash (a reader panic) is a crash for every engine, generic and pwsh
         included (F1): only a real 0 is a clean end.
+
+        A text session has no process at all (`attach_text` reports pid 0) and its kill answers
+        `exit_code=None, crashed=false` by contract, so a missing code says nothing about it: it
+        keeps the end state it reached, or exits. F1's rule needs a process to have died.
         """
         if self.terminated_by_user:
             return "terminated"
-        if exit_code is None or self._died_crashed:
+        if self._died_crashed:
             return "crashed"
+        if exit_code is None:
+            return "crashed" if self.has_process else (self.end_reason or "exited")
         if int(exit_code) != 0:
             return "crashed"
         if self.completion_reported:
@@ -2995,6 +3031,10 @@ class AgentSession:
             return True
         # The process had already ended: keep its real final status and activity untouched.
         return False
+
+    def mark_superseded(self) -> None:
+        """A resume is replacing this object; `_end_predecessor` owns the ending it causes (R2)."""
+        self.superseded = True
 
     @property
     def last_injection(self) -> Optional[Dict[str, Any]]:
@@ -3297,10 +3337,18 @@ class HubSessionManager:
         self._incarnations: Dict[str, int] = {}
         self._retire_inflight: Set[str] = set()
         # A refused retire has no record to wait for when the id never publishes one again (a
-        # first-class DSH session), so it is retried on its own timer: due time, attempts left.
-        self._retire_retry_at: Dict[str, float] = {}
+        # first-class DSH session), so it is retried on its own timer; see `_retire_ended_session`.
         self._retire_attempts: Dict[str, int] = {}
+        # The monotonic time of an id's next timer attempt: the fast interval until the cap, the slow
+        # one after it (r2-kimi 6).
+        self._retire_backoff: Dict[str, float] = {}
         self._retry_timer: Optional[asyncio.TimerHandle] = None
+        # A closed session's object, kept as its tombstone until `retire` succeeds: a code the core
+        # learns after the close still belongs to the row it already wrote (r2-kimi 5).
+        self._closed_sessions: Dict[str, AgentSession] = {}
+        # The in-flight row rewrite a late exit code needs, by session id, so a retire runs after it
+        # and never takes the core's answer away before the row has it (r2-kimi 5).
+        self._late_code_writes: Dict[str, asyncio.Task] = {}
         # The scheduled ordinary-exit finalizations, by session id, so the shutdown can wait for
         # the ones a death started before it instead of cancelling them away (kimi 4).
         self._exit_tasks: Dict[str, asyncio.Task] = {}
@@ -3608,30 +3656,44 @@ class HubSessionManager:
         except RuntimeError:
             pass
 
-    def _on_core_tick(self) -> None:
+    def _on_core_tick(self) -> int:
         """One `drain()`, applied record by record, then the bridge's frames and pending retires.
 
         Each record costs its own session and nothing else (§6.3, master `3874299`): an exception
         while applying one is logged against that session and the next record still applies.
+        Returns how many records the drain carried, so the stop can tell a quiet core from one whose
+        death record has not gone out yet (r2-kimi 2).
         """
         core = self.core
         if core is None:
-            return
-        for record in core.drain():
+            return 0
+        records = core.drain()
+        for record in records:
             session_id = str(record.get("session_id") or "")
             try:
                 sess = self.sessions.get(session_id)
+                closed = None if sess is not None else self._closed_sessions.get(session_id)
                 outcome = ""
                 if sess is not None:
                     outcome = sess.apply_core_record(record)
-                    if outcome == "late_code":
+                    if outcome == "late_code" and not sess.superseded:
                         # F2: the code the death record lacked arrived after the final row was
-                        # written; rewrite that row once, with no second lifecycle event.
-                        self._schedule(self._rewrite_late_exit_code(sess))
+                        # written; rewrite that row once, with no second lifecycle event. A
+                        # superseded predecessor writes its own final row in `_end_predecessor`.
+                        self._write_late_exit_code(session_id, sess)
+                elif (closed is not None and not closed._alive
+                      and record.get("exit_code") is not None and closed.exit_code is None):
+                    # r2-kimi 5: the id was already closed and its row written; the core refused the
+                    # retire until this record went out, so the code belongs to that row. It is
+                    # never routed to a successor: a resume drops the tombstone with its incarnation.
+                    closed.exit_code = record.get("exit_code")
+                    closed.end_reason = closed.classify_end_reason(closed.exit_code)
+                    closed.status = closed.end_reason
+                    self._write_late_exit_code(session_id, closed)
                 if session_id in self._retire_pending:
                     # Its exit record is in hand now, so `retire` will accept the id.
                     self._schedule(self._retire_ended_session(
-                        session_id, self._retire_pending.get(session_id)))
+                        session_id, self._retire_pending.get(session_id), retry="record"))
             except Exception:
                 logger.exception("terminal core: drain record for %s failed", session_id)
         for session_id, sockets in list(self.terminal_sockets.items()):
@@ -3652,36 +3714,107 @@ class HubSessionManager:
             # This tick's drain may have left an orphan; a closed sink publishes no further notify,
             # so the retry has to come from the timer.
             self._arm_retry_timer()
+        return len(records)
 
     def _next_incarnation(self, session_id: str) -> int:
         """Bumps and returns an id's incarnation; installing one cancels a pending retire (F3).
 
         The generation is what a pending drop is about: a resume's new object is a new incarnation,
-        so a retire queued for the predecessor must never be retried against it (kimi 6).
+        so a retire queued for the predecessor must never be retried against it (r2-kimi 6), and a
+        closed id's tombstone goes with it; a late code is never routed to the successor (r2-kimi 5).
         """
         generation = self._incarnations.get(session_id, 0) + 1
         self._incarnations[session_id] = generation
         self._clear_retire(session_id)
+        self._closed_sessions.pop(session_id, None)
         return generation
 
     def _clear_retire(self, session_id: str) -> None:
         self._retire_pending.pop(session_id, None)
-        self._retire_retry_at.pop(session_id, None)
         self._retire_attempts.pop(session_id, None)
+        self._retire_backoff.pop(session_id, None)
 
-    async def _retire_ended_session(self, session_id: str, incarnation: Optional[int] = None) -> None:
+    def _drop_stale_retire(self, session_id: str, incarnation: int) -> None:
+        """Forgets a drop that belongs to an incarnation a resume has replaced (r2-kimi 7).
+
+        Only an entry that still names that old incarnation is removed, and no timer is armed for
+        it: a newer incarnation's own pending drop is none of this call's business.
+        """
+        if self._retire_pending.get(session_id) == incarnation:
+            self._clear_retire(session_id)
+
+    def _resume_in_flight(self, session_id: str) -> bool:
+        """Whether a resume currently owns this id, so nothing may drop it from the core (R1)."""
+        lock = self._resume_locks.get(session_id)
+        return bool(lock is not None and lock.locked())
+
+    def _retire_retry_delay(self, session_id: str) -> float:
+        """A refused drop retries every 250 ms, then every 5 s once its fast attempts are spent."""
+        attempts = self._retire_attempts.get(session_id, 0)
+        return RETIRE_RETRY_SLOW_SEC if attempts > RETIRE_RETRY_MAX_ATTEMPTS else RETIRE_RETRY_INTERVAL_SEC
+
+    def _queue_retire_retry(self, session_id: str, incarnation: int, retry: str) -> None:
+        """Keeps a refused drop and decides when it is tried again (r2-kimi 6).
+
+        The entry stays until `retire` succeeds, the core no longer knows the id, or a resume of that
+        exact incarnation cancels it. Only the timer's own attempts count towards the cap, and
+        passing it just slows the retries down: the ring and screen are still in the core.
+        """
+        self._retire_pending[session_id] = incarnation
+        if retry == "timer":
+            attempts = self._retire_attempts.get(session_id, 0) + 1
+            self._retire_attempts[session_id] = attempts
+            if attempts == RETIRE_RETRY_MAX_ATTEMPTS + 1:
+                logger.warning(
+                    "terminal core: retire(%s) refused %d times; retrying every %g s until it succeeds",
+                    session_id, attempts, RETIRE_RETRY_SLOW_SEC)
+        self._retire_backoff[session_id] = time.monotonic() + self._retire_retry_delay(session_id)
+        self._arm_retry_timer()
+
+    async def _await_late_code_write(self, session_id: str) -> None:
+        """Lets the row write a late code needs finish before `retire` takes the core's answer away."""
+        task = self._late_code_writes.get(session_id)
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait([task], timeout=LATE_CODE_WRITE_WAIT_SEC)
+        except Exception:
+            logger.exception("terminal core: waiting for the final row write of %s failed", session_id)
+        if not task.done():
+            logger.warning("terminal core: retire(%s) did not wait for its final row write",
+                           session_id)
+
+    async def _retire_ended_session(self, session_id: str, incarnation: Optional[int] = None,
+                                    retry: str = "direct") -> None:
         """`retire` (rtc-retire): an ended session leaves the core's table for good.
 
         Called where the hub drops a session (`_close_session`, the failed resume). The core refuses
-        an id whose exit record no drain has carried yet (`ValueError`), one whose resume is in
-        flight, or a table that is busy (`TimeoutError`); the id stays pending, bound to the
-        incarnation it was dropped for, and its arrival or the retry timer tries again.
+        an id whose exit record no drain has carried yet (`ValueError`), one whose spawn, attach or
+        retire is in flight (`ValueError` "… in flight; retry"), or a table that is busy
+        (`TimeoutError`); the id stays pending, bound to the incarnation it was dropped for, and its
+        arrival or the retry timer tries again.
+
+        `retry` says who asks: "direct" is the caller that owns the operation (it may hold the
+        resume lock, and its own cleanup must go through), "record" is the drain that saw the id's
+        exit record, "timer" is the background retry. Both deferred kinds wait a resume out: a drop
+        that lands mid-resume closes the fan-out the successor is about to take over (A1, Q11). Only
+        the timer's refusals count towards RETIRE_RETRY_MAX_ATTEMPTS.
+
+        Every awaited result is checked against the id's incarnation before pending state is
+        touched: a resume that ran while the core call waited owns the id now (r2-kimi 7).
         """
         if incarnation is not None and self._incarnations.get(session_id) not in (None, incarnation):
             # A resume installed a successor while this retry waited: the drop is history.
+            self._drop_stale_retire(session_id, incarnation)
             return
         if incarnation is None:
             incarnation = self._incarnations.get(session_id, 0)
+        if retry != "direct" and self._resume_in_flight(session_id):
+            # The resume's own spawn/attach_text replaces the entry and takes the fan-out over, so
+            # dropping the id now would close the sockets it is handing to its successor (R1).
+            if self._retire_pending.get(session_id) == incarnation:
+                self._arm_retry_timer()
+            return
         if session_id in self._retire_inflight:
             return
         core = self.core
@@ -3690,16 +3823,15 @@ class HubSessionManager:
             return
         self._retire_inflight.add(session_id)
         try:
+            await self._await_late_code_write(session_id)
             retired = await asyncio.to_thread(core.retire, session_id)
         except (ValueError, TimeoutError):
-            self._retire_pending[session_id] = incarnation
-            self._retire_attempts[session_id] = self._retire_attempts.get(session_id, 0) + 1
-            if self._retire_attempts[session_id] <= RETIRE_RETRY_MAX_ATTEMPTS:
-                self._arm_retry_timer()
-            else:
-                logger.warning("terminal core: retire(%s) refused %d times; giving up",
-                               session_id, RETIRE_RETRY_MAX_ATTEMPTS)
-                self._clear_retire(session_id)
+            if self._incarnations.get(session_id) not in (None, incarnation):
+                # The id was resumed while the core call waited: this refusal belongs to the
+                # incarnation that is gone, so nothing is queued and no timer is armed for it.
+                self._drop_stale_retire(session_id, incarnation)
+                return
+            self._queue_retire_retry(session_id, incarnation, retry)
             return
         except Exception:
             logger.exception("terminal core: retire(%s) failed", session_id)
@@ -3707,7 +3839,12 @@ class HubSessionManager:
             return
         finally:
             self._retire_inflight.discard(session_id)
+        if self._incarnations.get(session_id) not in (None, incarnation):
+            self._drop_stale_retire(session_id, incarnation)
+            return
         self._clear_retire(session_id)
+        # The core no longer holds the id (removed, or never had it): its tombstone has no reader.
+        self._closed_sessions.pop(session_id, None)
         if retired:
             logger.debug("terminal core: retired %s", session_id)
 
@@ -3715,23 +3852,35 @@ class HubSessionManager:
         """Arms the one background retry timer (a refused retire, an orphaned handle).
 
         Both wait on a core call that missed its deadline, not on a new drain record: a quiet id
-        publishes none, and a retired sink's notify may never come.
+        publishes none, and a retired sink's notify may never come. A backed-off drop is only due at
+        its own time, so the timer takes the earliest one (r2-kimi 6).
         """
         loop = self._loop
         if loop is None or loop.is_closed() or self._shutting_down or self._retry_timer is not None:
             return
-        self._retry_timer = loop.call_later(RETIRE_RETRY_INTERVAL_SEC, self._retry_timer_fire)
+        now = time.monotonic()
+        delays = [max(0.0, self._retire_backoff.get(session_id, now) - now)
+                  for session_id in self._retire_pending]
+        if any(sockets.orphans for sockets in self.terminal_sockets.values()):
+            delays.append(RETIRE_RETRY_INTERVAL_SEC)
+        delay = min(delays) if delays else RETIRE_RETRY_INTERVAL_SEC
+        self._retry_timer = loop.call_later(delay, self._retry_timer_fire)
 
     def _retry_timer_fire(self) -> None:
         self._retry_timer = None
-        pending = list(self._retire_pending.items())
-        for session_id, incarnation in pending:
-            self._schedule(self._retire_ended_session(session_id, incarnation))
+        now = time.monotonic()
+        due = [(session_id, incarnation) for session_id, incarnation in self._retire_pending.items()
+               if self._retire_backoff.get(session_id, 0.0) <= now]
+        for session_id, incarnation in due:
+            # A retry in flight must not be scheduled twice, and the floor keeps the timer out of a
+            # fire-now loop while it runs; a refusal refines the time in `_queue_retire_retry`.
+            self._retire_backoff[session_id] = now + self._retire_retry_delay(session_id)
+            self._schedule(self._retire_ended_session(session_id, incarnation, retry="timer"))
         orphans = [(sid, sockets) for sid, sockets in list(self.terminal_sockets.items())
                    if sockets.orphans]
         for session_id, sockets in orphans:
             self._schedule(self._release_orphan_handles(session_id, sockets))
-        if pending or orphans:
+        if self._retire_pending or orphans:
             self._arm_retry_timer()
 
     async def _release_orphan_handles(self, session_id: str, sockets: "TerminalSockets") -> None:
@@ -3753,13 +3902,31 @@ class HubSessionManager:
         if sockets.orphans:
             self._arm_retry_timer()
 
+    def _write_late_exit_code(self, session_id: str, session: AgentSession) -> None:
+        """Schedules the one row rewrite a late code needs, remembered so a retire waits for it."""
+        task = self._schedule(self._rewrite_late_exit_code(session))
+        if task is None:
+            return
+        self._late_code_writes[session_id] = task
+
+        def finished(_done, key=session_id, tracked=task):
+            if self._late_code_writes.get(key) is tracked:
+                self._late_code_writes.pop(key, None)
+
+        task.add_done_callback(finished)
+
     async def _rewrite_late_exit_code(self, session: AgentSession) -> None:
         """SF3/F2: the code the death record lacked arrived after the final row was written.
 
         The row is rewritten from the object (the late record already updated its code and end
         reason) and no second lifecycle event is emitted: the death path already emitted that one.
+        A closed id's object is its tombstone until `retire` succeeds, so its archived row is
+        repaired too; an object a resume replaced never writes, the successor owns the row now
+        (r2-kimi 4/5).
         """
-        if self.sessions.get(session.session_id) is not session:
+        session_id = session.session_id
+        if (self.sessions.get(session_id) is not session
+                and self._closed_sessions.get(session_id) is not session):
             return
         self._finalize_session(session)
         await self.persist_session(session, final=True)
@@ -3770,9 +3937,21 @@ class HubSessionManager:
         The core's table insert drops a death record that was never drained, so the predecessor's
         records are drained while `sessions[id]` still maps to the old object; its exit path then
         writes the old final row and its one lifecycle event, and the successor starts clean.
+
+        The core may withhold that record for one tick (contract 5), and the kill's own record is
+        published when the process is gone, so the drain repeats until the predecessor's death has
+        been applied: the successor's spawn is what would otherwise swallow it (R6). The kill is a
+        supersede, not a death: the object is marked so its own end state survives it (R2).
+
+        A code the core learned only now, for a predecessor whose final row was already written,
+        gets that row rewritten here: once the successor is installed the identity guard correctly
+        refuses it, and the code would never reach the archive (r2-kimi 4).
         """
         if old is None or self.core is None:
             return
+        old.mark_superseded()
+        code_before = old.exit_code
+        ended_before = old.ended_at is not None
         try:
             if old._virtual or old.is_process_alive():
                 # A text entry is ended unconditionally; a process that already died is left to
@@ -3781,10 +3960,22 @@ class HubSessionManager:
                     await asyncio.to_thread(old.kill, KILL_GRACE_MS)
         except Exception:
             logger.debug("terminal core: ending the predecessor of %s failed", session_id, exc_info=True)
-        try:
-            self._on_core_tick()
-        except Exception:
-            logger.exception("terminal core: drain of %s's predecessor failed", session_id)
+        deadline = time.monotonic() + PREDECESSOR_DEATH_WAIT_SEC
+        while True:
+            try:
+                self._on_core_tick()
+            except Exception:
+                logger.exception("terminal core: drain of %s's predecessor failed", session_id)
+                break
+            if not old._alive or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(PREDECESSOR_DEATH_POLL_SEC)
+        if ended_before and old.exit_code != code_before:
+            try:
+                await self._rewrite_late_exit_code(old)
+            except Exception:
+                logger.exception("terminal core: the late code of %s did not reach its final row",
+                                 session_id)
         task = self._exit_tasks.get(session_id)
         if task is not None and not task.done():
             try:
@@ -5201,17 +5392,44 @@ class HubSessionManager:
         session.resume_block_reason = None if ok else reason
         return session
 
-    @logical_write
-    async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None,
-                               snapshot: Optional[Dict[str, Any]] = None) -> AgentSession:
-        """The final record, written when a session leaves the live list or at hub shutdown/start."""
+    def _prepare_final_row(self, session: AgentSession, end_reason: Optional[str] = None,
+                           snapshot: Optional[Dict[str, Any]] = None) -> None:
+        """The final record's fields, set before the store sees it; no await, no queue.
+
+        Shared by the archive and by the stop's last-resort write, which must not re-run the archive
+        body that stalled in the first place (r2-kimi 1).
+        """
         session.archived_at = time.time()
         self._finalize_session(session, end_reason=end_reason, snapshot=snapshot)
         # V5: an archived record must never report a live status; its end state is the truth.
         if session.end_reason:
             session.status = session.end_reason
+
+    @logical_write
+    async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None,
+                               snapshot: Optional[Dict[str, Any]] = None) -> AgentSession:
+        """The final record, written when a session leaves the live list or at hub shutdown/start."""
+        self._prepare_final_row(session, end_reason=end_reason, snapshot=snapshot)
         await self.persist_session(session, force_scrollback=True, final=True, snapshot=snapshot)
         return session
+
+    @staticmethod
+    def _read_session_snapshot(session: AgentSession) -> Dict[str, Any]:
+        """The core reads the archive makes for an id `snapshot_all` did not cover (§6.6).
+
+        The same fields `snapshot_all` returns, read through the seam so the archive writes the
+        rows it would have written: the screen and scrollback text and the raw ring with its
+        revision (which `_scrollback_blob` stores). Called through `asyncio.to_thread` by the stop:
+        on the loop these reads are what F5's "every blocking core call runs in a worker thread"
+        forbids.
+        """
+        raw = session.read_raw()
+        return {
+            "screen_text": session.read_screen(max_lines=80).text,
+            "scrollback_text": session.read_scrollback(max_lines=250).text,
+            "raw_text": raw.text,
+            "raw_rev": raw.rev,
+        }
 
     def _resume_check_context(self):
         """Value snapshot for filesystem probes; worker threads never inspect live sessions."""
@@ -5453,6 +5671,33 @@ class HubSessionManager:
             lock = asyncio.Lock()
             self._resume_locks[session_id] = lock
         return lock
+
+    @staticmethod
+    def _is_lifecycle_claim_refusal(error: BaseException) -> bool:
+        """Core contract 1's transient refusal: another lifecycle call of the id holds the claim."""
+        return isinstance(error, ValueError) and "in flight; retry" in str(error)
+
+    async def _start_with_claim_retry(self, start, *args, **kwargs) -> None:
+        """`spawn`/`attach_text` for a resume, waiting out a lifecycle claim the hub itself caused.
+
+        The hub's own retried `retire` can hold an id's claim exactly when a resume reaches its
+        spawn or attach (R4). The refusal's message is the only discriminator the contract offers,
+        and it says "retry": two more attempts, awaited (never blocking the loop), then the resume
+        fails as it did before. Nothing was created by a refused call, so a retry is safe.
+        """
+        last: Optional[BaseException] = None
+        for delay in (0.0, *LIFECYCLE_CLAIM_RETRY_DELAYS_SEC):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                start(*args, **kwargs)
+                return
+            except ValueError as error:
+                if not self._is_lifecycle_claim_refusal(error):
+                    raise
+                last = error
+        assert last is not None
+        raise last
 
     async def _make_resumed_session(
         self,
@@ -5722,13 +5967,15 @@ class HubSessionManager:
         # A1: browser sockets opened on the old object keep streaming without any Python step: the
         # handle belongs to the session id and the core's spawn carries the sink fan-out over, so
         # `ws_prefix` reaches them after the predecessor's last bytes.
-        # kimi 5: the predecessor is ended and finalized now, while the id still maps to it: after
-        # the spawn replaces the table entry its undrained death would be gone for good.
+        # R1: the incarnation is bumped first, which drops a retire still pending for the
+        # predecessor, so the drain below cannot schedule the drop that would close the fan-out the
+        # spawn is about to take over. The predecessor keeps its own ending because `sessions[id]`
+        # still maps to it until the spawn replaces the entry (kimi 5).
+        self._next_incarnation(session_id)
         await self._end_predecessor(session_id, old)
         if self.sessions.get(session_id) is not old and old is not None:
             # The predecessor's exit path ran and dropped the object; nothing else owns the id.
             old = None
-        self._next_incarnation(session_id)
         # A7: install the new object before the spawn. A resume that dies immediately then reports
         # its own exit (the callback carries the object), never the old dead object's.
         self.sessions[session_id] = sess
@@ -5746,7 +5993,8 @@ class HubSessionManager:
         try:
             # A9: a failed spawn (bad command, missing binary) must leave the archived record exactly
             # as it was — no zombie row, and the old ended object back in the live list.
-            sess.start_pty(
+            await self._start_with_claim_retry(
+                sess.start_pty,
                 loop,
                 env_overrides=resume_env or None,
                 ws_prefix=resume_banner(sess.resume_count) if old is not None else None,
@@ -5757,7 +6005,9 @@ class HubSessionManager:
             # blocks its caller for its grace, so it runs off the loop; the id then leaves the core.
             if sess.has_process:
                 await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
-                await self._retire_ended_session(session_id)
+            # The predecessor's dead entry is still the id's; `retire` refuses a live one, so a
+            # spawn that never got that far leaves only a pending drop behind.
+            await self._retire_ended_session(session_id)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -5985,21 +6235,25 @@ class HubSessionManager:
             sess.on_virtual_line_cb = lambda sid, line: self._schedule(self.deliver_parent_message(
                 sid, line, also_write_pty=False
             ))
-        # kimi 5: the predecessor is ended and finalized before the attach replaces the table entry.
+        # R1: the incarnation is bumped before the predecessor is ended, so the pending retire its
+        # drain would schedule cannot close the fan-out the attach is about to take over.
+        self._next_incarnation(session_id)
         await self._end_predecessor(session_id, old)
         if self.sessions.get(session_id) is not old and old is not None:
             old = None
-        self._next_incarnation(session_id)
         try:
             # `attach_text`: the ring starts from the archived scrollback plus the separator, and the
             # separator goes to the sockets already attached to the id before any `feed` can land.
-            sess.start_virtual(
+            await self._start_with_claim_retry(
+                sess.start_virtual,
                 loop,
                 on_virtual_line_cb=sess.on_virtual_line_cb,
                 seed=resume_banner(sess.resume_count) if old is not None else None,
             )
         except Exception as e:
-            # A9: a failed attach leaves the archived record exactly as it was.
+            # A9: a failed attach leaves the archived record exactly as it was, and the predecessor's
+            # ended text entry does not stay in the core's table for the hub's life.
+            await self._retire_ended_session(session_id)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -6316,6 +6570,10 @@ class HubSessionManager:
         await self._archive_session(sess)
         if self.sessions.get(session_id) is sess:
             del self.sessions[session_id]
+        # r2-kimi 5: the row is written, but the core may still learn the code the death record
+        # lacked, and it refuses the retire until that record is drained. The object stays as the
+        # id's tombstone so that code reaches the row it belongs to; a resume drops it.
+        self._closed_sessions[session_id] = sess
         # F4: a DSH session has no process, so `terminate` never ends its core text entry, and the
         # core refuses to retire a live one (it would block every later resume of the id). A killed
         # text entry publishes its death record, drained just below; `terminate` already killed the
@@ -6390,10 +6648,17 @@ class HubSessionManager:
         # (a death that already happened, or a spawn's first `alive`) is applied while the ordinary
         # exit path can still take it, so the reasons and `is_process_alive` read the core's truth
         # instead of a stale object, and a death the hub did not cause keeps its normal ending.
-        try:
-            self._on_core_tick()
-        except Exception:
-            logger.exception("Shutdown could not drain the terminal core before stopping")
+        # r2-kimi 2: the core may withhold a death record for one tick (contract 5), so one drain is
+        # not enough: a second, one drain interval later, still runs before `_shutting_down`, and a
+        # death it applies keeps its own classification and its ordinary lifecycle event.
+        for attempt in range(SHUTDOWN_RECONCILE_DRAINS):
+            if attempt:
+                await asyncio.sleep(SHUTDOWN_RECONCILE_GAP_SEC)
+            try:
+                self._on_core_tick()
+            except Exception:
+                logger.exception("Shutdown could not drain the terminal core before stopping")
+                break
         self._shutting_down = True
         self.db.stop_accepting()
         deadline = time.monotonic() + SHUTDOWN_MAX_SEC
@@ -6448,8 +6713,29 @@ class HubSessionManager:
                     snapshots[str(snapshot.get("session_id") or "")] = snapshot
             except Exception:
                 logger.exception("Shutdown could not snapshot the terminal core")
+            # R5b: a session the snapshot missed (a deadline) would be archived with its core reads
+            # back on the loop. They run here, off the loop, inside what is left of the snapshot's
+            # share; an id that still has no snapshot falls back to the archive's own reads.
+            missing = [sess for sess in sessions if sess.session_id not in snapshots]
+            if missing:
+                share = max(0.05, min(SHUTDOWN_SNAPSHOT_MAX_SEC,
+                                      deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC
+                                      - SHUTDOWN_KILL_MAX_SEC))
+                reads = [asyncio.ensure_future(asyncio.to_thread(self._read_session_snapshot, sess))
+                         for sess in missing]
+                done, pending = await asyncio.wait(reads, timeout=share)
+                for task in pending:
+                    task.cancel()
+                for sess, task in zip(missing, reads):
+                    if task.done() and not task.cancelled():
+                        try:
+                            snapshots[sess.session_id] = task.result()
+                        except Exception:
+                            logger.exception("Shutdown could not snapshot %s", sess.session_id)
         # F5: the kill is bounded by what is left of the one budget, not by a fresh 2 s; the
-        # core's own grace and the wait share it, so the archive still gets its share.
+        # core's own grace and the wait share it, so the archive still gets its share. R5a: the
+        # grace stays under the wait, so a kill that uses all of it cannot outlive the stop's own
+        # wait and the normal path never logs a timeout.
         kill_left = max(0.05, deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)
         kill_wait = min(SHUTDOWN_KILL_MAX_SEC, kill_left)
         stops = [
@@ -6458,11 +6744,11 @@ class HubSessionManager:
             if sess.dsh_job_id and sess.is_process_alive()
         ]
         if core is not None:
-            stops.append(asyncio.to_thread(core.kill_all, int(max(1.0, kill_wait) * 1000)))
+            stops.append(asyncio.to_thread(core.kill_all, max(100, int(kill_wait * 1000) - 100)))
         if stops:
             try:
                 await asyncio.wait_for(asyncio.gather(*stops, return_exceptions=True),
-                                       timeout=kill_wait)
+                                       timeout=kill_wait + 0.1)
             except asyncio.TimeoutError:
                 logger.error("Timed out stopping session processes")
         if core is not None and sessions:
@@ -6473,7 +6759,8 @@ class HubSessionManager:
         archived = 0
         remaining = list(sessions)
         try:
-            async with asyncio.timeout(max(0.001, deadline - time.monotonic() - 0.25)):
+            async with asyncio.timeout(max(0.001, deadline - time.monotonic()
+                                           - SHUTDOWN_FINAL_ROW_RESERVE_SEC)):
                 for sess in sessions:
                     await self.db.run_internal(self._archive_session(
                         sess,
@@ -6488,22 +6775,31 @@ class HubSessionManager:
         finally:
             if remaining:
                 # kimi 4: no session may leave without a final row, even when the budget ran out
-                # inside its own scrollback read. The writes are launched together and `db.close`
-                # flushes what the queue accepted before the loop ends.
+                # inside its own scrollback read. r2-kimi 1: the fallback must not run the archive
+                # body again (that is what stalled) and its writes must be tasks, not coroutines:
+                # `asyncio.wait` rejects the latter and then not one row is written. The writes are
+                # awaited together and `db.close` flushes what the queue accepted before the loop
+                # ends.
                 final = []
                 for sess in remaining:
                     session_snapshot = snapshots.get(sess.session_id)
-                    self._finalize_session(sess, end_reason=reasons[sess.session_id],
-                                           snapshot=session_snapshot)
-                    final.append(self.db.run_internal(self._archive_session(
-                        sess, end_reason=reasons[sess.session_id], snapshot=session_snapshot)))
+                    self._prepare_final_row(sess, end_reason=reasons[sess.session_id],
+                                            snapshot=session_snapshot)
+                    final.append(asyncio.create_task(self.db.run_internal(
+                        self.persist_session(sess, force_scrollback=True, final=True,
+                                             snapshot=session_snapshot))))
                 if final:
                     try:
-                        await asyncio.wait(final, timeout=max(
-                            0.05, deadline - time.monotonic()))
+                        _done, pending = await asyncio.wait(
+                            final, timeout=max(0.05, deadline - time.monotonic()
+                                               - SHUTDOWN_STORE_RESERVE_SEC))
+                        for task in pending:
+                            task.cancel()
                     except Exception:
                         logger.exception("Shutdown could not finish the remaining final rows")
             self.sessions.clear()
+            self._closed_sessions.clear()
+            self._late_code_writes.clear()
             self.terminal_sockets.clear()
             with self._transcript_lock:
                 self._claimed_transcripts.clear()
