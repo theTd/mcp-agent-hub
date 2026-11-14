@@ -105,6 +105,9 @@ class FakeTerminal:
         # The core's table read deadline: the next N session reads raise TimeoutError, as a table
         # held by a spawn insert or a snapshot does.
         self.read_timeouts = 0
+        # The shared table's read deadline of `watch_screen` (50 ms in the core); a test that
+        # proves the re-watch leaves the loop sets this.
+        self.watch_delay = 0.0
         # Shutdown scripting: how long each call takes, and the order they were made in.
         self.snapshot_delay = 0.0
         self.shutdown_delay = 0.0
@@ -409,6 +412,8 @@ class FakeTerminal:
 
     def watch_screen(self, session_id: str, max_lines: Optional[int] = None,
                      interval_ms: int = 250) -> None:
+        if self.watch_delay:
+            time.sleep(self.watch_delay)
         state = self.sessions[session_id]
         state.watched = True
         state.watched_max_lines = None if max_lines is None else int(max_lines)

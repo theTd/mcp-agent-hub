@@ -428,6 +428,9 @@ SHUTDOWN_RECONCILE_GAP_SEC = 0.05
 # this far before the deadline, so `db.close` still gets one commit batch (it keeps 0.2 s of its own).
 SHUTDOWN_FINAL_ROW_RESERVE_SEC = 0.6
 SHUTDOWN_STORE_RESERVE_SEC = 0.3
+# r4 #8: when the budget is already spent, a step still runs, but on this floor instead of a fresh
+# 1 s share it no longer has. The floors are what the stop can overrun its 8 s deadline by.
+SHUTDOWN_STEP_FLOOR_SEC = 0.05
 # r3-kimi 1: a session the stop's snapshot reads could not cover is archived from this one, so no
 # archive or forced final row reads the core on the loop. Empty text and revision 0 make every
 # persisted column keep what an earlier write stored (the upserts keep non-empty values only).
@@ -2183,6 +2186,14 @@ def _dsh_end_unrecorded(job: Dict[str, Any], last_turn_completed_at: Optional[fl
     return float(last_turn_completed_at) < ended_at - DSH_END_RECORD_SLACK_SEC
 
 
+class CoreCallRefused(KeyError):
+    """A queued request's worker refused to enter the core: the hub no longer owns the id (r4 #5).
+
+    It is a `KeyError` because that is the core's own answer for an id it does not have, so the
+    seam's callers already treat it as "nothing to do"; the hub only logs it at debug level.
+    """
+
+
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -2486,17 +2497,21 @@ class AgentSession:
         self.last_output_at = time.time()
         self._watch_rows()
 
-    def _watch_rows(self) -> None:
+    def _watch_rows(self, guard: Optional[Callable[[], None]] = None) -> None:
         """§5.6: the generic tool-line scan is a watched snapshot, bounded by its interval.
 
         The row count is the one the pane shows now, so a resize re-watches with it (F12): rows
-        that only became visible after the pane grew are part of the next `screen_text`.
+        that only became visible after the pane grew are part of the next `screen_text`. `guard` is
+        the resize consumer's worker-side check (r4 #5), so a re-watch for an id the hub dropped
+        never reaches the core.
         """
         if not self._wants_tool_line_scan():
             self._watched_rows = None
             return
         rows = max(5, int(self.rows))
         try:
+            if guard is not None:
+                guard()
             self._core().watch_screen(
                 self.session_id,
                 max_lines=rows,
@@ -2504,6 +2519,7 @@ class AgentSession:
             )
             self._watched_rows = rows
         except Exception:
+            # A refused call (r4 #5) and a failed watch are the same thing here: no watched rows.
             self._watched_rows = None
 
     def _finish_read(self, exit_code: Optional[int], crashed: bool = False) -> None:
@@ -2568,13 +2584,14 @@ class AgentSession:
             self.set_final_response(text, "terminal_turn_snapshot")
 
     async def _death_snapshot_async(self) -> Dict[str, Any]:
-        """The death's final-row snapshot, every read in a worker (r3-kimi 4/7).
+        """The final row's snapshot, every read in a worker (r3-kimi 4/7, r4 #8).
 
         The final row needs the screen text, the scrollback and the raw ring; all three are core
-        calls and the exit callback runs on the loop. `_read_session_snapshot` is the same read the
-        stop makes for an id `snapshot_all` missed, so the row keeps exactly the fields it wrote
-        before. A failed read leaves `EMPTY_SNAPSHOT`'s empty values, which store nothing: the row
-        keeps what an earlier persist wrote.
+        calls, and both callers run on the loop: the exit callback (`_on_session_exit`) and the close
+        (`_close_session`, which archives before it terminates). `_read_session_snapshot` is the same
+        read the stop makes for an id `snapshot_all` missed, so the row keeps exactly the fields it
+        wrote before. A failed read leaves `EMPTY_SNAPSHOT`'s empty values, which store nothing: the
+        row keeps what an earlier persist wrote.
         """
         try:
             return await asyncio.to_thread(HubSessionManager._read_session_snapshot, self)
@@ -2694,17 +2711,34 @@ class AgentSession:
                 return False
         return self._virtual_input_sync(text)
 
-    async def write_input_async(self, text: str) -> bool:
+    def _write_core(self, text: str, guard: Optional[Callable[[], None]] = None) -> int:
+        """The blocking half of `write_input`, on a worker thread (r4b #2, r4 #5)."""
+        if guard is not None:
+            guard()
+        return self.core.write(self.session_id, text)
+
+    def _feed_echo(self, echo: str, guard: Optional[Callable[[], None]] = None) -> None:
+        """The blocking half of a text session's echo, on a worker thread (r4b #2, r4 #5)."""
+        if guard is not None:
+            guard()
+        self.emit_virtual_ansi(echo)
+
+    async def write_input_async(self, text: str,
+                                guard: Optional[Callable[[], None]] = None) -> bool:
         """`write_input` for the drain consumer (r4b #2): its blocking core call leaves the loop.
 
         A process session's `write` waits on the core's queue deadline and a text session's echo
         waits on `feed`; both run in a worker. The line buffer and the line callbacks stay here,
-        on the loop, because a line callback schedules asyncio work and is not thread-safe.
+        on the loop, because a line callback schedules asyncio work and is not thread-safe. r4 #5:
+        `guard` runs in the worker, before the core call it protects.
         """
         if self.has_process and self._alive:
             try:
-                await asyncio.to_thread(self._core().write, self.session_id, text)
+                await asyncio.to_thread(self._write_core, text, guard)
                 return True
+            except CoreCallRefused:
+                logger.debug("write to %s refused: the hub no longer owns the id", self.session_id)
+                return False
             except TimeoutError:
                 logger.warning("write to %s timed out (queue full); input not delivered",
                                self.session_id)
@@ -2717,7 +2751,10 @@ class AgentSession:
         echo, lines = self._plan_virtual_input(text)
         if echo:
             try:
-                await asyncio.to_thread(self.emit_virtual_ansi, echo)
+                await asyncio.to_thread(self._feed_echo, echo, guard)
+            except CoreCallRefused:
+                logger.debug("the echo of %s refused: the hub no longer owns the id", self.session_id)
+                return False
             except (KeyError, RuntimeError, TimeoutError):
                 logger.exception("terminal core: the echo of %s failed", self.session_id)
         for line in lines:
@@ -2732,17 +2769,27 @@ class AgentSession:
         """Whether the core holds a grid for this id (a process, or a DSH job/spec)."""
         return self.core is not None and bool(self.has_process or self.dsh_job_id or self.dsh_spec)
 
-    def _finish_resize(self, cols: int, rows: int) -> Tuple[int, int]:
-        """Records the size the hub decided and re-watches the generic tool-line scan (F12)."""
+    def _record_resize(self, cols: int, rows: int) -> bool:
+        """Records the size the hub decided; True when the watched snapshot must be re-taken (F12)."""
         with self._lock:
             self.cols = cols
             self.rows = rows
-            rows_changed = self._watched_rows is not None and self._watched_rows != rows
-        if rows_changed:
+            return self._watched_rows is not None and self._watched_rows != rows
+
+    def _finish_resize(self, cols: int, rows: int) -> Tuple[int, int]:
+        """Records the size the hub decided and re-watches the generic tool-line scan (F12)."""
+        if self._record_resize(cols, rows):
             # F12: the watched snapshot must cover the rows the pane shows now, or a tool line that
             # only became visible after the pane grew never reaches `_on_tui_tool_detected`.
             self._watch_rows()
         return self.cols, self.rows
+
+    def _resize_core(self, cols: int, rows: int,
+                     guard: Optional[Callable[[], None]] = None) -> Tuple[int, int]:
+        """The blocking half of `resize`, on a worker thread: the caller's guard, then the core."""
+        if guard is not None:
+            guard()
+        return self.core.resize(self.session_id, cols, rows)
 
     def resize(self, cols: int, rows: int) -> Tuple[int, int]:
         """`resize`: applies the 20/5 clamp, then the core's PTY and screen; returns the applied size.
@@ -2762,19 +2809,33 @@ class AgentSession:
                 logger.debug("resize of %s missed its deadline", self.session_id)
         return self._finish_resize(target_cols, target_rows)
 
-    async def resize_async(self, cols: int, rows: int) -> Tuple[int, int]:
-        """`resize` with the core call in a worker (r4b #2: the drain consumer never blocks)."""
+    async def resize_async(self, cols: int, rows: int,
+                           guard: Optional[Callable[[], None]] = None) -> Tuple[int, int]:
+        """`resize` with the core calls in workers (r4b #2: the drain consumer never blocks).
+
+        r4 #6: the F12 re-watch is one of those calls (`watch_screen` takes the table's read
+        deadline), so it runs in a worker too. r4 #5: `guard` is the consumer's check inside the
+        worker, so a call handed to it before the id was closed but entering the core after refuses
+        first, instead of reaching an id the hub has already retired.
+        """
         target_cols, target_rows = self._resize_target(cols, rows)
+        refused = False
         if self._has_core_grid():
             try:
                 applied = await asyncio.to_thread(
-                    self.core.resize, self.session_id, target_cols, target_rows)
+                    self._resize_core, target_cols, target_rows, guard)
                 target_cols, target_rows = int(applied[0]), int(applied[1])
+            except CoreCallRefused:
+                # r4 #5: the id left the hub while this call waited; nothing of it may reach the
+                # core, and a re-watch is a core call too.
+                refused = True
             except (KeyError, ValueError):
                 pass
             except TimeoutError:
                 logger.debug("resize of %s missed its deadline", self.session_id)
-        return self._finish_resize(target_cols, target_rows)
+        if not refused and self._record_resize(target_cols, target_rows):
+            await asyncio.to_thread(self._watch_rows, guard)
+        return self.cols, self.rows
 
     # ---- The terminal seam (design §5.2) ------------------------------------------------
     # Every read and write of terminal state in the hub goes through these. Step 3b swapped what is
@@ -3305,6 +3366,13 @@ class HubSessionManager:
         # drain tick only queues. Both are touched on the loop only.
         self._terminal_request_queues: Dict[str, "asyncio.Queue"] = {}
         self._terminal_request_consumers: Dict[str, "asyncio.Task"] = {}
+        # r4 #5: each consumer turn runs as its own task, so a close or a stop can wait for the core
+        # call a cancelled consumer left in a worker thread (cancelling the coroutine does not
+        # cancel `to_thread`). Keyed by session id; touched on the loop only.
+        self._terminal_request_applies: Dict[str, Set["asyncio.Task"]] = {}
+        # r4 #5: true from the stop's core teardown on. A request worker that is still running then
+        # refuses at its guard instead of entering a core the hub has already stopped.
+        self._core_calls_closed: bool = False
         self.default_cols: int = 120
         self.default_rows: int = 36
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
@@ -3638,7 +3706,9 @@ class HubSessionManager:
                     self._schedule(self._retire_ended_session(
                         session_id, self._retire_pending.get(session_id), retry="record"))
                 # §6.4: the console's resize and typed input are requests the core recorded and
-                # never applied; the hub's policy runs them in arrival order, off this loop. A
+                # never applied; the hub's policy runs them off this loop, each kind in its own
+                # arrival order (a record's resizes are applied before its inputs; the core keeps
+                # two lists, so the record carries no interleaving). A
                 # socket's own loss is a diagnostic and stays out of the ring's `dropped_bytes`
                 # (§5.4). Queueing cannot fail: the consumer is created here, on the loop.
                 requests = record.get("resize_requests") or ()
@@ -3681,7 +3751,11 @@ class HubSessionManager:
         self._write_late_exit_code(session_id, closed)
 
     def _queue_terminal_requests(self, session_id: str, requests: Any, texts: Any) -> bool:
-        """Hands one drain record's requests to the id's consumer, in the record's order.
+        """Hands one drain record's requests to the id's consumer, each kind in its own order.
+
+        The core keeps resizes and inputs in two lists (§5.2), so a record carries each kind's own
+        arrival order and nothing about their interleaving: every resize in the record is queued
+        before its inputs, and a resize can therefore land before a keystroke typed before it.
 
         A resize is the console's unapplied size and text is a session with no PTY's typed input
         (the echo and the line callback are the hub's, design §8). Both are applied by
@@ -3728,13 +3802,17 @@ class HubSessionManager:
         return True
 
     async def _terminal_request_consumer(self, session_id: str, queue: "asyncio.Queue") -> None:
-        """Applies one session's queued requests in arrival order, one at a time (r4b #2).
+        """Applies one session's queued requests, one at a time, each kind in its own order (r4b #2).
 
         The consumer exists so a burst of console requests costs the loop nothing: each one's
         blocking core call (`write`'s queue deadline, `feed`, `resize`'s table deadline) runs in a
         worker, and `resize_session_from_client`'s fan-out, the session dict and the virtual line
         callbacks stay on this loop. One request that raises costs that request only (master
         3874299). The consumer ends at the sentinel the close and the stop enqueue, or at cancelling.
+
+        r4 #5: each turn runs as its own task (`_apply_request_tracked`), because cancelling this
+        consumer does not cancel the worker call its turn is awaiting; the close and the stop wait
+        for that task instead of letting it reach the core afterwards.
         """
         idle = 0
         while True:
@@ -3748,6 +3826,12 @@ class HubSessionManager:
                 # Nothing has arrived for a while, and the drain tick creates a consumer on demand,
                 # so this one can end and leave no task per quiet session.
                 if queue.empty():
+                    if (self._terminal_request_queues.get(session_id) is queue
+                            and self.sessions.get(session_id) is None):
+                        # omp 9: an id that left the hub without a close (a failed resume) keeps
+                        # no empty queue behind either; a listed id keeps it, because the next
+                        # record enqueues through the same object.
+                        self._terminal_request_queues.pop(session_id, None)
                     break
                 continue
             if item is _REQUESTS_CLOSED:
@@ -3755,12 +3839,7 @@ class HubSessionManager:
                 break
             kind, payload = item
             try:
-                if kind == "resize":
-                    await self._apply_resize_request(session_id, payload)
-                elif kind == "input":
-                    await self._apply_input_request(session_id, payload)
-            except Exception:
-                logger.exception("terminal core: %s request for %s failed", kind, session_id)
+                await self._apply_request_tracked(session_id, kind, payload)
             finally:
                 queue.task_done()
         # Apply what was already queued when a close or a stop asked for the end: those requests
@@ -3772,14 +3851,55 @@ class HubSessionManager:
                 continue
             kind, payload = item
             try:
-                if kind == "resize":
-                    await self._apply_resize_request(session_id, payload)
-                elif kind == "input":
-                    await self._apply_input_request(session_id, payload)
-            except Exception:
-                logger.exception("terminal core: %s request for %s failed at drain", kind, session_id)
+                await self._apply_request_tracked(session_id, kind, payload, at_end=True)
             finally:
                 queue.task_done()
+
+    async def _apply_request_tracked(self, session_id: str, kind: str, payload: Any,
+                                     at_end: bool = False) -> None:
+        """Applies one request in its own task and waits for it; a cancelled wait leaves it tracked.
+
+        The task is not a child of this consumer on purpose (r4 #5): when the consumer is cancelled
+        at its grace, the core call already running in a worker keeps running, and this manager can
+        still await the task through `_terminal_request_applies` before the id leaves the core.
+        """
+        task = asyncio.create_task(self._apply_one_request(session_id, kind, payload, at_end=at_end))
+        tracked = self._terminal_request_applies.setdefault(session_id, set())
+        tracked.add(task)
+
+        def finished(_done, key=session_id, done=task, group=tracked):
+            group.discard(done)
+            if not group and self._terminal_request_applies.get(key) is group:
+                self._terminal_request_applies.pop(key, None)
+
+        task.add_done_callback(finished)
+        await asyncio.wait([task])
+
+    async def _apply_one_request(self, session_id: str, kind: str, payload: Any,
+                                 at_end: bool = False) -> None:
+        """One queued request, isolated: a raise costs that request only (master 3874299)."""
+        try:
+            if kind == "resize":
+                await self._apply_resize_request(session_id, payload)
+            elif kind == "input":
+                await self._apply_input_request(session_id, payload)
+        except Exception:
+            logger.exception("terminal core: %s request for %s failed%s", kind, session_id,
+                             " at drain" if at_end else "")
+
+    def _core_call_guard(self, session_id: str) -> Callable[[], None]:
+        """The worker-side check of r4 #5: a call for an id the hub dropped refuses before the core.
+
+        The close removes the id from `sessions` before it ends the consumer and before
+        `close_sockets`/`retire`, and the stop shuts the core down after its own bounded wait; a
+        call the consumer handed to a worker before either point would otherwise enter the core
+        afterwards. `CoreCallRefused` is a `KeyError`, what the core answers for an id it no longer
+        has, so every seam caller already handles it.
+        """
+        def check() -> None:
+            if self._core_calls_closed or self.sessions.get(session_id) is None:
+                raise CoreCallRefused(session_id)
+        return check
 
     async def _apply_resize_request(self, session_id: str, request: Any) -> bool:
         """One console resize, with the console path's defaults (120x36, `propagate` true by default).
@@ -3793,7 +3913,8 @@ class HubSessionManager:
             logger.debug("terminal core: resize for an unlisted id %s dropped", session_id)
             return False
         await self.resize_session_from_client(
-            session_id, position[0], position[1], propagate_background=position[2])
+            session_id, position[0], position[1], propagate_background=position[2],
+            guard=self._core_call_guard(session_id))
         return True
 
     async def _apply_input_request(self, session_id: str, text: str) -> bool:
@@ -3803,8 +3924,25 @@ class HubSessionManager:
             # The hub already closed this id; the core's text entry has no echo to feed.
             logger.debug("terminal core: input for an unlisted id %s dropped", session_id)
             return False
-        await sess.write_input_async(text)
+        await sess.write_input_async(text, guard=self._core_call_guard(session_id))
         return True
+
+    async def _await_request_applies(self, session_ids: Any, until: float) -> None:
+        """Waits, until `until` (monotonic), for the core calls cancelled consumers left running.
+
+        r4 #5: a `to_thread` call outlives the coroutine that awaited it, so a close or a stop that
+        only cancelled the consumer could still have that call reach the core after `retire`,
+        `kill_all` or `shutdown`. The wait is bounded by the caller's own deadline.
+        """
+        pending = [task for session_id in session_ids
+                   for task in self._terminal_request_applies.get(session_id, ())
+                   if not task.done()]
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=max(0.0, until - time.monotonic()))
+        if still:
+            logger.warning("terminal core: %d core call(s) of queued requests were still in flight",
+                           len(still))
 
     async def _finish_terminal_requests(self, session_id: str, timeout: float) -> None:
         """Ends this id's consumer and settles what it still holds, bounded by `timeout`.
@@ -3814,25 +3952,38 @@ class HubSessionManager:
         the hub's list, so that queue applies nothing (omp 4b F4): what is finished there is the
         consumer itself, past `timeout` by cancelling it, so no task outlives the close and no
         wedged core call can hold it. The sentinel goes in before the wait, so a consumer that was
-        idle exits at once instead of waiting out its idle ticks.
+        idle exits at once instead of waiting out its idle ticks. r4 #5: the same share then waits
+        for the worker call the cancelled consumer may still have in flight, so nothing of the id
+        reaches the core after the caller's `close_sockets`/`retire`.
         """
+        deadline = time.monotonic() + max(0.0, float(timeout))
         queue = self._terminal_request_queues.pop(session_id, None)
         if queue is not None:
             queue.put_nowait(_REQUESTS_CLOSED)
         task = self._terminal_request_consumers.get(session_id)
-        if task is None or task.done():
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=max(0.0, float(timeout)))
-        except asyncio.TimeoutError:
-            # The consumer's own turn did not finish inside the share this close or stop gave it.
-            # `shield` kept it from being cancelled by the deadline, so cancel it here: no task may
-            # outlive the close, and a wedged core call must not hold it.
-            task.cancel()
-            logger.warning("terminal core: %s's queued requests did not finish before its close",
-                           session_id)
-        except Exception:
-            logger.exception("terminal core: finishing the requests of %s failed", session_id)
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task),
+                                       timeout=max(0.0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                # The consumer's own turn did not finish inside the share this close or stop gave
+                # it. `shield` kept it from being cancelled by the deadline, so cancel it here: no
+                # task may outlive the close, and a wedged core call must not hold it.
+                task.cancel()
+                logger.warning("terminal core: %s's queued requests did not finish before its close",
+                               session_id)
+            except Exception:
+                logger.exception("terminal core: finishing the requests of %s failed", session_id)
+        await self._await_request_applies((session_id,), deadline)
+
+    async def _end_terminal_requests(self, session_id: str) -> None:
+        """Ends an id's consumer and its queue the way every path that drops it does (r4 #3).
+
+        The close and a failed resume both take the id out of the hub's hands; each calls this
+        before its own core calls, so a request queued for the incarnation that is gone is never
+        applied to the next one (and a retry resume never receives a stale request).
+        """
+        await self._finish_terminal_requests(session_id, REQUEST_CONSUMER_DRAIN_SEC)
 
     def _note_socket_drops(self, session_id: str, drops: Any) -> None:
         """Keeps one console socket's cumulative loss per `(session id, handle)` (§5.4).
@@ -3989,8 +4140,15 @@ class HubSessionManager:
             self._queue_retire_retry(session_id, incarnation, retry)
             return
         except Exception:
-            logger.exception("terminal core: retire(%s) failed", session_id)
-            self._clear_retire(session_id)
+            logger.exception("terminal core: retire(%s) failed; dropping its tombstone", session_id)
+            if self._incarnations.get(session_id) in (None, incarnation):
+                # r4 #4: a retry cannot fix this (the core's `guarded` panic wrapper raises
+                # `RuntimeError`, a seam type error raises `TypeError`), so nothing may keep the id
+                # and its object for the hub's life: the tombstone goes with the pending drop, and
+                # one ERROR line names the id the core still holds.
+                self._clear_retire(session_id)
+                self._closed_sessions.pop(session_id, None)
+                self._forget_socket_drops(session_id)
             return
         finally:
             self._retire_inflight.discard(session_id)
@@ -4056,10 +4214,22 @@ class HubSessionManager:
         A closed id's object is its tombstone until `retire` succeeds, so its archived row is
         repaired too; an object a resume replaced never writes, the successor owns the row now
         (r2-kimi 4/5).
+
+        r4 #2: the identity is checked again after the only await on this path, immediately before
+        the row is built and written. The screen read is a worker round trip now, so a resume can
+        replace the id inside it; without the recheck the old object wrote its archived state after
+        a live successor's row and left that successor archived as crashed. The row write itself
+        is not inside the id's resume lock: a deferred retire holds that lock across its core call
+        and waits here for the row write (`_await_late_code_write`), so taking it would turn that
+        wait into a one-second stall (`LATE_CODE_WRITE_WAIT_SEC`) and drop the code it protects.
         """
         session_id = session.session_id
-        if (self.sessions.get(session_id) is not session
-                and self._closed_sessions.get(session_id) is not session):
+
+        def owns_the_id() -> bool:
+            return (self.sessions.get(session_id) is session
+                    or self._closed_sessions.get(session_id) is session)
+
+        if not owns_the_id():
             return
         # r3-kimi 4/7: `_last_screen_text` would read the core here, on the loop; the 80-row read
         # runs in a worker, and the rest of the row is not this rewrite's business: empty text
@@ -4069,6 +4239,10 @@ class HubSessionManager:
             snapshot["screen_text"] = (await asyncio.to_thread(session.read_screen, 80)).text
         except Exception:
             logger.exception("terminal core: screen of %s for its late code failed", session_id)
+        if not owns_the_id():
+            logger.debug("terminal core: %s was resumed during its late code's read; row left to it",
+                         session_id)
+            return
         self._finalize_session(session, snapshot=snapshot)
         await self.persist_session(session, final=True, snapshot=snapshot)
 
@@ -4130,6 +4304,7 @@ class HubSessionManager:
         cols: int,
         rows: int,
         propagate_background: bool = True,
+        guard: Optional[Callable[[], None]] = None,
     ) -> None:
         """Resizes the target session and tracks the console's viewport dimensions.
 
@@ -4140,7 +4315,8 @@ class HubSessionManager:
         Async since r4b #2: every core `resize` it makes can wait on the core's table/console
         deadline, so each one runs in a worker while the session dict stays on the loop. The
         target's request is applied before the propagation's, which is the arrival order the pane
-        sees.
+        sees. `guard` is the drain consumer's worker-side check for the target (r4 #5); the
+        background panes are the hub's own list, taken here on the loop.
         """
         c = max(20, int(cols or 120))
         r = max(5, int(rows or 36))
@@ -4148,7 +4324,7 @@ class HubSessionManager:
         self.default_rows = r
         target = self.sessions.get(session_id)
         if target is not None:
-            await target.resize_async(c, r)
+            await target.resize_async(c, r, guard=guard)
         if propagate_background:
             for sid, sess in list(self.sessions.items()):
                 if sid == session_id or sess is None:
@@ -6118,6 +6294,10 @@ class HubSessionManager:
         # predecessor, so the drain below cannot schedule the drop that would close the fan-out the
         # spawn is about to take over. The predecessor keeps its own ending because `sessions[id]`
         # still maps to it until the spawn replaces the entry (kimi 5).
+        # r4 #3: the bump also drops the closed id's tombstone, which is where a code the core still
+        # owes would be rewritten; a resume that fails below puts both back for the old generation.
+        previous_incarnation = self._incarnations.get(session_id, 0)
+        previous_tombstone = self._closed_sessions.get(session_id)
         self._next_incarnation(session_id)
         await self._end_predecessor(session_id, old)
         if self.sessions.get(session_id) is not old and old is not None:
@@ -6152,9 +6332,19 @@ class HubSessionManager:
             # blocks its caller for its grace, so it runs off the loop; the id then leaves the core.
             if sess.has_process:
                 await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
+            # r4 #3: what the pane asked for before the failure is the old incarnation's; end the
+            # queue and its consumer the way the close does, so a retry resume never applies it.
+            await self._end_terminal_requests(session_id)
+            # r4 #3: the tombstone and its pending drop go back, bound to the generation that
+            # owned them: a code the core still owes reaches the row it belongs to, and the drop is
+            # never retried against the incarnation that never installed.
+            if previous_tombstone is not None:
+                self._incarnations[session_id] = previous_incarnation
+                self._closed_sessions[session_id] = previous_tombstone
             # The predecessor's dead entry is still the id's; `retire` refuses a live one, so a
             # spawn that never got that far leaves only a pending drop behind.
-            await self._retire_ended_session(session_id)
+            await self._retire_ended_session(
+                session_id, previous_incarnation if previous_tombstone is not None else None)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -6384,6 +6574,10 @@ class HubSessionManager:
             ))
         # R1: the incarnation is bumped before the predecessor is ended, so the pending retire its
         # drain would schedule cannot close the fan-out the attach is about to take over.
+        # r4 #3: the bump drops the closed id's tombstone and its pending drop; the failure path
+        # below puts both back for the generation that owned them.
+        previous_incarnation = self._incarnations.get(session_id, 0)
+        previous_tombstone = self._closed_sessions.get(session_id)
         self._next_incarnation(session_id)
         await self._end_predecessor(session_id, old)
         if self.sessions.get(session_id) is not old and old is not None:
@@ -6400,7 +6594,14 @@ class HubSessionManager:
         except Exception as e:
             # A9: a failed attach leaves the archived record exactly as it was, and the predecessor's
             # ended text entry does not stay in the core's table for the hub's life.
-            await self._retire_ended_session(session_id)
+            # r4 #3: the failed incarnation's queue ends here, and its tombstone and pending drop go
+            # back bound to the old generation.
+            await self._end_terminal_requests(session_id)
+            if previous_tombstone is not None:
+                self._incarnations[session_id] = previous_incarnation
+                self._closed_sessions[session_id] = previous_tombstone
+            await self._retire_ended_session(
+                session_id, previous_incarnation if previous_tombstone is not None else None)
             if old is not None:
                 self.sessions[session_id] = old
             else:
@@ -6709,12 +6910,16 @@ class HubSessionManager:
         if not sess:
             return {"found": False, "was_alive": False, "status": None}
         was_alive = sess.is_process_alive()
+        # r4 #8: the archive's last row reads the screen, and that read is a core call; the close
+        # takes the death path's worker snapshot first (the same reads the stop's `snapshot_all`
+        # makes), so the archive writes every field without touching the core on the loop.
+        archive_snapshot = await sess._death_snapshot_async()
         terminated = await sess.terminate()
         if terminated:
             sess.end_reason = "terminated"
         if source == "auto_cleanup":
             sess.current_activity = TERMINATED_MESSAGES["auto_cleanup"]
-        await self._archive_session(sess)
+        await self._archive_session(sess, snapshot=archive_snapshot)
         if self.sessions.get(session_id) is sess:
             del self.sessions[session_id]
         # r2-kimi 5: the row is written, but the core may still learn the code the death record
@@ -6741,8 +6946,9 @@ class HubSessionManager:
         # of leaving the server side open and silent for the rest of the hub's life. Off the loop:
         # the call waits on the core's socket registry. r4b #2: the id left the hub's list above, so
         # its consumer applies nothing of what it still holds (omp 4b F4); this only ends the
-        # consumer, bounded, by cancelling it, so no task outlives the close.
-        await self._finish_terminal_requests(session_id, REQUEST_CONSUMER_DRAIN_SEC)
+        # consumer, bounded, by cancelling it, so no task outlives the close, and waits the same
+        # share for the worker call a cancelled consumer may still have in flight (r4 #5).
+        await self._end_terminal_requests(session_id)
         try:
             await asyncio.to_thread(self._close_terminal_sockets, session_id)
         except Exception:
@@ -6794,10 +7000,16 @@ class HubSessionManager:
 
         The snapshot is taken before the kill, so the archived rows carry the last screen and
         scrollback even when a kill costs a session its last bytes; `kill_all` ends every process
-        tree in parallel inside the recorded 2 s, and `shutdown` stops the core's ticker last, while
-        everything still runs inside the shared 8 s budget. Every blocking core call runs off the
-        loop (F5): `/health`, the console socket and the stop ack must stay answered while nine
-        readers are being snapshotted.
+        tree in parallel inside the recorded 2 s, and `shutdown` stops the core's ticker last. Every
+        blocking core call runs off the loop (F5): `/health`, the console socket and the stop ack
+        must stay answered while nine readers are being snapshotted.
+
+        The one budget starts here and every later share is what is left of it. r4 #8: the first
+        reconcile drain is not part of the bounded work — `_on_core_tick` only takes the records the
+        core already queued (`drain`'s own table read is bounded at 50 ms, §5.3) — and the steps
+        that run after the budget is spent still take `SHUTDOWN_STEP_FLOOR_SEC` each (and the
+        producer-cancel wait its own 0.3 s), so with a wedged core the stop can reach about 9 s,
+        never 8 s plus a fresh per-step timeout.
         """
         # One drain before the decision below: a record still buffered from just before the stop
         # (a death that already happened, or a spawn's first `alive`) is applied while the ordinary
@@ -6831,15 +7043,17 @@ class HubSessionManager:
         # consumer applies its queue now (bounded, inside the shared budget) and ends. The tasks
         # are cancelled below with the other producers, so nothing of this reaches the core after
         # its stop. The kill and the final rows still get their own share.
+        # r4 #5: a consumer cancelled at its share's end can leave a core call in a worker, so the
+        # stop waits for those too, on the same deadline, before `kill_all` and `shutdown`.
         queued_ids = [sid for sid in list(self._terminal_request_consumers)]
-        if queued_ids:
-            drain_by = time.monotonic() + max(0.05, min(
-                SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
-                deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC
-                - SHUTDOWN_ARCHIVE_RESERVE_SEC))
-            for session_id in queued_ids:
-                await self._finish_terminal_requests(
-                    session_id, max(0.0, drain_by - time.monotonic()))
+        drain_by = time.monotonic() + max(SHUTDOWN_STEP_FLOOR_SEC, min(
+            SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
+            deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC
+            - SHUTDOWN_ARCHIVE_RESERVE_SEC))
+        for session_id in queued_ids:
+            await self._finish_terminal_requests(
+                session_id, max(0.0, drain_by - time.monotonic()))
+        await self._await_request_applies(list(self._terminal_request_applies), drain_by)
         # kimi 4: a death that happened just before this shutdown already scheduled its
         # finalization (native transcript drain, final row, one lifecycle event). Those tasks run
         # their body instead of being cancelled and meeting a `_shutting_down` early return; only
@@ -6875,14 +7089,14 @@ class HubSessionManager:
         if core is not None:
             # §6.6: snapshot_all first, so the archive keeps what the kill can take away. It gets
             # its own sub-budget (a slow reader must not eat the kill's and the archive's share).
-            budget_ms = int(max(1.0, min(SHUTDOWN_SNAPSHOT_MAX_SEC,
-                                         deadline - time.monotonic()
-                                         - SHUTDOWN_ARCHIVE_RESERVE_SEC)) * 1000)
+            budget_ms = int(max(SHUTDOWN_STEP_FLOOR_SEC, min(
+                SHUTDOWN_SNAPSHOT_MAX_SEC,
+                deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)) * 1000)
             try:
                 taken = await asyncio.wait_for(
                     asyncio.to_thread(core.snapshot_all, 250, RESUME_SCROLLBACK_MAX_BYTES, budget_ms),
                     timeout=min(SHUTDOWN_SNAPSHOT_MAX_SEC + 0.5,
-                                max(0.05, budget_ms / 1000.0 + 0.25)),
+                                max(SHUTDOWN_STEP_FLOOR_SEC, budget_ms / 1000.0 + 0.25)),
                 )
                 for snapshot in taken or ():
                     snapshots[str(snapshot.get("session_id") or "")] = snapshot
@@ -6893,9 +7107,10 @@ class HubSessionManager:
             # share; an id that still has no snapshot falls back to the archive's own reads.
             missing = [sess for sess in sessions if sess.session_id not in snapshots]
             if missing:
-                share = max(0.05, min(SHUTDOWN_SNAPSHOT_MAX_SEC,
-                                      deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC
-                                      - SHUTDOWN_KILL_MAX_SEC))
+                share = max(SHUTDOWN_STEP_FLOOR_SEC, min(
+                    SHUTDOWN_SNAPSHOT_MAX_SEC,
+                    deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC
+                    - SHUTDOWN_KILL_MAX_SEC))
                 reads = [asyncio.ensure_future(asyncio.to_thread(self._read_session_snapshot, sess))
                          for sess in missing]
                 done, pending = await asyncio.wait(reads, timeout=share)
@@ -6913,11 +7128,16 @@ class HubSessionManager:
             # again, and the stored row keeps what earlier persists already wrote (COALESCE).
             for sess in sessions:
                 snapshots.setdefault(sess.session_id, dict(EMPTY_SNAPSHOT))
+        # r4 #5: the stop's own snapshots are in hand, so from here nothing a session asked for may
+        # enter the core again: a request worker still running after the stop's wait refuses at its
+        # guard rather than reaching the core after `kill_all` or `shutdown`.
+        self._core_calls_closed = True
         # F5: the kill is bounded by what is left of the one budget, not by a fresh 2 s; the
         # core's own grace and the wait share it, so the archive still gets its share. R5a: the
         # grace stays under the wait, so a kill that uses all of it cannot outlive the stop's own
         # wait and the normal path never logs a timeout.
-        kill_left = max(0.05, deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)
+        kill_left = max(SHUTDOWN_STEP_FLOOR_SEC,
+                        deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)
         kill_wait = min(SHUTDOWN_KILL_MAX_SEC, kill_left)
         stops = [
             asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=kill_wait)
@@ -6942,8 +7162,9 @@ class HubSessionManager:
             # now. One batch off the loop, inside what is left of the shared budget after the kill's
             # share and before the final rows'. `retire` is not run here; the stop tears the core
             # down itself.
-            close_share = max(0.05, min(SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
-                                        deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC))
+            close_share = max(SHUTDOWN_STEP_FLOOR_SEC, min(
+                SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
+                deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC))
             closers = [asyncio.to_thread(self._close_terminal_sockets, sess.session_id)
                        for sess in sessions]
             try:
@@ -6968,31 +7189,15 @@ class HubSessionManager:
                     archived += 1
         except (asyncio.TimeoutError, PersistenceUnavailable):
             logger.exception("Shutdown archived only %d/%d sessions", archived, len(sessions))
+        except Exception:
+            # r4 #1: the archive's own except only covered the budget and the store. Anything else
+            # costs the archive loop's remaining sessions their archive row, but not the forced
+            # rows below, the core's stop or the store's flush.
+            logger.exception("Shutdown's archive loop failed after %d/%d sessions", archived,
+                             len(sessions))
         finally:
             if remaining:
-                # kimi 4: no session may leave without a final row, even when the budget ran out
-                # inside its own scrollback read. r2-kimi 1: the fallback must not run the archive
-                # body again (that is what stalled) and its writes must be tasks, not coroutines:
-                # `asyncio.wait` rejects the latter and then not one row is written. The writes are
-                # awaited together and `db.close` flushes what the queue accepted before the loop
-                # ends.
-                final = []
-                for sess in remaining:
-                    session_snapshot = snapshots.get(sess.session_id)
-                    self._prepare_final_row(sess, end_reason=reasons[sess.session_id],
-                                            snapshot=session_snapshot)
-                    final.append(asyncio.create_task(self.db.run_internal(
-                        self.persist_session(sess, force_scrollback=True, final=True,
-                                             snapshot=session_snapshot))))
-                if final:
-                    try:
-                        _done, pending = await asyncio.wait(
-                            final, timeout=max(0.05, deadline - time.monotonic()
-                                               - SHUTDOWN_STORE_RESERVE_SEC))
-                        for task in pending:
-                            task.cancel()
-                    except Exception:
-                        logger.exception("Shutdown could not finish the remaining final rows")
+                await self._write_remaining_final_rows(remaining, reasons, snapshots, deadline)
             self.sessions.clear()
             self._closed_sessions.clear()
             self._late_code_writes.clear()
@@ -7028,6 +7233,60 @@ class HubSessionManager:
             except PersistenceUnavailable:
                 logger.exception("Shutdown could not flush every accepted write")
         return archived
+
+    async def _write_remaining_final_rows(self, remaining: List[AgentSession],
+                                          reasons: Dict[str, str],
+                                          snapshots: Dict[str, Dict[str, Any]],
+                                          deadline: float) -> None:
+        """kimi 4: no session leaves the stop without a final row, and one bad record costs one row.
+
+        r4 #1: `_prepare_final_row` stats the session's record and walks the object; a raise there
+        used to leave the loop, so the sessions after it got no row, their writes were never
+        awaited, and the exception skipped `core.shutdown` and `db.close`. Each session is therefore
+        prepared and queued inside its own guard, and this whole step is bounded by what is left of
+        the stop's budget. r2-kimi 1: it must not re-run the archive body (that is what stalled) and
+        its writes must be tasks, not coroutines (`asyncio.wait` rejects the latter).
+        """
+        final = []
+        try:
+            for sess in remaining:
+                session_snapshot = snapshots.get(sess.session_id)
+                self._prepare_final_row_guarded(sess, end_reason=reasons.get(sess.session_id),
+                                                snapshot=session_snapshot)
+                try:
+                    final.append(asyncio.create_task(self.db.run_internal(
+                        self.persist_session(sess, force_scrollback=True, final=True,
+                                             snapshot=session_snapshot))))
+                except Exception:
+                    logger.exception("Shutdown could not queue the final row of %s", sess.session_id)
+            if final:
+                done, pending = await asyncio.wait(
+                    final, timeout=max(SHUTDOWN_STEP_FLOOR_SEC,
+                                       deadline - time.monotonic() - SHUTDOWN_STORE_RESERVE_SEC))
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    if not task.cancelled() and task.exception() is not None:
+                        logger.error("Shutdown's forced final row failed", exc_info=task.exception())
+        except Exception:
+            logger.exception("Shutdown could not finish the remaining final rows")
+
+    def _prepare_final_row_guarded(self, session: AgentSession, end_reason: Optional[str] = None,
+                                   snapshot: Optional[Dict[str, Any]] = None) -> None:
+        """`_prepare_final_row` where one session's failure must cost that session's row only."""
+        try:
+            self._prepare_final_row(session, end_reason=end_reason, snapshot=snapshot)
+        except Exception:
+            logger.exception("Shutdown could not prepare the final row of %s", session.session_id)
+            # The row still goes out with what the object already has: an archive time and the
+            # status the stop decided, and nothing the probe that raised would have added.
+            try:
+                session.archived_at = session.archived_at or time.time()
+                session.end_reason = session.end_reason or end_reason
+                if session.end_reason:
+                    session.status = session.end_reason
+            except Exception:
+                logger.exception("Shutdown could not mark %s archived", session.session_id)
 
     async def _add_transcript_message(self, session_id: str, *args: Any, **kwargs: Any) -> None:
         """Store an intermediate message and mark the session's transcript as changed.
@@ -12309,22 +12568,31 @@ class HubSessionManager:
                     })
                 return
 
-    def _crash_tail(self, sess: AgentSession) -> str:
-        """The last ≤15 lines / ≤1500 chars of output, as the crash event carries them (spec §5)."""
-        text = sess.last_screen or self._last_screen_text(sess)
+    def _crash_tail(self, sess: AgentSession,
+                    snapshot: Optional[Dict[str, Any]] = None) -> str:
+        """The last ≤15 lines / ≤1500 chars of output, as the crash event carries them (spec §5).
+
+        r4 #8: the fallback used to read the core here, on the loop, whenever the final row had no
+        screen text. The death's own snapshot is all a dead session still has; an empty one is a
+        read that missed, and that is "(no output)", not another 50 ms core call on the loop.
+        """
+        text = sess.last_screen or self._last_screen_text(
+            sess, dict(EMPTY_SNAPSHOT) if snapshot is None else snapshot)
         lines = [ln for ln in text.splitlines() if ln.strip()][-15:]
         tail = "\n".join(lines)
         if not tail:
             return "(no output)"
         return tail[-1500:]
 
-    def _exit_event_content(self, session_id: str, exit_code: int, sess: Optional[AgentSession]) -> str:
+    def _exit_event_content(self, session_id: str, exit_code: int, sess: Optional[AgentSession],
+                            snapshot: Optional[Dict[str, Any]] = None) -> str:
         resumable = bool(sess.resumable) if sess is not None else False
         hint = f"Call get_subagent_final_response('{session_id}') for the persisted answer and trace."
         if resumable:
             hint += f" Call resume_subagent('{session_id}') to resume this session."
         if sess is not None and sess.end_reason == "crashed":
-            return f"Session crashed (exit_code={exit_code}). Last output:\n{self._crash_tail(sess)}\n{hint}"
+            return (f"Session crashed (exit_code={exit_code}). "
+                    f"Last output:\n{self._crash_tail(sess, snapshot)}\n{hint}")
         return f"Session exited (exit_code={exit_code}). {hint}"
 
     async def _on_session_exit(self, session: Any, exit_code: Optional[int]):
@@ -12406,7 +12674,7 @@ class HubSessionManager:
                 "type": ev_type,
                 "category": "lifecycle",
                 "status": end_reason,
-                "content": self._exit_event_content(session_id, exit_code, sess),
+                "content": self._exit_event_content(session_id, exit_code, sess, final_snapshot),
             },
         )
         # Q12: the exit event is out. The process ended on its own, so its conversation is nobody's
