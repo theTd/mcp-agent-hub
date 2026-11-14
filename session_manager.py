@@ -3892,9 +3892,11 @@ class HubSessionManager:
 
         The close removes the id from `sessions` before it ends the consumer and before
         `close_sockets`/`retire`, and the stop shuts the core down after its own bounded wait; a
-        call the consumer handed to a worker before either point would otherwise enter the core
-        afterwards. `CoreCallRefused` is a `KeyError`, what the core answers for an id it no longer
-        has, so every seam caller already handles it.
+        call the consumer handed to a worker before either point refuses here. The check and the
+        call are two steps, so a worker already past the check when the bounded wait runs out can
+        still enter the core, which answers a killed or retired entry with an error the request
+        path logs (DECISIONS `worker-guard-bound`). `CoreCallRefused` is a `KeyError`, what the
+        core answers for an id it no longer has, so every seam caller already handles it.
         """
         def check() -> None:
             if self._core_calls_closed or self.sessions.get(session_id) is None:
@@ -7050,7 +7052,8 @@ class HubSessionManager:
         # are cancelled below with the other producers, so nothing of this reaches the core after
         # its stop. The kill and the final rows still get their own share.
         # r4 #5: a consumer cancelled at its share's end can leave a core call in a worker, so the
-        # stop waits for those too, on the same deadline, before `kill_all` and `shutdown`.
+        # stop waits for those too, on the same deadline, before `kill_all` and `shutdown`; a
+        # worker still past its check after that wait gets a logged core error (worker-guard-bound).
         queued_ids = [sid for sid in list(self._terminal_request_consumers)]
         drain_by = time.monotonic() + max(SHUTDOWN_STEP_FLOOR_SEC, min(
             SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,

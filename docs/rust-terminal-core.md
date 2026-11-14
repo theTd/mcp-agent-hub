@@ -1,8 +1,9 @@
 # Rust terminal core
 
-Design for moving the per-output-chunk work out of Python so the hub can run 50 printing sessions at
-once. This document is the plan; nothing here is implemented yet. Line numbers refer to the tree at the
-time of writing and are anchors, not contracts.
+Design of the per-output-chunk work that moved out of Python so the hub can run 50 printing sessions at
+once. The hub runs on the core: `terminal-core/` is in the tree, every session's PTY, screen and raw ring
+live in `hub_terminal_core`, and the console's terminal sockets are the core's own behind a hub ticket
+(step 4). Line numbers refer to the tree at the time of writing and are anchors, not contracts.
 
 The owner chose the hosting on 2026-11-12 (decision page `hub-rust-core-1112`, the `terminal-core-*` rows
 in DECISIONS.md): a **PyO3 extension inside the hub process** (`hub_terminal_core`), which owns the
@@ -42,11 +43,12 @@ and persistence stay in Python.
 - Porting to macOS/Linux. The PTY layer, `CreatePseudoConsole` and the job objects are Windows-only; a
   POSIX backend is out of scope.
 - Keeping a Python implementation of the PTY or the parser that a runtime switch can fall back to.
-  Removed outright; `pyte` survives at most as an offline fixture generator (§9 step 0, §12).
+  Removed outright; `pyte` was an offline fixture generator only (§9 step 0), deleted at step 6.
 
-## 2. What the hub does today
+## 2. What the hub did before the core
 
-Measured on the live hub (2026-11-13, ~12 sessions printing), and confirmed in code:
+Measured on the live hub (2026-11-13, ~12 sessions printing) while it still ran pywinpty/pyte, and
+confirmed in code. This is the baseline §11 compares against; the path below no longer exists.
 
 | fact | value | source |
 |---|---|---|
@@ -58,32 +60,33 @@ Measured on the live hub (2026-11-13, ~12 sessions printing), and confirmed in c
 | output chunks | ~870/s across sessions | profile |
 | linear projection at 50 sessions | 2–3 cores, ~19,000 wakeups/s, ~250 threads | profile |
 
-Per chunk, today:
+Per chunk, then:
 
 ```
 winpty/ptyprocess.py _read_in_thread   read(blocking) -> loopback TCP send -> sleep(1 ms)
-  -> AgentSession._read_loop            session_manager.py:2280  (one thread per session)
-  -> AgentSession._on_pty_output        session_manager.py:2325
+  -> AgentSession._read_loop            one thread per session
+  -> AgentSession._on_pty_output
        lock -> pyte feed -> generic-engine tool-line scan -> raw_history append + W9 trim check
             -> snapshot of ws_queues
        unlock
      -> one loop.call_soon_threadsafe per chunk PER WebSocket
-  -> ws_pty_endpoint sender             server.py:1308  one WebSocket frame per chunk
+  -> ws_pty_endpoint sender             server.py  one WebSocket frame per chunk
 ```
 
-`pywinpty` 3.1.2 is a C extension built on **winpty-rs 1.0.8** (the crate path is embedded in
-`_winpty.cp314-win_amd64.pyd`) that calls the bundled `conpty.dll` exports
+`pywinpty` 3.1.2 was a C extension built on **winpty-rs 1.0.8** (the crate path is embedded in
+`_winpty.cp314-win_amd64.pyd`) that called the bundled `conpty.dll` exports
 `ConptyCreatePseudoConsole`, `ConptyResizePseudoConsole`, `ConptyClosePseudoConsole`,
 `ConptyReleasePseudoConsole`, `ConptyPackPseudoConsole`, `ConptyReparentPseudoConsole`,
 `ConptyShowHidePseudoConsole`, `ConptyClearPseudoConsole`. Its Python layer
-(`winpty/ptyprocess.py`) is the loopback socket plus 1 ms sleep loop above — that is where two of the
-five hub threads and most of the small-chunk overhead come from.
+(`winpty/ptyprocess.py`) was the loopback socket plus 1 ms sleep loop above — that is where two of the
+five hub threads and most of the small-chunk overhead came from.
 
-The pure-Python parser is pyte 0.8.2 through two subclasses: `HubTerminalScreen`
-(`session_manager.py:1792`, private-DSR guard and safe `display`) and `HubTerminalStream`
-(`:1832`, one bad escape sequence must not abandon the rest of a chunk).
+The pure-Python parser was pyte 0.8.2 through two subclasses, `HubTerminalScreen` (private-DSR guard
+and safe `display`) and `HubTerminalStream` (one bad escape sequence must not abandon the rest of a
+chunk). It rendered the frozen corpus offline and was deleted at step 6 with its renderer; the hub
+imports neither pyte nor pywinpty.
 
-## 3. What moves to Rust
+## 3. What moved to Rust
 
 1. **ConPTY lifecycle**: spawn (argv, cwd, env, cols×rows), write, resize, kill the process tree,
    report the exit code and the pid. `unwrap_windows_cmd_shim` stays in Python (decision
@@ -91,9 +94,10 @@ The pure-Python parser is pyte 0.8.2 through two subclasses: `HubTerminalScreen`
    path, so the hub unwraps argv and then calls `spawn`; its table stays in `test_session_launch_args.py`.
 2. **VT parsing**: screen (cols×rows, cursor, alt screen, wide/CJK cells), 3000-line history, and text
    rendering that matches `screen.display` plus `rstrip`/blank-line trimming.
-3. **Raw history**: the byte-capped ring with W9 trim (`trim_history_text`, `session_manager.py:630`),
-   the W8 `ESC[3J` strip for resumed sessions (`_strip_saved_lines_erase`, `:2390`) and the
-   `OSC_COLOR_QUERY_RE` strip (`:1852`), with their split-sequence carry buffers.
+3. **Raw history**: the byte-capped ring with W9 trim (`terminal_stream/src/history.rs`
+   `trim_history_text`), the W8 `ESC[3J` strip for resumed sessions (`history.rs`'s carry,
+   `strip_esc3j_on_output`) and the `OSC_COLOR_QUERY_RE` strip (`terminal_stream/src/esc.rs`
+   `strip_color_queries`), with their split-sequence carry buffers.
 4. **Per-frame batching**: one coalesced frame per session per flush window, instead of one frame per
    engine write. This is the only batching in the system (owner decision 7: the Python-side batching
    unit never lands).
@@ -104,11 +108,12 @@ The pure-Python parser is pyte 0.8.2 through two subclasses: `HubTerminalScreen`
    counters Python reads at a fixed rate, instead of being accumulated per chunk in Python.
 
 Kept in Python: env assembly and policy (`TERM`, `COLORTERM`, `PYTHONHOME` removal, model injection),
-the 20/5 col/row clamp and viewport propagation (`resize_session_from_client`, `:3161`), TuiWriterQueue
-ordering policy (`:1951`), approval/dialog detection and every parser of screen text
-(`parse_codex_approval_prompt`, `_tui_input_line`, `sanitize_tui_screen_text`), the DSH virtual
-session's echo emulation (`start_virtual`/`write_input` fallback, `:2200`/`:2463`), persistence,
-ticket issuing and the console-facing HTTP API.
+the 20/5 col/row clamp and viewport propagation (`resize_session_from_client`,
+`session_manager.py:4301`), TuiWriterQueue ordering policy (`:2098`), approval/dialog detection and
+every parser of screen text (`parse_codex_approval_prompt`, `:1774`; `_tui_input_line`, `:11386`;
+`sanitize_tui_screen_text`), the DSH virtual session's echo emulation (`start_virtual`, `:2368`, and
+`write_input`, `:2694`; the byte path into the core is `emit_virtual_ansi`'s `feed`, `:2397`),
+persistence, ticket issuing and the console-facing HTTP API.
 
 ## 4. Consumer map
 
@@ -150,9 +155,11 @@ one through `AgentSession`'s seam methods, one per core call: §4.1 is that map 
 Every place in `session_manager.py`, `server.py` and `tools/*.py` that read or wrote terminal state, by the
 function that holds it, with what it needs and the seam call it now makes. Line numbers are gone on purpose:
 they were stale at `b3d0614` and will be stale again. The table above maps consumers to core calls; this
-one, split by what each caller actually touched, maps them to the seam methods whose bodies step 3b swaps.
+one, split by what each caller actually touched, maps them to the seam methods 3b-hub swapped for core
+calls.
 
-The seam (design §5.2) lives on `AgentSession`:
+The seam (design §5.2) lives on `AgentSession`; each body is now one core call, as
+`seam-coverage.md` maps it (the file is gone from the tree; its tables survive here and in §5.2):
 
 | seam call | reply | replaces |
 |---|---|---|
@@ -170,37 +177,40 @@ The seam (design §5.2) lives on `AgentSession`:
 | `pid -> Optional[int]` (property) | the spawn reply's pid | `getattr(sess.pty, "pid", None)` |
 | `last_output_time() -> float` | unix seconds of the last byte | `sess.last_output_at` reads |
 
-#### `server.py` (4 sites)
+#### `server.py` (3 terminal sites)
 
 | consumer | needs | now calls |
 |---|---|---|
-| `read_subagent_screen` (MCP tool) | exact screen, `max_lines` (default 80), plus the composer line and K1 banner state from the same text | `read_screen(max_lines).text` |
-| `ws_pty_endpoint` (console `/ws/pty`) | ordered keystrokes from the browser, OSC replies stripped | `live.write_input(...)` (2 sites: `input` frame, bare text frame) |
-| `_session_can_receive` | live process, else a warm DSH job | `is_process_alive()` |
+| `read_subagent_screen` (MCP tool) | exact screen, `max_lines` (default 80), plus the composer line and K1 banner state from the same text | `read_screen(max_lines).text` (`server.py:644`) |
+| `_session_can_receive` | live process, else a warm DSH job | `is_process_alive()` (`server.py:122`) |
+| `api_terminal_ticket` (console ticket) | a one-use ticket URL, minted by the core | `core.ws_ticket` off the loop (`server.py:1343`); the socket itself is the core's (§6.4) |
 
-Resize frames from the browser go through `hub.resize_session_from_client` → `resize`.
+`ws_pty_endpoint` is gone (step 4): the console fetches the ticket and connects to the core's listener, so
+no hub route touches terminal input any more. Resize frames from the browser reach the core's socket, which
+records them as requests; `hub.resize_session_from_client` (`session_manager.py:4301`) applies them with the
+hub's clamp and propagation.
 
 #### `session_manager.py`, inside `AgentSession` (the seam's own bodies, not consumers)
 
-`read_screen`, `read_scrollback`, `read_raw`, `read_raw_tail`, `raw_revision`, `seed_history`, `write_input`,
-`resize`, `kill`, `is_process_alive`, `has_process`, `pid`, `last_output_time` hold the only field access that
-is left apart from the producers. `terminate` reads the session it ends (`read_scrollback(80)`,
-`is_process_alive()`, `kill`); `to_dict` reads `liveness`/`has_process`/`pid`/`last_output_time`;
-`_finish_read` reads `read_scrollback(80)` for the final-response snapshot.
+`read_screen`, `read_scrollback`, `read_raw`, `read_raw_tail`, `raw_revision`, `seed_history`, `write_input`
+(`write_input_async` for the drain consumer), `resize`/`resize_async`, `kill`, `is_process_alive`,
+`has_process`, `pid`, `last_output_time` hold the only field access that is left. `terminate` reads the
+session it ends (`read_scrollback(80)`, `is_process_alive()`, `kill`); `to_dict` reads
+`liveness`/`has_process`/`pid`/`last_output_time`; the exit path (`_finish_read`) no longer reads the
+scrollback itself: the 80-row final-response snapshot is the lifecycle callback's, taken in a worker by
+`_snapshot_final_response_async` (§6.5).
 
-Allowed direct readers/writers, unchanged (3b deletes or keeps them by design):
+Allowed direct readers/writers after 3b-hub:
 
-- `_read_loop`, `_on_pty_output` — the producers: `pty.read`, `stream.feed`, the ring append/trim, the
-  `last_output_at` bump, fan-out under `_lock`.
-- `start_pty` — the spawn path (`PtyProcess.spawn`, the `ws_prefix` frame, the reader thread).
-- `attach_ws_queue`/`detach_ws_queue`/`adopt_ws_frontends`/`push_ws_frame` — the replay snapshot and the
-  console fan-out; step 4 moves them to the core's own sockets.
-- `emit_virtual_ansi` — DSH virtual sessions feed text through `_on_pty_output`.
-- `_pid_alive` (module level) — `os.kill(pid, 0)` on a *pid number*, not on `AgentSession.pty`.
+- `start_pty` (`:2454`) — the spawn path: `env` assembly, `unwrap_windows_cmd_shim` and one
+  `core.spawn(…, seed_history, ws_prefix)`. This is a producer, not a reader: it holds no terminal state.
+- `emit_virtual_ansi` (`:2397`) — DSH virtual sessions feed text through the core's `feed`.
+- `_pid_alive` (module level, `:936`) — `os.kill(pid, 0)` on a *pid number* for the hub's single-instance
+  lock, not on `AgentSession.pty`.
 
 #### `session_manager.py`, `HubSessionManager` (the reads, liveness checks and writes below)
 
-Screen readers (24 sites in the manager, all `read_screen(...).text` unless noted):
+Screen readers (25 call sites in the manager, all `read_screen(...).text` unless noted):
 
 | consumer | needs | argument kept |
 |---|---|---|
@@ -216,64 +226,64 @@ Screen readers (24 sites in the manager, all `read_screen(...).text` unless note
 | `_register_omp_event_approval`, `poll_tui_screen_interactions_once` | OMP box rows | `max_rows` = `max(38, rows)` |
 | `wait_for_output_settle` | screen handed to `progress_cb` | 15 |
 
-Scrollback readers (2 sites in the manager, plus the seam's own `terminate`/`_finish_read`): `persist_session`
-(250 lines, the record) and the two 80-line exit snapshots, `_tui_banner_visible` (K1 banner may have scrolled, `TUI_READY_BANNER_HISTORY_ROWS`).
+Scrollback readers (3 call sites in the manager, plus the seam's own `terminate`): `persist_session`
+(250 lines, the record), `_read_session_snapshot` (250, for the stop's per-id fallback), and
+`_tui_banner_visible` (K1 banner may have scrolled, `TUI_READY_BANNER_HISTORY_ROWS`). The two 80-line exit
+snapshots are gone from this list: `_finish_read` hands its snapshot to the lifecycle callback, which reads
+it in a worker through `_snapshot_final_response_async`/`_capture_submit_diagnostic`'s sibling helpers.
 
-Raw readers (4 sites): `_scrollback_blob` — `read_raw()` for the text and `raw_revision` for the two change
+Raw readers (3 sites): `_scrollback_blob` — `read_raw()` for the text and `raw_revision` for the two change
 gates; `_capture_submit_diagnostic` — `read_raw_tail(SUBMIT_DIAGNOSTIC_TAIL_CHARS)`.
 
-Spawn/exit plumbing: `_make_resumed_session` → `seed_history(seed)`; `_resume_process_session` →
-`has_process` + `kill(KILL_GRACE_MS)` on a failed spawn; `_shutdown` → `has_process`, then
-`_terminate_pty_tree` → `kill(grace_ms)`; `_record_tui_injection` → `has_process`.
+Spawn/exit plumbing: `_make_resumed_session` → `seed_history(seed)`; `_end_predecessor` (a resume) →
+`kill(KILL_GRACE_MS)` on the predecessor; `_shutdown` → `kill_all` in the core, no per-session kill left.
+`start_pty` is the only `spawn`.
 
-Liveness, 16 `is_process_alive()` at manager level plus the seam's own `terminate`/`to_dict`: `compute_resumable`
-(2), `_claim_conversation`, `_resume_locked`, `_resume_check_context`, `_close_session`, `_shutdown`,
-`_scrollback_flush_loop`, `_submit_queued_live_text` (2), `_deliver_deny_feedback`, `_clear_tui_draft` (2),
-`_transcript_watch_alive`, `_agy_new_conversation_dir`, `deliver_parent_message`,
-`get_subagent_status_and_trace`, `resize_session_from_client`.
+Liveness, 21 `is_process_alive()` at manager level plus the seam's own `terminate`/`is_process_alive` body:
+`compute_resumable` (2), `_claim_conversation`, `_resume_locked`, `_resume_check_context`, `_close_session`,
+`_shutdown`, `_scrollback_flush_loop`, `_submit_queued_live_text` (2), `_deliver_deny_feedback`,
+`_clear_tui_draft` (2), `_transcript_watch_alive`, `_agy_new_conversation_dir`, `deliver_parent_message`,
+`get_subagent_status_and_trace`, `resize_session_from_client` and the resume/predecessor waits. Each reads the
+drain record's `alive`, never the status string; a DSH text session keeps its own status/job branch because
+the core has no process for it.
 
-Process presence, 3 `has_process`: `_shutdown` (replace `pty is not None`), `_resume_process_session`,
-`_record_tui_injection`; `to_dict` reads it too.
+Process presence, 3 `has_process` at manager level plus 8 inside `AgentSession` (the seam, `terminate`,
+`classify_end_reason`, `to_dict`): `_end_predecessor`, the close path, and the Codex live-write check.
 
-Write side: `write_input` at 61 sites (39 of them in `respond_to_interaction`), `resize` in
-`resize_session_from_client` (2: the target, then the background panes), `last_output_time()` in
-`to_dict` (2) and `wait_for_output_settle` (1), `kill` in `_terminate_pty_tree` and `_resume_process_session`.
+Write side: `write_input` at 46 call sites (26 of them in `respond_to_interaction`), `write_input_async` once
+(the drain consumer's text-session input), `resize_async` in `resize_session_from_client` (the target; the
+background panes go through the same async path), `last_output_time()` in `to_dict` (2) and
+`wait_for_output_settle` (3), `kill` in the seam and `_end_predecessor`.
 
-#### `tools/render_terminal_fixtures.py` (9 sites)
+#### `tools/render_terminal_fixtures.py` (deleted at step 6)
 
-Counts are call sites: `resize` three times inside `feed_session`, `read_raw_tail` twice (`render_session`,
-`render_trigger`).
-
-`screen_text` → `read_screen(80).text`; `joined_raw` → `read_raw().text`; `render_session` →
-`read_scrollback(250).text`, `read_raw_tail(RAW_TAIL_CHARS)`; `render_trigger` → `read_raw_tail`; `new_session`
-→ `seed_history(seed)`; `feed_session` → `resize` (3). `RAW_TAIL_CHARS` is now the imported
-`SUBMIT_DIAGNOSTIC_TAIL_CHARS`, and the two former "mirrored expressions" (the 65536 tail, the resume seed) are
-seam calls, so `test_terminal_fixtures` pins them by name instead of by source text.
-
-`render_trigger` still reads `len(session.raw_history)` and `raw_history_bytes` directly: it is the oracle for
-the W9 in-loop collapse and `trigger.json` pins the entry count before/after. Those are ring internals, not
-terminal text; the core's ring has no entry count to report. `tools/record_terminal_corpus.py` touches only
-its own recorder PTY, never `AgentSession`.
+The renderer was the oracle's seam consumer: `screen_text` → `read_screen(80).text`, `joined_raw` →
+`read_raw().text`, `render_session` → `read_scrollback(250).text`/`read_raw_tail`/`replay_frame`,
+`feed_session` → `resize`, `new_session` → `seed_history(seed)`. Step 6 deleted it with the oracle;
+the goldens it rendered are the spec and `terminal_stream/tests/fixture_corpus` compares them against the
+core. `tools/record_terminal_corpus.py` touches only its own recorder PTY (its live screen is now a core
+text session), never `AgentSession`.
 
 #### What did not fit the seam, and why
 
 - **`_scrollback_blob`'s change gate** uses `raw_revision` (the counter, no join) rather than `read_raw().rev`.
   Joining 512 KB per persist only to compare two integers would be a real regression; the counter is the same
-  revision the `raw` reply carries, and 3b's drain supplies it.
+  revision the `raw` reply carries, and the drain record supplies it.
 - **`session.cols` / `session.rows`** stay plain fields: they are the hub's chosen geometry, not a screen
   read, and the 20/5 clamp is applied by the hub (§6.4). The **screen's** `columns`/`lines` had no seam accessor
   before; they now come from `read_screen().cols/rows`.
 - **`_capture_submit_diagnostic`'s evidence JSON** keeps its two screen-geometry fields by asking
-  `read_screen()` for them; today `screen.columns`/`screen.lines` track `session.cols`/`rows` exactly.
+  `read_screen()` for them; the screen's `cols`/`rows` track `session.cols`/`rows` exactly.
 - **`write_input` and `is_process_alive` keep their names** (the brief's exception): `write_input` is patched by
   `test_session_approvals` (3 targets) and `test_tui_delivery` (2), and `is_process_alive` by
-  `test_transcript_view` (2); 61 and 16 internal sites plus `server.py` call them. The bodies are the core's `write`
-  and `alive`.
-- **`_terminate_pty_tree`** stays as the manager's `asyncio.to_thread` wrapper for shutdown; its body is one
-  `kill(grace_ms)` call, because `budget` is seconds and the seam's unit is `grace_ms`.
-- **`kill` returns `None` for a live process today**: `pty.terminate(force=True)` does not wait, so `exitstatus`
-  is usually not there yet. That matches §5.2's "None when the process outlived the budget"; 3b's reply carries
-  the code the core read before `TerminateJobObject`.
+  `test_transcript_view` (2); 46 and 21 internal sites plus `server.py` call them. The bodies are the core's `write`
+  and the drain record's `alive`.
+- **`kill` is one core call**: `asyncio.to_thread(sess.kill, …)` where a caller on the loop needs it, and the
+  core's 2 s bound covers the exit wait plus the console close. A text session has no process but the core
+  still owns its id, so the call ends it there and `retire` can accept the id afterwards.
+- **`kill` returns `None` for a process that outlived its budget**: the core reads the code before
+  `TerminateJobObject`, so `cmd /c "exit 3"` reports 3, and a code learned afterwards arrives on the next drain
+  record (which rewrites the row once, §5.3).
 
 ## 5. Interface between the core and Python
 
@@ -286,10 +296,13 @@ a Python value built by the core.
 ```
 hub_terminal_core.pyd (cdylib; kernel32 for ConPTY/pipes/jobs, bcrypt for the ticket key)
   Core(...)                    one object per hub; owns the session table, the WS listener, the ticket key
-  reader thread per session    ReadFile on the ConPTY output pipe: strip -> decode -> parse -> ring -> fan out
-  ticker thread                every 5 ms: flush due batches; at most every 50 ms: one Python wake
-  ws accept thread             one loopback listener; the handshake and the ticket check happen here
-  ws thread per connection     one per attached console socket (blocking send/recv, so a slow pane stalls itself)
+  reader thread per session    core-read-<id>: ReadFile on the ConPTY output pipe: strip -> decode -> parse -> ring -> fan out
+  writer thread per session    core-write-<id>: one WriteFile at a time, so input keeps arrival order
+  reaper thread per session    core-reap-<id>: WaitForSingleObject on the process, then the one exit teardown
+  ticker thread                core-ticker: every 5 ms flush due batches; at most every 50 ms one Python wake
+  ws accept thread             ws-accept: one loopback listener, which hands each connection to a handshake thread
+  ws handshake thread          ws-handshake-<n>: 5 s deadline, at most 16 at once (503 over the cap)
+  ws thread per connection     ws-<n>: one per attached console socket (blocking send/recv in a 250 ms slice, so a slow pane stalls itself)
 ```
 
 - Created in `Core::new(notify, log, opts)`: `notify` is the one callable the core calls at most every
@@ -302,7 +315,7 @@ hub_terminal_core.pyd (cdylib; kernel32 for ConPTY/pipes/jobs, bcrypt for the ti
   thread and hand over one `str`.
 - Errors: an unknown session id raises `KeyError`; a spawn failure raises `RuntimeError` with the
   Win32 message appended, which the hub turns into the same `RESUME_FAILED_PREFIX`/启动失败 path as
-  today.
+  before the core; `TimeoutError` is a deadline the caller retries (§5.2).
 
 ### 5.2 Calls from Python
 
@@ -317,26 +330,30 @@ exceeds 2 s, a spawn over the bound is logged with its measured time, and the re
 
 | call | arguments | reply | deadline | replaces |
 |---|---|---|---|---|
-| `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows, elapsed_ms | 2 s, measured by the selftest (not interruptible) | `PtyProcess.spawn` (`:2262`), `push_ws_frame` of the resume banner (`:2271`) |
-| `attach_text` | session_id, cols, rows, flags, seed_history, seed | ok | 50 ms | `HubTerminalScreen` for DSH virtual sessions (`seed_history` is A1's archived scrollback, `seed` the separator frame) |
+| `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows, elapsed_ms | 2 s, measured by the selftest (not interruptible) | `PtyProcess.spawn`, `push_ws_frame` of the resume banner |
+| `attach_text` | session_id, cols, rows, flags, seed_history, seed | pid (0), cols, rows | 50 ms | `HubTerminalScreen` for DSH virtual sessions (`seed_history` is A1's archived scrollback, `seed` the separator frame) |
 | `feed` | session_id, text | rev | 50 ms | `_on_pty_output` for virtual sessions |
-| `write` | session_id, text | bytes queued: the whole text or nothing; `0` for empty text; `TimeoutError` when the queue is still full at the deadline | 50 ms | `pty.write` (`:2465`) |
-| `resize` | session_id, cols, rows | cols, rows; `ValueError` when the pseudoconsole is already closing/closed, `TimeoutError` when the console is busy past the deadline | 50 ms | `pty.setwinsize` + `screen.resize` (`:2490`) |
-| `kill` | session_id, grace_ms | exit_code (None when the process outlived the budget) | 2 s for the whole call: the exit wait, then the same teardown the reaper runs (console close, wait for the reader's last bytes), which publishes on its deadline at the latest | `taskkill /T /F` (`:2593`, `:5680`) |
-| `screen` | session_id, max_lines | text, cursor, cols, rows, rev | 50 ms | `get_clean_screen_text` (`:2499`) |
-| `scrollback` | session_id, max_lines | text, rev | 50 ms | `get_full_scrollback_text` (`:2516`) |
-| `raw` | session_id | text, bytes, rev | 50 ms | `"".join(raw_history)` (`:4454`) |
-| `raw_tail` | session_id, max_chars | text | 50 ms | `raw_ansi_tail` (`:10194`); a character count, because the hub's tail is `"".join(raw_history)[-65536:]`, and it is cut on a character boundary |
-| `attach_queue` *(temporary: step 4 deletes it, the `FrameQueue` stays)* | session_id, max_bytes (`CoreOptions::sink_queue_bytes`, 2 MB, when null) | replay, handle | 50 ms | `attach_ws_queue`'s replay half (`:2425`): the raw ring with OSC colour queries stripped (`replay-shape`) |
-| `take_frames` *(temporary)* | handle | frames (bytes, in order), `dropped_bytes` (that queue's cumulative count), `closed` | no wait: a non-blocking take, the registry read bounded at 50 ms | `ws_pty_endpoint`'s sender task (`server.py:1308`) |
-| `detach_queue` *(temporary)* | handle | bool: `true` when it detached, `false` for a handle never issued or already detached | 50 ms | `detach_ws_queue` (`:2441`) |
-| `retire` | session_id | bool: `false` for an unknown id; `ValueError` for a live one and for one whose exit record has not been drained | 50 ms for the table read; releasing the last reference can wait for the console-close deadline, and the fan-out close waits for a delivery in flight (bounded by `deliver`'s no-block contract) | nothing removed a session before: every ended session kept its 512 KiB ring and its screen for the hub's lifetime |
-| `watch_screen` / `unwatch` | session_id, max_lines, interval_ms | ok | 50 ms | generic-engine tool-line polling (`:2345`), now bounded by `interval_ms` |
-| `ws_ticket` | session_id, ttl_ms | url, expires_at | 1 ms | nothing (the ticket is new, §6.4) |
-| `close_sockets` | session_id | count | 50 ms | `close_ws_frontends` (`:2415`, W7: normal close, code 1000) |
-| `snapshot_all` | max_lines, max_bytes | per-session dict | whole 8 s budget | graceful shutdown (`graceful-budget`) |
-| `kill_all` | grace_ms | ok; `TimeoutError` when the session table could not be snapshotted inside the budget | 2 s for the whole set after `snapshot_all`, every session in parallel | shutdown (`shutdown-ends-cli`) |
+| `write` | session_id, text | bytes queued: the whole text or nothing; `0` for empty text; `TimeoutError` when the queue is still full at the deadline | 50 ms | `pty.write` |
+| `resize` | session_id, cols, rows | cols, rows; `ValueError` when the pseudoconsole is already closing/closed, `TimeoutError` when the console is busy past the deadline | 50 ms | `pty.setwinsize` + `screen.resize` |
+| `kill` | session_id, grace_ms | exit_code (None when the process outlived the budget) | 2 s for the whole call: the exit wait, then the same teardown the reaper runs (console close, wait for the reader's last bytes), which publishes on its deadline at the latest | `taskkill /T /F` |
+| `screen` | session_id, max_lines | text, cursor_x, cursor_y, cols, rows, rev | 50 ms | `get_clean_screen_text` |
+| `scrollback` | session_id, max_lines | text, rev | 50 ms | `get_full_scrollback_text` |
+| `raw` | session_id | text, bytes, rev | 50 ms | `"".join(raw_history)` |
+| `raw_tail` | session_id, max_chars | text | 50 ms | `raw_ansi_tail`; a character count, because the hub's tail is `"".join(raw_history)[-65536:]`, and it is cut on a character boundary |
+| `retire` | session_id | bool: `false` for an unknown id; `ValueError` for a live one, for one whose exit record has not been drained, and for a spawn/attach/retire in flight; `TimeoutError` past the table deadline | 50 ms for the table read; releasing the last reference can wait for the console-close deadline, and the fan-out close waits for a delivery in flight (bounded by `deliver`'s no-block contract) | nothing removed a session before: every ended session kept its 512 KiB ring and its screen for the hub's lifetime |
+| `watch_screen` / `unwatch` | session_id, max_lines, interval_ms | ok | 50 ms | generic-engine tool-line polling, now bounded by `interval_ms` |
+| `ws_ticket` | session_id, ttl_ms | url, expires_at | 50 ms: it reads the session table like any other call, and the route awaits it in a worker | nothing (the ticket is new, §6.4) |
+| `ws_port` | — (property) | the `127.0.0.1` port the console's sockets are served on | none | nothing |
+| `ws_listening` | — | bool, false once the accept thread has ended | none | nothing (the health check, `ws-listening-health`) |
+| `close_sockets` | session_id | count: how many sockets were asked to close with 1000 | 50 ms | `close_ws_frontends` (W7: normal close, code 1000) |
+| `snapshot_all` | max_lines, max_bytes, budget_ms | per-session dict (`session_id`, `alive`, `exit_code`, `pid`, `crashed`, `degraded`, `screen_text`, `scrollback_text`, `raw_text`, `raw_rev`, `raw_bytes`) | whole 8 s budget | graceful shutdown (`graceful-budget`) |
+| `kill_all` | grace_ms | ok; `TimeoutError` when the session table could not be read inside the budget | 2 s for the whole set, every session in parallel | shutdown (`shutdown-ends-cli`) |
 | `stats` | — | counters (GIL released, table read bounded) | 5 ms | diagnostics; the 50 ms drain is the normal reader |
+| `socket_count` | — | how many console sockets the core holds | 50 ms | diagnostics and tests |
+| `attach_sink` | session_id, FrameSink | replay, sink handle | 50 ms | the core WebSocket registration and test sinks; replay and registration are one Q11 step |
+
+`replay(session_id)` stays as a test surface: it returns the text one new socket would get (`replay-shape`),
+which is what `test_terminal_core_client` asserts before the listener is exercised.
 
 The write queue's cap is 1 MiB (`CoreOptions::write_queue_bytes`). The cap bounds what *waits* in the
 queue, not what one call may hand it: a text larger than the cap is accepted whole when the queue is
@@ -344,44 +361,44 @@ empty, so a paste bigger than 1 MiB behaves as it did under pywinpty, and only a
 arrives while the first is still queued gets `TimeoutError`.
 
 `flags` for `spawn`/`attach_text`: `strip_esc3j_on_output` (true when `resume_count > 0`),
-`strip_osc_color_queries` (always true today), `history_rows` (3000), `raw_cap_bytes` (512 KiB),
+`strip_osc_color_queries` (always true), `history_rows` (3000), `raw_cap_bytes` (512 KiB),
 `raw_slack_bytes` (64 KiB). `seed_history` sets the raw ring before the first byte of the new process
-(today `sess.raw_history = [seed]`, `:4864`) and clears the `ESC[3J` carry. `ws_prefix` is written to
-every socket already subscribed to that id before the reader thread starts, which is where A1's "between
-spawn and first output" ordering stops depending on Python's timing. The sinks are the **id's**, not the
-new `Session`'s: `Session::start` takes the predecessor's fan-out over, so the prefix goes to the sockets
-that were attached before the resume, in stream order after the predecessor's last flushed batch and its
-`superseded` mark (`take_over`, §5.4). `attach_text` does the same with its `seed`.
+(it was `sess.raw_history = [seed]` before the swap) and clears the `ESC[3J` carry. `ws_prefix` is written
+to every socket already subscribed to that id before the reader thread starts, which is where A1's
+"between spawn and first output" ordering stops depending on Python's timing. The sinks are the **id's**,
+not the new `Session`'s: `Session::start` takes the predecessor's fan-out over, so the prefix goes to the
+sockets that were attached before the resume, in stream order after the predecessor's last flushed batch
+and its `superseded` mark (`take_over`, §5.4). `attach_text` does the same with its `seed`.
 
 `subscribe`/`unsubscribe` are gone: no Python object holds a terminal queue any more. The console
 attaches straight to the core's socket (§6.4), and `close_sockets` is the only fan-out call the hub
-still makes (on archive, `:5631`/`:5733).
+still makes (the close path, `_close_terminal_sockets`, and the stop's batch).
 
-**The temporary bridge (`attach_queue`/`take_frames`/`detach_queue`, step 3b-core).** Until step 4 moves
-the console sockets into the core, Python's `/ws/pty` endpoint still owns the socket and polls the id's
-`FrameQueue` (step 3b-hub swaps `AgentSession`'s seam bodies for these calls and polled `take_frames` on
-the 50 ms drain tick). Handles are unique per core and belong to the **session id**, not to one
-incarnation: `attach_queue` registers on the id's fan-out through `attach_sink` (so the replay and the
-registration are one step, Q11), a handle taken before a resume keeps receiving after the predecessor's
-last bytes and the separator (`take_over`, §5.4), and `detach_queue` works across the resume. The replay
-is exactly what `attach_ws_queue` sends today (`replay-shape`). `dropped_bytes` is that queue's
-**cumulative** count, not a per-take delta, so a caller that skips a poll cannot lose a drop. `closed`
-turns true when `retire` removes the id, which is where the Python socket closes with code 1000 as
-`close_ws_frontends` does. A handle never issued, or one already detached, raises `KeyError`; a handle of
-a retired id keeps answering (`closed = true`) until it is detached. Step 4 deletes all three calls and
-keeps the queue: its socket thread drains it and writes the replay and `replay_end` before the first
-frame.
+**The socket sink path (step 4).** The core WebSocket listener registers a bounded `FrameQueue` through
+`attach_sink`. The replay snapshot and sink registration are one Q11 step, so every byte belongs to
+exactly one of replay or queued frames. The socket thread writes replay and `replay_end`, then drains
+frames in order. Sink handles belong to the session id's fan-out and survive a resume; a later `spawn` or
+`attach_text` after `retire` starts with a fresh fan-out. Per-socket `dropped_bytes` remains cumulative
+and is reported by the socket listener's drain record.
 
 **`retire`.** Removes an ended session from the table, so its ring and its screen stop living for the
 hub's lifetime: `false` for an unknown id, `ValueError` for a live one (the hub kills first) and for one
 whose **exit record** no drain has reported yet — that record (exit code, `crashed`) is the one thing
 that cannot be re-created once the session is gone, so the hub drains it (within one 50 ms tick) and
 retires on the next attempt. A code learned after the death record (SF3) gates the same way. Every queue
-attached to the id is closed (`take_frames` reports `closed`), the fan-out is retired, and the table's
-reference is released **before** that close so an `attach_sink` racing the call cannot have its owner
-`Arc` dropped while it holds the delivery lock (`Session::drop` asserts it in test builds). A later
-`spawn`/`attach_text` of the same id builds a fresh fan-out: nothing is carried over from the incarnation
-`retire` removed.
+attached to the id is closed, the fan-out is retired, and the table's reference is released **before**
+that close so an `attach_sink` racing the call cannot have its owner `Arc` dropped while it holds the
+delivery lock (`Session::drop` asserts it in test builds).
+
+A resume and a retirement of one id never interleave: `spawn`, `attach_text` and `retire` each take the
+id's **lifecycle claim** for the whole call, and a call that finds it taken fails at once with `ValueError`
+("… in flight; retry") — never a wait, because the hub's loop must not park on another hub thread's
+`CreateProcessW`. The hub retries a claim refusal up to three times, 50 ms and then 100 ms apart
+(`_start_with_claim_retry`, `session_manager.py:6004`; `LIFECYCLE_CLAIM_RETRY_DELAYS_SEC`, `:473`), so a
+resume that races a snapshot's retire settles instead of failing for good. A `retire` therefore never
+closes a fan-out a successor owns or is taking over, and a `spawn`/`attach_text` of a retired id builds a
+fresh fan-out: nothing is carried over. A sink that races retirement is not registered; the listener
+returns `ended` and closes with 1000 rather than waiting for frames that will never come.
 
 ### 5.3 How Python learns about output, screens and exits
 
@@ -393,13 +410,27 @@ interval, however much output arrived:
 - At most every 50 ms (the drain interval) and only if any session is dirty, the ticker calls the one
   callback the hub registered, from a thread that attaches to the interpreter just for that call
   (`Python::try_attach` in PyO3 0.30; during interpreter finalization it returns `None` and the tick is
-  dropped) and calls
-  `loop.call_soon_threadsafe(hub._on_core_tick)`. One wakeup for all sessions.
-- `hub._on_core_tick` runs on the loop and makes a single `core.drain()` call, which returns only the
-  sessions whose flags were set and clears them: `(session_id, last_output_at, bytes_total,
-  chunks_total, screen_rev, raw_rev, alive, exit_code, dropped_bytes, screen_text)` — `raw_rev` is the
-  ring's revision (`raw`'s reply carries the same number, and `_scrollback_blob`'s change gate reads it
-  without joining the ring), and `screen_text` only for a watched session whose `screen_rev` changed.
+  dropped) and calls `loop.call_soon_threadsafe(hub._on_core_tick)`. One wakeup for all sessions.
+- `hub._on_core_tick` (`session_manager.py:3677`) runs on the loop and makes a single `core.drain()`
+  call, which returns only the sessions whose flags were set and clears them. A record carries
+  `session_id`, `alive`, `exit_code`, `crashed`, `degraded`, `pid`, `bytes_total`, `chunks_total`,
+  `last_output_at`, `dropped_bytes`, `screen_rev`, `raw_rev`, `screen_text`, and three hub-facing lists:
+  `resize_requests` (`{cols, rows, propagate}` in arrival order), `input_requests` (`str`, a session with
+  no PTY) and `socket_drops` (`(handle, bytes)` per console socket).
+  - `raw_rev` is the ring's revision: `raw`'s reply carries the same number, and `_scrollback_blob`'s
+    change gate reads it without joining the ring. The mirror is initialised from the stream in
+    `new_state` (a seeded attach's ring is already at 1) and advanced with `fetch_max` under the text
+    lock, before the frame is published, so a drain taken during a delivery reports the same number
+    `raw()` does.
+  - `screen_text` comes only for a watched session whose `screen_rev` changed (§5.6).
+  - `dropped_bytes` is the **raw ring's** own loss. A console socket's loss is in `socket_drops`, keyed
+    by `(session id, handle)` because the core numbers handles per session id, and it is never added to
+    the ring's count (§5.4).
+  - A console socket's dropped bytes are marked reported only by the drain record that carries them: a
+    drop that lands after a drain collected its records belongs to a session with no record in that
+    drain and stays unreported until one goes out.
+- Each record costs its own session and nothing else (§6.3): an exception while applying one is logged
+  against that session and the next record still applies.
 - Exits are detected on the process handle, not on the output pipe. The write end of the console's
   output pipe belongs to conhost, which lives as long as we hold the HPCON, so a session that exits by
   itself never ends the reader's read. Each session therefore has one reaper thread (512 KiB stack: its
@@ -412,13 +443,63 @@ interval, however much output arrived:
   handle is gone, so it is closed", so a second closer that finds another one inside
   `ClosePseudoConsole` waits for that completion instead of publishing over a live read. The death
   record (`alive = false`, one dirty record, `urgent`, so the ticker notifies on its next 5 ms tick)
-  therefore never precedes the session's last byte: the hub sees a process die within 5 ms and asks for
-  `scrollback(80)` in the same handler, exactly where `_finish_read` does it today (`:2305`).
+  therefore never precedes the session's last byte: the hub sees a process die within 5 ms and takes its
+  final snapshot in the lifecycle callback, in a worker.
+- The death record is never the first thing a drain reports about an ended session: `publish_death`
+  delivers the session's last batch inside its own `alive` gate, and a drain that finds the gate closed
+  while that flush is still running reports nothing and keeps the session dirty. The record therefore
+  arrives at most one 50 ms tick later than it used to, and always after the last byte.
 - A code learned after the death record went out — a crashed session the hub drained and then killed,
   or a late `GetExitCodeProcess` — marks the session dirty and pending, so the next drain carries it;
   the drain record stays the hub's only exit-code source. `kill` reads the code before
   `TerminateJobObject`, because a process that has exited but is still terminating can have its code
   replaced by the job's termination code.
+
+**A resume's kill is a supersede, not a death.** Before a successor's `spawn`/`attach_text` replaces an
+id's entry, the hub ends the entry the predecessor owns. The death record that kill publishes is a
+hand-over: a predecessor that had already ended (a completed DSH job, a user termination) keeps that end
+state and emits no lifecycle event for the kill, so a parent is never told that a session it is resuming
+crashed. A text entry has no process and the core's text kill answers `exit_code=None, crashed=false`, so
+"a death without a code is a crash" applies only to a session that had a process; a text entry keeps the
+end state it reached. The death record may be withheld for one tick (above), and the successor's table
+insert drops whatever record the core still holds for the id, so the hub drains again, one drain interval
+apart and at most 0.25 s, until the death has been applied; a code the core learns while the predecessor
+is still the id's object is written to its final row there, before the successor is installed. A
+permanent close keeps the closed object as the id's tombstone until `retire` succeeds, so a code the core
+publishes after the close still reaches the row it belongs to; a resume of the id drops the tombstone and a
+late record is never routed to a successor.
+
+**The console's requests.** The drain record's `resize_requests` and `input_requests` are applied by one
+consumer per session id, never by the drain itself: the tick only enqueues them, each kind in its own
+arrival order (the core keeps two lists, so a record's resizes are applied before its inputs and the
+record carries no interleaving between the kinds), and the consumer awaits each blocking core call
+(`resize`, `write`, `feed`, and the F12 `watch_screen` re-watch) in a worker thread while the 20/5 clamp,
+the single-window propagation, the session dict and the virtual line callbacks stay on the loop. A
+request whose id left the hub's list before it is applied does nothing: the pane is gone, so its intent
+must not resize the panes that are still there, and a worker that has not entered the core yet refuses
+for the same reason (`CoreCallRefused`). One bad request costs that request only. Each application runs
+as its own task, because cancelling the consumer does not cancel a `to_thread` call. A close waits for
+that task, bounded by its own deadline, before its `close_sockets`/`retire`, and the stop waits the same
+way before `kill_all`/`shutdown`; a worker that has not passed its check by then refuses, and one already
+past it when the wait runs out can still enter the core, which answers a killed or retired entry with an
+error the request path logs. The consumer ends after 10 s with nothing to do (the next record creates a
+new one, and an id the hub dropped leaves no empty queue behind), at the sentinel a permanent close, a
+failed resume or the stop puts in its queue, or by cancelling after that close's grace, so no task outlives
+the session. A full queue keeps the rest of a batch for the next turn; a backlog past the socket window is
+dropped, counted per handle apart from the ring's count, and logged once.
+
+A resume's queued requests belong to the id, not to the object: while its spawn or attach is in flight the
+id is listed under the object being installed, so what the console queues then is applied to that object (the
+pane is the same one). When the spawn raises, the failure path puts the id's entry back — the predecessor,
+or nothing — before it awaits anything and before it ends the queue, so a request still queued there reaches
+the incarnation that owns the id again, or, with no predecessor left, nothing at all, and never the object
+that never started.
+
+An exit code the core learns after the death record rewrites that row once, with no second lifecycle event.
+The rewrite's identity check is read again after its worker screen read and immediately before the write,
+because a resume of the closed id inside that read makes the successor the row's owner; the row write
+itself is not taken under the id's resume lock, which a deferred retire holds while it waits for that
+write.
 
 Note that Windows' Proactor loop has no `add_reader` (`NotImplementedError`, verified on CPython 3.14.7),
 so a self-pipe cannot be used to wake the loop; `call_soon_threadsafe` is the only mechanism, which is
@@ -426,7 +507,7 @@ why it must be one call and not one per session.
 
 Cost at 50 printing sessions:
 
-| quantity | today | after |
+| quantity | before the core | after |
 |---|---|---|
 | output chunks/s through Python | ~3,600 (50 × 72) | 0 |
 | Python wakeups/s from the terminal path | ~19,000 (projected) | ≤20, all sessions together |
@@ -434,8 +515,8 @@ Cost at 50 printing sessions:
 | screen rebuilds for polling readers | 1 per reader per poll (`screen.display` per call) | 0 unless watched; a watched session costs one render per changed rev, on a native thread |
 
 `last_output_at` keeps its meaning (unix seconds of the last byte) and is what
-`to_dict["idle_seconds"]` (`:2713`) and the "did it echo / is it quiet" wait (`:12643`) read, so both
-become reads of the drain record instead of thread-shared fields.
+`to_dict["idle_seconds"]` and the "did it echo / is it quiet" wait (`wait_for_output_settle`) read, so both
+are reads of the drain record instead of thread-shared fields.
 
 ### 5.4 Coalescing and backpressure
 
@@ -456,20 +537,21 @@ one-directional: the id's delivery lock, then a session's text lock; the sink li
 
 `FrameSink::deliver` runs on the session's reader thread under that lock, so it may not block and may not
 write a socket itself: it pushes onto the socket's own bounded queue (`FrameQueue`,
-`conpty_session/src/frame_queue.rs`), and the socket's own thread writes the replay and `replay_end`
-before the first queued frame (§6.4). The queue holds whole frames in arrival order up to its cap
-(`CoreOptions::sink_queue_bytes`, 2 MB; `attach_queue` may override it), drops the **oldest whole frames**
+`conpty_session/src/frame_queue.rs`). The socket's own thread is the consumer: it writes replay and
+`replay_end`, then drains frames in order. The queue holds whole frames in arrival order up to its cap
+(`CoreOptions::sink_queue_bytes`, 2 MB), drops the **oldest whole frames**
 on overflow — a frame larger than the whole cap is dropped by itself, so a reader never gets half a frame
 — and counts every dropped byte in its own `dropped_bytes`, so one slow client's loss is its own and not
 the session's. `deliver` holds the queue's mutex only for the append, never across a consumer's work.
-Step 4 adds the consumer: the socket's thread drains the queue and writes the frames, the per-handle count
-moves into the drain record instead of being summed per session (§12.6), and a client that accepts nothing
-for 30 s is closed with code 1000. Until then `Core::take_frames` (with `attach_queue`/`detach_queue`, §5.2)
-is that consumer, and `close` discards what a retired id's socket will never read. One sink's panic costs
-that sink and nothing else: `deliver` is wrapped in `catch_unwind`, the panicking sink is detached and
-counted in `stats.panics` and logged once with its handle, the other sinks still get the frame, and the
-session keeps running. No lock in the delivery path skips its work on poison, so `attach_sink` can never
-return a handle it did not register.
+The per-handle count moves into the drain record instead of being summed per session (§12.6), so a session
+with three sockets reports three counts, and each is marked reported only by the drain that carried it. A
+retired id's socket is closed with code 1000 and its queued frames are discarded. A client that accepts nothing for
+30 s is closed with code 1000. A retired id's socket drains what is still queued, is told `closed`, and
+the queue's memory is released when the socket ends. One sink's panic costs that sink and nothing else:
+`deliver` is wrapped in `catch_unwind`, the panicking sink is detached and counted in `stats.panics` and
+logged once with its handle, the other sinks still get the frame, and the session keeps running. No lock
+in the delivery path skips its work on poison, so `attach_sink` can never return a handle it did not
+register.
 
 One frame bypasses the batch: the resume separator (`spawn`'s `ws_prefix`, `attach_text`'s seed), which
 must land between the predecessor's last bytes and the new process's first. `Session::push_frame`'s
@@ -483,24 +565,34 @@ reads stays intact — the same guarantee `pty.read()` gave Python.
 
 A frame is dropped only when that socket's own queue is full (2 MB of unsent frames): the oldest whole
 frames go, the drop is counted in that connection's `dropped_bytes`, and the count appears in the next
-drain. This is the failure mode today's `put_nowait` on `asyncio.Queue(maxsize=500)` has, except that it
-is counted and a reconnect replays history. A socket that has not accepted a byte for 30 s is closed
-(code 1000) instead of pinning a thread and a 2 MB ring forever.
+drain. Before the core, `put_nowait` on `asyncio.Queue(maxsize=500)` did the same thing silently; the
+count is now visible. A socket that has not made write progress for 30 s is closed (code 1000) instead of
+pinning a thread and a 2 MB ring forever.
+
+The hub keeps each socket's cumulative count by `(session id, handle)` — the core numbers handles per
+session id, so two sessions' handles collide — and logs each increase against that socket
+(`_note_socket_drops`, `session_manager.py:3988`). It is never added to the session's ring loss
+(`dropped_bytes` in the drain record is the ring's), and an id's entries go when its `retire` succeeds or
+the hub stops.
 
 ### 5.5 Threading
 
-| today | after |
+| before the core | after |
 |---|---|
-| pywinpty reader thread + loopback socket per session | 1 blocking ConPTY read thread per session in the core (native, no GIL, no socket) |
+| pywinpty reader thread + loopback socket per session | 3 native threads per session in the core, no GIL, no socket: `core-read-<id>` blocked in `ReadFile`, `core-write-<id>` blocked on its queue, `core-reap-<id>` blocked in `WaitForSingleObject` (§5.3) |
 | `_read_loop` thread per session | gone |
 | `call_soon_threadsafe` per chunk per socket | ≤1 per 50 ms for the whole hub (§5.3) |
 | console `/ws/pty` sender task per socket (uvicorn + asyncio) | 1 core thread per console socket, no asyncio, no uvicorn |
 | `taskkill` process spawn per terminate | `TerminateJobObject` on the session's job |
-| ~5 hub threads per session (winpty reader, socket, asyncio task, accept, cleanup) | hub: 0 per session; core: 1 reader + 1 socket thread per attached console pane, plus 2 fixed (ticker, accept) |
+| ~5 hub threads per session (winpty reader, socket, asyncio task, accept, cleanup) | hub: 0 per session; core: 3 per session, 1 per attached console socket, and fixed ones: `core-ticker`, `ws-accept`, `ws-handshake-<n>` (≤16 at once) and `core-close` per close in flight |
 
 The core's readers are native threads that spend their life blocked in `ReadFile`, so they cost no
-scheduling. An optional later backend (overlapped pipes on a single IOCP) would collapse them, and is
-worth adding only if the load test shows thread count, not CPU, is the limit.
+scheduling; the writer and the reaper are the same, blocked on a condvar and a wait. An optional later
+backend (overlapped pipes on a single IOCP) would collapse the readers, and is worth adding only if the
+load test shows thread count, not CPU, is the limit — at 50 sessions the core alone is ~150 threads plus
+one per attached pane, so §11's "hub threads" criterion is measured on the hub's Python threads
+(`threading.active_count()`) and the process's thread count is recorded beside it, as a number rather than
+a gate.
 
 ### 5.6 What Python no longer does, per chunk
 
@@ -558,21 +650,26 @@ path to run. It also cannot survive the process dying, which is what §6.3 is ab
 - The failing item costs its item, never the loop. A panic in a reader thread ends **that session only**:
   the core drops the pseudoconsole, keeps the screen and scrollback, sets `alive = false`,
   `exit_code = None` and `crashed = true`, and the hub archives it through `classify_end_reason`
-  (`:2312`) the way it archives a failed exit today. The console shows a crashed pane, not a frozen one.
-  A panic in the ticker thread is caught and logged and the thread continues; a panic on the accept thread
-  refuses that connection and keeps the listener. A panic from a `FrameSink::deliver` costs **that sink**:
-  each delivery is wrapped in `catch_unwind`, the sink is detached, counted in `stats.panics` and logged
-  once with the session id and its handle, the other sinks still get that frame and every later one, and
-  the session's reader, screen and scrollback are untouched (§5.4).
+  (`session_manager.py:2953`) the way it archives a failed exit. The console shows a crashed pane, not a
+  frozen one. The hub maps that record exactly: `crashed = true` or `exit_code = None` ends the session as
+  `crashed` for every engine, generic and pwsh included, and the lifecycle event carries `exit_code=None`;
+  a code the core learns after the death record (SF3) rewrites the archived row once, without a second
+  event. A panic in the ticker thread is caught and logged and the thread continues; a panic on the accept
+  thread refuses that connection and keeps the listener. A panic from a `FrameSink::deliver` costs **that
+  sink**: each delivery is wrapped in `catch_unwind`, the sink is detached, counted in `stats.panics` and
+  logged once with the session id and its handle, the other sinks still get that frame and every later one,
+  and the session's reader, screen and scrollback are untouched (§5.4).
 - An error *returned* by one item is handled the same way as a panic: it costs that item, never the
   loop. A socket write that fails closes that socket; a frame a sink cannot take is dropped and counted;
   an accept that fails is logged and retried (§6.4). Only the reader's own end of pipe ends a reader, and
   only `shutdown` ends the ticker and the accept thread. A `?` that leaves a native thread's loop on any
   other error is a bug. Master `3874299` is the Python case of this: one tool output too large to store
-  raised out of the transcript watcher and ended it for the session's remaining life. The step 3 drain
-  handler isolates sessions the same way: an exception while handling one session's record (a scrollback
-  write that persistence refuses, a broken archive) is logged against that session and the drain goes
-  on with the next.
+  raised out of the transcript watcher and ended it for the session's remaining life. The drain handler
+  isolates sessions the same way: each record is applied inside its own guard, in the tick and in the
+  consumer's worker, so an exception while handling one session's record (a scrollback write that
+  persistence refuses, a broken archive) is logged against that session and the drain goes on with the
+  next; the stop's forced final rows are guarded per session too (`_write_remaining_final_rows`,
+  `session_manager.py:7243`).
 - Residual risk the owner accepted with in-process hosting: `abort()`, a stack overflow, an access
   violation, or a second panic while unwinding takes the **whole hub** down — every session, every MCP
   stream, every wait handle. Any dependency compiled with `panic = "abort"` restores exactly that
@@ -603,26 +700,60 @@ ended, and the hub reports that the way the desktop app now reports a hub whose 
 Step 4's test injects accept failures through a `test-hooks` seam and proves the next connection is
 served.
 
+**The handshake never runs on the accept thread.** The accept loop hands each connection to a
+short-lived `ws-handshake-<n>` thread and keeps only `accept` (`listener.rs:602`). At most 16 handshakes
+are in progress at once (`MAX_PENDING_HANDSHAKES`); a peer over the cap is answered `503 Service
+Unavailable` in the accept loop itself and dropped, never queued. Each handshake has one total deadline
+of 5 s (`HANDSHAKE_DEADLINE`, enforced by a timer that shuts the stream down — the socket's read timeout
+bounds one read, so a peer that sends a byte more often than that would otherwise hold its slot forever),
+and a handshake cut off by it is refused `408`. A peer that connects and says nothing, or dribbles its
+request, therefore costs one of 16 slots for at most 5 s and never delays another pane's attach. Refused
+handshakes are logged at the accept loop's cadence, the first and every hundredth of each HTTP status,
+and the line carries the status the wire answered (401 for a missing, unknown, expired or reused ticket, 403
+for a valid ticket of another session, 404 for the path, 408 for the deadline, 410 for an ended session,
+503 for a busy one or a core shutting down) and never the token.
+
 **Ticket.** `core.ws_ticket(session_id, ttl_ms=30_000)` returns
 `ws://127.0.0.1:<port>/ws/pty/<session_id>?ticket=<token>`; the token is
 `nonce || base64url(hmac_sha256(key, session_id ‖ 0x00 ‖ expiry_unix ‖ 0x00 ‖ nonce))`. `key` is 32
 bytes from `BCryptGenRandom`, one per hub process, held only inside the core — which is why the core mints
 the ticket instead of the hub, and why the sidecar design's `hello` handshake is no longer needed at all.
-The hub exposes `GET /api/sessions/{session_id}/terminal-ticket` → `{"url", "expires_in"}`. The handshake
-verifies the MAC, the expiry and that the ticket's session id equals the path's, and remembers the nonce
-until expiry so a ticket is single use. A session that has already ended 404s at the hub before a ticket
-is minted, keeping the console's existing not-found path.
+The hub exposes `GET /api/sessions/{session_id}/terminal-ticket` → `{"url", "expires_in"}`
+(`server.py:1316`). The handshake verifies the MAC, the expiry and that the ticket's session id equals the
+path's, and remembers the nonce until expiry so a ticket is single use.
+The hub 404s before minting for an id it does not list and for a listed id whose core entry is gone
+(retired, or closed for good); with no core built yet it 404s too, and a ticket never builds one (the lazy
+start `/health` keeps). A listed session that has already ended but whose core entry still exists **does**
+get a ticket: the pane attaches an ended session's terminal and shows the final replay, which `/ws/pty`
+always allowed, so the ended state alone is not the 404 test. A starting session (no first alive record
+yet) and a DSH text session get one as well. `expires_in` is the whole seconds left of that mint, and each
+call mints a new ticket because a ticket is single use and a suspended tab's has expired. The mint reads
+the core's session table, so a missed 50 ms deadline answers a retryable 503 in a worker rather than
+blocking the route. The token is a bearer credential: it appears only in the response body — never in a
+URL the hub serves, so uvicorn's access log cannot carry it — and never in a hub log line.
+The nonce table is a bounded store: at most 4096 remembered tickets, expired ones pruned by a heap pop on
+every mint and every consume (never a walk of the table), and a mint past the cap evicts the ticket
+closest to its own expiry. `ttl_ms` is capped at five minutes, so a caller cannot pin a nonce
+indefinitely; an evicted ticket is refused as unknown (401) and the console's reconnect fetches a fresh
+one.
+`core.ws_ticket` reads the session table, so the route awaits it in a worker thread. The answers are: 404
+when the hub does not list the id, when the hub has no core, or when the core's entry is gone
+(`KeyError`); 503 with `{"detail": "终端服务忙，请稍后重试"}` and `Retry-After: 1` when the table missed
+its read deadline (`TimeoutError`) — the console retries every non-404 answer on its existing backoff, so
+a busy table is a retry, not a fault; 500 only for a genuine core fault; otherwise
+`{"url", "expires_in"}`. `/health` also carries `terminal_ws: {listening, port}` from `ws_listening()` and
+`ws_port`, null while the hub has no core, so a dead accept thread is visible before a pane fails.
 
 **Frames and semantics.** The core reproduces `/ws/pty`'s contract, because both the console JS and
 `test_hub_persistence.py:276` parse it:
 
-- Replay: on connect the core sends the *ring as it stands* — `join(raw_history)`, already collapsed by
+- Replay: on connect the core sends the *ring as it stands* — the joined raw ring, already collapsed by
   the in-loop W9 trigger when it fired, and **not** the 512 KiB `_scrollback_blob` trim — followed by one
-  more `OSC_COLOR_QUERY_RE` pass over the joined text (`attach_ws_queue`, `:2426-2437`; the per-chunk
-  strip at `:2333` cannot see a query split across two chunks, so this second pass is what removes it),
-  then `{"type": "replay_end"}`. `isReplayEndFrame` (`static/js/session-workspace.js:33`) already
-  accepts a server that sends the marker, and the 1.5 s fallback timer covers one that does not, so no
-  JS change is needed for the marker itself.
+  more `strip_color_queries` pass over the joined text (`esc.rs:53-54`, the hub's `OSC_COLOR_QUERY_RE`;
+  the per-chunk strip cannot see a query split across two chunks, so this second pass is what removes
+  it), then `{"type":"replay_end"}`. `isReplayEndFrame`
+  (`static/js/session-workspace.js:29-33`) accepts a server that sends the marker, and the 1.5 s fallback
+  timer covers one that does not, so no JS change was needed for the marker itself.
 - Q11 atomicity lives in the core: one session mutex covers "append to the raw ring + publish to
   subscribers" and "snapshot the replay + register this socket", so a chunk is either inside the replay
   or in the socket's queue, never both and never neither. There is no Python lock left to race.
@@ -644,31 +775,57 @@ is minted, keeping the console's existing not-found path.
   during that swap is kept exactly once: it lands either fully before the handover (its replay includes
   the old bytes and the banner) or fully after it.
 - W8 on resume: `spawn(strip_esc3j_on_output=true)` drops `ESC[3J` with the same 3-byte carry.
-- Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as today. OSC
-  terminal replies are stripped in the core with `OSC_TERMINAL_REPLY_RE`'s pattern (`:1853`) before any
-  input reaches the PTY. A resize is **not** applied by the core: it raises a `resize` dirty flag with the
-  requested cols/rows, and the hub applies the 20/5 clamp and the single-window propagation
-  (`resize_session_from_client`, `:3161`) on its next tick, because propagation is policy. Worst case
-  that is one drain interval (50 ms), well inside what a pane refit already costs.
-- Slow client: per-socket 2 MB ring, oldest whole frames dropped and counted (§5.4); a socket that
-  accepts nothing for 30 s is closed with code 1000. Today's `asyncio.Queue(maxsize=500)` drops silently;
-  the new count is visible in `stats`.
+- Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as before, and a
+  frame is an object only when it is exactly one JSON value and that value is an object, which is
+  `json.loads`'s rule: trailing junk, a non-JSON number (`+1`, `01`, `1.`, `NaN`, `Infinity`), a bad
+  escape or an unterminated string makes the whole frame bare text, and bare text is written as it
+  arrived. Duplicate keys keep the last value. `"data"` that is a string is written as is (after the
+  reply strip); absent or `null` writes nothing; any other type is ignored and logged once per socket —
+  Python wrote `str(data)`, the console never sends it, and reproducing Python's `repr` is not worth a
+  code path. A lone surrogate escape becomes U+FFFD, because a Rust `String` cannot hold one and
+  `json.loads` accepts it. `resize` takes `cols`/`rows` as JSON integers (truncating a fraction as
+  `int()` does) or as the ASCII form `int()` accepts, with whitespace and a sign; `propagate` is `bool()`
+  of the value and `true` when absent; a size `int()` would refuse, or one outside `1..=65535`, is no
+  resize at all. OSC terminal replies are stripped in the core with `OSC_TERMINAL_REPLY_RE`'s pattern
+  (`OSC_TERMINAL_REPLY_RE`, `session_manager.py:2000`) before any input reaches the PTY. A resize is
+  **not** applied by the core: it raises a `resize` dirty flag with the requested cols/rows, and the hub
+  applies the 20/5 clamp and the single-window propagation (`resize_session_from_client`,
+  `session_manager.py:4301`) on its next tick, because propagation is policy. Worst case that is one
+  drain interval (50 ms), well inside what a pane refit already costs.
+- Slow client: per-socket 2 MB ring, oldest whole frames dropped and counted (§5.4); a socket that makes
+  no write progress for 30 s while it still owes the peer bytes is closed with code 1000. "Owes" counts a
+  write in flight — the replay above all, which goes out before the first frame — and not only a
+  non-empty frame queue; an idle pane owes nothing and keeps its socket. Writes block for at most a 250 ms
+  slice (`WRITE_SLICE`), tungstenite keeps an unfinished frame in its own buffer and the socket thread
+  resumes it, so a close request and the stall clock are never more than one slice behind.
+  `close_sockets`, `retire` and `shutdown` shut the stream down when they find a blocked write instead of
+  waiting for it: they return at once and the thread ends within a slice. Before the core,
+  `asyncio.Queue(maxsize=500)` dropped silently; the new count is per handle in the drain record.
+- **Close.** A permanent close (`close_session`), a hub stop and a `retire` each close the id's sockets
+  with code 1000 (`close_sockets`; `_close_terminal_sockets`, `session_manager.py:3636`); the close path
+  and the stop run that off the loop, and the stop's batch shares what is left of its 8 s budget. A
+  natural process death and a resume close nothing (A1): the pane keeps its socket across the resume, and
+  the retire is what ends it.
 - permessage-deflate: uvicorn's default offers it (`ws_per_message_deflate: bool = True` in the installed
   uvicorn 0.42.0 config source; the lock pins 0.54.0, unverified there), so today's frames are
   compressed. The core starts **without** deflate: the link is loopback, so bandwidth is free, while
   compression costs CPU on both ends for a stream the browser re-parses anyway. `tungstenite`'s deflate
   support (unverified) keeps the option open if §11 shows a difference worth having.
 
-**Console JS changes.** `hubApi.ptySocketUrl(id)` (`static/js/hub-api.js:79`) becomes asynchronous: it
-fetches `/api/sessions/{id}/terminal-ticket` with a bounded timeout, then opens the returned URL.
-Everything else stays — replay buffering, the marker, reconnect backoff (`:1129`), the reply-drop window.
-A failed ticket fetch takes the existing reconnect path, so a restarting hub looks exactly as it does
-today.
+**Console JS changes.** `hubApi.ptySocketUrl(id)` is gone; `hubApi.terminalTicket(id)`
+(`static/js/hub-api.js:82`) fetches `/api/sessions/{id}/terminal-ticket` with a 5 s bound, and the pane's
+`connect()` (`static/js/session-workspace.js:1100`) opens `new WebSocket(ticket.url)`. Everything else
+stays — replay buffering, the marker, reconnect backoff, the reply-drop window. A 404 takes the console's
+closed-pane path (`terminalClosed`, no retry); a timeout, a 503 or a missing `url` takes the existing
+reconnect path, so a restarting hub looks exactly as it did before. One attempt identity per fetch keeps
+a late response from opening a socket for a pane that was already removed. `test_terminal_seam` pins the
+shape: no `ptySocketUrl`, no `/ws/pty/` in `hub-api.js`, `terminal-ticket` present, `new WebSocket(url)` in
+the workspace.
 
 ### 6.5 GIL rules and the event loop
 
 - Every `pymethod` that can block (spawn, kill, screen, scrollback, raw, drain, `snapshot_all`) releases
-  the GIL for its duration (`Python::allow_threads`).
+  the GIL for its duration (`py.detach` in PyO3 0.30).
 - The core holds exactly two Python callables: `notify`, called by the ticker only (≤20/s, plus one per
   session end), and `log`, called on spawn, kill and panic only. Neither ever runs on a per-chunk path,
   and neither is called while the core holds a session mutex. Python may therefore hold the GIL for a
@@ -679,17 +836,49 @@ today.
   back).
 - Deadlines (§5.2) mean a wedged reader thread costs one bounded call, not a hung loop; the call returns
   the cached snapshot and marks the session `degraded`.
+- Every blocking call of the stop runs off the loop. The one 8 s budget starts at entry and every later step gets
+  what is left of it. The reconcile drains at the top are not part of that bounded work: a drain only takes the
+  records the core already queued, and the core's table read inside it is bounded at 50 ms, so a reconcile drain
+  is a loop call by intent (§5.3). The steps that still run after the budget is spent get a 0.05 s floor each,
+  and the producer-cancel wait keeps its own 0.3 s, so with a wedged core the stop can reach about 9 s — never
+  8 s plus a fresh per-step timeout. `snapshot_all`, `kill_all`, the `close_sockets` batch and the final rows
+  each get a share of what is left, and a share that is already spent skips its step; the consumer drain and the
+  request workers a cancelled consumer left running share one bounded wait. Every archive path (the stop's and
+  the close's) and the forced final rows are handed a worker snapshot; a session whose reads missed gets an
+  empty one, which stores nothing and so keeps what an earlier persist wrote, because a live read there is
+  exactly what would stall the stop again.
+
+**Retire retries and their cap.** A `retire` the core refuses (an exit record or code no drain has
+carried yet, a spawn/attach/retire in flight for that id, a busy table) keeps the id pending, bound to the
+incarnation it was dropped for, and one background timer tries again: every 250 ms
+(`RETIRE_RETRY_INTERVAL_SEC`, `session_manager.py:447`), and only the timer's own attempts count towards
+`RETIRE_RETRY_MAX_ATTEMPTS` (40, ≈10 s), so a busy drain's record-driven retries cannot spend the budget.
+Passing the cap does not abandon the drop: it logs one line with the real refusal count and retries every
+5 s (`RETIRE_RETRY_SLOW_SEC`) until `retire` succeeds or the core no longer knows the id. Only a resume of
+that exact incarnation cancels the pending drop, because its `spawn`/`attach_text` replaces the entry and
+takes the sink fan-out over (§5.4); a retry re-reads the id's incarnation after every awaited core result
+and queues nothing for a generation a resume has replaced. A retired id never happens before the row that
+needs it: a code the core learned after the death record is written to the archived row first, so `retire`
+cannot take the answer away from it.
+
+A non-retryable `retire` failure (`RuntimeError` from the core's panic wrapper or a seam `TypeError`) drops
+the tombstone and socket diagnostics and logs the id once; it does not start a delayed retry.
 
 ### 6.6 Lifecycle and shutdown
 
 - Sessions end with the hub by construction: the module and its threads die with the interpreter, so
   `shutdown-ends-cli` needs no supervision code — but it does need ordering, or agents are left with a
-  dead MCP endpoint. Shutdown keeps the recorded order (`graceful-budget`): stop producers,
-  `snapshot_all(max_lines=250, max_bytes=512 KiB)` per live session, `kill_all(grace_ms=2000)` — every
-  session terminated in parallel inside one 2 s budget, `TerminateJobObject` first and
-  `ClosePseudoConsole` on a helper that may outlive the call — then drain persistence inside the shared
-  8 s budget. `snapshot_all` returns what `persist_session` archives today (`:4369`), so the rows do not
-  change.
+  dead MCP endpoint. Shutdown keeps the recorded order (`graceful-budget`): one reconcile drain, then a
+  second one drain interval later (50 ms, `SHUTDOWN_RECONCILE_DRAINS`, `SHUTDOWN_RECONCILE_GAP_SEC`) —
+  both inside the budget — so a death that happened just before the stop keeps its ordinary finalization
+  (native transcript drain, final row, one lifecycle event) and only the deaths `kill_all` causes take the
+  stop's own archive path; then stop producers, `snapshot_all(max_lines=250, max_bytes=512 KiB)` per live
+  session, `kill_all(grace_ms=2000)` — every session terminated in parallel inside one 2 s budget,
+  `TerminateJobObject` first and `ClosePseudoConsole` on a helper that may outlive the call — then archive
+  inside the shared 8 s budget (`SHUTDOWN_MAX_SEC`) and stop the core's ticker last. `snapshot_all` returns
+  what `persist_session` archives today, so the rows do not change. Anything the budget leaves unarchived
+  still gets its final row before the store closes, each session inside its own guard: one session's
+  failing row costs that row only.
 - Interpreter exit does not kill sessions by itself: the per-session job objects do. Each session holds a
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job, so the CLI trees die when the interpreter's handles close even
   if `kill_all` never ran (a crash, a `taskkill`), which is the guarantee the desktop app's outer job gave
@@ -751,8 +940,9 @@ newest-first and stopped at `max_lines`. Padding cells render as spaces; a wide 
 
 The artifact is one `cdylib` renamed to a Python extension. No wheel, no index, no `requirements.lock`
 entry: `python server.py` puts the script's directory first on `sys.path`, so a `hub_terminal_core.pyd`
-beside `server.py` is importable in both run paths, and pywinpty leaves `requirements.in` at the same
-time.
+beside `server.py` is importable in both run paths. The core replaces `pywinpty`; neither `pywinpty` nor
+`pyte` is installed by the portable runtime, and step 6 deleted the dev-only oracle with its renderer and
+tests.
 
 `terminal-core/` is its own Cargo workspace (`terminal-core/Cargo.toml`), *not* a member of
 `desktop/src-tauri`, because that manifest sets `panic = "abort"`, `opt-level = "s"` and full LTO for the
@@ -774,16 +964,18 @@ a venv per interpreter, so per-minor artifacts would mean four builds and a sele
 Whether the current PyO3 release supports the stable ABI up to 3.14 is unverified — that is step 1's first
 gate; if it does not, build per minor and let the portable payload carry four files.
 
-**Portable build.** The payload is an explicit manifest: `desktop/portable/payload.txt` lists repo-relative
+**Portable build.** The release script builds the core with the same path remapping as the EXE; `strip =
+"symbols"` alone leaves Cargo registry paths in the `.pyd`. The payload is an explicit manifest:
+`desktop/portable/payload.txt` lists repo-relative
 paths, `build.rs` `embed_portable_resources()` embeds each file into the EXE and hashes them into
 `PAYLOAD_ID`, and the app unpacks them to `resources/<PAYLOAD_ID>/` where `server.py` lives
 (`portable_runtime.rs:18`). So the `.pyd` joins that manifest (`desktop/portable/hub_terminal_core.pyd`,
 produced by the release script before `pnpm build:portable`), lands beside `server.py` in the unpacked
 resources, and needs no venv change at all. Two consequences to handle in the release script:
 - `desktop/scripts/check-portable-privacy.mjs` scans every payload member for host paths and credentials
-  and rejects member names ending `.exe`/`.pdb` (a `.pyd` passes the name rule). A stripped Rust PE can
-  still carry a CodeView path, so the `.pyd` needs the same PE check the EXE already gets (`checkPe`) and
-  must build with `strip = true`; if the gate trips, that is a build-config fix, not a gate exemption.
+  and rejects member names ending `.exe`/`.pdb` (a `.pyd` passes the name rule). It runs `checkPe` on every
+  `.pyd` payload member. A stripped Rust PE can still carry a CodeView path, so the `.pyd` uses the same PE
+  check the EXE gets; if the gate trips, that is a build-config fix, not a gate exemption.
 - `bootstrap.ps1` `Check-Imports` runs `python -I -c 'import …'`; `-I` implies `-P`, so the script
   directory is *not* on `sys.path`. The check must add the resources dir explicitly
   (`sys.path.insert(0, …); import hub_terminal_core`) or it would report a false failure.
@@ -805,25 +997,27 @@ missing `.pyd` now stops it with the message above instead of starting a hub wit
 
 ### 7.4 Crates that need the owner's approval
 
-Versions marked "in lock" are already resolved in `desktop/src-tauri/Cargo.lock` (verified); the others
-are new downloads.
+The versions below are the ones `terminal-core/Cargo.lock` resolves today; "in the app lock" says whether
+the same version already sits in `desktop/src-tauri/Cargo.lock`, so a developer's registry copy is warm.
 
-| crate | purpose | in `desktop/src-tauri/Cargo.lock` |
-|---|---|---|
-| `pyo3` (version pinned at step 1) | the extension module, `#[pymethods]`, `allow_threads`, abi3 | no |
-| `tungstenite` (version pinned at step 1) | RFC 6455 handshake, frames, ping/pong on the console socket | no |
-| `hmac` | HMAC-SHA256 for the terminal ticket (pairs with the `sha2` already in the lock) | no |
-| `sha2` 0.10.9 | hash primitive under `hmac` | yes |
-| `base64` 0.21.7 | ticket encoding | yes |
-| `windows` 0.62.2 (`Win32_System_Console`, `Win32_System_JobObjects`, `Win32_System_Pipes`, `Win32_Storage_FileSystem`, `Win32_Security_Cryptography`) | ConPTY, job objects, pipes, `BCryptGenRandom` | yes (crate present; those features are not enabled in the app's manifest yet) |
-| `vte` 0.15.0 (`alacritty_terminal` was approved with it but is not used, §7.2) | VT parsing; the screen model is the core's own copy of pyte's | no |
-| `crossbeam-channel` 0.5.17 | bounded writer queue and ticker notifications | yes |
-| `regex` 1.13.1 | the two OSC patterns, only run when the buffer contains `\x1b]` | yes |
-| `flate2` 1.1.11 | only if §11 makes permessage-deflate worth enabling | yes |
+| crate | version | purpose | in the app lock |
+|---|---|---|---|
+| `pyo3` | 0.30.1 (`abi3-py311`, `extension-module`) | the extension module, `#[pymethods]`, `py.detach` (was `allow_threads`), abi3 | no |
+| `tungstenite` | 0.28.0 (default features) | RFC 6455 handshake, frames, ping/pong, close handshake on the console socket; blocking, no async runtime | no |
+| `hmac` | 0.12.1 | HMAC-SHA256 for the terminal ticket | no |
+| `sha2` | 0.10.9 | hash primitive under `hmac` | yes |
+| `base64` | 0.21.7 | ticket encoding (`URL_SAFE_NO_PAD`) | yes |
+| `windows` | 0.62.2 (`Win32_Foundation`, `Win32_Security`, `Win32_Security_Cryptography`, `Win32_Storage_FileSystem`, `Win32_System_Console`, `Win32_System_Diagnostics_ToolHelp`, `Win32_System_Environment`, `Win32_System_IO`, `Win32_System_JobObjects`, `Win32_System_Pipes`, `Win32_System_Threading`) | ConPTY, job objects, pipes, ToolHelp, `BCryptGenRandom` | yes (crate present; these features are not enabled in the app's manifest) |
+| `vte` | 0.15.0 (`alacritty_terminal` was approved with it but is not used, §7.2) | VT parsing; the screen model is the core's own copy of pyte's | no |
+| `regex` | 1.13.1 | the two OSC patterns, only run when the buffer contains `\x1b]` | yes |
+| `unicode-normalization` | 0.1.26 | pyte NFC-composes every combined cell; this crate supplies the same tables (decision `nfc-compose`) | no |
 
-Deliberately not used: `serde`/`serde_json` (there is no wire protocol any more), `parking_lot` (std
-mutexes are enough), `tokio` (no async runtime in the core), `unicode-width` (the parser's grid owns cell
-widths), `winpty-rs` and `portable-pty` (§7.1).
+The socket's two input shapes are read by the small hand-written `ws/input.rs` reader. `serde_json` remains
+the owner's open call (`json-reader`); the current default keeps it out of the approved crate set.
+Other deliberately unused crates are `crossbeam-channel` (the writer queue is a std condvar and `VecDeque`),
+`parking_lot` (std mutexes are enough), `tokio` (no async runtime in the core), `unicode-width` (the
+parser's grid owns cell widths), `flate2` (permessage-deflate stays off until §11 shows a reason),
+`winpty-rs` and `portable-pty` (§7.1).
 
 ## 8. Semantics that must survive migration
 
@@ -867,8 +1061,8 @@ before each step starts and again before step 6, so the Python suites of these f
 |---|---|---|---|
 | `4e693ce` | pyte drew the residue of a CSI with a `:`, `<` or `=` marker as text | §8 row; `vte` reads the sequence whole, `csi_marker.rs` (step 2's copy of the bug) is deleted in step 2c | 12 re-rendered screen goldens; `edge-screen-*` marker cases |
 | `ee943e3` | a trim cut inside the newest resume banner dropped it | §8 W9 row; `history.rs` carries `BANNER_LINE_MAX_BYTES` | `edge-w9-*` goldens |
-| `defa26b` (on master via `5abe2db`) | pyte dropped the rest of a text run after a zero-width character (ZWSP, ZWJ, VS16 in `⚠️`) | a zero-width character that is not combining takes no cell, starts no pending wrap, and the text after it is drawn | `edge-screen-*` zero-width cases; `test_terminal_screen_zero_width` |
-| `a3dce22` (branch `fix/pyte-csi-esc-restart`, not on master yet) | pyte drew the rest of a CSI cut by an ESC, a C0 control or a DEL as text | §8 row; `vte` already reads them as a terminal does, no core change | `edge-screen-csi-cancel`, `edge-screen-csi-controls`; `test_terminal_stream_csi` |
+| `defa26b` (on master via `5abe2db`) | pyte dropped the rest of a text run after a zero-width character (ZWSP, ZWJ, VS16 in `⚠️`) | a zero-width character that is not combining takes no cell, starts no pending wrap, and the text after it is drawn | `edge-screen-*` zero-width cases; `test_terminal_core_screen_cases` |
+| `a3dce22` (branch `fix/pyte-csi-esc-restart`, not on master yet) | pyte drew the rest of a CSI cut by an ESC, a C0 control or a DEL as text | §8 row; `vte` already reads them as a terminal does, no core change | `edge-screen-csi-cancel`, `edge-screen-csi-controls`; `test_terminal_core_screen_cases` |
 | `4b06139` | one failed accept closed the hub's listener for good | §6.4: the core's accept loop survives every accept error; `ws_listening()` in the health check | step 4 test with injected accept failures |
 | `3874299` | one oversized record ended a long-lived watcher loop | §6.3: an error costs its item, never the loop, in every native thread and in the step 3 drain handler | step 2c/3 review checks every `?` and `break` in the native loops; a step 3 test makes one session's scrollback write fail and sees the next session drained |
 | `0e17c54` | a scrolled or slowly typed Codex paste never settled, so no Enter was sent | new consumer (§4): the settle loop reads the composer every 0.1 s and must see the scroll mark `↑` and each new frame as pyte does | step 3 live capture `live-codex-scrolled-paste` (§10) |
@@ -885,19 +1079,22 @@ No flag, no shadow mode, no dual ownership. The work happens on the long-lived `
 branch; every step's gate is tests (cargo, the ported Python tests, fixture parity), never a runtime
 switch, and there is exactly **one cut-over merge**. Before the merge the hub still runs pywinpty; after
 it, the branch's tree runs only the extension. Rollback is `git revert` of the merge. No data migration:
-`raw`/`scrollback`/`last_screen` keep their formats. `pyte` survives to step 6 as an offline, dev-time
-oracle only: it renders the frozen corpus so the Rust parser can be compared against it, it is never
-imported by the hub after step 3, and it is deleted with its `requirements.in` entry in step 6.
+`raw`/`scrollback`/`last_screen` keep their formats. `pyte` was an offline, dev-time oracle only: it
+rendered the frozen corpus so the Rust parser could be compared against it, the hub never imported it after
+step 3, and step 6 deleted it with its renderer and its tests; the committed goldens are the spec and the
+corpus gate compares them against the core. No requirements file lists pyte (the portable manifest lost the
+entry in step 5).
 
 | step | work | gate | rollback | size |
 |---|---|---|---|---|
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
 | 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs`; step 2d makes the delivery state (lock, sinks, handles) belong to the session id, which step 4's sockets attach to | `cargo test` **and** `cargo test --features conpty_session/test-hooks` in `terminal-core/` (the delivery-order, resume-handover and panic-isolation cases need the hooks; neither the hooks nor their call sites exist in a release build): `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; `screen_exceptions.jsonl` is empty (the core NFC-composes with `unicode-normalization`), and a row that stops differing still fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach, `sink_handover.rs` the resume handover, and both pass 20 runs in a row with the hooks on | branch only | M, 5-7 d |
-| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b-core (done) delivered the calls the swap needs: the per-socket `FrameQueue` (`conpty_session/src/frame_queue.rs`) with the temporary `attach_queue`/`take_frames`/`detach_queue` bridge for the Python `/ws/pty` socket, `retire` (an ended session leaves the table, gated on its exit record), `raw_rev` in the drain record for the seam's `raw_revision`, and `attach_sink` releasing its owner `Arc` after the delivery lock; `seam-coverage.md` maps every seam method to its core call and reply field. 3b-hub swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase` and pywinpty deleted from the hub (the pyte classes and the trim helper move to a `tools/` oracle module, `oracle-to-tools`; `unwrap_windows_cmd_shim` stays, `cmd-shim-stays-python`); every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty`; the two screen readers master added (§8.1) get live captures from the step 0 recorder's stop points (`--followup FILE` types a draft and ends once the screen stands still, `--deny-box [TEXT]` ends at a settled approval box after denying it with Escape; both write `consumer.reads_at_chunk` to meta.json) and `test_terminal_live_consumers.py` replays that prefix through the core and through pyte and runs the real consumers on both | the full Python suite on the branch, with the ported tests from §10; `test_terminal_live_consumers` (skips without the built extension); `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
-| 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; the socket thread drains the `FrameQueue` step 3b-core built (it writes the replay and `replay_end` before the first frame) and **deletes the three pull calls** (`attach_queue`/`take_frames`/`detach_queue`), while `FrameQueue` and `retire` stay; per-socket `dropped_bytes` reported per handle in the drain record rather than summed per session, and `attach_sink`'s replay render measured under the delivery lock (≈1.5 ms at the 512 KiB cap) before deciding whether to move it out; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
-| 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
-| 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; delete `tools/fixtures`'s pyte oracle and the `pyte` dependency entry | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
+| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods. 3b-core (done) delivered `FrameQueue`, `attach_sink`, `retire`, `raw_rev`, and the delivery-lock ownership fix; 3b-hub swaps the seam bodies for the core and deletes the Python PTY/parser path. | the full Python suite on the branch, with the ported live-consumer tests | branch only | L, 6–9 d |
+| 4. Terminal sockets in the core | Done: the WS listener, tickets, replay/`replay_end`, input and OSC stripping, `close_sockets`, and console ticket fetch are in the core. The socket thread consumes `FrameQueue` directly through `attach_sink`; the temporary `attach_queue`/`take_frames`/`detach_queue` calls and Python `/ws/pty` path are removed. Per-socket `dropped_bytes` is reported per handle in the drain record. | the core WS tests, focused Python terminal suite, and the full suite | branch only | M, 4–6 d |
+| 5. Packaging and the required import | Done: `payload.txt` and the release script produce and embed the `.pyd`; the privacy gate applies `checkPe` to each `.pyd`; `bootstrap.ps1` `Check-Imports` adds the resources directory; `.gitignore` is updated; `requirements.in`/`requirements.lock` drop `pyte` and `pywinpty`. | the portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
+| 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; with the goldens frozen, delete the pyte oracle (`tools/pyte_oracle.py`), its renderer (`tools/render_terminal_fixtures.py`) and the three tests that drove the oracle's classes, porting every case to the core first (`terminal_stream/tests/trim_history_cases.rs`, `test_terminal_core_screen_cases.py`), and freeze the live consumers' stop-point screens as `screen-at-consumer-read.txt`; the recorder's own live screen becomes a core text session; no pyte dependency entry remains. | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
+| 6a. Load-test tooling | Done: `tools/fake_tui_engine.py`, `tools/load_terminal_core.py`, and `test_fake_tui_engine.py` provide the recorded-rate replay, marker accounting, and probe harness described in §11; the full 300 s comparison remains in step 6. | tool tests and the 60 s smoke runs; the full comparison is step 6's gate | branch only | S, 1–2 d |
 
 Total ≈ 5–6 weeks for one implementer plus review; steps 2 and 3 dominate, and step 3 is the only one that
 touches most of `session_manager.py`.
@@ -910,7 +1107,7 @@ Existing tests that cover this behaviour and what porting them means:
 |---|---|---|
 | `test_tui_delivery.py` | checked-submit key sequence, one Enter, clear input, no screen-based proofs | replace the shared `FakePty` (`test_native_records.py:15`) with a fake core client that records the same `inputs` list; keep the assertions literally |
 | `test_session_approvals.py` | approval keys reach the PTY, `get_clean_screen_text` patched per test | same fake client; patch the client's `screen` instead of the method |
-| `test_hub_persistence.py` | scrollback blob written once per rev, `_scrollback_rev_written`; and one live `/ws/pty` connect (`:276`) | assert on the core's `rev`; point the WS case at the core's listener with a minted ticket and keep the `replay_end` expectation |
+| `test_hub_persistence.py` | scrollback blob written once per rev, `_scrollback_rev_written`; and one live core-socket connect (`:276`) | assert on the core's `rev`; point the socket case at the core listener with a minted ticket and keep the `replay_end` expectation |
 | `test_restart_resume_on_start.py` | resume banner, continuation text, archived-at-stop paths | add: the seeded history and the banner arrive in one `spawn(seed_history=…, ws_prefix=…)` call and the banner precedes the first output frame |
 | `test_event_loop_stalls.py` | loop latency under a write backlog | add a case that fires 20 drains of 50 records through the fake client; existing cases unchanged |
 | `test_session_launch_args.py` | argument stripping/injection | unchanged; the shim table stays here with the shim (`cmd-shim-stays-python`) |
@@ -942,26 +1139,38 @@ New tests, none run by this unit:
   tree (a spawned `cmd /c start` grandchild must not survive), a failed accept followed by a served
   connection (§6.4, master `4b06139`).
 - Live captures for the screen readers master added after this design (§8.1), recorded in step 3 with
-  the step 0 recorder's stop points and rendered by the oracle: `live-codex-scrolled-paste` (Codex at
+  the step 0 recorder's stop points: `live-codex-scrolled-paste` (Codex at
   80×24, a 945-character follow-up typed unsent so the composer scrolled and the `↑` mark shows on its
   top visible row) and `live-omp-approval-box` (an omp approval box at 120×36 whose `Command:` row runs
   to the frame's edge and is cut with `…`; the recorder denied it with Escape and never approved it).
   Both record `consumer.reads_at_chunk`, the chunk a replay stops at to reproduce exactly the screen the
   consumer read, and `test_terminal_live_consumers.py` feeds that prefix through the core (`attach_text`
-  + `feed`) and through pyte, asserts the two screens are equal, and runs the real consumers on both:
+  + `feed`), asserts the screen equals `screen-at-consumer-read.txt` (the oracle's last answer, frozen
+  before step 6 deleted it), and runs the real consumers on the core:
   `_codex_composer_shows_whole` accepts the settled composer, and the omp box parse yields the same tool,
   command and `command_truncated` flag (True) from both. Their older tests pass the screen in as a
-  string; these are the only ones that feed recorded bytes through either screen model.
+  string; these are the only ones that feed recorded bytes through the core screen model.
 - Rust, build config: CI asserts the extension's profile unwinds (a `cargo metadata`
   `profile.release.panic` check for the core crate), because a stray `panic = "abort"` silently turns
   every caught panic back into a hub kill.
+- `test_terminal_ticket_endpoint.py`: the ticket route and `/health` on the fake core — 404 for an unknown id, a listed id with no core entry and a hub with no core; 200 for a starting, an ended-but-listed and a text session; the `{"url","expires_in"}` shape and one new URL per call; the token absent from every log record and from uvicorn's access log; `terminal_ws` for a live listener, a stopped one and no core (which is never built).
+- `test_terminal_core_contracts.py` (`DrainRequestTests`): the hub's application of a drain record — resize requests in arrival order with `propagate` false/true, the 20x5 clamp, taken once; text `input_requests` echoed and delivered once, with backspace editing; a bad request costs itself only; `socket_drops` per `(id, handle)` and apart from the ring; a close asks the core once and forgets the id.
+- Python and Rust, oracle cases ported at step 6: `test_terminal_core_screen_cases.py` drives the core
+  with the exact inputs of the deleted oracle tests (`test_terminal_screen_zero_width.py`,
+  `test_terminal_stream_csi.py`) — zero-width draws and splits, combining, marker CSIs whole and split,
+  DECAWM, CAN/SUB, `$p`, and ESC/C0/DEL inside a CSI — and `terminal_stream/tests/trim_history_cases.rs`
+  ports the W9 trim cases the unit tests did not cover. The core keeps no cell attributes, so the oracle's
+  `bold`/`fg`/`underscore` assertions are not ported; `vte` does not read `0x9b` as a CSI start, so an
+  eight-bit CSI renders its tail as text (no recording contains one).
 - Python: `test_terminal_core_client.py` — the wrapper's missing-module message, deadline expiry returns
   the cached snapshot and marks `degraded`, `drain` clears flags so a second call returns nothing,
   `crashed` sessions archive as crashed rather than hanging a call, and the ticket endpoint 404s for an
-  unknown or ended session.
-- Console: the repo has no JS test harness, so the ticket fetch (`ptySocketUrl` becoming async) is
-  covered by a manual pass per engine in step 4's gate: replay, reconnect after a hub restart, input,
-  resize and the resume banner.
+  unknown id or a core entry that is gone while an ended-but-listed entry still returns its final replay.
+- Console: the repo has no JS test harness, so the ticket fetch (`terminalTicket` and `connect` awaiting it)
+  is covered by a manual pass per engine in step 4's gate: replay, reconnect after a hub restart, input,
+  resize and the resume banner, plus a rejected-then-successful fetch, a pane disposed while its ticket is
+  in flight, overlapping attempts, two tabs of one session, a tab suspended past the TTL, a 404 that closes
+  the pane, and a restart with a pane open.
 - Load/soak: §11.
 
 ## 11. Load test
@@ -970,17 +1179,28 @@ Run only when the machine is idle; it is not part of the default suite.
 
 - `tools/fake_tui_engine.py` replays a recorded corpus (JSONL of `(delay_ms, chunk)` from step 0) at the
   recorded rate to stdout, then prints a final byte count. Started as a normal session, so the whole real
-  path is exercised (system ConPTY, core, hub, console), with `--speed 1` matching today's 72 chunks/s per
-  session.
+  path is exercised (system ConPTY, core, hub, console), with `--speed 1` replaying the recorded rate
+  (1.9–12.7 chunks/s per `live-*` case; `--speed` raises it, for example `--speed 6` is about 42 chunks/s
+  average).
 - `tools/load_terminal_core.py` starts 15 / 30 / 50 sessions, attaches one WebSocket consumer each, samples
-  for 5 minutes and records: hub CPU (`\Process(python*)\% Processor Time`), context switches per second
-  for the hub PID (`\Thread(*)\Context Switches/sec`), thread count, event-loop lag (a coroutine measuring
-  `sleep(0.05)` overshoot, p50/p99/max, the technique `test_event_loop_stalls.py` already uses), GIL-held
-  share (py-spy `--gil` if available, otherwise loop lag and CPU as proxies), `core.stats()` counters,
-  drain count per second (expected ≤20), and per-session byte accounting (corpus bytes vs bytes delivered
-  to the consumer).
+  for 5 minutes and records: hub CPU (`\Process(python*)\% Processor Time`), thread count, event-loop
+  lag (a coroutine measuring `sleep(0.05)` overshoot, p50/p99/max, the technique `test_event_loop_stalls.py`
+  already uses), GIL-held share (py-spy `--gil` if available, otherwise loop lag and CPU as proxies),
+  `core.stats()` counters, drain count per second (expected ≤20), and per-session byte accounting. The
+  latter needs a per-session byte counter from `core.stats()`; today the hub drops the drain record's
+  per-session counters, so the load tool compares the core's global `bytes_total` with the consumers' sum
+  and relies on `dropped_bytes`, the hub's socket-drop counter and numbered marker lines for loss.
+- Read event-loop lag against a baseline measured on the same machine before any session spawns: the probe's
+  floor on Windows is one timer tick, about 11 ms at 50 ms granularity, and under load the loop wakes more
+  often, which lowers the floor.
+- Method notes: lag is measured by a coroutine injected with `sys.remote_exec` (fallback: a `GET /health`
+  round trip, labelled); context switches per second are not measured because Windows has no cheap per-process
+  counter; the tool sets `HUB_PROFILES_PATH` under its data folder because the hub's default profiles file is
+  the live hub's (`%APPDATA%\mcp-agent-hub\agent_profiles.json`), so any second hub must do the same.
 - Pass criteria at 50 sessions: hub CPU < 0.5 core, p99 loop lag < 50 ms, no lost bytes, Python-side
-  wakeups < 1,000/s, hub threads < 20, console FPS ≥ 30 while a session prints continuously.
+  wakeups < 1,000/s, **Python-side hub threads < 20** (the core runs three native threads per session plus
+  one per console socket, so the total OS thread count at 50 sessions is about 200 by construction), and
+  console FPS ≥ 30 while a session prints continuously.
 - The comparison is against `master` before the cut-over merge: the same script pointed at a hub on the
   pywinpty code (the recorded 12-session profile in §2 is the baseline). There is no `off` mode to compare
   against after the merge, which is the point of removing the flag.
@@ -990,7 +1210,10 @@ Run only when the machine is idle; it is not part of the default suite.
 1. **Parser parity.** The approval and composer parsers match exact rows. `alacritty_terminal` may render
    a cell differently from pyte in ways nobody has hit yet. Mitigation: step 0's frozen corpus, rendered
    both ways in step 2's tests; an unexplained diff is a port bug, and one that survives review blocks the
-   merge rather than getting a per-engine exemption (there is no second path to fall back to).
+   merge rather than getting a per-engine exemption (there is no second path to fall back to). `vte` does
+   not read U+009B (an eight-bit CSI start) as a CSI, so `"\x9b<uhello"` renders `<uhello` where pyte
+   rendered `hello`; ConPTY emits only seven-bit sequences and no recording contains one, so this remains
+   a known limitation.
 2. **W9 byte parity.** The trim is byte-level (UTF-8 split, banner protection, prefix). Golden fixtures are
    the only defence; treat any diff as a bug in the port, not in the fixture.
 3. **GIL deadlock between a Python lock and a core lock.** The design has one direction only (Python may
@@ -1008,13 +1231,11 @@ Run only when the machine is idle; it is not part of the default suite.
 5. **Panic to abort.** Any dependency compiled with `panic = "abort"` (or an `abort()`/stack overflow/
    access violation) kills the whole hub. Mitigation: `cargo metadata` profile assertion in CI, and no
    `unsafe` outside the `windows` FFI wrappers, each with a `// SAFETY:` note in the existing style.
-6. **Per-socket drop accounting and the replay render under the delivery lock.** Two step-4 items are
-   carried forward from step 2's delivery review rather than built now: `dropped_bytes` is summed per
-   session (`stats`/drain record), so with two sockets one client cannot learn its own loss, and
-   `attach_sink` holds the delivery lock across `replay_text()` (one ring join plus one strip pass, ≈1.5 ms
-   at the 512 KiB cap), which serialises the reader for that long. Step 4 owns both: the count moves onto
-   `SinkEntry` and is surfaced per handle, and the load test (§11) measures the render before anyone decides
-   whether to render under `text` alone and re-take it for the batch.
+6. **Per-socket drop accounting and the replay render under the delivery lock.** Step 4 implements both:
+   `dropped_bytes` is carried per socket handle in the drain record, so one client can learn its own loss,
+   and `attach_sink` holds the delivery lock across `replay_text()` (one ring join plus one strip pass,
+   ≈1.5 ms at the 512 KiB cap). The load test (§11) measures the cost; there is no remaining per-session
+   sum or deferred implementation decision.
 7. **Control path on the event loop.** A wedged reader costs up to the deadline per call (50 ms for
    write/resize/screen/scrollback/raw/stats, 2 s for spawn/kill/kill_all). Mitigation: deadline,
    cached-snapshot fallback, `degraded` marking (itself a dirty flag, cleared by the next successful
@@ -1066,6 +1287,11 @@ Run only when the machine is idle; it is not part of the default suite.
     one was recorded with wrap slack). Fixed in Python per `oracle-bugs` on `fix/codex-scroll-mark-flush`
     (`a5d8272`): the mark needs whitespace only after it. Master takes it with the owner's OK; the core
     changes nothing, it only has to draw the mark in the same cell as pyte, which the case checks.
+
+16. **A narrow failed-resume identity limitation.** Drain records carry no incarnation. If a PTY resume
+    raises after its process has already started, that process's death record is routed by id to the restored
+    predecessor (or its tombstone), so the old row can take the failed spawn's exit code. The spawn must raise
+    after the process started for this to occur; the limitation is known and not fixed here.
 
 Open questions for the owner: none blocking. Two are deferred by design rather than unanswered: whether
 the `.pyd` ultimately ships as abi3 or per-minor follows from step 1's abi3 probe, and permessage-deflate
