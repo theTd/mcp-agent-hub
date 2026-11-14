@@ -163,6 +163,23 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         # Too little visible text is not trusted.
         self.assertFalse(self.hub._codex_composer_shows_whole("↑ " + self.LONG[-20:], self.LONG))
 
+    def test_scroll_mark_flush_against_a_full_row_counts(self):
+        # Live (live-codex-scrolled-paste): a full top row ends "…without changing↑", no space before the mark.
+        visible = self.LONG[self.LONG.index("but no file"):]
+        cut = visible.rindex(" ", 0, 60)  # the top row ends on a word, the mark right after it
+        self.assertTrue(self.hub._codex_composer_shows_whole(visible[:cut] + "↑ " + visible[cut + 1:], self.LONG))
+        # An arrow inside a word is text, not the mark.
+        self.assertFalse(self.hub._codex_composer_shows_whole(visible.replace("file", "fi↑le", 1), self.LONG))
+
+    async def test_scrolled_composer_with_a_flush_mark_settles(self):
+        visible = self.LONG[self.LONG.index("but no file"):]
+        cut = visible.rindex(" ", 0, 60)
+        self.screen = "› " + visible[:cut] + "↑\n  " + visible[cut + 1:] + "\n\n  ? for shortcuts"
+        with patch("session_manager.TUI_TYPE_SETTLE_SEC", .02), patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .01):
+            result = await self.hub._await_typed_text_settled(self.sess, "codex", self.LONG[:30], self.LONG[-30:],
+                                                           typed_len=len(self.LONG), expected_text=self.LONG)
+        self.assertTrue(result[2])
+
     async def test_scrolled_composer_settles(self):
         visible = self.LONG[self.LONG.index("but no file"):]
         self.screen = "› " + visible[:60] + "   ↑\n  " + visible[60:] + "\n\n  ? for shortcuts"
