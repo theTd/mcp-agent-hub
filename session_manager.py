@@ -533,8 +533,11 @@ TUI_TYPE_SETTLE_CAP_SEC = 10.0
 TUI_TYPE_STALL_SEC = 3.0
 TUI_TYPE_SETTLE_HARD_CAP_SEC = 120.0
 # Codex caps its composer's height; a taller draft scrolls and marks the hidden rows with an arrow
-# at the right edge of its top visible row. The visible end must then be at least this long.
-TUI_CODEX_SCROLL_MARK_RE = re.compile(r"(?<=\s)↑(?=\s)")
+# in the last column of its top visible row. The visible end must then be at least this long.
+# The arrow sits flush against the text when that row is full ("…without changing↑", live
+# capture live-codex-scrolled-paste), so only whitespace after it is required: the row's end, or
+# the space _tui_wrapped_glyph_composer joins rows with.
+TUI_CODEX_SCROLL_MARK_RE = re.compile(r"↑(?=\s)")
 TUI_CODEX_SCROLLED_MIN_CHARS = 40
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
