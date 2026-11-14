@@ -43,9 +43,10 @@ What one sample holds, and how each number is obtained (a proxy is labelled in `
 Bytes: every consumer counts UTF-8 bytes of the frames it got, split into ``bytes_replay`` (up to the
 ``replay_end`` control frame) and ``bytes_live``. ``core.bytes_total`` counts what the PTY delivered,
 so the cumulative total at the last sample is compared with the consumer total (replay + live) —
-both count from the session's spawn, and the core figure is a snapshot up to one second older. The
-precise no-loss checks are ``core.dropped_bytes``, the per-socket drops the hub records, and the
-marker sequence. Markers: the engine prints ``LOADMARK <n>`` every ``--marker-every`` chunks; every
+both count from the session's spawn, and the core figure is a snapshot up to one second older.
+``core.dropped_bytes`` is not a loss check: it counts what the raw history ring trimmed (output older
+than its cap), which a long run reaches by design. The precise no-loss checks are the per-socket drops
+the hub records and the marker sequence. Markers: the engine prints ``LOADMARK <n>`` every ``--marker-every`` chunks; every
 number the engine had written when the consumers stopped must have arrived, and each number's first
 appearance must come after the previous one (a repeat is a ConPTY repaint of an older line, not
 loss). On a tree without a core there is no hub-side byte counter, and the engine's journal is the
@@ -1037,9 +1038,9 @@ class LoadRun:
                                     "and costs a PowerShell process per sample",
                 "bytes": "consumer UTF-8 bytes per frame (replay + live) vs core.bytes_total, both "
                          "cumulative from spawn; the core value is a snapshot up to 1 s older, so the "
-                         "difference carries up to one second of output. dropped_bytes, socket_drops "
-                         "and the marker sequence are the precise no-loss checks; the engine journal is "
-                         "the producer side",
+                         "difference carries up to one second of output. socket_drops and the marker "
+                         "sequence are the precise no-loss checks; core dropped_bytes is the raw history "
+                         "ring's trim, not loss; the engine journal is the producer side",
             },
             "errors": self.errors,
         }

@@ -1094,7 +1094,7 @@ entry in step 5).
 | 4. Terminal sockets in the core | Done: the WS listener, tickets, replay/`replay_end`, input and OSC stripping, `close_sockets`, and console ticket fetch are in the core. The socket thread consumes `FrameQueue` directly through `attach_sink`; the temporary `attach_queue`/`take_frames`/`detach_queue` calls and Python `/ws/pty` path are removed. Per-socket `dropped_bytes` is reported per handle in the drain record. | the core WS tests, focused Python terminal suite, and the full suite | branch only | M, 4–6 d |
 | 5. Packaging and the required import | Done: `payload.txt` and the release script produce and embed the `.pyd`; the privacy gate applies `checkPe` to each `.pyd`; `bootstrap.ps1` `Check-Imports` adds the resources directory; `.gitignore` is updated; `requirements.in`/`requirements.lock` drop `pyte` and `pywinpty`. | the portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
 | 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; with the goldens frozen, delete the pyte oracle (`tools/pyte_oracle.py`), its renderer (`tools/render_terminal_fixtures.py`) and the three tests that drove the oracle's classes, porting every case to the core first (`terminal_stream/tests/trim_history_cases.rs`, `test_terminal_core_screen_cases.py`), and freeze the live consumers' stop-point screens as `screen-at-consumer-read.txt`; the recorder's own live screen becomes a core text session; no pyte dependency entry remains. | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
-| 6a. Load-test tooling | Done: `tools/fake_tui_engine.py`, `tools/load_terminal_core.py`, and `test_fake_tui_engine.py` provide the recorded-rate replay, marker accounting, and probe harness described in §11; the full 300 s comparison remains in step 6. | tool tests and the 60 s smoke runs; the full comparison is step 6's gate | branch only | S, 1–2 d |
+| 6a. Load-test tooling | Done: `tools/fake_tui_engine.py`, `tools/load_terminal_core.py`, and `test_fake_tui_engine.py` provide the recorded-rate replay, marker accounting, and probe harness described in §11; the full 300 s comparison ran on 2026-11-14 (§11's recorded table) and needed no tuning. | tool tests and the 60 s smoke runs; the full comparison is step 6's gate | branch only | S, 1–2 d |
 
 Total ≈ 5–6 weeks for one implementer plus review; steps 2 and 3 dominate, and step 3 is the only one that
 touches most of `session_manager.py`.
@@ -1183,13 +1183,15 @@ Run only when the machine is idle; it is not part of the default suite.
   (1.9–12.7 chunks/s per `live-*` case; `--speed` raises it, for example `--speed 6` is about 42 chunks/s
   average).
 - `tools/load_terminal_core.py` starts 15 / 30 / 50 sessions, attaches one WebSocket consumer each, samples
-  for 5 minutes and records: hub CPU (`\Process(python*)\% Processor Time`), thread count, event-loop
+  for 5 minutes and records: hub CPU (`GetProcessTimes` of the hub process, in cores), thread count, event-loop
   lag (a coroutine measuring `sleep(0.05)` overshoot, p50/p99/max, the technique `test_event_loop_stalls.py`
   already uses), GIL-held share (py-spy `--gil` if available, otherwise loop lag and CPU as proxies),
   `core.stats()` counters, drain count per second (expected ≤20), and per-session byte accounting. The
   latter needs a per-session byte counter from `core.stats()`; today the hub drops the drain record's
   per-session counters, so the load tool compares the core's global `bytes_total` with the consumers' sum
-  and relies on `dropped_bytes`, the hub's socket-drop counter and numbered marker lines for loss.
+  and relies on the hub's socket-drop counter and numbered marker lines for loss. The core's
+  `dropped_bytes` is not a loss check: it counts what the raw history ring trimmed (output older than its
+  cap), which a long run at 50 sessions reaches by design.
 - Read event-loop lag against a baseline measured on the same machine before any session spawns: the probe's
   floor on Windows is one timer tick, about 11 ms at 50 ms granularity, and under load the loop wakes more
   often, which lowers the floor.
@@ -1204,6 +1206,26 @@ Run only when the machine is idle; it is not part of the default suite.
 - The comparison is against `master` before the cut-over merge: the same script pointed at a hub on the
   pywinpty code (the recorded 12-session profile in §2 is the baseline). There is no `off` mode to compare
   against after the merge, which is the point of removing the flag.
+
+Recorded on 2026-11-14 (integration branch with the core vs `master` `ebe4740`; 300 s per run, `--speed 1`,
+on the owner's working machine rather than an idle one, so every number is an upper bound for the hub
+itself; idle lag floor 11.2–11.7 ms in every run):
+
+| tree | sessions | hub CPU cores p50 / p99 | OS / Python threads | loop lag p50 / p99 / max (ms) | wakeups/s p50 | markers lost | socket drops |
+|---|---|---|---|---|---|---|---|
+| core | 15 | 0.07 / 0.14 | 70 / 4 | 11.3 / 13.8 / 25 | 16.3 | 0 of 1,589 | 0 |
+| core | 30 | 0.11 / 0.18 | 130 / 4 | 11.3 / 13.8 / 43 | 16.3 | 0 of 3,223 | 0 |
+| core | 50 | 0.19 / 0.34 | 212 / 6 | 11.3 / 14.0 / 57 | 16.3 | 0 of 5,414 | 0 |
+| master | 15 | 0.28 / 0.68 | 82 / 33 | 5.3 / 17.0 / 91 | 158 | 0 of 1,596 | n/a |
+| master | 30 | 0.60 / 1.20 | 157 / 63 | 4.1 / 58.2 / 2,481 | 327 | 0 of 3,210 | n/a |
+| master | 50 | 0.90 / 1.19 | 255 / 103 | 3.9 / 156.1 / 8,495 | 512 | 0 of 6,060 | n/a |
+
+At 50 sessions the core passes every measured criterion: 0.19 cores, p99 lag 14.0 ms, no marker lost and no
+socket drop, 16 wakeups/s, 6 Python-side threads. Its one lag sample above 50 ms (57 ms) is a single 50 ms
+probe in 4,911. Master fails CPU and lag from 30 sessions on and stalls its loop for 2.5 s and 8.5 s. The
+recorded rate is lighter than §2's profile (about 350 chunks/s at 50 sessions), so a `--speed` run remains
+the way to probe headroom; no flush window, ring size or drain interval needed tuning at these numbers.
+Console FPS is the owner's manual check.
 
 ## 12. Risks and open questions
 
