@@ -29,7 +29,8 @@ import session_manager
 from tools import render_terminal_fixtures as renderer
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "tools" / "fixtures" / "terminal"
-LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-kimi", "live-omp")
+LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-codex-scrolled-paste", "live-kimi",
+              "live-omp", "live-omp-approval-box")
 EDGE_CASES = (
     "edge-screen-combining",
     "edge-screen-csi-cancel",
@@ -166,7 +167,8 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
             joined.decode("utf-8")  # a byte corpus that is not one UTF-8 stream would render as U+FFFD
         # live-agy is still the step-0 pywinpty capture: agy's own MCP config points at the live hub
         # and it has no session-scoped MCP flag, so the recorder refused to run it (step 2a report).
-        self.assertEqual(system, {"live-claude", "live-codex", "live-kimi", "live-omp"})
+        self.assertEqual(system, {"live-claude", "live-codex", "live-kimi", "live-omp",
+                                  "live-codex-scrolled-paste", "live-omp-approval-box"})
 
     def test_scrub_report_is_per_run(self):
         # Labels and counts only: the record names categories, never what was replaced.

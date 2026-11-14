@@ -39,6 +39,25 @@ What is isolated per engine, and by what:
   (``agy mcp list``) and has no session-scoped switch for it, so the recorder refuses when that file
   enables a server on 4444/4445; ``agy mcp disable`` is the operator's call, not the tool's.
 
+A recording normally ends the way a hub session would: a resize mid-recording, then ``/exit``.  Two
+stop points end it at a screen a consumer reads instead, because a consumer's input is not the
+engine's exit:
+
+- ``--followup FILE`` types FILE's text into the composer once the first idle is reached, waits for
+  the screen to stop changing, and ends the run there (the Codex settle loop reads the composer
+  before its Enter, so the draft must stay unsent).
+- ``--deny-box [TEXT]`` stops at the first approval box -- or the first whose command contains
+  TEXT -- once that box has stood still, and denies it with Escape: never an approval (RULES.md: the
+  recorder approves nothing that writes).  TEXT is matched against the screen with all whitespace
+  removed, because a box wraps its command.
+
+Both suppress the mid-recording resize and the exit keys (a stop point replaces that script), and
+both record ``consumer`` in meta.json: ``reads_at_chunk`` is the number of chunks a replay feeds to
+reproduce exactly the screen the consumer read, ``settled`` whether the screen stood still before
+that, and -- for ``--followup`` -- ``expected_text``, the text the settle loop takes as the payload
+it must see.  A ``--deny-box`` run records the box's screen before the denial, so a replay that stops
+there is the consumer's input, not the box's aftermath.
+
 Chunks are recorded as ``{"delay_ms": <since the previous chunk>, "chunk": …}`` in ``chunks.jsonl``.
 With the system backend ``chunk`` is **base64 of the exact bytes** one read returned
 (``chunk_encoding: "utf8_bytes"`` in meta.json), because the core decodes UTF-8 itself with a carry and
@@ -66,7 +85,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -88,7 +107,8 @@ TAP_READ_BYTES = 8192
 TAP_FRAME_HEADER = struct.Struct("<BI")
 # CREATE_NO_WINDOW: the tap is a console binary, and nothing may appear on the desktop.
 CREATE_NO_WINDOW = 0x08000000
-RECORDER_VERSION = 2
+# 3: meta.json carries ``consumer`` (the chunk index a stop point's screen is replayed to).
+RECORDER_VERSION = 3
 # The hub's default PTY size (SessionManager.default_cols/default_rows, session_manager.py:2922).
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 36
@@ -106,17 +126,38 @@ MAX_CORPUS_BYTES = 2 * 1024 * 1024
 # reads up to 4096, as AgentSession._read_loop does (session_manager.py:2282).
 READ_SIZE = 4096
 IDLE_SLEEP_SEC = 0.02
+# A stop point waits for the screen a consumer reads to stand still this long before it records where
+# a replay ends on it (and, for a box, before the keys change it).
+CONSUMER_SETTLE_SEC = 1.5
+# The engine may still be drawing that screen (Codex takes a long paste in a few words per frame), so
+# the wait has a bound; running out is recorded on the event rather than passed off as settled.
+CONSUMER_SETTLE_MAX_SEC = 60.0
+# The rows of an approval box: its header, and the frame rows that close it (omp draws the options
+# and the key hints inside the same frame). What a snapshot waits on stands still between them.
+BOX_HEADER = "Allow tool:"
+BOX_CLOSING_ROWS = ("\u251c", "\u2570", "\u2514", "\u2523", "\u2517")
 
 
 class Answer:
-    """One screen prompt this recorder answers, and the keys it types (the hub types keys too)."""
+    """One screen prompt this recorder answers, and the keys it types (the hub types keys too).
+
+    ``guard_flat`` is a guard matched against the screen with every whitespace character removed: an
+    approval box wraps a long command, so the literal it must contain is split across rows on the
+    screen but whole in that form.  ``snapshot`` marks the matched screen as the one a consumer reads:
+    the screen (or ``snapshot_focus``: "box" = the approval box's own rows) is allowed to stand
+    still, ``consumer.reads_at_chunk`` is recorded for it, and only then are the keys sent.
+    ``end_after`` ends the run once the screen settles after those keys.
+    """
 
     def __init__(self, name: str, pattern: str, keys: str, guard: Optional[str] = None,
                  delay_after_match_sec: float = 1.0, repeat_after_sec: float = 0.0,
-                 then_keys: str = "", then_delay_sec: float = 0.0):
+                 then_keys: str = "", then_delay_sec: float = 0.0,
+                 guard_flat: Optional[str] = None, snapshot: bool = False,
+                 snapshot_focus: str = "", end_after: bool = False, consumer_why: str = ""):
         self.name = name
         self.pattern = re.compile(pattern, re.IGNORECASE)
         self.guard = re.compile(guard, re.IGNORECASE) if guard else None
+        self.guard_flat = re.compile(guard_flat, re.IGNORECASE) if guard_flat else None
         self.keys = keys
         self.delay_after_match_sec = delay_after_match_sec
         # A tool prompt can appear several times in one session; answering it once is not enough.
@@ -125,6 +166,10 @@ class Answer:
         # write once the pasted task has been rendered (the hub's checked submit does the same).
         self.then_keys = then_keys
         self.then_delay_sec = then_delay_sec
+        self.snapshot = snapshot
+        self.snapshot_focus = snapshot_focus
+        self.end_after = end_after
+        self.consumer_why = consumer_why
 
 
 # A permission prompt is only ever approved for a read-only command: the task is "list the files",
@@ -622,7 +667,8 @@ class Recorder:
                  cols: int, rows: int, resize_after_idle_sec: float, idle_sec: float,
                  min_duration_sec: float, max_duration_sec: float,
                  extra_env: Optional[Dict[str, str]] = None, backend: str = "system",
-                 tap: Optional[Path] = None, command: Optional[str] = None):
+                 tap: Optional[Path] = None, command: Optional[str] = None,
+                 followup_text: Optional[str] = None, deny_box: Optional[str] = None):
         if backend not in ("system", "pywinpty"):
             raise SystemExit(f"unknown backend {backend!r}")
         self.engine = engine
@@ -639,6 +685,24 @@ class Recorder:
         self.min_duration_sec = min_duration_sec
         self.max_duration_sec = max_duration_sec
         self.extra_env = dict(extra_env or {})
+        # A stop point replaces the resize-and-exit script: the consumer reads the screen there, and
+        # a repaint or a typed "/exit" would change it.
+        self.followup_text = followup_text
+        self.deny_box = deny_box
+        self.scripted_stop = followup_text is not None or deny_box is not None
+        self.answers = list(ANSWERS[engine])
+        if deny_box is not None:
+            # Never an approval: Escape denies the box once (D7), after the box's own screen has been
+            # recorded, and the run ends on it. It goes first so no other rule can answer the box; an
+            # empty guard denies whichever box comes first.
+            self.answers.insert(0, Answer(
+                "deny_box", r"Allow tool:", "\x1b",
+                guard_flat=re.escape(deny_box) if deny_box else None,
+                delay_after_match_sec=0.0, snapshot=True, snapshot_focus="box", end_after=True,
+                consumer_why="the OMP approval box is on screen here, before its denial",
+            ))
+        # What a replay has to feed to arrive at the screen a consumer reads (meta.json "consumer").
+        self.consumer: Optional[Dict[str, object]] = None
         # Latest moment for the resize when the answer never produces a quiet second.
         self.resize_deadline_sec = min_duration_sec + 20.0
         # The system ConPTY hands back pipe bytes; the core decodes them with a carry, so the corpus
@@ -682,6 +746,67 @@ class Recorder:
         while lines and not lines[-1]:
             lines.pop()
         return "\n".join(lines[-self.rows:])
+
+    def _settle_screen(self, focus: Optional[Callable[[str], str]] = None) -> bool:
+        """Waits until the screen has not changed for ``CONSUMER_SETTLE_SEC``; False on the bound.
+
+        The screen text, not the chunk arrival, is the signal: a blinking cursor or a spinner redraw
+        keeps the pipe busy while what a consumer reads stays the same.  ``focus`` narrows the
+        compared text to what the consumer parses: omp repaints its spinner and clock under the
+        approval box, so the box rows are what has to stand still, not the whole screen.
+        """
+        def current() -> str:
+            text = self._screen_text()
+            return focus(text) if focus is not None else text
+
+        deadline = time.monotonic() + CONSUMER_SETTLE_MAX_SEC
+        last = current()
+        changed_at = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+            text = current()
+            if text != last or (focus is not None and not text):
+                last, changed_at = text, time.monotonic()
+            elif time.monotonic() - changed_at >= CONSUMER_SETTLE_SEC:
+                return True
+        return False
+
+    @staticmethod
+    def _box_rows(screen_text: str) -> str:
+        """The approval box's own rows: its ``Allow tool:`` header to the frame row that closes it.
+
+        A box is drawn row by row and omp keeps repainting the status lines under it; the box's rows
+        are what an approval consumer parses, so they are what a snapshot waits on.
+        """
+        lines = screen_text.splitlines()
+        head = max((index for index, line in enumerate(lines) if BOX_HEADER in line), default=None)
+        if head is None:
+            return ""
+        rows = [lines[head]]
+        for line in lines[head + 1:]:
+            rows.append(line)
+            if line.lstrip()[:1] in BOX_CLOSING_ROWS:
+                break
+        return "\n".join(rows)
+
+    def _mark_consumer(self, started: float, event: str, why: str, settled: bool,
+                       **extra: object) -> None:
+        """Records where a replay of the chunk stream ends on the screen a consumer reads.
+
+        ``extra`` carries what the consumer's call needs besides the screen: a follow-up stop point
+        records the text it typed, which is the settle loop's ``expected_text``.
+        """
+        with self._lock:
+            chunk_index = len(self.chunks)
+        self.consumer = {
+            "reads_at_chunk": chunk_index,
+            "reason": why,
+            "settled": settled,
+            **extra,
+        }
+        self.events.append({"event": "consumer_read", "reason": event,
+                            "at_ms": self._now_ms(started), "chunk_index": chunk_index,
+                            "settled": settled})
 
     @staticmethod
     def _chunk_bytes(chunk: Union[str, bytes]) -> bytes:
@@ -747,26 +872,40 @@ class Recorder:
         self.events.append({"event": "keys", "reason": reason, "at_ms": self._now_ms(started),
                             "bytes": len(keys.encode("utf-8", "replace"))})
 
-    def _answer_prompts(self, started: float, answered: Dict[str, float]) -> None:
+    def _answer_prompts(self, started: float, answered: Dict[str, float]) -> bool:
+        """Answers the prompts on screen; True when a rule with ``end_after`` fired."""
         text = self._screen_text()
         if not text:
-            return
+            return False
+        flat = "".join(text.split())
         now = time.monotonic()
-        for rule in ANSWERS.get(self.engine, []):
+        for rule in self.answers:
             fired_at = answered.get(rule.name)
             if fired_at is not None and not (
                     rule.repeat_after_sec and (now - fired_at) >= rule.repeat_after_sec):
                 continue
             if rule.guard is not None and not rule.guard.search(text):
                 continue
+            if rule.guard_flat is not None and not rule.guard_flat.search(flat):
+                continue
             if not rule.pattern.search(text):
                 continue
             answered[rule.name] = now
-            time.sleep(rule.delay_after_match_sec)
+            if rule.snapshot:
+                # The screen a consumer reads is this one, not what the keys make of it: let it stand
+                # still and record where a replay ends on it before the keys change anything.
+                focus = self._box_rows if rule.snapshot_focus == "box" else None
+                self._mark_consumer(started, rule.name, rule.consumer_why,
+                                    self._settle_screen(focus))
+            if rule.delay_after_match_sec:
+                time.sleep(rule.delay_after_match_sec)
             self._write(rule.keys.replace("{task}", self.task), started, rule.name)
             if rule.then_keys:
                 time.sleep(rule.then_delay_sec)
                 self._write(rule.then_keys, started, f"{rule.name}_submit")
+            if rule.end_after:
+                return True
+        return False
 
     def _resize(self, started: float) -> None:
         pty = self.pty
@@ -826,6 +965,7 @@ class Recorder:
         task_sent = False
         idle_since: Optional[float] = None
         resized = False
+        followup_at: Optional[float] = None
         exit_at: Optional[float] = None
         stop_reason = "max_duration"
 
@@ -841,28 +981,51 @@ class Recorder:
                 # waits for the TUI before it types, and text written into a booting TUI is lost.
                 task_sent = True
 
-            self._answer_prompts(started, answered)
+            if self._answer_prompts(started, answered):
+                # A box the run exists for was read and denied; nothing may answer it now.
+                self._settle_screen()
+                stop_reason = "box_denied"
+                break
 
             if idle_since is None and quiet >= 1.0 and elapsed >= self.min_duration_sec:
                 idle_since = last_output + 1.0
                 self.events.append({"event": "answer_settled", "at_ms": self._now_ms(started)})
 
+            if self.followup_text is not None and idle_since is not None and followup_at is None:
+                # The first idle is the moment a follow-up is typed: the composer holds the draft, and
+                # the consumer reads it once Codex has taken every character and the screen is still.
+                followup_at = now
+                self._write(self.followup_text, started, "followup")
+                settled = self._settle_screen()
+                self._mark_consumer(
+                    started, "followup",
+                    "the Codex settle loop reads the composer here: the follow-up was typed, Codex "
+                    "took all of it, and the screen has stood still since",
+                    settled, expected_text=self.followup_text,
+                )
+                stop_reason = "followup_settled" if settled else "followup_timeout"
+                break
+
             # The resize goes in mid-recording, after the answer settled: the repaint it causes is
             # the chunk stream step 2 has to reproduce. An engine that never goes quiet (kimi paints
-            # a spinner and a rotating tip) gets it at a deadline instead, still mid-recording.
-            resize_due = idle_since is not None and (now - idle_since) >= self.resize_after_idle_sec
-            if not resized and not resize_due and elapsed >= self.resize_deadline_sec:
-                resize_due = True
-            if not resized and resize_due:
-                self._resize(started)
-                resized = True
-                idle_since = time.monotonic()
-                self._last_chunk_at = idle_since
+            # a spinner and a rotating tip) gets it at a deadline instead, still mid-recording. A
+            # stop point replaces this whole script: no repaint, and no "/exit" typed into a screen
+            # a consumer reads.
+            if not self.scripted_stop:
+                resize_due = (idle_since is not None
+                              and (now - idle_since) >= self.resize_after_idle_sec)
+                if not resized and not resize_due and elapsed >= self.resize_deadline_sec:
+                    resize_due = True
+                if not resized and resize_due:
+                    self._resize(started)
+                    resized = True
+                    idle_since = time.monotonic()
+                    self._last_chunk_at = idle_since
 
-            if resized and exit_at is None and (now - self._last_chunk_at) >= self.idle_sec:
-                self.events.append({"event": "idle_reached", "at_ms": self._now_ms(started)})
-                self._write(EXIT_KEYS, started, "exit")
-                exit_at = now
+                if resized and exit_at is None and (now - self._last_chunk_at) >= self.idle_sec:
+                    self.events.append({"event": "idle_reached", "at_ms": self._now_ms(started)})
+                    self._write(EXIT_KEYS, started, "exit")
+                    exit_at = now
 
             if exit_at is not None and (self._eof.is_set() or (now - exit_at) >= 8.0):
                 stop_reason = "exited" if self._eof.is_set() else "exit_timeout"
@@ -917,6 +1080,9 @@ class Recorder:
             # any other transcript provably this recording's (deleted by hand after the run).
             "session_files": {"engine_session_id": self.engine_session_id},
             "task": self.task,
+            # A stop point's screen: how many chunks a replay feeds to reach exactly the screen the
+            # consumer read (steps 3's live captures; test_terminal_live_consumers.py).
+            "consumer": self.consumer,
             "recorder": {
                 "version": RECORDER_VERSION,
                 "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -999,11 +1165,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--command", default=None,
                         help="the engine binary to launch instead of the hub's default, e.g. the "
                              "reclaude.exe account wrapper the hub's claude profile uses")
+    parser.add_argument("--followup", type=Path, default=None, metavar="FILE",
+                        help="stop point: type FILE's text into the composer at the first idle, wait "
+                             "for the screen to stand still, and end there (no resize, no exit keys)")
+    parser.add_argument("--deny-box", nargs="?", const="", default=None, metavar="TEXT",
+                        help="stop point: stop at the first approval box (or the first whose command "
+                             "contains TEXT, with whitespace removed), deny it with Escape, and end "
+                             "there (no resize, no exit keys)")
     args = parser.parse_args(argv)
 
     task_dir = args.task_dir.resolve()
     if not task_dir.is_dir():
         raise SystemExit(f"task folder does not exist: {task_dir}")
+    if args.followup is not None and args.deny_box is not None:
+        raise SystemExit("--followup and --deny-box are two different stop points; pass one")
+    followup_text: Optional[str] = None
+    if args.followup is not None:
+        try:
+            followup_text = args.followup.read_text(encoding="utf-8").strip("\r\n")
+        except OSError as exc:
+            raise SystemExit(f"cannot read the follow-up text {args.followup}: {exc}") from exc
+        if not followup_text:
+            raise SystemExit(f"the follow-up file {args.followup} is empty")
+        # One write of one line: a newline would submit the draft instead of leaving it on screen.
+        followup_text = " ".join(followup_text.split())
     assert_port_closed(ISOLATED_PORT)
     marker_id = args.marker_id or marker_session_id(args.engine)
     base_task = args.task or ("list the files in this folder and say how many there are; change nothing")
@@ -1031,6 +1216,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         backend=args.backend,
         tap=args.tap,
         command=args.command,
+        followup_text=followup_text,
+        deny_box=args.deny_box,
     )
     meta = recorder.run()
     recorded = meta["recorder"]  # type: ignore[index]

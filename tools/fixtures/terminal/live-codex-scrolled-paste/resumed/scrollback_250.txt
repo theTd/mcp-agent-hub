@@ -1,0 +1,24 @@
+› [Hub Session: session_id=rtc-corpus-codex-0b480d68] list the files in this f…
+  • notes.txt
+  • todo.txt
+
+  Total: 3 files
+
+  Worked for 15s • 07:55
+
+
+› per line, that a new teammate could follow to review this folder without     ↑
+  changing it: first read the names of the files in it one by one and write
+  each name as you see it, then count them and write the count on its own line,
+  then note which of them look like text files and say why in a few words, then
+  list the questions you would ask the owner before touching anything at all;
+  keep every item to one short sentence, use no tables and no markdown beyond
+  the numbers, do not run any command that writes, moves, renames or deletes a
+  file, and finish with a single line that says nothing here was modified.
+  Also, before you start, say in one sentence that you will only read; after
+  the checklist, add a second numbered list with three things a reviewer should
+  double-check by hand, and keep the whole reply under twelve lines so that it
+  stays readable in a small window.
+
+  GPT-6.1-Sol minimal · <SCRATCH>…
+                                                      ⚠ 2 warnings · f2 to view
