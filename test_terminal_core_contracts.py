@@ -8,10 +8,16 @@ Run: python -m unittest -v test_terminal_core_contracts
 """
 
 import asyncio
+import logging
 import sqlite3
+import threading
+import time
 import unittest
+import zlib
 from contextlib import closing
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 import session_manager
 from test_terminal_core_hub import _ManagerCase, _session
@@ -112,6 +118,33 @@ class ExitCodeTests(_ManagerCase):
             ).fetchone()
         self.assertEqual(row, ("crashed", "crashed", None))
         self.assertEqual(sess.exit_code, None)
+
+    async def test_a_late_code_after_a_close_rewrites_the_archived_row(self):
+        # r2-kimi 5: the object left `sessions` when the session closed, so the record carrying the
+        # code the death lacked was applied to nothing and the row kept None forever; the retire
+        # then took the core's answer away for good.
+        await _live(self.hub, "closed-late-code")
+        self.hub.core.set_exit("closed-late-code", None, crashed=True)
+        self.hub.core.die("closed-late-code")
+        self.hub._on_core_tick()
+        await _settle(self.hub)
+        self.assertIsNone((await self.hub.db.get_session_record("closed-late-code"))["exit_code"])
+        self.hub.core.block_retire = 1
+        await self.hub.close_session("closed-late-code", source="console")
+        self.assertIn("closed-late-code", self.hub._retire_pending)
+
+        self.hub.core.late_code("closed-late-code", 11)
+        self.hub._on_core_tick()
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if "closed-late-code" in self.hub.core.retired:
+                break
+        row = await self.hub.db.get_session_record("closed-late-code")
+        events = [e for e in self.hub.get_worker_events("closed-late-code")
+                  if e["type"] in ("exited", "crashed")]
+        self.assertEqual(row["exit_code"], 11, "the late code never reached the archived row")
+        self.assertIn("closed-late-code", self.hub.core.retired, "the id left the core unwritten")
+        self.assertEqual(len(events), 1, f"a second lifecycle event was emitted: {events}")
 
 
 class DeathSnapshotFailureTests(_ManagerCase):
@@ -236,6 +269,112 @@ class ShutdownTests(_ManagerCase):
         self.assertEqual(row, ("crashed", 3))
         self.assertIsNotNone(sess.ended_at)
 
+    async def test_a_death_whose_record_lags_one_tick_keeps_its_classification(self):
+        # r2-kimi 2: the fixed core may withhold a death record for one drain (contract 5). One
+        # pre-stop drain then still sees the session as alive, marks it interrupted, and the real
+        # death lands after `_shutting_down`, where its ordinary lifecycle event is suppressed.
+        sess = await _live(self.hub, "lagged-stop", engine="omp")
+        self.hub.core.set_exit("lagged-stop", 5)
+        self.hub.core.withhold_death_records = 1
+        self.hub.core.die("lagged-stop")
+        with patch.object(session_manager, "NATIVE_TRANSCRIPT_DRAIN_SEC", 0.0):
+            await self.hub.archive_all_sessions_on_shutdown()
+        with closing(sqlite3.connect(self.root / "hub_state.db")) as conn:
+            row = conn.execute(
+                "SELECT status, end_reason, exit_code FROM sessions WHERE session_id='lagged-stop'"
+            ).fetchone()
+        events = [e for e in self.hub.get_worker_events("lagged-stop")
+                  if e["type"] in ("exited", "crashed")]
+        self.assertEqual(row, ("crashed", "crashed", 5),
+                         "a death that preceded the stop was archived as an interruption")
+        self.assertEqual([e["type"] for e in events], ["crashed"],
+                         "the natural death lost its ordinary lifecycle event")
+        self.assertFalse(sess.is_process_alive())
+
+    async def test_the_forced_final_row_is_really_written(self):
+        # r2-kimi 1: the last-resort fallback passed coroutines to `asyncio.wait`, which rejects
+        # them, so a stop that ran out of archive budget wrote no final row at all.
+        await _live(self.hub, "forced-final")
+        await self.hub.db.flush()
+
+        async def stalled(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        with patch.object(self.hub, "_archive_session", new=stalled), patch.multiple(
+            session_manager,
+            SHUTDOWN_MAX_SEC=1.0,
+            SHUTDOWN_SNAPSHOT_MAX_SEC=0.0,
+            SHUTDOWN_KILL_MAX_SEC=0.05,
+            SHUTDOWN_CORE_STOP_MAX_SEC=0.05,
+        ):
+            await self.hub.archive_all_sessions_on_shutdown()
+        with closing(sqlite3.connect(self.root / "hub_state.db")) as conn:
+            row = conn.execute(
+                "SELECT status, archived_at FROM sessions WHERE session_id='forced-final'"
+            ).fetchone()
+        self.assertIsNotNone(row, "the forced path wrote no row for the session")
+        self.assertIsNotNone(row[1], "the forced path left the session without a final row")
+        self.assertEqual(row[0], "interrupted")
+
+    async def test_the_kill_grace_fits_inside_the_stop_s_wait(self):
+        # R5a: the core was handed a fresh 1 s grace whenever less than that was left for the wait,
+        # so a kill that used it outlived the stop and logged a timeout on the normal path.
+        await _live(self.hub, "kill-grace")
+        messages = []
+        handler = logging.Handler()
+        handler.emit = lambda record: messages.append(record.getMessage())
+        manager_log = logging.getLogger("mcp-agent-hub.session_manager")
+        manager_log.addHandler(handler)
+
+        def wedged(grace_ms):
+            self.hub.core.kill_graces.append(int(grace_ms))
+            time.sleep(int(grace_ms) / 1000.0)  # a tree that uses every bit of its grace
+
+        try:
+            with patch.object(session_manager, "SHUTDOWN_KILL_MAX_SEC", 0.3), \
+                    patch.object(self.hub.core, "kill_all", wedged):
+                await self.hub.archive_all_sessions_on_shutdown()
+        finally:
+            manager_log.removeHandler(handler)
+        self.assertEqual(self.hub.core.kill_graces, [200],
+                         "the grace did not leave room for the stop's own wait")
+        self.assertFalse([m for m in messages if "Timed out stopping session processes" in m],
+                         messages)
+
+    async def test_a_session_the_snapshot_missed_is_archived_off_the_loop(self):
+        # R5b: with no snapshot the archive reads the core itself, and on the loop those reads held
+        # it for their deadline. The stop takes that snapshot off the loop, inside its budget.
+        sess = await _live(self.hub, "snapshot-miss")
+        self.hub.core.output("snapshot-miss", "ARCHIVED-BLOB\r\n")
+        self.hub.core.set_exit("snapshot-miss", 0)
+        self.hub.core.die("snapshot-miss")
+        self.hub._on_core_tick()  # the death takes its own path now; the stop is only the archive
+        await _settle(self.hub)
+        self.assertFalse(sess.is_process_alive())
+        core = self.hub.core
+        screen, scrollback = core.screen, core.scrollback
+
+        def slow_screen(*args, **kwargs):
+            time.sleep(0.12)
+            return screen(*args, **kwargs)
+
+        def slow_scrollback(*args, **kwargs):
+            time.sleep(0.12)
+            return scrollback(*args, **kwargs)
+
+        with patch.object(core, "snapshot_all", return_value=[]), \
+                patch.object(core, "screen", slow_screen), \
+                patch.object(core, "scrollback", slow_scrollback):
+            worst = await _worst_loop_lag(self.hub.archive_all_sessions_on_shutdown)
+        self.assertLess(worst, 0.08, f"the archive read the core on the loop for {worst:.3f}s")
+        with closing(sqlite3.connect(self.root / "hub_state.db")) as conn:
+            row = conn.execute(
+                "SELECT archived_at, scrollback FROM sessions WHERE session_id='snapshot-miss'"
+            ).fetchone()
+        self.assertIsNotNone(row[0], "the missed session was never archived")
+        self.assertIn("ARCHIVED-BLOB", zlib.decompress(bytes(row[1])).decode("utf-8"),
+                      "the fallback snapshot lost the raw ring the archive stores")
+
 
 class RetireIncarnationTests(_ManagerCase):
     async def test_a_refused_retire_is_retried_without_a_new_record(self):
@@ -254,22 +393,39 @@ class RetireIncarnationTests(_ManagerCase):
         self.assertNotIn("retire-retry", self.hub._retire_pending)
 
     async def test_a_pending_retire_never_removes_the_resumed_incarnation(self):
-        # F3: close → retire refused → resume inside that window. The retry used to fire when the
-        # resumed session died on its own, removing a session the hub still lists.
+        # F3/R1: close → retire refused → resume inside that window. The retry used to fire while
+        # the resume ran, removing the id from the core: the resumed session was unlisted and the
+        # sockets attached before it were closed instead of handed the successor's banner.
         await _resumable(self.hub, self.root, "retire-resume")
         self.hub.core.spawn("retire-resume", ["cmd.exe"])
         self.hub._on_core_tick()
+        old = self.hub.sessions["retire-resume"]
+        _replay, queue = old.attach_ws_queue()
+        handle = old.sockets.handles[queue]
         self.hub.core.kill("retire-resume", 200)
         self.hub._on_core_tick()
         self.hub.core.block_retire = 1
-        await self.hub._retire_ended_session("retire-resume",
-                                             self.hub._incarnations.get("retire-resume", 0))
-        self.assertIn("retire-resume", self.hub._retire_pending)
+        # The exit callback is still inside its transcript drain, so `_end_predecessor` has to wait
+        # for it; that wait is the window the scheduled retire used to fire in.
+        with patch.object(session_manager, "NATIVE_TRANSCRIPT_DRAIN_SEC", 0.2):
+            await self.hub._retire_ended_session(
+                "retire-resume", self.hub._incarnations.get("retire-resume", 0))
+            self.assertIn("retire-resume", self.hub._retire_pending)
 
-        result = await self.hub.resume_subagent("retire-resume", source="console")
+            result = await self.hub.resume_subagent("retire-resume", source="console")
         self.assertTrue(result["resumed"], result)
         self.assertNotIn("retire-resume", self.hub._retire_pending,
                          "the predecessor's drop survived the resume")
+        # A1/Q11: the handle belongs to the id, so the fan-out the predecessor had survives the
+        # resume and the successor's ws_prefix is written to it.
+        self.assertFalse(self.hub.core.handles[handle][1].closed,
+                         "the pending retire closed the socket the resume hands over")
+        self.hub._on_core_tick()
+        delivered = []
+        while not queue.empty():
+            delivered.append(queue.get_nowait())
+        self.assertIn(session_manager.resume_banner(1), delivered,
+                      "the resume banner never reached the socket attached before it")
         resumed = self.hub.sessions["retire-resume"]
         self.hub.core.output("retire-resume", "STILL-LIVE\r\n")
         self.hub.core.set_exit("retire-resume", 0)
@@ -280,6 +436,66 @@ class RetireIncarnationTests(_ManagerCase):
         self.assertIn("retire-resume", self.hub.sessions)
         self.assertIn("STILL-LIVE", resumed.read_raw().text,
                       "the retried retire removed the resumed incarnation from the core")
+
+    async def test_a_refused_drop_keeps_retrying_past_the_cap(self):
+        # r2-kimi 6: the cap cleared the pending drop and armed nothing, so a core entry the table
+        # kept refusing stayed (ring, screen and all) until the hub restarted. The cap now only
+        # slows the retries down, and the one warning states the real refusal count.
+        await _live(self.hub, "retire-cap")
+        self.hub.core.kill("retire-cap", 200)
+        self.hub._on_core_tick()
+        self.hub.core.block_retire = 1000
+        with patch.object(session_manager, "RETIRE_RETRY_MAX_ATTEMPTS", 3), \
+                patch.object(session_manager, "RETIRE_RETRY_INTERVAL_SEC", 0.0):
+            # The first refusal arms the timer; the timer's own attempts are what the cap counts.
+            await self.hub._retire_ended_session(
+                "retire-cap", self.hub._incarnations.get("retire-cap", 0))
+            with self.assertLogs("mcp-agent-hub.session_manager", level="WARNING") as logs:
+                for _ in range(100):
+                    await asyncio.sleep(0.02)
+                    if logs.output:
+                        break
+        warnings = [line for line in logs.output if "retire(retire-cap)" in line]
+        self.assertEqual(len(warnings), 1, logs.output)
+        self.assertIn("refused 4 times", warnings[0],
+                      "the warning counts the refusals it saw, not the cap")
+        self.assertIn("retrying every", warnings[0],
+                      "the cap gave up on a drop the core still holds")
+        self.assertIn("retire-cap", self.hub._retire_pending,
+                      "a permanent drop was forgotten while the core entry still exists")
+        self.assertGreater(self.hub._retire_backoff.get("retire-cap", 0.0) - time.monotonic(),
+                           1.0, "the drop did not back off after the cap")
+
+    async def test_a_refusal_that_lands_after_a_resume_is_not_queued_again(self):
+        # r2-kimi 7: a retire already inside the core when a resume bumped the incarnation wrote
+        # its old generation back into the pending map, and every later timer attempt returned at
+        # the stale guard without removing it: a permanent 250 ms no-op.
+        await _live(self.hub, "stale-retire")
+        self.hub.core.kill("stale-retire", 200)
+        self.hub._on_core_tick()
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def delayed_refusal(session_id):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2):
+                raise AssertionError("the probe did not release retire")
+            raise ValueError("session stale-retire's exit record has not been drained")
+
+        original = self.hub.core.retire
+        self.hub.core.retire = delayed_refusal
+        try:
+            task = asyncio.create_task(self.hub._retire_ended_session("stale-retire", 0))
+            await asyncio.wait_for(entered.wait(), 1)
+            self.hub._next_incarnation("stale-retire")
+            release.set()
+            await task
+        finally:
+            self.hub.core.retire = original
+        self.assertNotIn("stale-retire", self.hub._retire_pending,
+                         "a refusal of the old incarnation was queued against the new one")
+        self.assertIsNone(self.hub._retry_timer, "a timer was armed for a stale drop")
 
 
 class PredecessorResumeTests(_ManagerCase):
@@ -329,6 +545,167 @@ class PredecessorResumeTests(_ManagerCase):
         successor = self.hub.sessions["predecessor-code"]
         self.assertIsNot(successor, old)
         self.assertIsNone(successor.exit_code)
+
+    async def test_a_withheld_death_record_still_finalizes_the_predecessor_once(self):
+        # R6/contract 5: the core may publish the predecessor's death one drain late, and the
+        # successor's spawn drops whatever record the table still holds for the id. A single drain
+        # in `_end_predecessor` then loses the predecessor's final row and its one lifecycle event.
+        sess = await _live(self.hub, "withheld-exit")
+        self.hub.core.set_exit("withheld-exit", 4)
+        self.hub.core.withhold_death_records = 1
+        self.hub.core.die("withheld-exit")
+        with patch.object(session_manager, "NATIVE_TRANSCRIPT_DRAIN_SEC", 0.0):
+            await self.hub._end_predecessor("withheld-exit", sess)
+            self.assertIsNotNone(sess.ended_at, "the withheld death record was lost")
+            self.assertEqual((sess.status, sess.exit_code), ("crashed", 4))
+            events = [e for e in self.hub.get_worker_events("withheld-exit")
+                      if e["type"] in ("exited", "crashed")]
+            self.assertEqual([e["type"] for e in events], ["crashed"],
+                             "the predecessor's one event was lost")
+            # The resume's spawn is what drops an unread record: run it and check the ending held.
+            self.hub.core.spawn("withheld-exit", ["cmd.exe"])
+            self.hub._on_core_tick()
+            await _settle(self.hub)
+        events = [e for e in self.hub.get_worker_events("withheld-exit")
+                  if e["type"] in ("exited", "crashed")]
+        self.assertEqual([e["type"] for e in events], ["crashed"],
+                         "the successor's arrival emitted a second lifecycle event")
+        self.assertIsNone(self.hub.core.session("withheld-exit").exit_code,
+                          "the predecessor's death hit the successor")
+
+    async def test_a_predecessor_late_code_reaches_its_final_write(self):
+        # r2-kimi 4: the late code updated the old object and scheduled a rewrite, but the resume
+        # installed the successor first and the rewrite's identity guard dropped the write.
+        await _resumable(self.hub, self.root, "late-predecessor")
+        self.hub.core.spawn("late-predecessor", ["cmd.exe"])
+        self.hub._on_core_tick()
+        self.hub.core.set_exit("late-predecessor", None, crashed=True)
+        self.hub.core.die("late-predecessor")
+        # No transcript drain: the exit task is finished before the resume, so `_end_predecessor`
+        # has no await window in which the scheduled rewrite could still find the old object.
+        with patch.object(session_manager, "NATIVE_TRANSCRIPT_DRAIN_SEC", -1.0):
+            self.hub._on_core_tick()
+            await _settle(self.hub)
+            old = self.hub.sessions["late-predecessor"]
+            self.assertIsNone(old.exit_code)
+            self.hub.core.late_code("late-predecessor", 9)  # queued, not drained
+            writes = []
+            original = self.hub.persist_session
+
+            async def spy(session, **kwargs):
+                writes.append((session, bool(kwargs.get("final")), session.exit_code))
+                await original(session, **kwargs)
+
+            with patch.object(self.hub, "persist_session", new=spy):
+                result = await self.hub.resume_subagent("late-predecessor", source="console")
+        self.assertTrue(result["resumed"], result)
+        self.assertTrue(any(session is old and final and code == 9
+                            for session, final, code in writes),
+                        "the predecessor's late code never reached its final row")
+        self.assertIsNone(self.hub.sessions["late-predecessor"].exit_code)
+
+
+class LifecycleClaimTests(_ManagerCase):
+    def _refusing_spawn(self, refusals):
+        """Injects the core's exact lifecycle refusal (contract 1) into `spawn` this many times."""
+        original = self.hub.core.spawn
+        calls = []
+
+        def refuse(*args, **kwargs):
+            calls.append(args[0] if args else "")
+            if len(calls) <= refusals:
+                raise ValueError(
+                    f"session {args[0]}: another spawn, attach_text or retire is in flight; retry")
+            return original(*args, **kwargs)
+
+        self.hub.core.spawn = refuse
+        return calls
+
+    async def test_a_lifecycle_claim_refusal_is_retried_before_the_resume_fails(self):
+        # R4/r2-kimi 3: the hub's own retried retire holds the id's claim exactly when a resume
+        # reaches its spawn; the refusal says "retry" and used to become a permanent 恢复失败.
+        await _resumable(self.hub, self.root, "claim-retry")
+        calls = self._refusing_spawn(1)
+        try:
+            result = await self.hub.resume_subagent("claim-retry", source="console")
+        except ValueError as error:
+            self.fail(f"a transient claim refusal failed the resume: {error}")
+        self.assertTrue(result["resumed"], result)
+        self.assertEqual(len(calls), 2, "the refusal was not retried")
+        self.assertIn("claim-retry", self.hub.sessions)
+
+    async def test_three_lifecycle_claim_refusals_still_fail_the_resume(self):
+        # The retry is bounded: a claim that never frees fails as it did before, with the existing
+        # Chinese message, and no other ValueError is retried.
+        old = await _resumable(self.hub, self.root, "claim-fail")
+        calls = self._refusing_spawn(3)
+        with self.assertRaises(ValueError) as raised:
+            await self.hub.resume_subagent("claim-fail", source="console")
+        self.assertIn("恢复失败", str(raised.exception))
+        self.assertEqual(len(calls), 3, "the retry count is not the two more the contract allows")
+        self.assertIs(self.hub.sessions["claim-fail"], old,
+                      "the failed resume did not put the archived object back")
+
+    async def test_another_value_error_is_not_retried(self):
+        # kimi 3: only the exact in-flight refusal is transient. A core refusal that means "this id
+        # is live" must fail the resume at once, not after three attempts.
+        await _resumable(self.hub, self.root, "claim-live")
+        calls = []
+
+        def refuse(*args, **kwargs):
+            calls.append(args[0] if args else "")
+            raise ValueError(f"session {args[0]} is already running in the core")
+
+        self.hub.core.spawn = refuse
+        with self.assertRaises(ValueError) as raised:
+            await self.hub.resume_subagent("claim-live", source="console")
+        self.assertIn("恢复失败", str(raised.exception))
+        self.assertEqual(len(calls), 1, "a non-transient ValueError was retried")
+
+
+class DshResumeTests(_ManagerCase):
+    async def test_a_completed_text_predecessor_is_not_a_crash(self):
+        # R2: the core's kill of a text entry publishes `exit_code=None, crashed=false`, and F1
+        # turned that into a crash: a completed DSH session was archived as crashed and the parent
+        # was told a session it is resuming had crashed.
+        sess = _session(self.hub, "dsh-resume", command="", args=[])
+        sess.engine = "dsh"
+        sess.kind = "virtual"
+        sess.dsh_job_id = "job-1"
+        sess.profile_snapshot = {"engine": "dsh", "kind": "virtual", "cwd": str(self.root),
+                                 "dsh_spec": {}}
+        sess.conversation_ref = {"dsh_job_id": "job-1", "dsh_token": "tok"}
+        sess._loop = asyncio.get_running_loop()
+        sess.start_virtual(sess._loop)
+        self.hub._on_core_tick()
+        # The job watcher saw the job finish; the core's text entry stays live until a resume ends it.
+        sess.status = "completed"
+        sess.end_reason = "exited"
+        sess.exit_code = 0
+        sess.completion_reported = True
+        sess.ended_at = time.time()
+        await self.hub.persist_session(sess)
+        record = {
+            "session_id": "dsh-resume", "engine": "dsh", "cwd": str(self.root),
+            "profile_snapshot": dict(sess.profile_snapshot),
+            "conversation_ref": dict(sess.conversation_ref),
+        }
+        answer = httpx.Response(200, json={"job": {"id": "job-1", "status": "done"}})
+        with patch.object(session_manager, "prepare_dsh_workspace",
+                          return_value={"allowed": True, "status": "ready", "reason": ""}), \
+                patch.object(self.hub, "build_resume_launch", return_value={"cwd": str(self.root)}), \
+                patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=answer):
+            await self.hub._resume_dsh_session("dsh-resume", record, None)
+        events = [e for e in self.hub.get_worker_events("dsh-resume")
+                  if e["type"] in ("exited", "crashed")]
+        self.assertEqual(events, [], "the completed predecessor was announced as crashed")
+        self.assertEqual((sess.status, sess.end_reason, sess.exit_code),
+                         ("completed", "exited", 0),
+                         "the supersede overwrote the end state the session had earned")
+        row = await self.hub.db.get_session_record("dsh-resume")
+        self.assertEqual(row["status"], "completed")
+        self.assertNotEqual(row["end_reason"], "crashed",
+                            "the completed predecessor's row was archived as a crash")
 
 
 class DshLifecycleTests(_ManagerCase):

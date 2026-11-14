@@ -13,10 +13,12 @@ What it keeps faithful, because the hub's behaviour depends on it:
 - an id's incarnation counter drops the predecessor's queued records when the id is re-created, as
   the core's table insert does, so a death that was not drained before a same-id reattach is lost;
 - `attach_text` gives a text session pid 0 (no process), like the real core;
-- `kill` never invents a clean code 0: it answers the code the session was scripted with, otherwise
-  the job's nonzero termination code;
+- `kill` never invents a clean code 0 for a process: it answers the code the session was scripted
+  with, otherwise the job's nonzero termination code; a text session's kill answers `None`, as the
+  real core's does;
 - `drain` returns queued records and clears them, so `_on_core_tick` sees exactly what the core would
-  publish, and only the current incarnation's records can mark its death drained;
+  publish, and only the current incarnation's records can mark its death drained; it can withhold a
+  death record for N drains (`withhold_death_records`), which the fixed core may do for one;
 - `retire` refuses a live id, one whose death record has not been drained (`rtc-retire`) and one
   whose resume is in flight (the coming core contract), and it can be made busy (`TimeoutError`);
 - `take_frames` is non-blocking; a detached or retired handle reports `closed` at its first take,
@@ -24,7 +26,8 @@ What it keeps faithful, because the hub's behaviour depends on it:
 
 Test-only knobs: `set_exit`, `die`, `late_code`, `set_last_output_at`, `set_write_timeouts`,
 `block_detach`, `block_retire`, `resume_in_flight`, `read_timeouts`, `snapshot_delay`,
-`shutdown_delay`, `calls` (with `snapshot_budgets`, `kill_graces`, `detach_calls`, `retire_calls`).
+`shutdown_delay`, `withhold_death_records`, `calls` (with `snapshot_budgets`, `kill_graces`,
+`detach_calls`, `retire_calls`).
 """
 
 from __future__ import annotations
@@ -106,6 +109,9 @@ class FakeTerminal:
         self.snapshot_delay = 0.0
         self.shutdown_delay = 0.0
         self.calls: List[str] = []
+        # Core contract 5: a death record can be withheld for N drains (until the session's final
+        # batch has flushed), so the hub's ordering around a death is testable as it really is.
+        self.withhold_death_records = 0
 
     # ---- helpers a test uses to script the session ----------------------------------------
 
@@ -252,9 +258,11 @@ class FakeTerminal:
         if not state.alive:
             return state.exit_code
         state.alive = False
-        # A forced kill of a live process yields the job's termination code, never a clean 0.
-        if state.exit_code is None:
+        if state.pid and state.exit_code is None:
+            # A forced kill of a live process yields the job's termination code, never a clean 0.
             state.exit_code = 1
+        # A text session has no process: the real core publishes `exit_code=None, crashed=false`
+        # for its kill, and only a scripted code (`set_exit`) is ever reported for one.
         state.death_drained = False
         self.records.append((state.generation, self._record(state, urgent=True)))
         return state.exit_code
@@ -271,14 +279,23 @@ class FakeTerminal:
     def drain(self) -> List[Dict[str, Any]]:
         records, self.records = self.records, []
         out: List[Dict[str, Any]] = []
+        held: List[Tuple[int, Dict[str, Any]]] = []
         for generation, record in records:
             state = self.sessions.get(str(record.get("session_id") or ""))
             if state is None or state.generation != generation:
                 # The id was re-created (a resume): the core's table insert dropped this record.
                 continue
+            if record.get("alive") is False and self.withhold_death_records > 0:
+                # Contract 5: the record waits until the session's last batch has flushed, one
+                # drain later; its death is not drained yet, so `retire` still refuses the id.
+                held.append((generation, record))
+                continue
             if record.get("alive") is False:
                 state.death_drained = True
             out.append(record)
+        if held:
+            self.withhold_death_records -= 1
+            self.records = held + self.records
         return out
 
     def raw_tail(self, session_id: str, max_chars: Optional[int] = None,
