@@ -106,7 +106,7 @@ impl FrameQueue {
 }
 
 impl FrameSink for FrameQueue {
-    fn deliver(&self, _session_id: &str, frame: &[u8]) -> u64 {
+    fn deliver(&self, _session_id: &str, frame: &[u8]) {
         let mut state = self
             .state
             .lock()
@@ -114,9 +114,9 @@ impl FrameSink for FrameQueue {
         if state.closed {
             // The socket is gone: nothing to count, nothing to queue (§5.4's drop accounting is for a
             // live client that falls behind).
-            return 0;
+            return;
         }
-        state.ring.push(frame)
+        state.ring.push(frame);
     }
 }
 
@@ -128,7 +128,7 @@ mod tests {
 
     use super::*;
 
-    fn sink(queue: &Arc<FrameQueue>, frame: &[u8]) -> u64 {
+    fn sink(queue: &Arc<FrameQueue>, frame: &[u8]) {
         queue.deliver("s", frame)
     }
 
@@ -137,7 +137,7 @@ mod tests {
     fn frames_leave_in_arrival_order() {
         let queue = Arc::new(FrameQueue::new(1024));
         for index in 0..5u8 {
-            assert_eq!(sink(&queue, &[b'f', index]), 0);
+            sink(&queue, &[b'f', index]);
         }
         let taken = queue.take();
         assert!(!taken.closed);
@@ -147,19 +147,21 @@ mod tests {
         assert!(queue.take().frames.is_empty(), "take clears the queue");
     }
 
-    /// §5.4: the byte cap holds, the oldest whole frames go first, and every dropped byte is counted.
+    /// §5.4: the byte cap holds, the oldest whole frames go first, and every dropped byte is counted in
+    /// the queue (the trait reports nothing back, so one socket's loss cannot reach the session).
     #[test]
     fn the_cap_drops_the_oldest_whole_frames_and_counts_them() {
         let queue = Arc::new(FrameQueue::new(10));
-        assert_eq!(sink(&queue, b"12345"), 0);
-        assert_eq!(sink(&queue, b"67890"), 0);
-        assert_eq!(sink(&queue, b"abc"), 5, "the oldest whole frame made room");
+        sink(&queue, b"12345");
+        sink(&queue, b"67890");
+        sink(&queue, b"abc");
         assert_eq!(queue.queued_bytes(), 8);
+        assert_eq!(queue.dropped_bytes(), 5, "the oldest whole frame made room");
         let taken = queue.take();
         assert_eq!(taken.frames, vec![b"67890".to_vec(), b"abc".to_vec()]);
         assert_eq!(taken.dropped_bytes, 5);
         // A frame larger than the whole queue is dropped by itself: a reader never gets half a frame.
-        assert_eq!(sink(&queue, &[b'z'; 11]), 11);
+        sink(&queue, &[b'z'; 11]);
         assert!(queue.take().frames.is_empty());
         assert_eq!(queue.dropped_bytes(), 16, "the count is cumulative");
     }
@@ -206,10 +208,11 @@ mod tests {
     #[test]
     fn a_closed_queue_reports_closed_and_receives_nothing() {
         let queue = Arc::new(FrameQueue::new(64));
-        assert_eq!(sink(&queue, b"before"), 0);
+        sink(&queue, b"before");
         queue.close();
         assert!(queue.is_closed());
-        assert_eq!(sink(&queue, b"after"), 0, "a closed queue counts no drops");
+        sink(&queue, b"after");
+        assert_eq!(queue.dropped_bytes(), 0, "a closed queue counts no drops");
         let taken = queue.take();
         assert!(taken.closed, "take reports the close");
         assert!(

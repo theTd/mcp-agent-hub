@@ -324,6 +324,98 @@ fn a_respawn_after_retire_carries_nothing_over() {
     core.shutdown();
 }
 
+/// A seeded attach's ring is already at revision 1 when the session is built, so the drain record must
+/// report that number from the first record on — not a mirror that starts at 0 and only catches up with
+/// the first ingest (review F5/K4).
+#[test]
+fn a_seeded_attach_reports_the_rings_raw_revision_from_the_first_record() {
+    let _serial = serialized();
+    let core = core();
+    core.attach_text(TextRequest {
+        session_id: "seeded-rev".to_string(),
+        cols: 40,
+        rows: 6,
+        flags: SessionFlags::default(),
+        seed_history: Some("ARCHIVED-HISTORY\r\n".to_string()),
+        seed: None,
+    })
+    .expect("a seeded attachment");
+    // `resize` dirties the session without touching the ring: the record below carries the ring as the
+    // seed left it, not as an ingest moved it.
+    core.resize("seeded-rev", 41, 6, DEADLINE).expect("resize");
+    let record = core
+        .drain()
+        .into_iter()
+        .find(|record| record.session_id == "seeded-rev")
+        .expect("a drain record");
+    let raw = core.raw("seeded-rev", DEADLINE).expect("raw");
+    let snapshot = core
+        .snapshot_all(10, 4096, DEADLINE)
+        .into_iter()
+        .find(|snapshot| snapshot.session_id == "seeded-rev")
+        .expect("a snapshot");
+    assert_eq!(raw.rev, 1, "the seeded ring is at revision 1");
+    assert_eq!(snapshot.raw_rev, raw.rev, "snapshot_all reads the ring itself");
+    assert_eq!(
+        record.raw_rev, raw.rev,
+        "the first record after a seeded attach carries the ring's revision"
+    );
+    core.kill("seeded-rev", Duration::from_millis(100)).expect("kill");
+    core.shutdown();
+}
+
+/// The same number while the id's delivery lock is held: `ingest` stores both revisions under the text
+/// lock, before it waits for a delivery, so a drain taken inside that window cannot report the previous
+/// revision while `raw()` already answers the new one (review F5/K4, `step3b-raw-rev`).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_drain_record_keeps_up_while_a_delivery_is_in_flight() {
+    use conpty_session::test_hooks::set_attach_delay;
+
+    let _serial = serialized();
+    let core = core();
+    core.attach_text(text_request("held-rev", None)).expect("attach_text");
+    core.feed("held-rev", "ONE", DEADLINE).expect("feed ONE");
+
+    // The attach parks holding the delivery lock, so the second feed's pump cannot deliver yet; its
+    // ingest has already moved the ring and both mirrors.
+    set_attach_delay(Duration::from_millis(400));
+    let attacher = {
+        let core = Arc::clone(&core);
+        thread::spawn(move || core.attach_queue("held-rev", None).expect("attach_queue"))
+    };
+    thread::sleep(Duration::from_millis(80));
+    let feeder = {
+        let core = Arc::clone(&core);
+        thread::spawn(move || core.feed("held-rev", "TWO", DEADLINE).expect("feed TWO"))
+    };
+
+    let end = Instant::now() + Duration::from_secs(1);
+    let raw = loop {
+        let raw = core.raw("held-rev", DEADLINE).expect("raw");
+        if raw.text == "ONETWO" {
+            break raw;
+        }
+        assert!(Instant::now() < end, "the second feed never reached the ring");
+        thread::sleep(Duration::from_millis(2));
+    };
+    let record = core
+        .drain()
+        .into_iter()
+        .find(|record| record.session_id == "held-rev")
+        .expect("the first feed left a dirty record");
+    set_attach_delay(Duration::ZERO);
+    attacher.join().expect("attacher");
+    feeder.join().expect("feeder");
+    core.kill("held-rev", Duration::from_millis(100)).expect("kill");
+    core.shutdown();
+    assert_eq!(
+        record.raw_rev, raw.rev,
+        "the record reports the ring's revision while a delivery is still held: raw={raw:?}, \
+         record={record:?}"
+    );
+}
+
 /// The seam's `raw_revision` comes from the drain record: the same number `raw`'s reply carries, without
 /// joining the ring.
 #[test]
@@ -342,6 +434,79 @@ fn the_drain_record_carries_the_raw_revision() {
     assert_eq!(record.raw_rev, raw.rev, "the record and the raw reply share one revision");
     assert!(record.alive);
     core.kill("rev", Duration::from_millis(100)).expect("kill");
+    core.shutdown();
+}
+
+/// §5.4: a socket's own loss is its own count. One queue over its cap drops the oldest whole frames and
+/// reports them from its handle; the session's `dropped_bytes` (drain record, `stats`) stays at zero,
+/// because the ring lost nothing (review F6).
+#[test]
+fn a_sockets_dropped_bytes_stay_out_of_the_sessions_count() {
+    let _serial = serialized();
+    let core = core();
+    core.attach_text(text_request("socket-loss", None)).expect("attach_text");
+    let (_replay, handle) = core.attach_queue("socket-loss", Some(8)).expect("a tiny queue");
+    core.feed("socket-loss", &"x".repeat(16), DEADLINE).expect("feed");
+    // The ticker's window flushes the batch into the tiny queue, which cannot hold the whole frame.
+    thread::sleep(Duration::from_millis(100));
+    let taken = core.take_frames(handle).expect("take_frames");
+    assert_eq!(taken.dropped_bytes, 16, "the queue counted its own loss");
+    assert!(taken.frames.is_empty(), "an oversize frame is dropped whole, never split");
+
+    let record = core
+        .drain()
+        .into_iter()
+        .find(|record| record.session_id == "socket-loss")
+        .expect("a drain record for the fed session");
+    assert_eq!(
+        record.dropped_bytes, 0,
+        "a socket's overflow is not the session's loss"
+    );
+    assert_eq!(
+        core.stats(DEADLINE).dropped_bytes,
+        0,
+        "one slow socket's drop never reaches the session's counters"
+    );
+    assert!(core.detach_queue(handle));
+    core.kill("socket-loss", Duration::from_millis(100)).expect("kill");
+    core.shutdown();
+}
+
+/// The ring's own loss is the session's: a frame too large for the raw ring is counted in the drain
+/// record and in `stats`, which is the count §5.4 keeps there. The per-socket count above is separate.
+#[test]
+fn the_rings_own_loss_is_counted_by_the_session() {
+    let _serial = serialized();
+    let core = core();
+    core.attach_text(TextRequest {
+        session_id: "ring-loss".to_string(),
+        cols: 40,
+        rows: 6,
+        flags: SessionFlags {
+            raw_cap_bytes: 64,
+            raw_slack_bytes: 0,
+            ..SessionFlags::default()
+        },
+        seed_history: None,
+        seed: None,
+    })
+    .expect("attach_text");
+    core.feed("ring-loss", &"y".repeat(4096), DEADLINE).expect("feed");
+    let record = core
+        .drain()
+        .into_iter()
+        .find(|record| record.session_id == "ring-loss")
+        .expect("a drain record");
+    assert!(
+        record.dropped_bytes > 0,
+        "the ring dropped the oversize chunk and the record says so: {record:?}"
+    );
+    assert_eq!(
+        core.stats(DEADLINE).dropped_bytes,
+        record.dropped_bytes,
+        "the session's counter is the ring's loss, cumulative"
+    );
+    core.kill("ring-loss", Duration::from_millis(100)).expect("kill");
     core.shutdown();
 }
 

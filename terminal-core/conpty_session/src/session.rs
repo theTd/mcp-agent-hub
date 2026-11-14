@@ -588,6 +588,9 @@ pub struct Session {
     /// The ring's `raw_rev`, mirrored for the same reason: the seam's `raw_revision` must not join the
     /// ring (`_scrollback_blob`'s change gate).
     raw_rev: AtomicU64,
+    /// `true` once `publish_death` has delivered the session's last batch. A drain never reports the
+    /// death before it: the record that says "ended" must not precede the last byte (§5.3).
+    death_flushed: AtomicBool,
     /// `true` once a drain reported this incarnation's death record. `retire` refuses before that, so
     /// the exit record (code, `crashed`) cannot be dropped with the session.
     death_reported: AtomicBool,
@@ -639,6 +642,11 @@ impl Session {
                 stream.seed_history(seed);
             }
         }
+        // The mirrors start at the stream's own revisions, not at 0: a seeded attach's ring is already
+        // at 1, and every record that reports a revision must report the number `raw()`/`screen`
+        // carried (the drain record's `raw_rev` gates `_scrollback_blob`).
+        let screen_rev = stream.screen_rev();
+        let raw_rev = stream.raw_rev();
         Arc::new(Self {
             id,
             pid,
@@ -650,9 +658,13 @@ impl Session {
                 frame: Vec::with_capacity(8192),
             }),
             cached: Mutex::new(CachedText::default()),
+            // A predecessor whose fan-out is already closed was retired while this incarnation was
+            // being built (`Core::retire` closes it): its sinks are gone, so adopting it would drop
+            // every frame this session prints and no socket would ever be told `closed`. A spawn of a
+            // retired id always starts on a fresh fan-out.
             fanout: match previous {
-                Some(previous) => Arc::clone(&previous.fanout),
-                None => Arc::new(SinkFanout::default()),
+                Some(previous) if !previous.fanout.is_closed() => Arc::clone(&previous.fanout),
+                _ => Arc::new(SinkFanout::default()),
             },
             superseded: AtomicBool::new(false),
             reader_started: AtomicBool::new(false),
@@ -662,8 +674,9 @@ impl Session {
             exit_code: AtomicI32::new(-1),
             output_ended: AtomicBool::new(false),
             bytes_total: AtomicU64::new(0),
-            screen_rev: AtomicU64::new(0),
-            raw_rev: AtomicU64::new(0),
+            screen_rev: AtomicU64::new(screen_rev),
+            raw_rev: AtomicU64::new(raw_rev),
+            death_flushed: AtomicBool::new(false),
             death_reported: AtomicBool::new(false),
             code_pending: AtomicBool::new(false),
             chunks_total: AtomicU64::new(0),
@@ -1124,6 +1137,13 @@ impl Session {
         }
         let rev = stream.screen_rev();
         let raw_rev = stream.raw_rev();
+        // The mirrors are stored here, under the text lock, not after `pump`: `pump` waits for the
+        // id's delivery lock, and a drain taken in that window would otherwise report the *previous*
+        // revision while `raw()` already carries the new one (`step3b-raw-rev`: the record's `raw_rev`
+        // is the same number `raw` reports). `fetch_max` because a revision is monotonic: two
+        // concurrent ingests can only ever move it forward.
+        self.screen_rev.fetch_max(rev, Ordering::Relaxed);
+        self.raw_rev.fetch_max(raw_rev, Ordering::Relaxed);
         let processed = frame.len() as u64;
         let ring_dropped = stream.ring_dropped_bytes();
         drop(guard);
@@ -1135,8 +1155,6 @@ impl Session {
             ring_dropped.saturating_sub(ring_before),
             Ordering::Relaxed,
         );
-        self.screen_rev.store(rev, Ordering::Relaxed);
-        self.raw_rev.store(raw_rev, Ordering::Relaxed);
         self.bytes_total.fetch_add(processed, Ordering::Relaxed);
         self.chunks_total.fetch_add(1, Ordering::Relaxed);
         self.last_output_ms.store(now_unix_ms(), Ordering::Relaxed);
@@ -1191,11 +1209,11 @@ impl Session {
             .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            // A code learned after the death record went out is a record of its own, and `retire` must
-            // not drop it (§5.3 SF3).
-            if self.death_reported.load(Ordering::Acquire) {
-                self.code_pending.store(true, Ordering::Release);
-            }
+            // Unconditional: the record that carries the code clears this again, and a code is *pending*
+            // until one does. Testing `death_reported` here instead lost a code learned inside a drain's
+            // own window — the drain had already read the code as absent, and nothing told `retire` to
+            // wait (§5.3 SF3, review F3).
+            self.code_pending.store(true, Ordering::Release);
             self.dirty.store(true, Ordering::Release);
             self.tick.pending.store(true, Ordering::Release);
         }
@@ -1203,13 +1221,20 @@ impl Session {
 
     /// Publishes the death record: `alive = false`, one dirty record and an urgent wakeup (§5.3). Called
     /// after the reader's last bytes (or when the console-close deadline passes), never before.
+    ///
+    /// The last batch is delivered **inside** the `alive` gate and `death_flushed` follows it, so no drain
+    /// can report the death before that delivery finished: the record that says "ended" never precedes
+    /// the session's last byte (§5.3). Every caller flushes — `kill` and the reaper may publish after the
+    /// reader published, and the bytes they learned about last belong to the same console.
     fn publish_death(&self) {
-        if self.alive.swap(false, Ordering::AcqRel) {
+        let first = self.alive.swap(false, Ordering::AcqRel);
+        if first {
+            // `alive = false` is visible before this flush ends, so `drain_record` skips the record
+            // until `death_flushed` says the delivery finished: the next tick carries the death.
+            self.flush_frames_all();
+            self.death_flushed.store(true, Ordering::Release);
             self.dirty.store(true, Ordering::Release);
             self.tick.urgent.store(true, Ordering::Release);
-            // The console's last bytes go out before the death record: a pane that sees the end must
-            // already have everything the process printed (§5.3).
-            self.flush_frames_all();
             // Nothing can reach a dead process: closing the queue ends its writer thread, so the
             // session's last `Arc` is released instead of being held by a thread parked on a condvar
             // (B1: the replaced session must release its handles, not leak a writer). The count is
@@ -1221,6 +1246,9 @@ impl Session {
                     self.id, dropped
                 ));
             }
+        } else {
+            // A concurrent publish owns the record; whatever this caller learned goes out too.
+            self.flush_frames_all();
         }
     }
 
@@ -1656,7 +1684,10 @@ impl Session {
     ///
     /// Never returns a handle it did not register: a sink that panicked earlier leaves a poisoned sink
     /// list behind, and `register` recovers it with `into_inner`.
-    pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, u64) {
+    /// `(replay, handle)`, where `handle` is `None` when the id was retired before the registration:
+    /// a registered sink in a closed fan-out would receive no frame and no `closed`, so nothing is
+    /// registered and the caller answers `closed` at once (review F1).
+    pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, Option<u64>) {
         // The owner `Arc<Session>` taken for the replay is released **after** the delivery lock: once
         // `retire` exists, an attach through a predecessor can hold the last reference to the owner, and
         // dropping it here would run `Session::drop` (pipes, console close helper) under the lock that
@@ -1681,10 +1712,10 @@ impl Session {
             // The pending batch already reached the other sinks, except when the frame that carried it
             // was taken by a sink that has since detached; `skip` is this sink, whose replay holds those
             // bytes.
-            let delivery = match (pending, &owner) {
-                (Some(frame), Some(owner)) => owner.fan_out(&frame, Some(handle)),
-                (Some(frame), None) => self.fan_out(&frame, Some(handle)),
-                (None, _) => Delivery::default(),
+            let delivery = match (pending, &owner, handle) {
+                (Some(frame), Some(owner), handle) => owner.fan_out(&frame, handle),
+                (Some(frame), None, handle) => self.fan_out(&frame, handle),
+                (None, _, _) => Delivery::default(),
             };
             owner_slot = owner;
             (replay, handle, delivery)
@@ -1912,6 +1943,15 @@ impl Session {
             raw_rev: self.raw_rev.load(Ordering::Relaxed),
             screen_text: self.watched_screen(Instant::now()),
         };
+        if !alive && !self.death_flushed.load(Ordering::Acquire) {
+            // The death is published but its last delivery is still running (or pending): this tick
+            // reports nothing for the session and keeps it dirty, so the record that says "ended"
+            // never precedes the session's last byte (§5.3, review F2).
+            self.dirty.store(true, Ordering::Release);
+            return None;
+        }
+        #[cfg(test)]
+        death_record_tests::drain_snapshot_gate(&self.id);
         // This record is the report `retire` waits for: the death (code, crashed) is in it, and a code
         // learned after the death record is carried by the first record that has one.
         if !alive {
@@ -2074,5 +2114,106 @@ mod tests {
             Err(WriteError::Closed)
         );
         assert!(queue.pop().is_none());
+    }
+}
+
+/// §5.3's ordering rules for the record that says "ended".
+///
+/// A code learned inside a drain's own window must not be lost: the record that carried no code is
+/// already out, so `retire` has to wait for the next one (review F3/K2). The gate below parks a drain
+/// between its snapshot and its `death_reported`/`code_pending` update, which is exactly that window.
+#[cfg(test)]
+mod death_record_tests {
+    use super::*;
+    use crate::{Core, CoreError, CoreOptions, TextRequest};
+
+    /// The armed gate: `id` names the one session a drain may park on, so a drain of another core
+    /// running in parallel (cargo runs a binary's tests on many threads) can never consume it — that
+    /// would park the wrong drain and let this test's own drain through.
+    static DRAIN_GATE: Mutex<(Option<String>, u8)> = Mutex::new((None, 0));
+    static DRAIN_GATE_CHANGED: Condvar = Condvar::new();
+
+    /// Called by `drain_record` after its snapshot is built; inert unless a test armed the gate for
+    /// this session.
+    pub(super) fn drain_snapshot_gate(session_id: &str) {
+        let mut gate = DRAIN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+        if gate.1 != 1 || gate.0.as_deref() != Some(session_id) {
+            return;
+        }
+        gate.1 = 2;
+        DRAIN_GATE_CHANGED.notify_all();
+        while gate.1 == 2 {
+            gate = DRAIN_GATE_CHANGED
+                .wait(gate)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// The exit code arrives after the death record was built but before the drain finished with it. The
+    /// record goes out without a code, `retire` refuses (the code is not carried by any record yet), the
+    /// next drain carries it, and then `retire` accepts.
+    #[test]
+    fn a_code_learned_inside_the_first_death_drain_gates_retire() {
+        let core = Core::new(
+            Box::new(|| false),
+            Box::new(|_line: &str| {}),
+            CoreOptions::default(),
+        );
+        core.attach_text(TextRequest {
+            session_id: "late-code".to_string(),
+            cols: 40,
+            rows: 6,
+            flags: SessionFlags::default(),
+            seed_history: None,
+            seed: None,
+        })
+        .expect("attach_text");
+        let session = core.session_for_test("late-code").expect("session");
+        session.publish_death();
+
+        *DRAIN_GATE.lock().unwrap_or_else(|error| error.into_inner()) =
+            (Some("late-code".to_string()), 1);
+        let drainer = {
+            let core = Arc::clone(&core);
+            thread::spawn(move || core.drain())
+        };
+        let mut gate = DRAIN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+        while gate.1 != 2 {
+            gate = DRAIN_GATE_CHANGED
+                .wait(gate)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        drop(gate);
+        session.set_exit_code(9);
+        let records = {
+            gate = DRAIN_GATE.lock().unwrap_or_else(|error| error.into_inner());
+            gate.1 = 3;
+            DRAIN_GATE_CHANGED.notify_all();
+            drop(gate);
+            drainer.join().expect("drain")
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].exit_code, None,
+            "the race needs the code to arrive after this snapshot"
+        );
+
+        let refused = core
+            .retire("late-code")
+            .expect_err("retire must wait for the record that carries the code");
+        assert!(matches!(refused, CoreError::Invalid(_)), "{refused:?}");
+        assert!(
+            refused.to_string().contains("exit record"),
+            "the refusal names the record: {refused}"
+        );
+
+        let carried = core
+            .drain()
+            .into_iter()
+            .find(|record| record.session_id == "late-code")
+            .expect("the code is its own record");
+        assert_eq!(carried.exit_code, Some(9), "the second record carries the code");
+        assert!(core.retire("late-code").expect("retire after the code went out"));
+        core.shutdown();
     }
 }

@@ -87,8 +87,9 @@ impl Coalescer {
     }
 }
 
-/// One console socket's queue. `deliver` hands the frame over and returns the bytes it had to drop to
-/// accept it.
+/// One console socket's queue. `deliver` hands the frame over; what a sink does with a frame it cannot
+/// hold — the bytes it drops — is the sink's own accounting and never the session's (`FrameQueue` keeps
+/// its `dropped_bytes` per handle, §5.4), so the trait reports nothing back.
 ///
 /// `deliver` runs on the session's reader thread (or on `feed`'s caller) while the session's delivery
 /// lock and sink list are held, in stream order, one frame at a time. It must therefore not block and
@@ -97,7 +98,7 @@ impl Coalescer {
 /// (§6.4). A panic from `deliver` costs that sink alone: the core catches it, detaches the sink and
 /// reports it, and the other sinks still get the frame (§6.3).
 pub trait FrameSink: Send + Sync {
-    fn deliver(&self, session_id: &str, frame: &[u8]) -> u64;
+    fn deliver(&self, session_id: &str, frame: &[u8]);
 }
 
 /// A bounded ring of whole frames: the oldest leave first, and every dropped byte is counted.
@@ -207,11 +208,11 @@ impl QueueSink {
 }
 
 impl FrameSink for QueueSink {
-    fn deliver(&self, _session_id: &str, frame: &[u8]) -> u64 {
+    fn deliver(&self, _session_id: &str, frame: &[u8]) {
         self.queue
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .push(frame)
+            .push(frame);
     }
 }
 

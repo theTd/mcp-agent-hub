@@ -479,9 +479,11 @@ impl Core {
     }
 
     /// **Temporary (step 4 deletes it).** `detach_queue(handle) -> bool`: closes the queue, unregisters
-    /// the sink and forgets the handle; `false` the second time (and for a handle never issued).
-    fn detach_queue(&self, py: Python<'_>, handle: u64) -> bool {
-        py.detach(|| self.inner.detach_queue(handle))
+    /// the sink and forgets the handle; `false` the second time (and for a handle never issued). It never
+    /// reports a missed deadline as `false`: the registry has no deadline, so a `false` means the handle
+    /// was already gone (review F4).
+    fn detach_queue(&self, py: Python<'_>, handle: u64) -> PyResult<bool> {
+        guarded(|| Ok(py.detach(|| self.inner.detach_queue(handle))))
     }
 
     /// `retire(session_id) -> bool`: removes an ended session from the table. `false` for an unknown id;

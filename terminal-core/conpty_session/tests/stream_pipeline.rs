@@ -63,10 +63,10 @@ fn q11_every_chunk_reaches_each_sink_exactly_once() {
     }
 }
 
-/// §5.4: a sink whose queue cannot hold a frame drops it whole and the drop is counted in the drain
-/// record.
+/// §5.4: a sink whose queue cannot hold a frame drops it whole, and that loss stays the sink's own: the
+/// session's `dropped_bytes` counts the ring's losses, not one slow client's (review F6).
 #[test]
-fn a_slow_sink_drops_whole_frames_and_counts_them() {
+fn a_slow_sink_drops_whole_frames_and_keeps_the_count_itself() {
     let core = core();
     core.attach_text(text_request("slow")).expect("attach_text");
     let sink = Arc::new(QueueSink::new(8));
@@ -81,9 +81,9 @@ fn a_slow_sink_drops_whole_frames_and_counts_them() {
         .find(|record| record.session_id == "slow")
         .expect("a death record");
     assert!(!record.alive);
-    assert!(
-        record.dropped_bytes >= payload.len() as u64,
-        "record: {record:?}"
+    assert_eq!(
+        record.dropped_bytes, 0,
+        "one slow sink's loss is not the session's: {record:?}"
     );
 }
 
