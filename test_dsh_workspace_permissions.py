@@ -284,7 +284,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "hub", self.hub), \
                 patch.object(server, "ensure_profiles_loaded", new_callable=AsyncMock), \
                 patch.object(self.hub, "resolve_launch", return_value={"engine": "dsh", "cwd": str(self.root)}):
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://test") as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://127.0.0.1:4444") as client:
                 response = await client.post("/api/launch-preview", json={"profile_id": "dsh"})
         self.assertEqual(response.json()["sandbox_preparation"]["status"], "blocked")
         self.assertFalse(self.prepare.call_args.kwargs["repair"])

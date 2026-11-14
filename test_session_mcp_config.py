@@ -186,7 +186,7 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_and_mcp_share_fields_and_errors(self):
         config = dict(mcp_servers=SERVERS, disabled_mcp_servers=["old"], strict_mcp_config=True)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             preview = await client.post("/api/launch-preview", json=dict(profile_id="claude", **config))
             self.assertTrue(preview.json()["ok"])
             self.assertEqual(preview.json()["mcp_servers"], SERVERS)

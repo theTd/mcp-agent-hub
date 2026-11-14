@@ -10015,16 +10015,9 @@ class HubSessionManager:
             await asyncio.sleep(self._transcript_scan_interval(time.time() - scan_start))
             if not self._transcript_watch_alive(session):
                 break
-            candidates = []
-            for p in brain_root.rglob("transcript.jsonl"):
-                try:
-                    # V2/Q2: the conversation directory (brain/<uuid>) must be younger than this
-                    # session's process. A transcript that already existed belongs to somebody else.
-                    if not self._conversation_created_after(p, session, levels_up=2):
-                        continue
-                    candidates.append(p)
-                except OSError:
-                    continue
+            # Off the event loop: four agy sessions starting together once kept the loop busy with
+            # back-to-back walks of the whole brain tree, and the hub stopped answering.
+            candidates = await asyncio.to_thread(self._agy_new_transcripts, session, brain_root)
             target_file = await self._claim_conversation(session, candidates, levels_up=2)
             if target_file:
                 break
@@ -10275,6 +10268,35 @@ class HubSessionManager:
             return any(p.iterdir())
         except OSError:
             return False
+
+    @classmethod
+    def _agy_new_transcripts(cls, session: AgentSession, brain_root: Path) -> List[Path]:
+        """Transcripts of the conversations started after this session's process.
+
+        agy keeps one conversation per brain/<uuid> dir with its transcript at
+        .system_generated/logs/transcript.jsonl, so this checks that one path in each top-level
+        dir (a few hundred stats) instead of walking every nested dir (thousands). Runs in a
+        worker thread.
+        """
+        try:
+            entries = list(os.scandir(brain_root))
+        except OSError:
+            return []
+        found: List[Path] = []
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+                path = Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                if not path.is_file():
+                    continue
+                # V2/Q2: the conversation must be younger than this session's process. A
+                # transcript that already existed belongs to somebody else.
+                if cls._conversation_created_after(path, session, levels_up=2):
+                    found.append(path)
+            except OSError:
+                continue
+        return found
 
     def _agy_new_conversation_dir(self, session: AgentSession, brain_root: Path) -> Optional[Path]:
         """A3: a conversation dir that proves the resumed agy opened a NEW conversation.
