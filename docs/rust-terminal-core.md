@@ -86,9 +86,9 @@ The pure-Python parser is pyte 0.8.2 through two subclasses: `HubTerminalScreen`
 ## 3. What moves to Rust
 
 1. **ConPTY lifecycle**: spawn (argv, cwd, env, cols×rows), write, resize, kill the process tree,
-   report the exit code and the pid. `unwrap_windows_cmd_shim` (`session_manager.py:1864`) moves with
-   it: it is argv surgery in front of the spawn, and it needs the same PATH lookup and npm-shim regex;
-   its table becomes a Rust unit test fed by the same fixtures.
+   report the exit code and the pid. `unwrap_windows_cmd_shim` stays in Python (decision
+   `cmd-shim-stays-python`, step 3): it is argv preparation that runs once per spawn, off the output
+   path, so the hub unwraps argv and then calls `spawn`; its table stays in `test_session_launch_args.py`.
 2. **VT parsing**: screen (cols×rows, cursor, alt screen, wide/CJK cells), 3000-line history, and text
    rendering that matches `screen.display` plus `rstrip`/blank-line trimming.
 3. **Raw history**: the byte-capped ring with W9 trim (`trim_history_text`, `session_manager.py:630`),
@@ -894,7 +894,7 @@ imported by the hub after step 3, and it is deleted with its `requirements.in` e
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
 | 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs`; step 2d makes the delivery state (lock, sinks, handles) belong to the session id, which step 4's sockets attach to | `cargo test` **and** `cargo test --features conpty_session/test-hooks` in `terminal-core/` (the delivery-order, resume-handover and panic-isolation cases need the hooks; neither the hooks nor their call sites exist in a release build): `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach, `sink_handover.rs` the resume handover, and both pass 20 runs in a row with the hooks on | branch only | M, 5-7 d |
-| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b-core (done) delivered the calls the swap needs: the per-socket `FrameQueue` (`conpty_session/src/frame_queue.rs`) with the temporary `attach_queue`/`take_frames`/`detach_queue` bridge for the Python `/ws/pty` socket, `retire` (an ended session leaves the table, gated on its exit record), `raw_rev` in the drain record for the seam's `raw_revision`, and `attach_sink` releasing its owner `Arc` after the delivery lock; `seam-coverage.md` maps every seam method to its core call and reply field. 3b-hub swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
+| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b-core (done) delivered the calls the swap needs: the per-socket `FrameQueue` (`conpty_session/src/frame_queue.rs`) with the temporary `attach_queue`/`take_frames`/`detach_queue` bridge for the Python `/ws/pty` socket, `retire` (an ended session leaves the table, gated on its exit record), `raw_rev` in the drain record for the seam's `raw_revision`, and `attach_sink` releasing its owner `Arc` after the delivery lock; `seam-coverage.md` maps every seam method to its core call and reply field. 3b-hub swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase` and pywinpty deleted from the hub (the pyte classes and the trim helper move to a `tools/` oracle module, `oracle-to-tools`; `unwrap_windows_cmd_shim` stays, `cmd-shim-stays-python`); every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty`; the two screen readers master added (§8.1) get live captures from the step 0 recorder's stop points (`--followup FILE` types a draft and ends once the screen stands still, `--deny-box [TEXT]` ends at a settled approval box after denying it with Escape; both write `consumer.reads_at_chunk` to meta.json) and `test_terminal_live_consumers.py` replays that prefix through the core and through pyte and runs the real consumers on both | the full Python suite on the branch, with the ported tests from §10; `test_terminal_live_consumers` (skips without the built extension); `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
 | 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; the socket thread drains the `FrameQueue` step 3b-core built (it writes the replay and `replay_end` before the first frame) and **deletes the three pull calls** (`attach_queue`/`take_frames`/`detach_queue`), while `FrameQueue` and `retire` stay; per-socket `dropped_bytes` reported per handle in the drain record rather than summed per session, and `attach_sink`'s replay render measured under the delivery lock (≈1.5 ms at the 512 KiB cap) before deciding whether to move it out; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
 | 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
 | 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; delete `tools/fixtures`'s pyte oracle and the `pyte` dependency entry | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
@@ -913,13 +913,12 @@ Existing tests that cover this behaviour and what porting them means:
 | `test_hub_persistence.py` | scrollback blob written once per rev, `_scrollback_rev_written`; and one live `/ws/pty` connect (`:276`) | assert on the core's `rev`; point the WS case at the core's listener with a minted ticket and keep the `replay_end` expectation |
 | `test_restart_resume_on_start.py` | resume banner, continuation text, archived-at-stop paths | add: the seeded history and the banner arrive in one `spawn(seed_history=…, ws_prefix=…)` call and the banner precedes the first output frame |
 | `test_event_loop_stalls.py` | loop latency under a write backlog | add a case that fires 20 drains of 50 records through the fake client; existing cases unchanged |
-| `test_session_launch_args.py` | argument stripping/injection | unchanged; the shim table moves to a Rust test with the same fixtures |
+| `test_session_launch_args.py` | argument stripping/injection | unchanged; the shim table stays here with the shim (`cmd-shim-stays-python`) |
 | `test_transcript_feed.py` | transcript rendering | unchanged |
 
 New tests, none run by this unit:
 
-- Rust, parser and history: the shim-unwrap table (same fixtures as `test_session_launch_args.py`) and
-  the step-0 corpus (`tools/fixtures/terminal/`, rendered screen-for-screen against the frozen Python
+- Rust, parser and history: the step-0 corpus (`tools/fixtures/terminal/`, rendered screen-for-screen against the frozen Python
   output): W9 trim goldens (UTF-8 split, `budget <= 0`, and the three banner outcomes — banner after the
   cut, cut inside the banner line (banner kept, history over the cap by less than the line), banner
   older than the budget); the in-loop W9 trigger
@@ -943,13 +942,16 @@ New tests, none run by this unit:
   tree (a spawned `cmd /c start` grandchild must not survive), a failed accept followed by a served
   connection (§6.4, master `4b06139`).
 - Live captures for the screen readers master added after this design (§8.1), recorded in step 3 with
-  the step 0 recorder and rendered by the oracle: `live-codex-scrolled-paste` (Codex at 80×24, a
-  ~900-character follow-up that scrolls the composer, so the `↑` mark shows) and `live-omp-approval-box`
-  (an OMP approval box whose command is longer than the box is wide). Besides the golden match, the step 3
-  test runs the real consumers on the core's screen: `_codex_composer_shows_whole` accepts the settled
-  composer, and the OMP box parse yields the command and its `command_truncated` flag as it does on pyte's
-  screen. Today their tests pass the screen in as a string, so no test feeds their bytes through either
-  screen model.
+  the step 0 recorder's stop points and rendered by the oracle: `live-codex-scrolled-paste` (Codex at
+  80×24, a 945-character follow-up typed unsent so the composer scrolled and the `↑` mark shows on its
+  top visible row) and `live-omp-approval-box` (an omp approval box at 120×36 whose `Command:` row runs
+  to the frame's edge and is cut with `…`; the recorder denied it with Escape and never approved it).
+  Both record `consumer.reads_at_chunk`, the chunk a replay stops at to reproduce exactly the screen the
+  consumer read, and `test_terminal_live_consumers.py` feeds that prefix through the core (`attach_text`
+  + `feed`) and through pyte, asserts the two screens are equal, and runs the real consumers on both:
+  `_codex_composer_shows_whole` accepts the settled composer, and the omp box parse yields the same tool,
+  command and `command_truncated` flag (True) from both. Their older tests pass the screen in as a
+  string; these are the only ones that feed recorded bytes through either screen model.
 - Rust, build config: CI asserts the extension's profile unwinds (a `cargo metadata`
   `profile.release.panic` check for the core crate), because a stray `panic = "abort"` silently turns
   every caught panic back into a hub kill.
@@ -1056,6 +1058,14 @@ Run only when the machine is idle; it is not part of the default suite.
     reporting 3 when the hub kills it in that window. A failed query logs and leaves `exit_code = None`
     (archived as a crash) instead of a fake 0; a code that arrives after the death record is re-carried
     by the next drain.
+15. **The Codex scroll mark can sit flush against the text (found and fixed).** Codex puts its `↑`
+    mark in the composer's last column, so a top visible row filled up to that column ends
+    `… without changing↑`. `TUI_CODEX_SCROLL_MARK_RE` wanted whitespace on both sides, so
+    `_codex_composer_shows_whole` rejected a settled, fully typed draft and the settle loop ran to its
+    cap before pressing Enter (found by the first `live-codex-scrolled-paste` recording; the committed
+    one was recorded with wrap slack). Fixed in Python per `oracle-bugs` on `fix/codex-scroll-mark-flush`
+    (`a5d8272`): the mark needs whitespace only after it. Master takes it with the owner's OK; the core
+    changes nothing, it only has to draw the mark in the same cell as pyte, which the case checks.
 
 Open questions for the owner: none blocking. Two are deferred by design rather than unanswered: whether
 the `.pyd` ultimately ships as abi3 or per-minor follows from step 1's abi3 probe, and permessage-deflate
