@@ -1,4 +1,5 @@
 server.py
+loopback_request_guard.py
 agent_guidance.py
 parent_waiting.py
 session_manager.py

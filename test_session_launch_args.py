@@ -117,7 +117,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_and_mcp_forward_same_argv(self):
         extra = ["-c", "mcp_servers.hidden.enabled=false"]
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             preview = await client.post("/api/launch-preview", json={"profile_id": "codex", "extra_args": extra})
             self.assertTrue(preview.json()["ok"])
             self.assertEqual(preview.json()["args"][-2:], extra)

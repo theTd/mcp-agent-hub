@@ -33,6 +33,7 @@ from session_manager import (
 )
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
+from loopback_request_guard import LoopbackRequestGuard
 from agent_guidance import SERVER_INSTRUCTIONS
 import windows_accept_guard
 
@@ -822,6 +823,12 @@ async def hold_requests_during_restart_resume(request: Request, call_next):
     if not hub.restart_resume_gate.is_open and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
         await hub.restart_resume_gate.wait()
     return await call_next(request)
+
+
+# Outermost of the app's middlewares: `add_middleware` inserts at the front, so registering the guard
+# last means a DNS-rebinding or cross-site request is refused before any other middleware, route or
+# MCP session handles it. Env allowlists: HUB_ALLOWED_HOSTS, HUB_ALLOWED_ORIGINS.
+app.add_middleware(LoopbackRequestGuard)
 
 
 # ============================================================================
