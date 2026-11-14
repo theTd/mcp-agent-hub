@@ -77,7 +77,10 @@ export function checkRelease(exe, report) {
     const full = path.join(root, name);
     if (fs.lstatSync(full).isSymbolicLink()) throw new Error('Symbolic payload member');
     const bytes = fs.readFileSync(full);
-    try { scanContent(bytes, markers); } catch (error) { throw new Error(`${name}: ${error.message}`); }
+    try {
+      scanContent(bytes, markers);
+      if (name.toLowerCase().endsWith('.pyd')) checkPe(bytes);
+    } catch (error) { throw new Error(`${name}: ${error.message}`); }
     hashes[name] = crypto.createHash('sha256').update(bytes).digest('hex');
   }
   let exeHash;
@@ -87,7 +90,7 @@ export function checkRelease(exe, report) {
     checkPe(bytes);
     exeHash = crypto.createHash('sha256').update(bytes).digest('hex');
   }
-  const result = { passed: true, exe_sha256: exeHash, source_files: hashes, checks: ['UTF-8/ASCII/UTF-16', 'host identifiers and paths', 'credentials', 'explicit resource manifest', ...(exe ? ['x64 PE and CodeView/PDB'] : [])] };
+  const result = { passed: true, exe_sha256: exeHash, source_files: hashes, checks: ['UTF-8/ASCII/UTF-16', 'host identifiers and paths', 'credentials', 'explicit resource manifest', 'x64 PE and CodeView/PDB for .pyd payloads', ...(exe ? ['x64 PE and CodeView/PDB'] : [])] };
   if (report) fs.writeFileSync(report, JSON.stringify(result, null, 2) + '\n');
   return result;
 }
