@@ -40,6 +40,7 @@ fn core_logging(lines: Arc<Mutex<Vec<String>>>) -> Arc<Core> {
         }),
         CoreOptions::default(),
     )
+    .expect("core")
 }
 
 fn text_request(id: &str, seed: Option<&str>) -> TextRequest {

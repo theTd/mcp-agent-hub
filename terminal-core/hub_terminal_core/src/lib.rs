@@ -38,6 +38,10 @@ const SPAWN_DEADLINE: Duration = Duration::from_millis(2000);
 /// §5.2's `stats` bound; the table read it needs is contended only by a spawn insert.
 const STATS_DEADLINE: Duration = Duration::from_millis(5);
 
+/// §6.4's ticket lifetime: a console opens the URL within a second of fetching it, so 30 s is slack
+/// for a slow tab and short enough that a leaked URL is worthless.
+const DEFAULT_TICKET_TTL_MS: u64 = 30_000;
+
 /// `KeyError` for an unknown id, `TimeoutError` for a deadline that left nothing done, `ValueError` for a
 /// refused argument, `RuntimeError` for everything a spawn or a thread could fail with (§5.1).
 fn core_error(error: CoreError) -> PyErr {
@@ -174,9 +178,56 @@ impl Core {
             None => Box::new(|_: &str| {}),
         };
         Ok(Self {
-            inner: conpty_session::Core::new(notify_fn, log_fn, options_from_dict(opts)),
+            inner: conpty_session::Core::new(notify_fn, log_fn, options_from_dict(opts))
+                .map_err(core_error)?,
             log: log_shared,
         })
+    }
+
+    /// The port the console's terminal sockets are served on (`127.0.0.1:<ws_port>`, §6.4). The hub
+    /// reports it; the console only ever sees it inside a ticket URL.
+    #[getter]
+    fn ws_port(&self) -> u16 {
+        self.inner.ws_port()
+    }
+
+    /// `ws_listening()`: false once the accept thread has ended, which the hub's health check reports
+    /// (§6.4, `ws-listening-health`).
+    fn ws_listening(&self) -> bool {
+        self.inner.ws_listening()
+    }
+
+    /// `ws_ticket(session_id, ttl_ms=30000) -> {"url", "expires_at"}`: the one-use ticket the console
+    /// connects with (§6.4). The key never leaves the core, so the mint is here and not in Python.
+    /// `KeyError` for an unknown id (the hub 404s before it asks).
+    #[pyo3(signature = (session_id, ttl_ms=None))]
+    fn ws_ticket<'py>(
+        &self,
+        py: Python<'py>,
+        session_id: String,
+        ttl_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guarded(|| {
+            let ttl = Duration::from_millis(ttl_ms.unwrap_or(DEFAULT_TICKET_TTL_MS));
+            let (url, expires_at) = py
+                .detach(|| self.inner.ws_ticket(&session_id, ttl))
+                .map_err(core_error)?;
+            let dict = PyDict::new(py);
+            dict.set_item("url", url)?;
+            dict.set_item("expires_at", expires_at)?;
+            Ok(dict)
+        })
+    }
+
+    /// `close_sockets(session_id) -> count`: asks every console socket of the id to close with 1000
+    /// (W7's normal close) and reports how many it asked. A retired id answers 0.
+    fn close_sockets(&self, py: Python<'_>, session_id: String) -> PyResult<usize> {
+        guarded(|| Ok(py.detach(|| self.inner.close_sockets(&session_id))))
+    }
+
+    /// How many console sockets the core holds (diagnostics).
+    fn socket_count(&self, py: Python<'_>) -> PyResult<usize> {
+        guarded(|| Ok(py.detach(|| self.inner.socket_count())))
     }
 
     /// Starts one console session. `flags`/`seed_history`/`ws_prefix` are the §5.2 shape: the flags set
@@ -326,6 +377,28 @@ impl Core {
                 dict.set_item("screen_rev", record.screen_rev)?;
                 dict.set_item("raw_rev", record.raw_rev)?;
                 dict.set_item("screen_text", record.screen_text)?;
+                // §6.4: the console's pending size requests, in arrival order (the hub applies its
+                // clamp and its propagation to each), the input a text-only session must feed to its
+                // own echo, and each socket's own drop count, per handle.
+                let resize_requests = PyList::empty(py);
+                for request in record.resize_requests {
+                    let item = PyDict::new(py);
+                    item.set_item("cols", request.cols)?;
+                    item.set_item("rows", request.rows)?;
+                    item.set_item("propagate", request.propagate)?;
+                    resize_requests.append(item)?;
+                }
+                dict.set_item("resize_requests", resize_requests)?;
+                let input_requests = PyList::empty(py);
+                for text in record.input_requests {
+                    input_requests.append(text)?;
+                }
+                dict.set_item("input_requests", input_requests)?;
+                let socket_drops = PyList::empty(py);
+                for (handle, dropped) in record.socket_drops {
+                    socket_drops.append((handle, dropped))?;
+                }
+                dict.set_item("socket_drops", socket_drops)?;
                 out.push(dict);
             }
             Ok(out)

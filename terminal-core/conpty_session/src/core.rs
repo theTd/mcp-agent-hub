@@ -26,6 +26,25 @@ use crate::session::{
     SessionOptions, SessionSnapshot, TextReply, TickFlags,
 };
 use crate::sink_fanout::SinkFanout;
+use crate::ws::WsServer;
+
+/// The answer `attach_socket` gives the listener: a registered console socket, an id the core never
+/// had, one that ended and was retired, or one whose table read missed its deadline.
+pub enum SocketAttach {
+    Attached {
+        session: Arc<Session>,
+        /// The replay to write before the first frame (Q11: it ends exactly where the frames begin).
+        replay: String,
+        /// The sink's handle inside the id's fan-out.
+        handle: u64,
+    },
+    /// No session under this id: `ws_pty_endpoint` closed with 1008.
+    Unknown,
+    /// The id was retired while the registration was in flight: the endpoint closed with 1000.
+    Ended,
+    /// The table was busy past its deadline: the endpoint closed with 1013.
+    Busy,
+}
 
 /// Calls this step's Python layer makes. `drain_interval` is the 50 ms notify window; `tick_interval`
 /// is how often the ticker looks (§5.3) and flushes due batches (§5.4).
@@ -132,6 +151,10 @@ impl std::fmt::Display for CoreError {
 /// short, so 50 ms is the same bound the other table reads use.
 const BRIDGE_DEADLINE: Duration = Duration::from_millis(50);
 
+/// §6.4's bound for closing every console socket and joining the listener and socket threads: local
+/// sockets with their close frames, plus one cut-off for a peer that accepts nothing.
+const SHUTDOWN_SOCKET_BUDGET: Duration = Duration::from_secs(2);
+
 /// Bounded wait for a read lock, so a writer (a spawn inserting a session) cannot hold the hub's loop.
 fn read_deadline<'a, T>(lock: &'a RwLock<T>, deadline: Duration) -> Option<RwLockReadGuard<'a, T>> {
     let end = Instant::now() + deadline;
@@ -233,17 +256,30 @@ pub struct Core {
     panics: Arc<AtomicU64>,
     ticker: Mutex<Option<JoinHandle<()>>>,
     /// The ticker's id: `shutdown` must not join the ticker from the ticker.
-    ticker_id: Mutex<Option<thread::ThreadId>>,
+    ticker_id: Mutex<Option<std::thread::ThreadId>>,
+    /// The console's sockets (§6.4): the loopback listener, the ticket table and one thread per
+    /// attached pane. Python no longer owns a terminal socket in step 4.
+    ws: Arc<WsServer>,
 }
 
 impl Core {
-    /// Starts the ticker thread. `notify` is called at most every `drain_interval` and only when a
-    /// session is dirty (§5.3); `log` is called on spawn, kill and panic only.
+    /// Starts the ticker and the terminal WebSocket listener. `notify` is called at most every
+    /// `drain_interval` and only when a session is dirty (§5.3); `log` is called on spawn, kill, panic
+    /// and a refused or closed console socket only.
+    ///
+    /// `Err` when the loopback listener cannot bind or the ticket key cannot be minted: the console has
+    /// no other path to a session (§6.4), so a core without its socket server must not start.
     pub fn new(
         notify: Box<dyn Fn() -> bool + Send + Sync>,
         log: Box<dyn Fn(&str) + Send + Sync>,
         opts: CoreOptions,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, CoreError> {
+        let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::from(log);
+        // §6.4: the listener is part of the core, so its port and its health are known before the
+        // first session is spawned.
+        let ws = WsServer::start(Arc::clone(&log), opts.sink_queue_bytes).map_err(|error| {
+            CoreError::Internal(format!("terminal socket listener could not start: {error}"))
+        })?;
         let tick = Arc::new(TickFlags::default());
         let panics = Arc::new(AtomicU64::new(0));
         let core = Arc::new(Self {
@@ -253,7 +289,7 @@ impl Core {
             next_queue_handle: AtomicU64::new(1),
             lifecycle: Mutex::new(HashSet::new()),
             notify,
-            log: Arc::from(log),
+            log: Arc::clone(&log),
             opts,
             tick,
             stop: Mutex::new(false),
@@ -263,7 +299,10 @@ impl Core {
             panics,
             ticker: Mutex::new(None),
             ticker_id: Mutex::new(None),
+            ws: Arc::clone(&ws),
         });
+        ws.spawn_accept(Arc::downgrade(&core))
+            .map_err(|error| CoreError::Internal(format!("ws accept thread: {error}")))?;
         let ticker_core = Arc::clone(&core);
         let handle = thread::Builder::new()
             .name("core-ticker".to_string())
@@ -275,7 +314,7 @@ impl Core {
             }
             *slot = Some(handle);
         }
-        core
+        Ok(core)
     }
 
     /// 5 ms ticks flush step-2 batches; the Python wakeup is gated to `drain_interval`, and one exit per
@@ -311,6 +350,10 @@ impl Core {
                 for session in sessions {
                     let _ = catch_unwind(AssertUnwindSafe(|| session.flush_frames(now)));
                 }
+                // §6.4's slow client: a console socket that has not written for the stall limit is
+                // asked to close with 1000 here, on the ticker, because a blocked write cannot time
+                // itself out.
+                let _ = catch_unwind(AssertUnwindSafe(|| self.ws.check_stalls()));
                 let urgent = self.tick.urgent.swap(false, Ordering::AcqRel);
                 let pending = self.tick.pending.swap(false, Ordering::AcqRel);
                 let due = last_notify
@@ -546,14 +589,33 @@ impl Core {
 
     /// One record per session whose flags were set since the previous call, flags cleared (§5.3).
     pub fn drain(&self) -> Vec<DrainRecord> {
-        let sessions: Vec<Arc<Session>> = match read_deadline(&self.sessions, Duration::from_millis(50)) {
-            Some(map) => map.values().cloned().collect(),
+        let sessions = match read_deadline(&self.sessions, Duration::from_millis(50)) {
+            Some(map) => map,
             None => return Vec::new(),
         };
-        sessions
-            .into_iter()
+        // §5.4/§9 step 4: a console socket's drop happens on the delivery path, where no output may
+        // follow it, so a drop the hub has not seen dirties its session here. The record then carries
+        // the count per handle, never in the session's own `dropped_bytes`.
+        for id in self.ws.sessions_with_unreported_drops() {
+            if let Some(session) = sessions.get(&id) {
+                session.note_socket_drop();
+            }
+        }
+        let mut records: Vec<DrainRecord> = sessions
+            .values()
             .filter_map(|session| session.drain_record())
-            .collect()
+            .collect();
+        drop(sessions);
+        if !records.is_empty() {
+            // One walk for the whole drain, not one per record.
+            let drops = self.ws.take_socket_drops();
+            for record in &mut records {
+                if let Some(sockets) = drops.get(&record.session_id) {
+                    record.socket_drops = sockets.clone();
+                }
+            }
+        }
+        records
     }
 
     pub fn raw_tail(
@@ -705,6 +767,113 @@ impl Core {
 
     pub fn detach_sink(&self, id: &str, handle: u64) -> Result<bool, CoreError> {
         Ok(self.session(id)?.detach_sink(handle))
+    }
+
+    /// Registers one console socket's sink on the id's fan-out and hands back the replay that goes with
+    /// the registration (§6.4, Q11). The three refusals are the listener's close codes.
+    pub(crate) fn attach_socket(&self, id: &str, sink: Arc<dyn FrameSink>) -> SocketAttach {
+        let session = match self.session(id) {
+            Ok(session) => session,
+            Err(CoreError::UnknownSession(_)) => return SocketAttach::Unknown,
+            Err(_) => return SocketAttach::Busy,
+        };
+        match session.attach_sink(sink) {
+            (replay, Some(handle)) => SocketAttach::Attached {
+                session,
+                replay,
+                handle,
+            },
+            // Retired while the registration was in flight: nothing was registered, so there is no
+            // replay to send and the socket closes the way an ended pane always did.
+            (_, None) => SocketAttach::Ended,
+        }
+    }
+
+    /// Console input from a socket (§6.4 "Input"). A session with a PTY gets the bytes written; a
+    /// text-only session has nothing to write to, so the input becomes an ordered drain-record request
+    /// that the hub feeds to its own echo and line callback (§8: for a text session the core never owns
+    /// the echo). Either way a failure is logged by the caller and costs only that frame.
+    pub fn socket_input(
+        &self,
+        id: &str,
+        text: &str,
+        deadline: Duration,
+    ) -> Result<(), CoreError> {
+        let session = self.session(id)?;
+        if session.is_text_only() {
+            session.request_input(text.to_string());
+            return Ok(());
+        }
+        session
+            .write(text.as_bytes(), deadline)
+            .map(|_| ())
+            .map_err(|error| CoreError::Invalid(format!("session {id}: write failed: {error:?}")))
+    }
+
+    /// The console's size request (§6.4): recorded on the session, carried by the drain record, and
+    /// applied by the hub with its own clamp and propagation — never by the core.
+    pub fn request_resize(
+        &self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+        propagate: bool,
+    ) -> Result<(), CoreError> {
+        self.session(id)?.request_resize(cols, rows, propagate);
+        Ok(())
+    }
+
+    /// The port the console connects to (§6.4); fixed once, at start.
+    pub fn ws_port(&self) -> u16 {
+        self.ws.port()
+    }
+
+    /// Whether the accept thread is still serving. False means every new console pane is refused, which
+    /// the hub's health check reports (§6.4, `ws-listening-health`).
+    pub fn ws_listening(&self) -> bool {
+        self.ws.listening()
+    }
+
+    /// A console ticket for `id`: the URL to open and the unix second it expires in. An unknown id is
+    /// `UnknownSession` (the hub 404s before it asks), because a ticket must never name a session that
+    /// does not exist.
+    pub fn ws_ticket(&self, id: &str, ttl: Duration) -> Result<(String, u64), CoreError> {
+        self.session(id)?;
+        let minted = self.ws.ticket(id, ttl)?;
+        Ok((self.ws.ticket_url(&minted, id), minted.expires_at_unix))
+    }
+
+    /// Asks every socket of `id` to close with 1000 (§5.2, W7) and returns how many it asked. A retired
+    /// id answers 0: its sockets are already gone.
+    pub fn close_sockets(&self, id: &str) -> usize {
+        self.ws.close_sockets(id)
+    }
+
+    /// How many console sockets the core holds (diagnostics and tests).
+    pub fn socket_count(&self) -> usize {
+        self.ws.socket_count()
+    }
+
+    /// Test-only: lowers the stall limit so a 30 s slow-client case runs in a second.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_socket_stall_limit(&self, limit: Duration) {
+        self.ws.set_stall_limit(limit);
+    }
+
+    /// Test-only: how many accepts failed, real or injected.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn ws_accept_failures(&self) -> u64 {
+        self.ws.accept_failures()
+    }
+
+    /// Test-only: makes the next `count` accepted connections fail like a client that dropped
+    /// mid-accept (§6.4's `4b06139` case).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn fail_next_accepts(&self, count: u64) {
+        self.ws.fail_next_accepts(count);
     }
 
     /// **Temporary (step 4 deletes it).** Registers a bounded [`FrameQueue`] on the id's fan-out — the
@@ -864,6 +1033,9 @@ impl Core {
         // held (`Session::drop` asserts that in test builds).
         drop(session);
         self.close_queues_of(id);
+        // §6.4: the id's console sockets close with 1000 here too, the way `close_ws_frontends` did on
+        // archive; the fan-out close below keeps a socket that attached in between from staying open.
+        self.ws.close_sockets(id);
         // No lock from here on: closing a fan-out hands back its sinks and a sink's `Drop` may wait on a
         // socket.
         drop(fanout.close());
@@ -941,9 +1113,11 @@ impl Core {
         stats
     }
 
-    /// Stops the ticker and joins it. The caller must have released the GIL: the ticker may be inside a
-    /// Python callback, and joining it while holding the GIL is exactly the deadlock B2 is about. Called
-    /// from the ticker itself (a `notify` callback that drops the core), the join is skipped.
+    /// Stops the ticker and the terminal socket server, and joins both. The caller must have released
+    /// the GIL: the ticker may be inside a Python callback, and joining it while holding the GIL is
+    /// exactly the deadlock B2 is about. Called from the ticker itself (a `notify` callback that drops
+    /// the core), the ticker join is skipped; the socket threads are still joined, because they are
+    /// never the ticker.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
         if let Ok(mut stop) = self.stop.lock() {
@@ -957,14 +1131,16 @@ impl Core {
             .and_then(|id| *id)
             .map(|id| id == thread::current().id())
             .unwrap_or(false);
-        if on_ticker {
-            return;
-        }
-        if let Ok(mut slot) = self.ticker.lock() {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
+        if !on_ticker {
+            if let Ok(mut slot) = self.ticker.lock() {
+                if let Some(handle) = slot.take() {
+                    let _ = handle.join();
+                }
             }
         }
+        // §6.4: every socket closes, and the listener and socket threads are joined inside its budget.
+        // Idempotent, so a second `shutdown` (the binding's `Drop` after Python's call) is cheap.
+        self.ws.shutdown(SHUTDOWN_SOCKET_BUDGET);
     }
 }
 
@@ -992,6 +1168,7 @@ mod retire_gates {
             Box::new(|_line: &str| {}),
             CoreOptions::default(),
         )
+        .expect("core")
     }
 
     fn attach_text(core: &Core, id: &str) {

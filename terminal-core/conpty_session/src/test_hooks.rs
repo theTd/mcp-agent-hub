@@ -136,3 +136,108 @@ pub(crate) fn hold_resize_slot() {
     *RESIZE_INSIDE.lock().unwrap_or_else(|error| error.into_inner()) = false;
     RESIZE_INSIDE_CHANGED.notify_all();
 }
+
+/// `true` while a console socket's frame write is parked, so a test can make its queue overflow or
+/// trip the stall watchdog without filling a real TCP buffer.
+static HOLD_WRITES: Mutex<bool> = Mutex::new(false);
+/// Wakes a parked write when the test releases it.
+static WRITES_RELEASED: Condvar = Condvar::new();
+/// `true` while a socket is inside the gate (so a test knows its queue is really not being drained).
+static WRITE_INSIDE: Mutex<bool> = Mutex::new(false);
+/// Wakes `wait_until_socket_write_held` when a socket enters or leaves the gate.
+static WRITE_INSIDE_CHANGED: Condvar = Condvar::new();
+
+/// The session whose next socket frame write panics; `None` in every normal run. One socket's panic
+/// must cost that socket only (§6.3), and no other way reaches that path without a real fault.
+static PANIC_WRITE_SESSION: Mutex<Option<String>> = Mutex::new(None);
+
+/// Makes the next frame write of `session_id`'s sockets panic, and only that session's: other sessions'
+/// sockets in the same test binary keep running, parallel tests included.
+pub fn panic_socket_writes_for(session_id: &str) {
+    *PANIC_WRITE_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(session_id.to_string());
+}
+
+/// Called by the socket thread before it writes frames: panics while the test asked it to.
+pub(crate) fn panic_socket_write(session_id: &str) {
+    let armed = {
+        let mut slot = PANIC_WRITE_SESSION
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match slot.as_deref() {
+            Some(id) if id == session_id => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    };
+    if armed {
+        panic!("injected socket write panic (test hook)");
+    }
+}
+
+/// Parks every console socket's frame write until `release_socket_writes`.
+pub fn hold_socket_writes() {
+    *HOLD_WRITES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = true;
+}
+
+/// Unparks them.
+pub fn release_socket_writes() {
+    *HOLD_WRITES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = false;
+    WRITES_RELEASED.notify_all();
+}
+
+/// Waits until a socket is parked inside the gate. `false` when none entered within `timeout`.
+pub fn wait_until_socket_write_held(timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    let mut inside = WRITE_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    loop {
+        if *inside {
+            return true;
+        }
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        inside = WRITE_INSIDE_CHANGED
+            .wait_timeout(inside, remaining)
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|error| error.into_inner().0);
+    }
+}
+
+/// Called by the socket thread before it writes frames, so a held gate means "nothing is leaving the
+/// queue". `closing` lets a close request through, or a watchdog close would wait out the gate.
+pub(crate) fn hold_socket_write(mut closing: impl FnMut() -> bool) {
+    {
+        let held = HOLD_WRITES.lock().unwrap_or_else(|error| error.into_inner());
+        if !*held {
+            return;
+        }
+    }
+    *WRITE_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = true;
+    WRITE_INSIDE_CHANGED.notify_all();
+    let end = Instant::now() + HOLD_LIMIT;
+    let mut held = HOLD_WRITES.lock().unwrap_or_else(|error| error.into_inner());
+    while *held && Instant::now() < end && !closing() {
+        held = WRITES_RELEASED
+            .wait_timeout(held, Duration::from_millis(5))
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|error| error.into_inner().0);
+    }
+    drop(held);
+    *WRITE_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = false;
+    WRITE_INSIDE_CHANGED.notify_all();
+}

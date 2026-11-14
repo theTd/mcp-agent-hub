@@ -99,6 +99,22 @@ pub struct TickFlags {
     pub urgent: AtomicBool,
 }
 
+/// A size the console asked for through its socket (§6.4 "Input"). The core never applies one: it
+/// records the request and the hub applies its 20x5 clamp and its single-window propagation, which is
+/// policy and stays in Python (§8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResizeRequest {
+    pub cols: u16,
+    pub rows: u16,
+    /// The console's `propagate` flag: `state.layoutMode === 'single'`.
+    pub propagate: bool,
+}
+
+/// How many unapplied requests one session may hold before the oldest leave. The hub drains every
+/// 50 ms, so a backlog this deep means it stopped draining; keeping the newest is what a user typing
+/// (or a pane being refitted) would expect, and it bounds a socket's memory.
+const MAX_PENDING_REQUESTS: usize = 1024;
+
 /// What `drain` reports for one dirty session (§5.3).
 #[derive(Clone, Debug)]
 pub struct DrainRecord {
@@ -119,6 +135,21 @@ pub struct DrainRecord {
     pub raw_rev: u64,
     /// Only for a watched session whose `screen_rev` changed and whose interval is due.
     pub screen_text: Option<String>,
+    /// The console's unapplied size requests, in arrival order and taken once (§6.4). `propagate`
+    /// travels with each one: dropping it would resize every background session in matrix mode. A
+    /// backlog over the cap has had its oldest removed.
+    pub resize_requests: Vec<ResizeRequest>,
+    /// Console input for a session with no PTY, in arrival order, already OSC-stripped and taken once
+    /// (`attach_text` sessions: the hub owns their echo and line callback, so the core never writes
+    /// them anywhere — §8, `session_manager.py`'s virtual branch). Empty for a process session, whose
+    /// input goes to its PTY directly.
+    pub input_requests: Vec<String>,
+    /// Per console socket of this id, its sink handle and the cumulative bytes it dropped (§5.4, §9
+    /// step 4). A slow pane's loss stays its own and is never added to `dropped_bytes`; only handles
+    /// with a drop are listed, and a socket that detached since the last drain reports its final count
+    /// once. Handles are unique per session id, so the pair (record's `session_id`, handle) identifies a
+    /// socket across the whole hub.
+    pub socket_drops: Vec<(u64, u64)>,
 }
 
 /// The pseudoconsole's single close point. Three states, because "somebody took the handle" and "the
@@ -605,6 +636,18 @@ pub struct Session {
     cols: AtomicU32,
     rows: AtomicU32,
     tick: Arc<TickFlags>,
+    /// The console's unapplied size requests (§6.4), set by a socket in arrival order, taken by the
+    /// drain record. Ordered rather than latest-wins: the hub must apply each one in turn, because
+    /// `propagate` is part of the request and an earlier single-window resize still moves the other
+    /// sessions' screens even if a later request only resizes this one.
+    resize_requests: Mutex<Vec<ResizeRequest>>,
+    /// Console input for a text-only session, in arrival order, already OSC-stripped (`attach_text`:
+    /// the hub owns the echo and the line callback, so nothing may write it into a PTY). Bounded by
+    /// `MAX_PENDING_REQUESTS`; a process session never fills it.
+    input_requests: Mutex<Vec<String>>,
+    /// `true` once the input backlog overflowed, so the loss is logged once per incarnation, not per
+    /// keystroke.
+    request_backlog_logged: AtomicBool,
     panics: Arc<AtomicU64>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
 }
@@ -688,6 +731,9 @@ impl Session {
             cols: AtomicU32::new(cols as u32),
             rows: AtomicU32::new(rows as u32),
             tick,
+            resize_requests: Mutex::new(Vec::new()),
+            input_requests: Mutex::new(Vec::new()),
+            request_backlog_logged: AtomicBool::new(false),
             panics,
             log,
         })
@@ -1347,6 +1393,82 @@ impl Session {
         self.writer.push(text, deadline)
     }
 
+    /// The console's size request, recorded for the hub instead of applied (§6.4 "Input"): `resize` is
+    /// policy (the 20x5 clamp and the single-window propagation), so the core only carries the request
+    /// on the drain record. Requests keep their arrival order — an earlier one whose `propagate` was set
+    /// still moves the other sessions' screens, so the hub has to see both — and the flag dirties the
+    /// session so the record goes out even when no byte follows.
+    pub fn request_resize(&self, cols: u16, rows: u16, propagate: bool) {
+        if cols == 0 || rows == 0 {
+            // A zero size is not a size: the console's `fit()` never sends one, and the hub's clamp
+            // would refuse it anyway.
+            return;
+        }
+        self.push_bounded(
+            &self.resize_requests,
+            ResizeRequest {
+                cols,
+                rows,
+                propagate,
+            },
+        );
+        self.dirty.store(true, Ordering::Release);
+        self.tick.pending.store(true, Ordering::Release);
+    }
+
+    /// Console input that reached this session through its socket and has no PTY to go to
+    /// (`attach_text`: the hub's virtual sessions). It is stored, never written: the hub owns that echo
+    /// and its line callback (§8, `session_manager.py`'s `emit_virtual_ansi` path). Already stripped by
+    /// `strip_osc_color_queries`, the same rule the hub applies to a PTY write's echo.
+    pub(crate) fn request_input(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.push_bounded(&self.input_requests, text);
+        self.dirty.store(true, Ordering::Release);
+        self.tick.pending.store(true, Ordering::Release);
+    }
+
+    /// Whether this session has no PTY at all, which is what sends console input to `request_input`
+    /// instead of `write`.
+    pub(crate) fn is_text_only(&self) -> bool {
+        self.resources.is_none()
+    }
+
+    /// Appends to an ordered backlog, dropping the oldest past the cap. The hub drains every 50 ms, so
+    /// reaching the cap means it stopped draining; keeping the newest is what a user typing expects,
+    /// and the loss is logged once per session rather than silently every time.
+    fn push_bounded<T>(&self, backlog: &Mutex<Vec<T>>, item: T) {
+        let mut requests = backlog.lock().unwrap_or_else(|e| e.into_inner());
+        if requests.len() >= MAX_PENDING_REQUESTS {
+            requests.remove(0);
+            if !self.request_backlog_logged.swap(true, Ordering::AcqRel) {
+                self.log(&format!(
+                    "session {}: more than {} console requests waiting for a drain; the oldest were dropped",
+                    self.id, MAX_PENDING_REQUESTS
+                ));
+            }
+        }
+        requests.push(item);
+    }
+
+    /// Takes both pending request lists, in one call so a drain that goes out carries a consistent pair.
+    /// Called by `drain_record` only once it is sure the record goes out, so a request is never dropped
+    /// with a record that was withheld.
+    fn take_requests(&self) -> (Vec<ResizeRequest>, Vec<String>) {
+        (
+            std::mem::take(&mut *self.resize_requests.lock().unwrap_or_else(|e| e.into_inner())),
+            std::mem::take(&mut *self.input_requests.lock().unwrap_or_else(|e| e.into_inner())),
+        )
+    }
+
+    /// A console socket dropped bytes for itself (§5.4): the drain record reports the count per handle,
+    /// so a drop with no output after it still reaches the hub.
+    pub(crate) fn note_socket_drop(&self) {
+        self.dirty.store(true, Ordering::Release);
+        self.tick.pending.store(true, Ordering::Release);
+    }
+
     /// `ResizePseudoConsole`. The core never propagates a size (that is hub policy); it only applies it.
     ///
     /// The slot lock stays held across the call on purpose: releasing it first would let a concurrent
@@ -1924,7 +2046,7 @@ impl Session {
         let last_ms = self.last_output_ms.load(Ordering::Relaxed);
         let alive = self.alive.load(Ordering::Acquire);
         let exit_code = self.exit_code();
-        let record = DrainRecord {
+        let mut record = DrainRecord {
             session_id: self.id.clone(),
             alive,
             exit_code,
@@ -1942,6 +2064,11 @@ impl Session {
             screen_rev: self.screen_rev.load(Ordering::Relaxed),
             raw_rev: self.raw_rev.load(Ordering::Relaxed),
             screen_text: self.watched_screen(Instant::now()),
+            // Filled in by the caller: the request lists below (only once the record goes out) and the
+            // per-socket drop counts, which belong to the core's socket registry.
+            resize_requests: Vec::new(),
+            input_requests: Vec::new(),
+            socket_drops: Vec::new(),
         };
         if !alive && !self.death_flushed.load(Ordering::Acquire) {
             // The death is published but its last delivery is still running (or pending): this tick
@@ -1950,6 +2077,11 @@ impl Session {
             self.dirty.store(true, Ordering::Release);
             return None;
         }
+        // Only now, when the record is sure to go out, are the requests taken: one that arrived during
+        // a withheld record must survive to the next one.
+        let (resize_requests, input_requests) = self.take_requests();
+        record.resize_requests = resize_requests;
+        record.input_requests = input_requests;
         #[cfg(test)]
         death_record_tests::drain_snapshot_gate(&self.id);
         // This record is the report `retire` waits for: the death (code, crashed) is in it, and a code
@@ -2158,7 +2290,8 @@ mod death_record_tests {
             Box::new(|| false),
             Box::new(|_line: &str| {}),
             CoreOptions::default(),
-        );
+        )
+        .expect("core");
         core.attach_text(TextRequest {
             session_id: "late-code".to_string(),
             cols: 40,

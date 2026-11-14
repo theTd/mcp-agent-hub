@@ -30,6 +30,7 @@ fn core() -> Arc<Core> {
         Box::new(|_line: &str| {}),
         CoreOptions::default(),
     )
+    .expect("core")
 }
 
 /// A sink that records every frame and parks the first one until the test opens the gate; the first frame
