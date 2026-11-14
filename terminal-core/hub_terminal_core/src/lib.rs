@@ -730,8 +730,8 @@ impl Drop for Core {
 }
 
 /// `strip_osc_terminal_replies` (§6.4/§8): the xterm.js colour, clipboard and `1[01]\d` replies are
-/// removed from one browser message before it can reach a PTY. A function with its tests now; step 4
-/// wires it to the socket's input path.
+/// removed from one browser message before it can reach a PTY. The socket's input path calls it
+/// (`ws/connection.rs`), and a function with its tests is why it is also exported.
 #[pyfunction]
 fn strip_osc_terminal_replies(text: &str) -> String {
     strip_terminal_replies(text).into_owned()

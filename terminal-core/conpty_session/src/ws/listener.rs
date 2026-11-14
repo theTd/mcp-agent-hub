@@ -7,35 +7,46 @@
 //! every 100th, backs off 0/50/200 ms/1 s, and accepts again. Only `shutdown` ends it, and
 //! [`WsServer::listening`] is false once it has.
 //!
-//! The handshake runs on this thread with a 2 s timeout: the ticket is verified there (an invalid one
-//! gets an HTTP 4xx and no socket), and the session is looked up after it, because an unknown id must
-//! close with `ws_pty_endpoint`'s code rather than an HTTP error.
+//! The handshake does **not** run on the accept thread. Each accepted connection is handed to a
+//! `ws-handshake` thread under a bounded number of simultaneous handshakes, with one total deadline
+//! (a per-read timeout would let a peer that dribbles one byte at a time hold its slot forever), and a
+//! peer over the cap is answered 503 at once instead of queueing. A handshake verifies the ticket (an
+//! invalid one gets an HTTP 4xx and no socket) and the session is looked up after it, because an
+//! unknown id must close with `ws_pty_endpoint`'s code rather than an HTTP error.
 
 use std::collections::HashMap;
-use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{self, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use terminal_stream::FrameSink;
-use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tungstenite::handshake::server::{ErrorResponse, Request, Response, ServerHandshake};
+use tungstenite::handshake::HandshakeError;
 use tungstenite::http::{Response as HttpResponse, StatusCode};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::frame::CloseFrame;
 use tungstenite::protocol::{WebSocket, WebSocketConfig};
 
 use super::connection::{
-    QueuedSink, SocketConnection, NORMAL_CLOSE, TRY_AGAIN_CLOSE, UNKNOWN_SESSION_CLOSE,
+    QueuedSink, SocketConnection, TrackedStream, NORMAL_CLOSE, TRY_AGAIN_CLOSE,
+    UNKNOWN_SESSION_CLOSE,
 };
 use super::ticket::{Minted, Tickets};
 use crate::core::{Core, CoreError, SocketAttach};
 use crate::frame_queue::FrameQueue;
 
-/// The request must arrive within this, or the connection is another accept's problem.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// One handshake from start to finish. The socket's read timeout bounds one `read`, not the request: a
+/// peer that sends a byte just before every timeout never trips it, so the handshake thread is cut off
+/// by a clock instead.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+/// Handshakes in progress at once. Each costs a socket and two threads (the handshake and its cut-off)
+/// until it finishes; a console attach uses one of them for milliseconds. This is what a peer that
+/// connects and says nothing can hold, so it is small, and the excess is refused rather than queued.
+const MAX_PENDING_HANDSHAKES: usize = 16;
 /// `windows_accept_guard`'s `RETRY_DELAYS`: the wait after the 1st, 2nd, 3rd and every later failure.
 const RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
@@ -43,13 +54,17 @@ const RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(200),
     Duration::from_secs(1),
 ];
-/// A socket that accepts nothing for this long is closed with 1000 (§5.4, §6.4).
+/// A socket that takes no byte for this long, while it still owes the peer some, is closed with 1000
+/// (§5.4, §6.4).
 const STALL_LIMIT: Duration = Duration::from_secs(30);
 /// After the close request, a socket whose write is still blocked is cut off: the peer is gone.
 const STALL_CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// The path the hub's own endpoint used (`/ws/pty/<id>`), so the console's URL builder only gains a
 /// ticket query.
 pub(super) const PATH_PREFIX: &str = "/ws/pty/";
+/// How many sessions' final socket-drop counts may wait for a drain (diagnostics, one pair per
+/// socket). An id the core no longer has can never be carried by a record, so the backlog is capped.
+const RETIRED_DROPS_CAP: usize = 256;
 /// An input frame is keystrokes: the default 64 MiB ceiling would let one frame allocate freely.
 const MAX_INBOUND_MESSAGE: usize = 1024 * 1024;
 
@@ -59,12 +74,18 @@ pub struct WsServer {
     tickets: Tickets,
     connections: Mutex<HashMap<u64, Arc<SocketConnection>>>,
     next_seq: AtomicU64,
+    next_handshake: AtomicU64,
     /// The bound listener until `spawn_accept` moves it into the accept thread.
     pending_listener: Mutex<Option<TcpListener>>,
     stopping: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
     accept_thread: Mutex<Option<JoinHandle<()>>>,
     accept_failures: AtomicU64,
+    /// Simultaneous handshakes, capped at [`MAX_PENDING_HANDSHAKES`].
+    handshakes: Arc<HandshakeSlots>,
+    /// Refused handshakes per HTTP status: the log names the first and every hundredth of each, the
+    /// cadence the accept loop keeps, so a local process with bad tickets cannot flood the hub's log.
+    refusals: Mutex<HashMap<u16, u64>>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     queue_bytes: usize,
     epoch: Instant,
@@ -114,12 +135,137 @@ impl Refused {
         }
     }
 
+    /// The status tungstenite answered with, so the refusal's log line says 401 or 403 instead of a
+    /// blanket 400. The wire already carries it (the callback's response); this is the log's copy.
+    fn from_handshake<S, C>(error: HandshakeError<ServerHandshake<S, C>>) -> Self
+    where
+        S: std::io::Read + std::io::Write,
+        C: tungstenite::handshake::server::Callback,
+    {
+        let status = match &error {
+            HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            _ => 400,
+        };
+        Self::new(status, format!("handshake failed: {error}"))
+    }
+
     /// The HTTP answer tungstenite writes instead of a `101`: no socket exists for this connection.
     fn into_response(self) -> ErrorResponse {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::UNAUTHORIZED);
         let mut response = HttpResponse::new(Some(self.reason));
         *response.status_mut() = status;
         response
+    }
+}
+
+/// The bounded set of handshakes in progress. A slot is taken before a connection gets a thread and
+/// released when its handshake is over (or its thread never started), so the cap is what an
+/// unauthenticated peer can hold, not what a session can.
+struct HandshakeSlots {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl HandshakeSlots {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    /// `None` when every slot is taken: the caller refuses the connection now, never queues it.
+    fn try_acquire(self: &Arc<Self>) -> Option<HandshakeSlot> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(HandshakeSlot { slots: Arc::clone(self) }),
+                Err(seen) => active = seen,
+            }
+        }
+    }
+}
+
+struct HandshakeSlot {
+    slots: Arc<HandshakeSlots>,
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        self.slots.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Cuts the stream off at one absolute deadline, because a socket read timeout only bounds the silence
+/// between two reads. Dropping it disarms the timer and waits for the thread (it wakes at once).
+struct HandshakeCutoff {
+    state: Arc<(Mutex<bool>, Condvar)>,
+    fired: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl HandshakeCutoff {
+    fn start(stream: &TcpStream, deadline: Instant) -> Option<Self> {
+        let stream = stream.try_clone().ok()?;
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let fired = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&state);
+        let cut = Arc::clone(&fired);
+        let thread = thread::Builder::new()
+            .name("ws-handshake-cut".to_string())
+            .spawn(move || {
+                let (lock, wake) = &*armed;
+                let mut done = lock.lock().unwrap_or_else(|error| error.into_inner());
+                while !*done {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (guard, timeout) = wake
+                        .wait_timeout(done, deadline - now)
+                        .unwrap_or_else(|error| error.into_inner());
+                    done = guard;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                if !*done {
+                    cut.store(true, Ordering::Release);
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            })
+            .ok()?;
+        Some(Self {
+            state,
+            fired,
+            thread: Some(thread),
+        })
+    }
+
+    /// `true` when the deadline shut the stream down: the refusal is a timeout, not a bad request.
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HandshakeCutoff {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.state;
+        *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -139,11 +285,14 @@ impl WsServer {
             tickets,
             connections: Mutex::new(HashMap::new()),
             next_seq: AtomicU64::new(1),
+            next_handshake: AtomicU64::new(1),
             pending_listener: Mutex::new(Some(listener)),
             stopping: Arc::new(AtomicBool::new(false)),
             listening: Arc::new(AtomicBool::new(false)),
             accept_thread: Mutex::new(None),
             accept_failures: AtomicU64::new(0),
+            handshakes: HandshakeSlots::new(MAX_PENDING_HANDSHAKES),
+            refusals: Mutex::new(HashMap::new()),
             log,
             queue_bytes,
             epoch: Instant::now(),
@@ -221,19 +370,29 @@ impl WsServer {
 
     /// Per session, its sockets' cumulative dropped bytes keyed by sink handle, and marks each count as
     /// reported (§9 step 4: per handle, never summed into the session's `dropped_bytes`). Only handles
-    /// with a drop are listed.
-    pub fn take_socket_drops(&self) -> HashMap<String, Vec<(u64, u64)>> {
-        // The retired sockets first, with no lock held across the two maps: a socket that finishes
-        // between the two takes lands its count in the backlog, its session is dirtied by
-        // `sessions_with_unreported_drops`, and the next drain carries it.
-        let mut drops: HashMap<String, Vec<(u64, u64)>> = std::mem::take(
-            &mut *self
+    /// with a drop are listed, and only for `sessions` — the ids the drain is actually returning a
+    /// record for. Marking any other socket would lose its count: it has no record to ride in, and the
+    /// next drain would find nothing unreported (review omp 11 / kimi 4).
+    pub fn take_socket_drops(&self, sessions: &[String]) -> HashMap<String, Vec<(u64, u64)>> {
+        // Only the ids a record is going out for are taken, so a count that has no record to ride in
+        // keeps waiting (in `retired_drops`, or on its live socket) and the next drain carries it.
+        let mut drops: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+        {
+            let mut retired = self
                 .retired_drops
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+                .unwrap_or_else(|e| e.into_inner());
+            for id in sessions {
+                if let Some(counts) = retired.remove(id) {
+                    drops.insert(id.clone(), counts);
+                }
+            }
+        }
         let connections = self.connections.lock().unwrap_or_else(|e| e.into_inner());
         for connection in connections.values() {
+            if !sessions.contains(&connection.session_id) {
+                continue;
+            }
             let dropped = connection.dropped_bytes();
             if dropped > 0 {
                 connection.mark_drops_reported(dropped);
@@ -276,34 +435,41 @@ impl WsServer {
             .len()
     }
 
-    /// The ticker's 5 ms pass: a socket whose queue holds bytes it has not written for the stall limit
-    /// is asked to close with 1000, and one that is still blocked a second later is cut off.
+    /// The ticker's 5 ms pass: a socket that still owes the peer bytes and has made no write progress
+    /// for the stall limit is asked to close with 1000, and one that is still blocked a second later is
+    /// cut off. The queue and a write already in flight (the replay included) both count as owed.
     pub fn check_stalls(&self) {
         let now = self.now_ms();
         let limit = self.stall_limit_ms.load(Ordering::Acquire);
-        let connections = self.connections.lock().unwrap_or_else(|e| e.into_inner());
-        for connection in connections.values() {
-            if !connection.has_pending() {
-                continue;
+        // The registry walk decides and collects; the Python log runs after the guard is gone (§6.5: no
+        // callback while a core lock is held).
+        let mut lines: Vec<String> = Vec::new();
+        {
+            let connections = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+            for connection in connections.values() {
+                if !connection.has_output() {
+                    continue;
+                }
+                if now.saturating_sub(connection.last_progress_ms()) <= limit {
+                    continue;
+                }
+                if connection.close_code() == 0 {
+                    connection.request_close(NORMAL_CLOSE);
+                    lines.push(format!(
+                        "session {}: console socket {} took nothing for {} ms; closing it with 1000",
+                        connection.session_id, connection.seq, limit
+                    ));
+                } else if now.saturating_sub(connection.close_requested_ms())
+                    > STALL_CLOSE_GRACE.as_millis() as u64
+                {
+                    // The peer accepted nothing, so it cannot read the close frame either: cut the socket
+                    // so the blocked write returns and the thread ends.
+                    connection.abort();
+                }
             }
-            if now.saturating_sub(connection.last_progress_ms()) <= limit {
-                continue;
-            }
-            if connection.close_code() == 0 {
-                connection.request_close(NORMAL_CLOSE);
-                (self.log)(&format!(
-                    "session {}: console socket {} took nothing for {} ms; closing it with 1000",
-                    connection.session_id,
-                    connection.seq,
-                    limit
-                ));
-            } else if now.saturating_sub(connection.close_requested_ms())
-                > STALL_CLOSE_GRACE.as_millis() as u64
-            {
-                // The peer accepted nothing, so it cannot read the close frame either: cut the socket
-                // so the blocked write returns and the thread ends.
-                connection.abort();
-            }
+        }
+        for line in lines {
+            (self.log)(&line);
         }
     }
 
@@ -333,7 +499,10 @@ impl WsServer {
         for connection in &connections {
             connection.request_close(NORMAL_CLOSE);
         }
-        // Half the budget for the close handshakes, the rest for the cut-off sockets to notice.
+        // A socket whose write was blocked is cut off by `request_close` itself: it cannot be woken any
+        // other way and shutdown may not wait a slice for one. The rest are reading, so they see the
+        // code and send the close frame within one read poll. Half the budget for those handshakes, the
+        // rest for the cut-off sockets to notice.
         let cut_off_at = Instant::now() + budget / 2;
         for connection in &connections {
             if !connection.wait_finished(cut_off_at) {
@@ -369,9 +538,18 @@ impl WsServer {
         };
         let dropped = connection.dropped_bytes();
         if dropped > connection.reported_drops() {
-            self.retired_drops
+            let mut backlog = self
+                .retired_drops
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|e| e.into_inner());
+            // A pane the core no longer has cannot be carried by any record, so its backlog entry waits
+            // forever: keep the backlog bounded by the session ids a drain can still answer for.
+            if backlog.len() >= RETIRED_DROPS_CAP {
+                if let Some(oldest) = backlog.keys().next().cloned() {
+                    backlog.remove(&oldest);
+                }
+            }
+            backlog
                 .entry(connection.session_id.clone())
                 .or_default()
                 .push((connection.sink_handle(), dropped));
@@ -407,21 +585,33 @@ impl WsServer {
                         // The connection `shutdown` made to wake this thread.
                         break;
                     }
-                    // A panic while serving one connection must cost that connection, never the
-                    // listener (§6.3, item 12): the thread catches it, logs it, and accepts again.
-                    match catch_unwind(AssertUnwindSafe(|| self.serve(stream, &core))) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(refused)) => (self.log)(&format!(
-                            "terminal core: console socket refused: {} ({})",
-                            refused.reason, refused.status
-                        )),
-                        Err(_) => {
-                            self.accept_failures.fetch_add(1, Ordering::Relaxed);
-                            (self.log)(
-                                "terminal core: a console socket panicked while being set up and was \
-                                 closed; the listener keeps accepting",
-                            );
-                        }
+                    // No slot: this peer is answered 503 and dropped here, at once. Queueing it behind
+                    // the others would turn the cap into an unbounded wait.
+                    let Some(slot) = self.handshakes.try_acquire() else {
+                        refuse_busy(stream);
+                        self.note_refusal(Refused::new(
+                            503,
+                            "too many handshakes in progress".to_string(),
+                        ));
+                        continue;
+                    };
+                    let server = Arc::clone(&self);
+                    let core = core.clone();
+                    let seq = self.next_handshake.fetch_add(1, Ordering::Relaxed);
+                    let started = thread::Builder::new()
+                        .name(format!("ws-handshake-{seq}"))
+                        .spawn(move || {
+                            // The slot lives exactly as long as the handshake: the thread itself
+                            // becomes the socket thread's launcher and exits right after.
+                            let _slot = slot;
+                            server.serve_handshake(stream, &core);
+                        });
+                    if let Err(error) = started {
+                        // The closure, with its slot and its stream, is dropped with the error.
+                        self.accept_failures.fetch_add(1, Ordering::Relaxed);
+                        (self.log)(&format!(
+                            "terminal core: a console handshake thread did not start: {error}"
+                        ));
                     }
                 }
                 Err(error) => {
@@ -463,16 +653,27 @@ impl WsServer {
         None
     }
 
-    /// Handshake, session lookup, attach and the socket thread.
+    /// Handshake, session lookup, attach and the socket thread. Runs on its own `ws-handshake` thread,
+    /// so anything slow or silent here costs one bounded slot and never the accept loop.
     // The callback's `Err` type is tungstenite's `ErrorResponse`, which is large by design; the
     // signature is the library's, not ours (clippy::result_large_err).
     #[allow(clippy::result_large_err)]
     fn serve(self: &Arc<Self>, stream: TcpStream, core: &Weak<Core>) -> Result<(), Refused> {
-        let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+        let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+        let stream = TrackedStream::new(stream, self.epoch);
+        let progress = stream.progress_handle();
+        let blocked = stream.blocked_handle();
+        let _ = stream.stream().set_read_timeout(Some(HANDSHAKE_DEADLINE));
+        let _ = stream.stream().set_write_timeout(Some(HANDSHAKE_DEADLINE));
+        let socket = stream
+            .stream()
+            .try_clone()
+            .map_err(|error| Refused::new(400, format!("socket clone: {error}")))?;
+        // The read timeout above bounds one read, not the request; this bounds the handshake.
+        let cutoff = HandshakeCutoff::start(stream.stream(), deadline);
         let mut authorized: Option<String> = None;
         let config = WebSocketConfig::default().max_message_size(Some(MAX_INBOUND_MESSAGE));
-        let ws = tungstenite::accept_hdr_with_config(
+        let handshake = tungstenite::accept_hdr_with_config(
             stream,
             |request: &Request, response: Response| match self.authorize(request) {
                 Ok(id) => {
@@ -482,19 +683,29 @@ impl WsServer {
                 Err(refusal) => Err(refusal.into_response()),
             },
             Some(config),
-        )
-        .map_err(|error| Refused::new(400, format!("handshake failed: {error}")))?;
+        );
+        let timed_out = cutoff
+            .as_ref()
+            .map(HandshakeCutoff::fired)
+            .unwrap_or(false);
+        drop(cutoff);
+        let mut ws = handshake.map_err(|error| {
+            if timed_out {
+                Refused::new(
+                    408,
+                    "handshake did not finish within its deadline".to_string(),
+                )
+            } else {
+                Refused::from_handshake(error)
+            }
+        })?;
         let Some(session_id) = authorized else {
             // `authorize` returns the id whenever the handshake is accepted; this is unreachable and
-            // refusing is still better than panicking on the accept thread.
+            // refusing is still better than panicking on the handshake thread.
             return Err(Refused::new(400, "handshake carried no session id".to_string()));
         };
-        let socket = ws
-            .get_ref()
-            .try_clone()
-            .map_err(|error| Refused::new(400, format!("socket clone: {error}")))?;
         let Some(core) = core.upgrade() else {
-            close_now(ws, TRY_AGAIN_CLOSE);
+            close_now(&mut ws, TRY_AGAIN_CLOSE);
             return Err(Refused::new(503, "the core is shutting down".to_string()));
         };
 
@@ -514,15 +725,15 @@ impl WsServer {
             // was retired (1000). The ticket itself was valid, so this is a socket close, not an HTTP
             // error.
             SocketAttach::Unknown => {
-                close_now(ws, UNKNOWN_SESSION_CLOSE);
+                close_now(&mut ws, UNKNOWN_SESSION_CLOSE);
                 return Err(Refused::new(404, format!("unknown session {session_id}")));
             }
             SocketAttach::Ended => {
-                close_now(ws, NORMAL_CLOSE);
+                close_now(&mut ws, NORMAL_CLOSE);
                 return Err(Refused::new(410, format!("session {session_id} has ended")));
             }
             SocketAttach::Busy => {
-                close_now(ws, TRY_AGAIN_CLOSE);
+                close_now(&mut ws, TRY_AGAIN_CLOSE);
                 return Err(Refused::new(503, format!("session {session_id} is busy")));
             }
         };
@@ -546,6 +757,8 @@ impl WsServer {
             queue,
             pending,
             socket,
+            progress,
+            blocked,
             Arc::downgrade(&core),
             Arc::downgrade(self),
             self.epoch,
@@ -573,6 +786,39 @@ impl WsServer {
                 session.detach_sink(handle);
                 Err(Refused::new(500, format!("socket thread: {error}")))
             }
+        }
+    }
+
+    /// One connection's handshake on its own thread. A panic or a refusal costs that connection only
+    /// (§6.3, item 12): the accept loop never sees it.
+    fn serve_handshake(self: &Arc<Self>, stream: TcpStream, core: &Weak<Core>) {
+        match catch_unwind(AssertUnwindSafe(|| self.serve(stream, core))) {
+            Ok(Ok(())) => {}
+            Ok(Err(refused)) => self.note_refusal(refused),
+            Err(_) => {
+                self.accept_failures.fetch_add(1, Ordering::Relaxed);
+                (self.log)(
+                    "terminal core: a console socket panicked while being set up and was closed; \
+                     the listener keeps accepting",
+                );
+            }
+        }
+    }
+
+    /// The accept loop's cadence for refused handshakes: the first and every hundredth of each HTTP
+    /// status. A local process with bad tickets must not be able to write a hub log line per try.
+    fn note_refusal(&self, refused: Refused) {
+        let count = {
+            let mut counts = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
+            let count = counts.entry(refused.status).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if count == 1 || count.is_multiple_of(100) {
+            (self.log)(&format!(
+                "terminal core: console socket refused ({count} at {}): {}",
+                refused.status, refused.reason
+            ));
         }
     }
 
@@ -612,6 +858,12 @@ impl WsServer {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    /// How many handshakes are in flight (the cap's current use).
+    pub fn pending_handshakes(&self) -> usize {
+        self.handshakes.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     /// Lowers the stall limit so a 30 s case runs in a second.
     pub fn set_stall_limit(&self, limit: Duration) {
         self.stall_limit_ms
@@ -632,11 +884,21 @@ fn wait_thread(handle: &JoinHandle<()>, deadline: Instant) {
 }
 
 /// Closes a socket that never became a session's: a refusal close frame, then the stream.
-fn close_now(mut ws: WebSocket<TcpStream>, code: u16) {
+fn close_now(ws: &mut WebSocket<TrackedStream>, code: u16) {
     let _ = ws.close(Some(CloseFrame {
         code: CloseCode::from(code),
         reason: "closed by the hub".into(),
     }));
+}
+
+/// Answers a handshake the cap could not take without reading a byte of it: a bare HTTP 503, then the
+/// stream goes. The console treats it like any failed ticket fetch (its reconnect path).
+fn refuse_busy(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    );
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 /// `?ticket=<token>` out of the request's query string. A token is base64url, so it needs no decoding.

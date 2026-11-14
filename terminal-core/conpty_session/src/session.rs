@@ -1419,7 +1419,8 @@ impl Session {
     /// Console input that reached this session through its socket and has no PTY to go to
     /// (`attach_text`: the hub's virtual sessions). It is stored, never written: the hub owns that echo
     /// and its line callback (§8, `session_manager.py`'s `emit_virtual_ansi` path). Already stripped by
-    /// `strip_osc_color_queries`, the same rule the hub applies to a PTY write's echo.
+    /// `strip_terminal_replies` on the socket (`ws/connection.rs`), the same pattern the hub's reply
+    /// strip uses — not the colour-query strip.
     pub(crate) fn request_input(&self, text: String) {
         if text.is_empty() {
             return;
@@ -1439,17 +1440,23 @@ impl Session {
     /// reaching the cap means it stopped draining; keeping the newest is what a user typing expects,
     /// and the loss is logged once per session rather than silently every time.
     fn push_bounded<T>(&self, backlog: &Mutex<Vec<T>>, item: T) {
-        let mut requests = backlog.lock().unwrap_or_else(|e| e.into_inner());
-        if requests.len() >= MAX_PENDING_REQUESTS {
-            requests.remove(0);
-            if !self.request_backlog_logged.swap(true, Ordering::AcqRel) {
-                self.log(&format!(
-                    "session {}: more than {} console requests waiting for a drain; the oldest were dropped",
-                    self.id, MAX_PENDING_REQUESTS
-                ));
+        let mut dropped = false;
+        {
+            let mut requests = backlog.lock().unwrap_or_else(|e| e.into_inner());
+            if requests.len() >= MAX_PENDING_REQUESTS {
+                requests.remove(0);
+                dropped = true;
             }
+            requests.push(item);
         }
-        requests.push(item);
+        // §6.5: the Python log runs with no core lock held, so a callback that drains or resizes cannot
+        // deadlock the socket thread that hit the cap.
+        if dropped && !self.request_backlog_logged.swap(true, Ordering::AcqRel) {
+            self.log(&format!(
+                "session {}: more than {} console requests waiting for a drain; the oldest were dropped",
+                self.id, MAX_PENDING_REQUESTS
+            ));
+        }
     }
 
     /// Takes both pending request lists, in one call so a drain that goes out carries a consistent pair.

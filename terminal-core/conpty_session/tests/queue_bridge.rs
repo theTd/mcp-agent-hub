@@ -450,8 +450,13 @@ fn a_sockets_dropped_bytes_stay_out_of_the_sessions_count() {
     let (_replay, handle) = core.attach_queue("socket-loss", Some(8)).expect("a tiny queue");
     core.feed("socket-loss", &"x".repeat(16), DEADLINE).expect("feed");
     // The ticker's window flushes the batch into the tiny queue, which cannot hold the whole frame.
-    thread::sleep(Duration::from_millis(100));
-    let taken = core.take_frames(handle).expect("take_frames");
+    // Wait for the count itself, not for a fixed sleep: the ticker's flush is scheduled work.
+    let mut taken = core.take_frames(handle).expect("take_frames");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while taken.dropped_bytes == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+        taken = core.take_frames(handle).expect("take_frames");
+    }
     assert_eq!(taken.dropped_bytes, 16, "the queue counted its own loss");
     assert!(taken.frames.is_empty(), "an oversize frame is dropped whole, never split");
 

@@ -10,7 +10,8 @@
 //! (`hmac`'s `verify_slice`) and answers a refusal that the handshake turns into an HTTP 4xx; no
 //! socket exists for a refused token.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,15 @@ const MAC_BYTES: usize = 32;
 /// `URL_SAFE_NO_PAD` of 32 bytes.
 const MAC_TEXT_CHARS: usize = 43;
 const TOKEN_CHARS: usize = NONCE_TEXT_CHARS + MAC_TEXT_CHARS;
+
+/// The hard bound on remembered nonces. It is a cap on memory, not on the hub: a console that reloads
+/// more often than this within one TTL is not a console, and an evicted (unexpired) ticket is simply
+/// refused as unknown, which the browser answers by fetching a fresh one. 4096 nonces ≈ 300 KB of
+/// nonce, session id and expiry.
+const MAX_TRACKED: usize = 4096;
+/// `ttl_ms` comes from the caller, so it is capped: no ticket outlives this, and the table's pruning
+/// therefore always drains. The hub asks for 30 s (§6.4).
+const MAX_TTL: Duration = Duration::from_secs(300);
 
 /// What `ws_ticket` hands the hub: the token and the unix second it stops working in.
 #[derive(Clone, Debug)]
@@ -85,11 +95,51 @@ struct Issued {
     used: bool,
 }
 
+/// The nonces the store remembers, with their expiries ordered so pruning and the cap are a pop, not
+/// a scan: `by_expiry` carries one `(expiry, nonce)` per live entry, and a stale pair left by an
+/// evicted nonce is discarded when it surfaces.
+#[derive(Default)]
+struct Table {
+    entries: HashMap<String, Issued>,
+    by_expiry: BinaryHeap<Reverse<(u64, String)>>,
+}
+
+impl Table {
+    /// Forgets every entry whose expiry has passed. Amortized: each entry is popped once.
+    fn prune(&mut self, now: u64) {
+        while let Some(Reverse((expiry, nonce))) = self.by_expiry.peek() {
+            if *expiry >= now {
+                break;
+            }
+            let expiry = *expiry;
+            let nonce = nonce.clone();
+            self.by_expiry.pop();
+            if self.entries.get(&nonce).map(|entry| entry.expires_at_unix) == Some(expiry) {
+                self.entries.remove(&nonce);
+            }
+        }
+    }
+
+    /// Makes room for one more entry: the soonest-expiring nonce goes first, so the cap costs the
+    /// ticket closest to its own expiry. `prune` has already run, so the table is at `MAX_TRACKED`
+    /// live entries at most.
+    fn make_room(&mut self) {
+        while self.entries.len() >= MAX_TRACKED {
+            let Some(Reverse((expiry, nonce))) = self.by_expiry.pop() else {
+                return;
+            };
+            if self.entries.get(&nonce).map(|entry| entry.expires_at_unix) == Some(expiry) {
+                self.entries.remove(&nonce);
+            }
+        }
+    }
+}
+
 /// The per-core ticket key and the nonces it has minted (§6.4: "remembers the nonce until expiry so a
 /// ticket is used once").
 pub struct Tickets {
     key: [u8; KEY_BYTES],
-    issued: Mutex<HashMap<String, Issued>>,
+    issued: Mutex<Table>,
 }
 
 impl Tickets {
@@ -100,13 +150,14 @@ impl Tickets {
         entropy::fill_random(&mut key)?;
         Ok(Self {
             key,
-            issued: Mutex::new(HashMap::new()),
+            issued: Mutex::new(Table::default()),
         })
     }
 
-    /// Mints one ticket for `session_id`, valid for `ttl`. The expiry is rounded up to a whole unix
-    /// second, so a `ttl` below 1 s still produces a usable token.
+    /// Mints one ticket for `session_id`, valid for `ttl` (capped at [`MAX_TTL`]). The expiry is
+    /// rounded up to a whole unix second, so a `ttl` below 1 s still produces a usable token.
     pub fn mint(&self, session_id: &str, ttl: Duration) -> Result<Minted, String> {
+        let ttl = ttl.min(MAX_TTL);
         let now = now_unix();
         let expires_at_unix = now + ttl.as_secs() + u64::from(ttl.subsec_nanos() > 0);
         let mut nonce = [0u8; NONCE_BYTES];
@@ -116,9 +167,14 @@ impl Tickets {
         let token = format!("{nonce_text}{}", URL_SAFE_NO_PAD.encode(mac));
         let mut issued = self.issued.lock().unwrap_or_else(|error| error.into_inner());
         // The table lives exactly as long as the tickets in it: an expired nonce can be forgotten, a
-        // used one must stay until its expiry so a replay cannot be mistaken for a fresh mint.
-        issued.retain(|_, entry| entry.expires_at_unix >= now);
-        issued.insert(
+        // used one must stay until its expiry so a replay cannot be mistaken for a fresh mint. Both
+        // bounds are a heap pop, never a walk of the table.
+        issued.prune(now);
+        issued.make_room();
+        issued
+            .by_expiry
+            .push(Reverse((expires_at_unix, nonce_text.clone())));
+        issued.entries.insert(
             nonce_text,
             Issued {
                 session_id: session_id.to_string(),
@@ -146,7 +202,20 @@ impl Tickets {
             return Err(Refusal::Unknown);
         }
         let mut issued = self.issued.lock().unwrap_or_else(|error| error.into_inner());
-        let entry = issued.get_mut(nonce_text).ok_or(Refusal::Unknown)?;
+        // The asked token keeps its own answer (`Expired`, not `Unknown`) while the rest of the table
+        // gives back what has expired, so a store that outlived its tickets drains even when minting
+        // has stopped.
+        let now = now_unix();
+        if issued
+            .entries
+            .get(nonce_text)
+            .is_some_and(|entry| now > entry.expires_at_unix)
+        {
+            issued.entries.remove(nonce_text);
+            return Err(Refusal::Expired);
+        }
+        issued.prune(now);
+        let entry = issued.entries.get_mut(nonce_text).ok_or(Refusal::Unknown)?;
         if entry.session_id != session_id {
             return Err(Refusal::WrongSession);
         }
@@ -175,11 +244,12 @@ impl Tickets {
     }
 
     #[cfg(test)]
-    /// How many nonces the table still holds: the pruning bound the mint keeps.
+    /// How many nonces the table still holds: the bounds the mint and the consume keep.
     pub fn tracked(&self) -> usize {
         self.issued
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+            .entries
             .len()
     }
 }
@@ -282,5 +352,56 @@ mod tests {
         }
         let _fresh = tickets.mint("session-b", Duration::from_secs(30)).expect("mint");
         assert_eq!(tickets.tracked(), 1, "the expired nonce was kept");
+    }
+
+    /// `consume` prunes as well, so a store whose minting stopped still gives expired nonces back.
+    #[test]
+    fn expired_nonces_are_pruned_by_a_consume_too() {
+        let store = tickets();
+        let minted = store.mint("session-a", Duration::ZERO).expect("mint");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while now_unix() <= minted.expires_at_unix {
+            assert!(std::time::Instant::now() < deadline, "the clock never passed the expiry");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A well-formed token this core never minted reaches the table, and the prune runs first.
+        let elsewhere = tickets();
+        let elsewhere = elsewhere.mint("session-a", Duration::from_secs(30)).expect("mint");
+        assert_eq!(store.consume("session-a", &elsewhere.token), Err(Refusal::Unknown));
+        assert_eq!(store.tracked(), 0, "the expired nonce outlived a consume");
+    }
+
+    /// The store is a bounded table: past the cap the soonest-expiring nonce is evicted, and the
+    /// survivor is still one use.
+    #[test]
+    fn the_ticket_table_is_capped_and_evicts_the_soonest_expiry() {
+        let tickets = tickets();
+        let doomed = tickets.mint("session-a", Duration::from_secs(2)).expect("mint");
+        assert_eq!(tickets.tracked(), 1);
+        let mut last = doomed.clone();
+        for _ in 0..(MAX_TRACKED + 16) {
+            last = tickets.mint("session-a", MAX_TTL).expect("mint");
+        }
+        assert_eq!(tickets.tracked(), MAX_TRACKED, "the store grew past its cap");
+        assert_eq!(
+            tickets.consume("session-a", &doomed.token),
+            Err(Refusal::Unknown),
+            "the soonest-expiring nonce was not the one evicted"
+        );
+        assert_eq!(tickets.consume("session-a", &last.token), Ok(()));
+        assert_eq!(tickets.consume("session-a", &last.token), Err(Refusal::Reused));
+    }
+
+    /// `ttl_ms` is caller-controlled, so an unbounded one would pin a nonce for as long as it liked.
+    #[test]
+    fn a_tickets_lifetime_is_capped() {
+        let tickets = tickets();
+        let minted = tickets.mint("session-a", Duration::from_secs(86_400)).expect("mint");
+        let longest = now_unix() + MAX_TTL.as_secs() + 1;
+        assert!(
+            minted.expires_at_unix <= longest,
+            "a day-long ttl outlived the cap: {} > {longest}",
+            minted.expires_at_unix
+        );
     }
 }

@@ -606,9 +606,18 @@ impl Core {
             .filter_map(|session| session.drain_record())
             .collect();
         drop(sessions);
+        // A socket's drop count is marked reported only when this drain's records carry it: a drop that
+        // lands between the scan above and the take below belongs to a session with no record and must
+        // stay unreported, or no later drain would ever see it (review omp 11 / kimi 4).
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::drain_before_drops_gate();
         if !records.is_empty() {
+            let ids: Vec<String> = records
+                .iter()
+                .map(|record| record.session_id.clone())
+                .collect();
             // One walk for the whole drain, not one per record.
-            let drops = self.ws.take_socket_drops();
+            let drops = self.ws.take_socket_drops(&ids);
             for record in &mut records {
                 if let Some(sockets) = drops.get(&record.session_id) {
                     record.socket_drops = sockets.clone();
@@ -866,6 +875,13 @@ impl Core {
     #[doc(hidden)]
     pub fn ws_accept_failures(&self) -> u64 {
         self.ws.accept_failures()
+    }
+
+    /// Test-only: how many handshakes are in progress (the cap's current use).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn ws_pending_handshakes(&self) -> usize {
+        self.ws.pending_handshakes()
     }
 
     /// Test-only: makes the next `count` accepted connections fail like a client that dropped
