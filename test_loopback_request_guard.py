@@ -25,6 +25,9 @@ FOREIGN_ORIGIN = {"origin": "http://attacker.example:4444"}
 HUB_ORIGIN = {"origin": f"http://127.0.0.1:{HUB_PORT}"}
 LOOPBACK_HOST = {"host": f"127.0.0.1:{HUB_PORT}"}
 
+# The guard's per-minute budget for refusal lines, mirrored here because it is part of the contract.
+LOG_BUDGET = 20
+
 
 class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -47,6 +50,12 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
             base_url=f"http://127.0.0.1:{HUB_PORT}",
         ) as client:
             return await client.request(method, path, headers=headers or None)
+
+    @staticmethod
+    def log_window(seconds):
+        """A guard clock far from the previous test's: the first refusal rolls the log window, so each
+        test sees exactly its own refusal lines."""
+        return patch("loopback_request_guard._monotonic", lambda: seconds)
 
     def websocket(self, path="/ws/pty/missing", **headers):
         """Enter the handshake; raises `WebSocketDenialResponse` instead of accepting on a refusal.
@@ -71,9 +80,23 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_loopback_host_with_foreign_origin_is_refused(self):
         response = await self.request(**FOREIGN_ORIGIN)
         self.assertEqual(response.status_code, 403)
-        with self.assertRaises(WebSocketDenialResponse):
-            with self.websocket(**FOREIGN_ORIGIN):
-                pass
+        # The WebSocket leg carries a loopback Host on purpose: with a default `Host: testserver` the
+        # handshake would be refused by the Host rule and this test would stay green even if the Origin
+        # rule were gone for WebSocket scopes.
+        with self.log_window(6_000_000.0), \
+                self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
+            with self.assertRaises(WebSocketDenialResponse) as refused:
+                with self.websocket(**LOOPBACK_HOST, **FOREIGN_ORIGIN):
+                    pass
+        self.assertEqual(refused.exception.status_code, 403)
+        self.assertIn(b"loopback", refused.exception.content)
+        # And the refusal is the Origin one: the loopback Host was validated and the foreign Origin
+        # was not.
+        blocked = [record.getMessage() for record in captured.records
+                   if record.getMessage().startswith("Blocked request")]
+        self.assertEqual(len(blocked), 1, blocked)
+        self.assertIn(f"host='127.0.0.1:{HUB_PORT}'", blocked[0])
+        self.assertIn("origin='http://attacker.example:4444'", blocked[0])
 
     async def test_a_non_loopback_ip_literal_host_is_refused(self):
         # A name that is an IP literal is judged by the address, not by the text: only loopback addresses
@@ -141,6 +164,25 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
         status = await _raw_status(self.server.app, [(b"origin", b"http://127.0.0.1:4444")])
         self.assertEqual(status, 403)
 
+    async def test_duplicate_or_empty_host_and_origin_are_refused(self):
+        # Two parsers can disagree about which value of a repeated header counts, so the guard takes the
+        # multi-value view and refuses anything but exactly one Host and at most one Origin.
+        host = (b"host", f"127.0.0.1:{HUB_PORT}".encode("ascii"))
+        origin = (b"origin", f"http://127.0.0.1:{HUB_PORT}".encode("ascii"))
+        self.assertEqual(await _raw_status(self.server.app, [host, origin]), 200)
+        refused = {
+            "duplicate host": [host, host, origin],
+            "empty host": [(b"host", b"")],
+            "whitespace host": [(b"host", b"   ")],
+            "duplicate origin": [host, origin, (b"origin", b"http://attacker.example:4444")],
+            "duplicate identical origin": [host, origin, origin],
+            "empty origin": [host, (b"origin", b"")],
+            "whitespace origin": [host, (b"origin", b"  ")],
+        }
+        for name, headers in refused.items():
+            with self.subTest(name):
+                self.assertEqual(await _raw_status(self.server.app, headers), 403)
+
     async def test_rebinding_request_cannot_read_sessions(self):
         response = await self.request("GET", "/api/sessions", **FOREIGN_HOST, **FOREIGN_ORIGIN)
         self.assertEqual(response.status_code, 403)
@@ -170,18 +212,119 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await call(origin="http://evil.example:4444")).status_code, 403)
             self.assertEqual((await call(origin="https://console.internal:8443")).status_code, 403)
 
+    async def test_env_allowlist_entries_are_parsed_like_request_headers(self):
+        # A Host entry goes through the request's Host parser (so `host:port` is one entry, not a name
+        # that never matches) and is normalised the same way: case and a trailing root dot drop, and the
+        # entry's port is ignored. An origin entry loses one trailing `/`. Unusable entries are dropped
+        # with one warning each instead of silently admitting nothing; `*` is never a wildcard.
+        spec = importlib.util.spec_from_file_location("guard_env_parsing_server", Path(__file__).with_name("server.py"))
+        module = importlib.util.module_from_spec(spec)
+        env = {
+            "HUB_ALLOWED_HOSTS": "proxy.internal:8443, Console.Internal., [::2]:9000, , *, bad/name, proxy.internal:http",
+            "HUB_ALLOWED_ORIGINS": "https://console.internal/, http://[::2]:9000, https://*, not-an-origin",
+        }
+        with patch.dict(os.environ, env), \
+                patch.object(HubSessionManager, "_initial_discovery", lambda hub: hub._discovery_ready.set()), \
+                self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
+            spec.loader.exec_module(module)
+
+            async def call(**headers):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app),
+                                             base_url=f"http://127.0.0.1:{HUB_PORT}") as client:
+                    return await client.get("/api/hub/info", headers=headers or None)
+
+            self.assertEqual((await call(host="proxy.internal")).status_code, 200)
+            self.assertEqual((await call(host="PROXY.INTERNAL:8443")).status_code, 200)
+            # The entry's port is ignored by design (the name is the trust, not the port).
+            self.assertEqual((await call(host="proxy.internal:9999")).status_code, 200)
+            self.assertEqual((await call(host="console.internal.")).status_code, 200)
+            self.assertEqual((await call(host="[::2]:9000")).status_code, 200)
+            self.assertEqual((await call(host="proxy.internal", origin="https://console.internal")).status_code, 200)
+            self.assertEqual((await call(host="proxy.internal", origin="https://CONSOLE.INTERNAL:443")).status_code, 200)
+            self.assertEqual((await call(host="proxy.internal", origin="http://[::2]:9000")).status_code, 200)
+            # Dropped entries admit nothing, and no entry widens the rule for other names.
+            self.assertEqual((await call(host="anything.example:4444")).status_code, 403)
+            self.assertEqual((await call(host="proxy.internal", origin="https://anything.example")).status_code, 403)
+            self.assertEqual((await call(origin="https://console.internal//")).status_code, 403)
+        warnings = "\n".join(record.getMessage() for record in captured.records)
+        for dropped in ("'*'", "'bad/name'", "'proxy.internal:http'", "'https://*'", "'not-an-origin'"):
+            self.assertIn(dropped, warnings)
+
+    async def test_refusal_log_redacts_headers_it_could_not_validate(self):
+        # A refusal line carries a normalised host/port or origin, or `<invalid>`, and never what the
+        # sender wrote: a query, a fragment, userinfo or a control character could carry a secret, and
+        # the path goes in with `%r` so a percent-decoded newline cannot forge a second log line.
+        cases = [
+            ("host", "127.0.0.1:4444?ticket=host-secret", "/api/hub/info"),
+            ("host", "127.0.0.1:4444#host-fragment", "/api/hub/info"),
+            ("host", "someone:pa55@127.0.0.1:4444", "/api/hub/info"),
+            ("host", "127.0.0.1:4444%0aforged", "/api/hub/info"),
+            ("origin", "http://127.0.0.1:4444/?ticket=origin-secret", "/api/hub/info"),
+            ("origin", "http://127.0.0.1:4444/#origin-fragment", "/api/hub/info"),
+            ("origin", "http://someone:pa55@127.0.0.1:4444", "/api/hub/info"),
+            ("host", "attacker.example:4444", "/api/x%0Aforged%20line"),
+        ]
+        with self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
+            for index, (kind, value, path) in enumerate(cases):
+                with self.subTest(kind=kind, value=value, path=path):
+                    with self.log_window(5_000_000.0 + index * 100):
+                        response = await self.request("GET", path, **{kind: value})
+                    self.assertEqual(response.status_code, 403)
+        messages = [record.getMessage() for record in captured.records]
+        blocked = [message for message in messages if message.startswith("Blocked request")]
+        self.assertEqual(len(blocked), len(cases), messages)
+        for message in messages:
+            for secret in ("ticket", "secret", "pa55", "fragment", "forged\n", "\n", "\r"):
+                self.assertNotIn(secret, message)
+        self.assertEqual(sum("<invalid>" in message for message in blocked), len(cases) - 1, blocked)
+        # The one valid header pair is reported in normalised form, and the decoded newline in the path
+        # arrives escaped.
+        injected = blocked[-1]
+        self.assertIn("host='attacker.example:4444'", injected)
+        self.assertIn("origin='none'", injected)
+        self.assertIn(r"path='/api/x\nforged line'", injected)
+
     async def test_refusal_log_omits_the_query_string_and_repeats_once_a_minute(self):
         headers = {**FOREIGN_HOST, **FOREIGN_ORIGIN}
         headers["host"] = "log-check.example:4444"
-        with self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
+        clock = [1_000_000.0]
+        with patch("loopback_request_guard._monotonic", lambda: clock[0]), \
+                self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
             for _ in range(3):
                 self.assertEqual((await self.request("GET", "/api/sessions?ticket=supersecret", **headers)).status_code, 403)
-        lines = [record.getMessage() for record in captured.records]
+        lines = [record.getMessage() for record in captured.records
+                 if record.getMessage().startswith("Blocked request")]
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("log-check.example:4444", lines[0])
         self.assertIn("/api/sessions", lines[0])
         self.assertNotIn("supersecret", lines[0])
         self.assertNotIn("ticket", lines[0])
+
+    async def test_refusal_log_volume_is_bounded(self):
+        # A page can mint a fresh name per request from its own DNS, and the per-pair rule alone would
+        # let one line out per request; a per-minute budget caps the file and one summary line reports
+        # what the budget kept out.
+        clock = [2_000_000.0]
+        with patch("loopback_request_guard._monotonic", lambda: clock[0]), \
+                self.assertLogs("mcp-agent-hub.request_guard", level="WARNING") as captured:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app),
+                                         base_url=f"http://127.0.0.1:{HUB_PORT}") as client:
+                for index in range(500):
+                    response = await client.get("/api/hub/info",
+                                                headers={"host": f"flood-{index}.example:4444"})
+                    self.assertEqual(response.status_code, 403)
+            clock[0] += 61
+            self.assertEqual((await self.request(host="after-window.example:4444")).status_code, 403)
+        records = captured.records
+        first = next(index for index, record in enumerate(records)
+                     if record.getMessage().startswith("Blocked request"))
+        blocked = [record.getMessage() for record in records[first:]
+                   if record.getMessage().startswith("Blocked request")]
+        summary = [record.getMessage() for record in records[first:]
+                   if "refusals not logged" in record.getMessage()]
+        self.assertEqual(len(blocked), LOG_BUDGET + 1, blocked)
+        self.assertEqual(len(summary), 1, summary)
+        self.assertIn(f"{500 - LOG_BUDGET} refusals not logged", summary[0])
 
 
 async def _raw_status(app, headers):
