@@ -3,7 +3,7 @@
 //! §5.4 and §6.4 (`rtc-sink-contract`): `deliver` runs on the session's reader thread (or on `feed`'s
 //! caller) while the id's delivery lock is held, so it only appends — it never waits for a consumer and
 //! never writes a socket. The socket's own thread drains the queue and writes the replay and
-//! `replay_end` **before** the first queued frame. In step 3b that consumer is `Core::take_frames`.
+//! `replay_end` **before** the first queued frame. The socket connection owns the consumer in step 4.
 //!
 //! The cap counts bytes of unsent frames (§5.4's 2 MB, `CoreOptions::sink_queue_bytes`). On overflow the
 //! **oldest whole frames** leave first, so a reader always gets whole frames in order and one slow

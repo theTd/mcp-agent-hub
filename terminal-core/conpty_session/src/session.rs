@@ -2116,7 +2116,8 @@ impl Session {
         None
     }
 
-    /// The id's delivery state; `Core::attach_queue` keeps it so a handle detaches without the table.
+    /// The id's delivery state; socket and test sinks keep their handle here so detachment is scoped to
+    /// the current incarnation.
     pub(crate) fn fanout(&self) -> Arc<SinkFanout> {
         Arc::clone(&self.fanout)
     }
