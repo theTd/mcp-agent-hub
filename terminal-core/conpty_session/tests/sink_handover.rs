@@ -81,12 +81,11 @@ impl RecordingSink {
 }
 
 impl FrameSink for RecordingSink {
-    fn deliver(&self, _session_id: &str, frame: &[u8]) -> u64 {
+    fn deliver(&self, _session_id: &str, frame: &[u8]) {
         self.bytes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend_from_slice(frame);
-        0
     }
 }
 
@@ -324,6 +323,7 @@ fn a_sink_attached_during_the_swap_is_kept_exactly_once() {
         .expect("attach_text incarnation 2");
     core.feed("swap", "NEW", DEADLINE).expect("feed NEW");
     let (replay, handle) = attacher.join().expect("the attaching thread");
+    let handle = handle.expect("a live id's fan-out registers the sink");
     let mut framed = wait_for_marker(&sink, "NEW", Duration::from_secs(2));
     let whole = format!("{replay}{framed}");
     assert!(

@@ -10,10 +10,10 @@
 //! instead of waiting when the interpreter is finalizing, and `shutdown` only joins the ticker from a
 //! caller that has released the GIL (the binding's `Drop` skips the join).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use terminal_stream::FrameSink;
 use crate::conpty::{self, SpawnSpec};
 use crate::frame_queue::{FrameQueue, Frames};
 use crate::session::{
-    lock_deadline, DrainRecord, RawReply, ResizeError, ScreenReply, Session, SessionFlags,
+    DrainRecord, RawReply, ResizeError, ScreenReply, Session, SessionFlags,
     SessionOptions, SessionSnapshot, TextReply, TickFlags,
 };
 use crate::sink_fanout::SinkFanout;
@@ -170,6 +170,36 @@ fn write_deadline<'a, T>(
     }
 }
 
+/// `lock_deadline`'s plain twin for the queue registry. Its critical sections are a `HashMap` insert or
+/// remove and a walk that only closes queues; none of them waits on a sink, a process or a delivery, so a
+/// deadline there could only turn "busy for a moment" into a wrong answer — `false` for a detach that did
+/// not happen, a `retire` that reports success while leaving queues open (review F4).
+fn lock_queues(queues: &Mutex<HashMap<u64, AttachedQueue>>) -> MutexGuard<'_, HashMap<u64, AttachedQueue>> {
+    queues.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One id's lifecycle claim: held by `spawn`, `attach_text` and `retire` from the predecessor lookup to
+/// the table insert (or removal), so two lifecycle calls for the same id cannot interleave a handover
+/// with a retirement (review F1: a resume that took over a fan-out `retire` was closing left the live
+/// successor silent for good).
+///
+/// It is a set membership, not a lock on the session: taking one never waits on a process, a console or
+/// a sink, and the loser fails fast with `ValueError` instead of blocking the hub's loop. The table lock
+/// is not held across `CreateProcessW`; this claim is what makes the predecessor stable in that window.
+struct Claim<'a> {
+    claims: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// One Python socket's registration (§5.2's temporary bridge): the queue it drains, and where the sink
 /// sits so a detach needs neither the session table nor the id's current incarnation.
 struct AttachedQueue {
@@ -187,6 +217,8 @@ pub struct Core {
     /// core, not per id, because `take_frames`/`detach_queue` name the queue alone.
     queues: Mutex<HashMap<u64, AttachedQueue>>,
     next_queue_handle: AtomicU64,
+    /// The ids a lifecycle call (`spawn`, `attach_text`, `retire`) is inside right now; see [`Claim`].
+    lifecycle: Mutex<HashSet<String>>,
     /// Returns whether the wakeup actually ran: the binding's `try_attach` skips it at interpreter
     /// teardown, and a skipped call must not be counted as a notify (nit 7).
     notify: Box<dyn Fn() -> bool + Send + Sync>,
@@ -219,6 +251,7 @@ impl Core {
             queues: Mutex::new(HashMap::new()),
             // Handle 0 is never handed out, so a missing handle and a real one are distinguishable.
             next_queue_handle: AtomicU64::new(1),
+            lifecycle: Mutex::new(HashSet::new()),
             notify,
             log: Arc::from(log),
             opts,
@@ -327,6 +360,10 @@ impl Core {
         if cols == 0 || rows == 0 {
             return Err(CoreError::Invalid("spawn needs cols and rows >= 1".into()));
         }
+        // The whole resume is one lifecycle claim: the predecessor lookup, the handover and the table
+        // insert happen with no `retire` of this id able to run, so no successor can take over a fan-out
+        // that a `retire` is closing (review F1).
+        let _claim = self.claim(&session_id)?;
         // The dead incarnation this spawn resumes for the same id, if any (§6.4 A1): its sink fan-out
         // and its pending batch are handed to the new session, so the sockets attached to the id keep
         // working and the resume banner reaches them.
@@ -392,6 +429,26 @@ impl Core {
             .insert(session_id, session);
         drop(replaced);
         Ok(reply)
+    }
+
+    /// Takes the id's lifecycle claim, or fails fast: two lifecycle calls for one id would let a
+    /// handover and a retirement interleave (review F1), and waiting would hold a hub thread on another
+    /// hub thread's spawn. `ValueError` is the contract's "refused, retry" answer, never a `TimeoutError`
+    /// the hub's tick loop would treat as a deadline to back off on.
+    fn claim(&self, id: &str) -> Result<Claim<'_>, CoreError> {
+        let mut claims = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !claims.insert(id.to_string()) {
+            return Err(CoreError::Invalid(format!(
+                "session {id}: another spawn, attach_text or retire is in flight; retry"
+            )));
+        }
+        Ok(Claim {
+            claims: &self.lifecycle,
+            id: id.to_string(),
+        })
     }
 
     fn session(&self, id: &str) -> Result<Arc<Session>, CoreError> {
@@ -556,6 +613,8 @@ impl Core {
                 "attach_text needs cols and rows >= 1".into(),
             ));
         }
+        // One lifecycle claim for the whole resume, like `spawn` (§6.4 A1, review F1).
+        let _claim = self.claim(&session_id)?;
         let previous = self
             .sessions
             .read()
@@ -634,7 +693,14 @@ impl Core {
         id: &str,
         sink: Arc<dyn FrameSink>,
     ) -> Result<(String, u64), CoreError> {
-        Ok(self.session(id)?.attach_sink(sink))
+        match self.session(id)?.attach_sink(sink) {
+            (replay, Some(handle)) => Ok((replay, handle)),
+            // Retired while the registration was in flight: nothing was registered, so there is no
+            // handle to hand back (review F1).
+            (_, None) => Err(CoreError::Invalid(format!(
+                "session {id}: retired; the sink was not registered"
+            ))),
+        }
     }
 
     pub fn detach_sink(&self, id: &str, handle: u64) -> Result<bool, CoreError> {
@@ -666,35 +732,56 @@ impl Core {
         let fanout = session.fanout();
         let handle = self.next_queue_handle.fetch_add(1, Ordering::Relaxed);
         // The entry goes in before the registration, so a retire that lands in between closes this queue
-        // (it reports `closed`) instead of leaving a registered sink no handle can reach.
-        {
-            let mut queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
-                .ok_or_else(|| CoreError::Deadline("queue table busy, nothing attached".into()))?;
-            queues.insert(
-                handle,
-                AttachedQueue {
-                    session_id: id.to_string(),
-                    fanout: Arc::clone(&fanout),
-                    sink_handle: None,
-                    queue: Arc::clone(&queue),
-                },
-            );
-        }
+        // and unregisters the sink instead of leaving a sink no handle can reach (review F4).
+        lock_queues(&self.queues).insert(
+            handle,
+            AttachedQueue {
+                session_id: id.to_string(),
+                fanout: Arc::clone(&fanout),
+                sink_handle: None,
+                queue: Arc::clone(&queue),
+            },
+        );
         let (replay, sink_handle) = session.attach_sink(Arc::clone(&queue) as Arc<dyn FrameSink>);
-        let mut queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
-            .ok_or_else(|| CoreError::Deadline("queue table busy, nothing attached".into()))?;
-        let orphaned = match queues.get_mut(&handle) {
-            // The normal case: the entry is still here, so a later detach can unregister the sink.
-            Some(entry) if !entry.queue.is_closed() => {
-                entry.sink_handle = Some(sink_handle);
-                false
+        // The registration is complete here, so this call always answers with a usable handle: either
+        // the queue is live and a detach unregisters the sink, or the id was retired while the
+        // registration was in flight — then the sink is unregistered and the queue closed, and the
+        // caller learns it from `take_frames`'s `closed` on the first take (review F1, F4).
+        let mut unregistered = None;
+        {
+            let mut queues = lock_queues(&self.queues);
+            match (queues.get_mut(&handle), sink_handle) {
+                (Some(entry), sink_handle) if !entry.fanout.is_closed() => {
+                    entry.sink_handle = sink_handle;
+                }
+                // The id was retired while the registration was in flight: the entry is kept (so the
+                // handle answers) with its queue closed, and the sink — if `register` accepted it
+                // before the fan-out closed — is taken back out. The socket's first take then reports
+                // `closed` and it closes with 1000 instead of waiting for frames that never come
+                // (review F1, F4: a registration must never outlive the fan-out it was made for).
+                (Some(entry), sink_handle) => {
+                    entry.queue.close();
+                    unregistered = sink_handle;
+                }
+                (None, sink_handle) => {
+                    // The entry was removed under the registration, which only a detach of this handle
+                    // could do — impossible before it is returned. Put a closed entry back anyway, so
+                    // the handle answers `closed` rather than `KeyError` below.
+                    queues.insert(
+                        handle,
+                        AttachedQueue {
+                            session_id: id.to_string(),
+                            fanout: Arc::clone(&fanout),
+                            sink_handle: None,
+                            queue: Arc::clone(&queue),
+                        },
+                    );
+                    queue.close();
+                    unregistered = sink_handle;
+                }
             }
-            // A detach or retire emptied the entry while the registration was in flight: unregister the
-            // sink instead of holding a queue nobody polls.
-            _ => true,
-        };
-        drop(queues);
-        if orphaned {
+        }
+        if let Some(sink_handle) = unregistered {
             fanout.detach(sink_handle);
         }
         Ok((replay, handle))
@@ -705,30 +792,36 @@ impl Core {
     /// retired) — which is what lets the Python socket close with code 1000 as `close_ws_frontends`
     /// does today. A detached or never-issued handle is `KeyError`.
     pub fn take_frames(&self, handle: u64) -> Result<Frames, CoreError> {
-        let queue = {
-            let queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
-                .ok_or_else(|| CoreError::Deadline("queue table busy, nothing taken".into()))?;
-            queues
-                .get(&handle)
-                .map(|entry| Arc::clone(&entry.queue))
-                .ok_or(CoreError::UnknownQueue(handle))?
+        let (queue, fanout_closed) = {
+            let queues = lock_queues(&self.queues);
+            let entry = queues.get(&handle).ok_or(CoreError::UnknownQueue(handle))?;
+            (Arc::clone(&entry.queue), entry.fanout.is_closed())
         };
         // The registry lock is released before the queue's own: a taker must not stall another socket's
         // take or a session's retire.
-        Ok(queue.take())
+        let mut taken = queue.take();
+        // A queue that was registered while the id's fan-out was open and whose id is retired now sees
+        // `closed` even if `close_queues_of` closed it before this take started: the fan-out's flag is
+        // the id's own, so the socket is told to close with 1000 either way (review F1).
+        if fanout_closed {
+            taken.closed = true;
+        }
+        Ok(taken)
     }
 
     /// **Temporary (step 4 deletes it).** Closes the queue, unregisters the sink and forgets the handle:
     /// `true` when this call detached it, `false` for a handle that was never issued or is already
     /// detached (a second detach). Works across a resume, like `detach_sink`.
+    ///
+    /// The registry lock is never missed by a deadline: its critical sections are short and always
+    /// complete, so `false` always means what it says (review F4).
     pub fn detach_queue(&self, handle: u64) -> bool {
-        let entry = match lock_deadline(&self.queues, BRIDGE_DEADLINE) {
-            Some(mut queues) => queues.remove(&handle),
-            None => None,
-        };
+        let entry = lock_queues(&self.queues).remove(&handle);
         let Some(entry) = entry else {
             return false;
         };
+        // The registry is released first: a detach only removes an entry, and closing the queue or
+        // unregistering the sink must not stall another socket's take or a retire.
         entry.queue.close();
         if let Some(sink_handle) = entry.sink_handle {
             entry.fanout.detach(sink_handle);
@@ -746,6 +839,10 @@ impl Core {
     /// retired; a later `spawn`/`attach_text` of the same id builds a fresh fan-out, so it carries
     /// nothing over from the incarnation this call removed.
     pub fn retire(&self, id: &str) -> Result<bool, CoreError> {
+        // The claim spans the removal, the queue close and the fan-out close: a resume of this id that
+        // is in flight is refused instead of taking over a fan-out this call is about to close, and one
+        // that starts after this returns gets a fresh fan-out (review F1).
+        let _claim = self.claim(id)?;
         let (session, fanout) = {
             let mut sessions = write_deadline(&self.sessions, BRIDGE_DEADLINE)
                 .ok_or_else(|| CoreError::Deadline(format!("session table busy, {id} not retired")))?;
@@ -776,9 +873,10 @@ impl Core {
     /// Closes every queue registered for `id` and keeps its entry: `take_frames` must still answer
     /// `closed = true` until the socket detaches (§5.2 `retire`).
     fn close_queues_of(&self, id: &str) {
-        let Some(queues) = lock_deadline(&self.queues, BRIDGE_DEADLINE) else {
-            return;
-        };
+        // No deadline: `retire` either closes every queue of the id or it does not remove the session,
+        // and a silent miss would let it report success while a socket never learns `closed` (review
+        // F4). The hold is one hash walk with `FrameQueue::close` (a flag, a lock and a swap).
+        let queues = lock_queues(&self.queues);
         for entry in queues.values() {
             if entry.session_id == id {
                 entry.queue.close();
@@ -873,5 +971,152 @@ impl Core {
 impl Drop for Core {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The queue registry's answers, at the level the bridge's Python callers depend on: a `true`/`false`
+/// from `retire`/`detach_queue` is always exactly what happened, and an attach that loses a race with
+/// `retire` never leaves a sink nobody can reach.
+///
+/// The registry is a plain mutex (review F4): its critical sections are one hash insert or remove and a
+/// walk that closes queues, so "busy for a moment" cannot be turned into a wrong answer. These cases
+/// therefore pin *completion*, not a deadline: a call that finds the registry held finishes once it is
+/// released, and never returns a shorter answer first.
+#[cfg(test)]
+mod retire_gates {
+    use super::*;
+
+    fn core() -> Arc<Core> {
+        Core::new(
+            Box::new(|| false),
+            Box::new(|_line: &str| {}),
+            CoreOptions::default(),
+        )
+    }
+
+    fn attach_text(core: &Core, id: &str) {
+        core.attach_text(TextRequest {
+            session_id: id.to_string(),
+            cols: 40,
+            rows: 6,
+            flags: SessionFlags::default(),
+            seed_history: None,
+            seed: None,
+        })
+        .expect("attach_text");
+    }
+
+    fn drain_death(core: &Core, id: &str) {
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            if core
+                .drain()
+                .into_iter()
+                .any(|record| record.session_id == id && !record.alive)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("no death record for {id}");
+    }
+
+    /// `retire` closes every queue of the id before it reports success, even when another thread held the
+    /// registry when it started: `true` never comes with an open queue behind it (review F4).
+    #[test]
+    fn retire_completes_under_a_held_registry_and_closes_every_queue() {
+        let core = core();
+        attach_text(&core, "retire-open-queue");
+        let (_replay, first) = core.attach_queue("retire-open-queue", None).expect("attach");
+        let (_replay, second) = core.attach_queue("retire-open-queue", None).expect("attach two");
+        core.kill("retire-open-queue", Duration::from_millis(100))
+            .expect("kill");
+        drain_death(&core, "retire-open-queue");
+
+        let registry = core.queues.lock().expect("queue registry");
+        let retired = {
+            let core = Arc::clone(&core);
+            thread::spawn(move || core.retire("retire-open-queue"))
+        };
+        // The registry is held here, so `retire` is parked in `close_queues_of`; it must not answer yet.
+        thread::sleep(Duration::from_millis(50));
+        assert!(!retired.is_finished(), "retire answered while the registry was held");
+        drop(registry);
+        assert!(
+            retired.join().expect("retire thread").expect("retire"),
+            "retire answered without an error"
+        );
+        for handle in [first, second] {
+            let taken = core.take_frames(handle).expect("a retired queue still answers");
+            assert!(taken.closed, "retire reported success and left a queue open");
+            assert!(taken.frames.is_empty(), "a closed queue holds no bytes");
+            assert!(core.detach_queue(handle), "a closed queue still detaches");
+        }
+        core.shutdown();
+    }
+
+    /// `detach_queue`'s `false` means the handle is already gone — never "the registry was busy". A
+    /// second take after it says `UnknownQueue` (review F4).
+    #[test]
+    fn detach_false_means_the_handle_is_gone() {
+        let core = core();
+        attach_text(&core, "detach-once");
+        let (_replay, handle) = core.attach_queue("detach-once", None).expect("attach");
+
+        let registry = core.queues.lock().expect("queue registry");
+        let detacher = {
+            let core = Arc::clone(&core);
+            thread::spawn(move || core.detach_queue(handle))
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(!detacher.is_finished(), "a detach answered while the registry was held");
+        drop(registry);
+        assert!(detacher.join().expect("detach thread"), "the first detach is true");
+        assert!(!core.detach_queue(handle), "the second detach is false");
+        assert!(
+            matches!(core.take_frames(handle), Err(CoreError::UnknownQueue(_))),
+            "false said the handle was gone, so it must not take frames any more"
+        );
+        core.kill("detach-once", Duration::from_millis(100))
+            .expect("kill");
+        core.shutdown();
+    }
+
+    /// An `attach_queue` whose registration loses the race with a `retire` reports a closed queue and
+    /// leaves nothing registered: no sink without a handle, no entry without a queue (review F1, F4).
+    #[test]
+    fn an_attach_that_loses_to_a_retire_reports_closed_and_leaves_no_sink() {
+        let core = core();
+        attach_text(&core, "attach-vs-retire");
+        core.kill("attach-vs-retire", Duration::from_millis(100))
+            .expect("kill");
+        drain_death(&core, "attach-vs-retire");
+        // The registry is held by this thread while the attach runs on another, so the attach's
+        // registration and the retire's close cannot be ordered by luck: whichever wins, the handle the
+        // attach returns must answer `closed` and there must be no sink left behind afterwards.
+        let registry = core.queues.lock().expect("queue registry");
+        let attacher = {
+            let core = Arc::clone(&core);
+            thread::spawn(move || core.attach_queue("attach-vs-retire", None))
+        };
+        thread::sleep(Duration::from_millis(50));
+        let retired = {
+            let core = Arc::clone(&core);
+            thread::spawn(move || core.retire("attach-vs-retire"))
+        };
+        drop(registry);
+        let (result, retire_result) = (
+            attacher.join().expect("attach thread"),
+            retired.join().expect("retire thread"),
+        );
+        assert!(retire_result.expect("retire"), "the ended session was retired");
+        let (_replay, handle) = result.expect("the attach still answers with a handle");
+        let taken = core.take_frames(handle).expect("a handle from the losing attach answers");
+        assert!(taken.closed, "a queue attached to a retired id reports closed");
+        assert!(core.detach_queue(handle));
+        // Nothing of the attach survives the retire: no queue answers, no entry is left.
+        assert!(matches!(core.take_frames(handle), Err(CoreError::UnknownQueue(_))));
+        assert_eq!(core.stats(Duration::from_millis(100)).sessions, 0);
+        core.shutdown();
     }
 }

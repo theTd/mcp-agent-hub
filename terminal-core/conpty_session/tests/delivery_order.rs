@@ -99,7 +99,7 @@ impl RecordingSink {
 }
 
 impl FrameSink for RecordingSink {
-    fn deliver(&self, _session_id: &str, frame: &[u8]) -> u64 {
+    fn deliver(&self, _session_id: &str, frame: &[u8]) {
         let text = String::from_utf8_lossy(frame).into_owned();
         {
             let mut recorder = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
@@ -123,7 +123,6 @@ impl FrameSink for RecordingSink {
         recorder.in_flight -= 1;
         recorder.exited.push(text);
         recorder.bytes.extend_from_slice(frame);
-        0
     }
 }
 
@@ -245,7 +244,7 @@ struct PanickingSink {
 }
 
 impl FrameSink for PanickingSink {
-    fn deliver(&self, _session_id: &str, _frame: &[u8]) -> u64 {
+    fn deliver(&self, _session_id: &str, _frame: &[u8]) {
         let mut delivered = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
         *delivered += 1;
         panic!("sink out of order");

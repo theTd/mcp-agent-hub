@@ -49,8 +49,10 @@ struct SinkEntry {
     sink: Arc<dyn FrameSink>,
 }
 
-/// What one fan-out did: the bytes the sinks reported dropping, the sinks that a panic removed, and
-/// whether the frame belonged to a superseded incarnation (dropped without reaching any sink).
+/// What one fan-out did: the bytes this fan-out dropped instead of delivering (a superseded
+/// incarnation, or an id that was retired), the sinks that a panic removed, and whether the frame
+/// belonged to a superseded incarnation. A sink's own drops are not here: they stay in the sink's
+/// accounting (§5.4, per handle), so one slow socket's loss never becomes the session's.
 #[derive(Debug, Default)]
 pub struct Delivery {
     pub dropped: u64,
@@ -103,6 +105,12 @@ impl SinkFanout {
         DELIVERY_HELD_HERE.with(|depth| depth.get() > 0)
     }
 
+    /// Whether the id was retired: no frame is delivered any more, no sink is registered, and a queue
+    /// attached to it must report `closed` (§5.2 `retire`).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Retires the id (§ `Core::retire`): from here on a frame is dropped and counted instead of handed
     /// to a sink, and the sinks the fan-out still lists are returned so the caller drops them with no
     /// lock held. `FrameSink::deliver` and a sink's `Drop` may take the queue's mutex or wait on a
@@ -126,15 +134,18 @@ impl SinkFanout {
         sinks
     }
 
-    /// Registers a sink and returns its handle. The caller holds the delivery lock, so the handle is
-    /// registered before any later frame can be handed out — and before `attach_sink` returns it.
-    pub fn register(&self, sink: Arc<dyn FrameSink>) -> u64 {
+    /// Registers a sink and returns its handle, or `None` when the id is retired: a sink must never end
+    /// up in a closed fan-out, where every frame is dropped and the socket is never told `closed`
+    /// (§5.4). The caller holds the delivery lock, which `close` also takes, so "closed" cannot change
+    /// between the check and the push.
+    pub fn register(&self, sink: Arc<dyn FrameSink>) -> Option<u64> {
+        let mut sinks = self.sinks.lock().unwrap_or_else(|error| error.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
         let handle = self.next_sink.fetch_add(1, Ordering::Relaxed);
-        self.sinks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(SinkEntry { handle, sink });
-        handle
+        sinks.push(SinkEntry { handle, sink });
+        Some(handle)
     }
 
     /// Makes `owner` the incarnation whose ring a new sink's replay is taken from. Called by a handover
@@ -198,10 +209,7 @@ impl SinkFanout {
                 // `AssertUnwindSafe`: a sink that panics leaves only its own state behind, and it is
                 // gone from the list before the next frame, so nothing observes a half-updated sink.
                 match catch_unwind(AssertUnwindSafe(|| entry.sink.deliver(session_id, frame))) {
-                    Ok(dropped) => {
-                        delivery.dropped += dropped;
-                        index += 1;
-                    }
+                    Ok(()) => index += 1,
                     Err(payload) => {
                         let entry = sinks.remove(index);
                         delivery
@@ -232,16 +240,14 @@ mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    struct Fixed(u64);
+    struct Fixed;
     impl FrameSink for Fixed {
-        fn deliver(&self, _session_id: &str, _frame: &[u8]) -> u64 {
-            self.0
-        }
+        fn deliver(&self, _session_id: &str, _frame: &[u8]) {}
     }
 
     struct Exploding;
     impl FrameSink for Exploding {
-        fn deliver(&self, _session_id: &str, _frame: &[u8]) -> u64 {
+        fn deliver(&self, _session_id: &str, _frame: &[u8]) {
             panic!("sink out of order");
         }
     }
@@ -251,13 +257,16 @@ mod tests {
     #[test]
     fn one_panicking_sink_is_removed_and_the_rest_still_get_the_frame() {
         let fanout = SinkFanout::default();
-        let before = fanout.register(Arc::new(Fixed(3)));
-        let bad = fanout.register(Arc::new(Exploding));
-        let after = fanout.register(Arc::new(Fixed(5)));
+        let before = fanout.register(Arc::new(Fixed)).expect("a live fan-out registers");
+        let bad = fanout.register(Arc::new(Exploding)).expect("a live fan-out registers");
+        let after = fanout.register(Arc::new(Fixed)).expect("a live fan-out registers");
 
         let delivery = catch_unwind(AssertUnwindSafe(|| fanout.fan_out("s", b"x", None)))
             .expect("a panicking sink must not unwind into the caller");
-        assert_eq!(delivery.dropped, 8, "both healthy sinks reported their drops");
+        assert_eq!(
+            delivery.dropped, 0,
+            "a sink's own drops stay in that sink, never in the session's count"
+        );
         assert_eq!(delivery.panicked.len(), 1);
         assert_eq!(delivery.panicked[0].0, bad);
         assert!(delivery.panicked[0].1.contains("sink out of order"));
@@ -276,7 +285,9 @@ mod tests {
             panic!("poison the sink list");
         }));
         assert!(fanout.sinks.is_poisoned());
-        let handle = fanout.register(Arc::new(Fixed(0)));
+        let handle = fanout
+            .register(Arc::new(Fixed))
+            .expect("a poisoned sink list still registers");
         assert!(fanout.detach(handle));
     }
 
@@ -284,9 +295,9 @@ mod tests {
     #[test]
     fn handles_are_unique_across_takeovers() {
         let first = SinkFanout::default();
-        let a = first.register(Arc::new(Fixed(0)));
+        let a = first.register(Arc::new(Fixed)).expect("a live fan-out registers");
         let second = first; // a resume carries the same structure: same counter, same sinks
-        let b = second.register(Arc::new(Fixed(0)));
+        let b = second.register(Arc::new(Fixed)).expect("a live fan-out registers");
         assert!(a < b);
         assert!(second.detach(a), "a handle registered before the takeover detaches after it");
     }
@@ -296,16 +307,21 @@ mod tests {
     #[test]
     fn closing_the_fanout_releases_its_sinks_and_drops_later_frames() {
         let fanout = SinkFanout::default();
-        let first = Arc::new(Fixed(7));
-        let second = Arc::new(Fixed(9));
-        let first_handle = fanout.register(first.clone());
-        fanout.register(second.clone());
+        let first = Arc::new(Fixed);
+        let second = Arc::new(Fixed);
+        let first_handle = fanout.register(first.clone()).expect("a live fan-out registers");
+        fanout.register(second.clone()).expect("a live fan-out registers");
 
         let released = fanout.close();
         assert_eq!(released.len(), 2, "every attached sink is handed back");
+        assert!(fanout.is_closed());
         assert!(
             !fanout.detach(first_handle),
             "a closed fan-out lists no sink to detach"
+        );
+        assert!(
+            fanout.register(Arc::new(Fixed)).is_none(),
+            "a closed fan-out never takes a sink: every frame and no close would reach it"
         );
         let delivery = fanout.fan_out("s", b"xyz", None);
         assert_eq!(delivery.dropped, 3, "a retired id's frame is dropped and counted");
