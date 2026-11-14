@@ -20,7 +20,7 @@ from fake_terminal_core import FakeTerminal
 from session_manager import AgentSession, HubSessionManager
 
 
-def _session(hub, session_id, sockets=None, **kwargs):
+def _session(hub, session_id, **kwargs):
     """An `AgentSession` wired to the hub the way `create_session` wires it."""
     sess = AgentSession(
         session_id,
@@ -33,7 +33,6 @@ def _session(hub, session_id, sockets=None, **kwargs):
         kwargs.pop("args", []),
         core=hub.core,
         on_exit_cb=hub._exit_callback,
-        sockets=sockets if sockets is not None else hub._terminal_sockets(session_id),
         **kwargs,
     )
     sess.engine = "pwsh"
@@ -101,33 +100,29 @@ class TerminalDrainTests(_ManagerCase):
             await asyncio.sleep(0.01)
         self.assertEqual(self.hub.core.stats()["sessions"], 0)
 
-    async def test_the_sockets_of_a_replaced_session_keep_receiving(self):
-        # §6.4 A1 / rtc-sinks-per-id: the handle, the queue and the closer belong to the id, so the
-        # manager's tick keeps serving a socket the console attached before the resume.
+    async def test_a_resume_hands_the_banner_to_the_core_and_keeps_the_ids_entry(self):
+        # §6.4 A1 / rtc-sinks-per-id: the sockets belong to the id inside the core, so the hub's
+        # part of a resume is only the banner (`ws_prefix`) and never a re-registration. That an
+        # attached socket really survives the swap is the core's own case
+        # (`test_terminal_core_client.TerminalSocketTests`, `a_resume_banner_reaches_an_attached_socket`).
         old = _session(self.hub, "resume-socket")
         self.hub.core.spawn("resume-socket", ["cmd.exe"])
-        replay, queue = old.attach_ws_queue()
-        closer_called = []
-        old.register_ws_closer(queue, lambda: closer_called.append(True))
         self.hub.core.output("resume-socket", "OLD-MARK\r\n")
         self.hub.core.kill("resume-socket", 1500)
         self.hub._on_core_tick()  # the predecessor's death record, as the hub would drain it
 
-        resumed = _session(self.hub, "resume-socket")  # same id, same registry, new object
-        self.assertIs(resumed.sockets, old.sockets)
+        resumed = _session(self.hub, "resume-socket")  # same id, new object
         self.hub.core.spawn("resume-socket", ["cmd.exe"], ws_prefix="已恢复 (1)\r\n")
         self.hub.core.output("resume-socket", "NEW-MARK\r\n")
 
         self.hub._on_core_tick()
-        self.assertEqual([], [f for f in [replay] if "OLD-MARK" in f],
-                         "the replay was taken before the old bytes arrived")
-        frames = []
-        while not queue.empty():
-            frames.append(queue.get_nowait())
-        self.assertEqual(frames, ["OLD-MARK\r\n", "已恢复 (1)\r\n", "NEW-MARK\r\n"])
-
-        resumed.close_ws_frontends()
-        self.assertEqual(closer_called, [True], "the closer registered on the old object still closed it")
+        state = self.hub.core.session("resume-socket")
+        self.assertEqual(state.ws_prefix, "已恢复 (1)\r\n",
+                         "the resume banner never reached the core's handover")
+        self.assertEqual(state.ring, "NEW-MARK\r\n",
+                         "the id's entry is the successor's, not the predecessor's")
+        self.assertEqual(resumed.raw_revision, state.rev)
+        self.assertNotIn("resume-socket", self.hub.core.retired)
 
 
 class HubOnCoreTests(_ManagerCase):
@@ -160,7 +155,6 @@ class HubOnCoreTests(_ManagerCase):
         self.assertIn("hub-core-echo", await self._screen_until("hub-core-echo"))
 
         self.assertEqual(self.session.resize(96, 24), (96, 24))
-        self.session.drain_ws_frames()  # nothing attached: a no-op that still reads the seam
         self.assertEqual(self.session.read_screen().cols, 96)
 
         code = self.session.kill(1500)
@@ -188,7 +182,7 @@ class HubOnCoreTests(_ManagerCase):
         self.assertTrue(closed["found"])
         self.assertEqual(self.hub.core.stats()["sessions"], 0, "retire left the id in the core's table")
         self.assertNotIn("hub-core-probe", self.hub.sessions)
-        self.assertNotIn("hub-core-probe", self.hub.terminal_sockets)
+        self.assertEqual(self.hub.core.socket_count(), 0, "a console socket outlived its session")
 
 
 class FakeCoreFidelityTests(unittest.TestCase):

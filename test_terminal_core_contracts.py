@@ -399,9 +399,6 @@ class RetireIncarnationTests(_ManagerCase):
         await _resumable(self.hub, self.root, "retire-resume")
         self.hub.core.spawn("retire-resume", ["cmd.exe"])
         self.hub._on_core_tick()
-        old = self.hub.sessions["retire-resume"]
-        _replay, queue = old.attach_ws_queue()
-        handle = old.sockets.handles[queue]
         self.hub.core.kill("retire-resume", 200)
         self.hub._on_core_tick()
         self.hub.core.block_retire = 1
@@ -416,16 +413,12 @@ class RetireIncarnationTests(_ManagerCase):
         self.assertTrue(result["resumed"], result)
         self.assertNotIn("retire-resume", self.hub._retire_pending,
                          "the predecessor's drop survived the resume")
-        # A1/Q11: the handle belongs to the id, so the fan-out the predecessor had survives the
-        # resume and the successor's ws_prefix is written to it.
-        self.assertFalse(self.hub.core.handles[handle][1].closed,
-                         "the pending retire closed the socket the resume hands over")
+        # A1/Q11: the sockets belong to the id inside the core, so the hub's part of the handover is
+        # the banner; a retried retire must never take the successor's entry away.
         self.hub._on_core_tick()
-        delivered = []
-        while not queue.empty():
-            delivered.append(queue.get_nowait())
-        self.assertIn(session_manager.resume_banner(1), delivered,
-                      "the resume banner never reached the socket attached before it")
+        state = self.hub.core.session("retire-resume")
+        self.assertEqual(state.ws_prefix, session_manager.resume_banner(1),
+                         "the resume banner never reached the id's fan-out")
         resumed = self.hub.sessions["retire-resume"]
         self.hub.core.output("retire-resume", "STILL-LIVE\r\n")
         self.hub.core.set_exit("retire-resume", 0)
@@ -738,83 +731,130 @@ class DshLifecycleTests(_ManagerCase):
         self.hub.core.attach_text("dsh-done", cols=120, rows=36)
 
 
-class BridgeTests(_ManagerCase):
-    async def test_a_closed_handle_is_detached_exactly_once(self):
-        # F7/kimi 7: the core keeps a closed sink's handle until `detach_queue`; popping it first
-        # leaked the handle and its 2 MB queue for the hub's life.
-        sess = await _live(self.hub, "bridge-closed")
-        _replay, q = sess.attach_ws_queue()
-        handle = sess.sockets.handles[q]
-        self.hub.core.handles[handle][1].closed = True  # the fan-out closed under the sink
-        self.hub._on_core_tick()
-        self.assertEqual(self.hub.core.detach_calls, [handle], "detach ran zero or twice")
-        self.assertEqual(self.hub.core.handles, {}, "the core kept the handle")
-        self.assertEqual(sess.sockets.handles, {})
+class DrainRequestTests(_ManagerCase):
+    """§6.4/§5.2: what the console's socket recorded is applied by the hub, in order, once."""
 
-    async def test_a_detach_that_misses_its_deadline_is_retried_off_the_loop(self):
-        # F8: the coming core raises TimeoutError on a busy registry and keeps the sink registered.
-        sess = await _live(self.hub, "bridge-orphan")
-        _replay, q = sess.attach_ws_queue()
-        handle = sess.sockets.handles[q]
-        self.hub.core.block_detach = 1
-        self.hub.core.handles[handle][1].closed = True
+    async def test_resize_requests_apply_in_order_with_the_console_rules(self):
+        # The socket no longer calls the core's resize: the request travels in the drain record and
+        # the hub applies its own clamp and single-window propagation, in arrival order.
+        target = await _live(self.hub, "resize-target")
+        background = await _live(self.hub, "resize-background")
+        self.hub.default_cols, self.hub.default_rows = 120, 36
+        self.hub.core.request_resize("resize-target", 100, 30, propagate=False)
+        self.hub.core.request_resize("resize-target", 140, 44, propagate=False)
         self.hub._on_core_tick()
-        self.assertIn(handle, sess.sockets.orphans)
-        for _ in range(80):
-            await asyncio.sleep(0.02)
-            if not self.hub.core.handles:
-                break
-        self.assertEqual(self.hub.core.handles, {}, "the orphaned handle was never detached")
-        self.assertEqual(sess.sockets.orphans, set())
-
-    async def test_a_full_python_queue_keeps_the_rest_of_the_batch(self):
-        # F13: take_frames already removed the batch from the core; a QueueFull used to discard the
-        # remainder without a count. It now waits for the next tick.
-        sess = await _live(self.hub, "bridge-full")
-        with patch.object(session_manager, "WS_QUEUE_MAX_FRAMES", 2):
-            _replay, q = sess.attach_ws_queue()
-            q.put_nowait("held")
-            q.put_nowait("held")
-        self.hub.core.output("bridge-full", "ONE")
-        self.hub.core.output("bridge-full", "TWO")
+        self.assertEqual((target.cols, target.rows), (140, 44), "the last request in order did not win")
+        self.assertEqual((self.hub.core.session("resize-target").cols,
+                          self.hub.core.session("resize-target").rows), (140, 44),
+                         "the applied size never reached the core")
+        self.assertEqual((background.cols, background.rows), (120, 36),
+                         "propagate=false resized a background session")
+        # A single-window request propagates; an earlier `false` must not survive it.
+        self.hub.core.request_resize("resize-target", 96, 24, propagate=True)
         self.hub._on_core_tick()
-        self.assertEqual(q.qsize(), 2)  # nothing fitted; both frames are pending
-        pending = list(sess.sockets.pending.values())
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(len(pending[0]), 2)
-        q.get_nowait()
-        q.get_nowait()
+        self.assertEqual((background.cols, background.rows), (96, 24),
+                         "the propagated request never reached the background session")
+        self.assertEqual((self.hub.default_cols, self.hub.default_rows), (96, 24))
+
+    async def test_a_resize_request_is_clamped_and_taken_once(self):
+        target = await _live(self.hub, "resize-clamp")
+        self.hub.core.request_resize("resize-clamp", 4, 2, propagate=False)
         self.hub._on_core_tick()
-        self.assertEqual([q.get_nowait() for _ in range(2)], ["ONE", "TWO"],
-                         "the rest of the taken batch was dropped")
-        self.assertEqual(sess.sockets.pending, {})
+        self.assertEqual((target.cols, target.rows), (20, 5), "the 20x5 clamp is missing")
+        self.hub._on_core_tick()  # nothing was recorded again: the request is consumed
+        self.assertEqual((target.cols, target.rows), (20, 5))
+        self.assertEqual(self.hub.core.session("resize-clamp").resize_requests, [])
 
-    async def test_a_backlog_past_the_socket_window_is_counted_as_overflow(self):
-        # F13's other half: what cannot be kept is counted per handle in frames and logged once,
-        # never mixed with the core's byte count.
-        sess = await _live(self.hub, "bridge-overflow")
-        with patch.object(session_manager, "WS_QUEUE_MAX_FRAMES", 1):
-            _replay, q = sess.attach_ws_queue()
-            q.put_nowait("held")
-            for text in ("ONE", "TWO", "THREE"):
-                self.hub.core.output("bridge-overflow", text)
-            with self.assertLogs("mcp-agent-hub.session_manager", level="WARNING") as logs:
-                self.hub._on_core_tick()
-        handle = next(iter(sess.sockets.handles.values()))
-        self.assertEqual(sess.sockets.overflow[handle], 2)
-        self.assertTrue(any("dropped 2 frames" in line for line in logs.output), logs.output)
+    async def test_text_input_requests_reach_the_echo_and_the_line_callback_once(self):
+        # A session with no PTY: the core records the socket's input and never writes it, because
+        # the DSH echo and its line callback are the hub's (design §8, gaps 9).
+        sess = _session(self.hub, "text-input", command="", args=[])
+        sess.engine = "dsh"
+        sess.kind = "virtual"
+        lines = []
+        sess.start_virtual(asyncio.get_running_loop(),
+                           on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        self.hub._on_core_tick()
+        self.hub.core.request_input("text-input", "hi")
+        self.hub.core.request_input("text-input", "there\r")
+        self.hub._on_core_tick()
+        self.assertEqual(lines, [("text-input", "hithere")], "the line callback missed the typed text")
+        self.assertIn("hithere", sess.read_raw().text, "the echo never reached the text screen")
+        self.assertEqual(self.hub.core.inputs_of("text-input"), [],
+                         "text-session input was written to the core")
+        self.hub._on_core_tick()
+        self.assertEqual(lines, [("text-input", "hithere")], "the request was delivered twice")
 
-    async def test_the_core_s_socket_drop_is_reported_per_handle(self):
-        # The coming contract: `dropped_bytes` in the drain record is the ring's loss only; a
-        # socket's loss comes from its own `take_frames` count.
-        sess = await _live(self.hub, "bridge-drops")
-        _replay, q = sess.attach_ws_queue()
-        handle = sess.sockets.handles[q]
-        self.hub.core.handles[handle][1].dropped = 5
+    async def test_a_text_session_echoes_a_backspace_and_delivers_one_line(self):
+        sess = _session(self.hub, "text-edit", command="", args=[])
+        sess.kind = "virtual"
+        lines = []
+        sess.start_virtual(asyncio.get_running_loop(),
+                           on_virtual_line_cb=lambda sid, line: lines.append(line))
+        self.hub.core.request_input("text-edit", "ab\x7f\r")
+        self.hub._on_core_tick()
+        self.assertEqual(lines, ["a"], "backspace did not edit the virtual line")
+
+    async def test_a_bad_request_costs_that_request_only(self):
+        # master 3874299: one record (or request) that raises must not stop the next one.
+        target = await _live(self.hub, "request-bad")
+        sess = _session(self.hub, "request-bad-2", command="", args=[])
+        sess.start_virtual(asyncio.get_running_loop())
+        self.hub._on_core_tick()
+        self.hub.core.request_resize("request-bad", "not-a-number", 24, propagate=False)
+        self.hub.core.request_resize("request-bad-2", 88, 22, propagate=False)
+        with self.assertLogs("mcp-agent-hub.session_manager", level="ERROR") as logs:
+            self.hub._on_core_tick()
+        self.assertTrue(any("resize request for request-bad failed" in line for line in logs.output),
+                        logs.output)
+        self.assertEqual((target.cols, target.rows), (120, 36), "the bad request was applied")
+        self.assertEqual((sess.cols, sess.rows), (88, 22),
+                         "a bad request stopped the next session's record")
+
+    async def test_a_socket_s_loss_is_kept_per_handle_and_apart_from_the_ring(self):
+        # §5.4: the per-handle count is that socket's own; handles are per id and collide, so the
+        # key is (session id, handle). It never joins the ring's `dropped_bytes`.
+        first = await _live(self.hub, "drops-first")
+        second = await _live(self.hub, "drops-second")
+        self.hub.core.note_socket_drops("drops-first", 7, 5)
+        self.hub.core.note_socket_drops("drops-second", 7, 9)
         with self.assertLogs("mcp-agent-hub.session_manager", level="WARNING") as logs:
             self.hub._on_core_tick()
-        self.assertEqual(sess.sockets.dropped[handle], 5)
-        self.assertTrue(any("dropped 5 bytes" in line for line in logs.output), logs.output)
+        self.assertEqual(self.hub._socket_drops, {("drops-first", 7): 5, ("drops-second", 7): 9})
+        warnings = [line for line in logs.output if "dropped" in line]
+        self.assertEqual(len(warnings), 2, warnings)
+        # The ring's own loss and the socket's stay apart: the record's `dropped_bytes` is the ring's.
+        self.assertEqual((self.hub.core.session("drops-first").dropped_bytes,
+                          self.hub.core.session("drops-second").dropped_bytes), (0, 0))
+        self.assertEqual((first.read_raw().bytes, second.read_raw().bytes), (0, 0))
+
+    async def test_the_same_socket_reports_a_growing_count_once_per_increase(self):
+        await _live(self.hub, "drops-grow")
+        self.hub.core.note_socket_drops("drops-grow", 3, 5)
+        self.hub._on_core_tick()
+        with self.assertLogs("mcp-agent-hub.session_manager", level="WARNING") as logs:
+            self.hub.core.note_socket_drops("drops-grow", 3, 9)
+            self.hub._on_core_tick()
+        self.assertEqual(self.hub._socket_drops[("drops-grow", 3)], 9)
+        self.assertEqual(len([line for line in logs.output if "dropped" in line]), 1, logs.output)
+        # A detached socket's final count is reported once and is not reported again.
+        self.hub.core.note_socket_drops("drops-grow", 3, 9)
+        self.hub._on_core_tick()
+        self.assertEqual(self.hub._socket_drops[("drops-grow", 3)], 9)
+
+    async def test_closing_a_session_closes_its_sockets_and_forgets_them(self):
+        await _live(self.hub, "close-sockets")
+        self.hub.core.open_socket("close-sockets", 2)
+        self.hub.core.note_socket_drops("close-sockets", 1, 4)
+        self.hub._on_core_tick()
+        await self.hub.close_session("close-sockets", source="console")
+        self.assertEqual(self.hub.core.close_socket_calls.count("close-sockets"), 1,
+                         "the close path did not ask the core to close the pane's sockets")
+        self.assertEqual(self.hub.core.socket_count(), 0, "a console socket outlived its session")
+        self.assertEqual(self.hub._socket_drops, {}, "the closed id's diagnostics stayed")
+        self.assertNotIn("close-sockets", self.hub.sessions)
+        self.assertNotIn("close-sockets", self.hub.core.sessions,
+                         "the core's entry outlived the close's retire")
 
 
 if __name__ == "__main__":

@@ -87,10 +87,45 @@ class TerminalSeamScanTests(unittest.TestCase):
             self.assertFalse(hasattr(session_manager.AgentSession, name), name)
         for name in ("read_screen", "read_scrollback", "read_raw", "read_raw_tail", "seed_history",
                      "write_input", "resize", "kill", "is_process_alive", "last_output_time",
-                     "apply_core_record", "drain_ws_frames", "start_pty", "start_virtual"):
+                     "apply_core_record", "start_pty", "start_virtual"):
             self.assertTrue(callable(getattr(session_manager.AgentSession, name, None)), name)
         for name in ("has_process", "pid", "raw_revision"):
             self.assertIsInstance(getattr(session_manager.AgentSession, name, None), property, name)
+
+    def test_the_python_socket_bridge_is_gone(self):
+        """Step 4b: the core serves the console's sockets, so no Python half of that path may stay.
+
+        Each name here was the bridge's: a queue per socket, a poll per tick, a closer per pane and
+        the three temporary core calls behind them (§5.2). A survivor would be a second path the
+        console could reach, or bookkeeping nobody reads.
+        """
+        for name in ("attach_ws_queue", "detach_ws_queue", "register_ws_closer",
+                     "close_ws_frontends", "drain_ws_frames"):
+            self.assertFalse(hasattr(session_manager.AgentSession, name), name)
+        for name in ("TerminalSockets", "drain_terminal_frames", "_offer_frames",
+                     "release_terminal_handle", "WS_QUEUE_MAX_FRAMES", "pump_terminal_frames"):
+            self.assertFalse(hasattr(session_manager, name), name)
+        for name in ("terminal_sockets", "_terminal_sockets", "pump_terminal_frames",
+                     "_release_orphan_handles"):
+            self.assertFalse(hasattr(session_manager.HubSessionManager, name), name)
+        self.assertFalse(hasattr(server, "ws_pty_endpoint"))
+        # The three pull calls stay in the core for a later unit, but the hub may not call them.
+        for name in ("attach_queue", "take_frames", "detach_queue"):
+            self.assertNotIn(name, Path(session_manager.__file__).read_text(encoding="utf-8"))
+            self.assertNotIn(name, Path(server.__file__).read_text(encoding="utf-8"))
+
+    def test_the_console_asks_for_a_ticket_before_it_opens_a_socket(self):
+        """§6.4: the console's terminal URL comes from the hub's ticket route, never from itself."""
+        hub_api = (Path(__file__).parent / "static" / "js" / "hub-api.js").read_text(
+            encoding="utf-8")
+        workspace = (Path(__file__).parent / "static" / "js" / "session-workspace.js").read_text(
+            encoding="utf-8")
+        self.assertNotIn("ptySocketUrl", hub_api)
+        self.assertNotIn("ptySocketUrl", workspace)
+        self.assertIn("terminal-ticket", hub_api)
+        self.assertIn("hubApi.terminalTicket(", workspace)
+        self.assertNotIn("/ws/pty/", hub_api)
+        self.assertIn("new WebSocket(url)", workspace)
 
 
 if __name__ == "__main__":

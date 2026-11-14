@@ -221,6 +221,14 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads((await tail.read_batch())[0][1]), {"kind": "text"})
 
 
+def is_replay_end(frame) -> bool:
+    """The core's marker is `{"type":"replay_end"}` (no space); the console parses it as JSON."""
+    try:
+        return json.loads(frame).get("type") == "replay_end"
+    except Exception:
+        return False
+
+
 class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Match the production loop; debug traceback capture distorts socket latency.
@@ -284,13 +292,30 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.socket.close()
         self.temporary.cleanup()
 
-    async def connect_terminal(self):
+    async def connect_terminal(self, session_id="test-tui"):
+        websocket, _replay = await self.open_terminal(session_id)
+        return websocket
+
+    async def open_terminal(self, session_id="test-tui"):
+        """§6.4's path: a ticket from the hub, then the core's socket, read through its marker.
+
+        The console does exactly this (`terminalTicket` then `new WebSocket(url)`); the replay comes
+        first (one frame, or none for an empty ring), then one `replay_end`, then live output.
+        """
         from websockets.asyncio.client import connect
-        websocket = await connect(f"ws://127.0.0.1:{self.port}/ws/pty/test-tui", proxy=None)
+        response = await self.client.get(f"/api/sessions/{session_id}/terminal-ticket")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(str(body.get("url", "")).startswith("ws://127.0.0.1:"), body)
+        self.assertGreater(body.get("expires_in"), 0, body)
+        self.assertLessEqual(body.get("expires_in"), 30, body)
+        websocket = await connect(body["url"], proxy=None)
+        replay = []
         while True:
-            frame = await asyncio.wait_for(websocket.recv(), timeout=1)
-            if frame == '{"type": "replay_end"}':
-                return websocket
+            frame = await asyncio.wait_for(websocket.recv(), timeout=2)
+            if is_replay_end(frame):
+                return websocket, "".join(replay)
+            replay.append(frame)
 
     async def test_mcp_and_console_launches_have_distinct_sources(self):
         from unittest.mock import AsyncMock
@@ -600,28 +625,144 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             lock.close()
 
-    async def test_a_session_without_a_core_entry_closes_the_socket_normally(self):
-        # F6: an attach raises when the core never had the id (a failed spawn still listed, a
-        # desktop window, a retired id). Uncaught, uvicorn closes with 1011 and the browser
-        # reconnects in a loop; an ended id closes 1000, one the core never had 1008.
+    async def test_health_reports_the_real_terminal_listener(self):
+        # §6.4: the listener's own state, from the real core (a fake core's case is in
+        # test_terminal_ticket_endpoint, and the no-core nulls are there too).
+        core = self.module.hub.core
+        response = await self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["terminal_ws"],
+                         {"listening": True, "port": core.ws_port})
+        self.assertGreater(core.ws_port, 0)
+        self.assertTrue(core.ws_listening())
+
+    async def test_a_ticket_connect_replays_the_ring_before_the_marker(self):
+        # §6.4: the socket's first frames are the ring as it stands, then one `replay_end`, then
+        # live output as raw text. The console's replay buffering and its 1.5 s fallback depend on
+        # exactly that order, so the two halves are checked apart.
+        self.assertTrue(self.session.write_input("echo TICKET-REPLAY-PROBE\r\n"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "TICKET-REPLAY-PROBE" in self.session.read_raw().text:
+                break
+            await asyncio.sleep(0.02)
+        self.assertIn("TICKET-REPLAY-PROBE", self.session.read_raw().text)
+
+        websocket, replay = await self.open_terminal()
+        try:
+            self.assertIn("TICKET-REPLAY-PROBE", replay, "the replay lost the ring it stands for")
+            self.assertTrue(self.session.write_input("echo LIVE-AFTER-MARKER\r\n"))
+            seen = ""
+            deadline = time.monotonic() + 5
+            while "LIVE-AFTER-MARKER" not in seen and time.monotonic() < deadline:
+                frame = await asyncio.wait_for(websocket.recv(), timeout=2)
+                self.assertFalse(is_replay_end(frame),
+                                 "a second replay marker arrived after the first")
+                seen += frame
+            self.assertIn("LIVE-AFTER-MARKER", seen, "live output never followed the marker")
+        finally:
+            await websocket.close()
+
+    async def test_a_quiet_session_resizes_through_the_drain_not_the_socket(self):
+        # gaps 4: the socket only records the request. The hub applies it on the drain record with
+        # its own clamp and propagation, and the PTY prints nothing for it.
+        websocket, _replay = await self.open_terminal()
+        try:
+            await websocket.send(json.dumps({"type": "resize", "cols": 96, "rows": 24,
+                                             "propagate": False}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (self.session.cols, self.session.rows) != (96, 24):
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual((self.session.cols, self.session.rows), (96, 24),
+                             "the resize request never reached the session")
+            screen = self.session.read_screen()
+            self.assertEqual((screen.cols, screen.rows), (96, 24),
+                             "the core never applied the hub's size")
+        finally:
+            await websocket.close()
+
+    async def test_dsh_socket_input_is_echoed_and_delivered_once(self):
+        # gaps 9: a session with no PTY gets its socket input back as an ordered drain request; the
+        # hub's own echo and line callback do the work, and the core writes nothing anywhere.
         import session_manager
-        from websockets.asyncio.client import connect
-        from websockets.exceptions import ConnectionClosed
-        hub = self.module.hub
-        ghost = session_manager.AgentSession(
-            session_id="ws-nocore", profile_id="pwsh", profile_name="Ghost", kind="tui",
-            title="Ghost", cwd=str(self.directory), command="cmd.exe", args=[],
+        lines = []
+        session = session_manager.AgentSession(
+            session_id="test-dsh-input", profile_id="dsh", profile_name="DSH", kind="virtual",
+            title="Text input", cwd=str(self.directory), command="", args=[],
         )
-        ghost.core = hub.core
-        ghost.status = "running"
-        hub.sessions["ws-nocore"] = ghost
-        for status, ended_at, expected in (("running", None, 1008), ("exited", 1.0, 1000)):
-            ghost.status = status
-            ghost.ended_at = ended_at
-            websocket = await connect(f"ws://127.0.0.1:{self.port}/ws/pty/ws-nocore", proxy=None)
-            with self.assertRaises(ConnectionClosed) as ctx:
-                await asyncio.wait_for(websocket.recv(), timeout=3)
-            self.assertEqual(ctx.exception.rcvd.code, expected, status)
+        session.engine = "dsh"
+        session.status = "running"
+        session.core = self.module.hub._ensure_core()
+        session.start_virtual(asyncio.get_running_loop(),
+                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        self.module.hub.sessions[session.session_id] = session
+        websocket, _replay = await self.open_terminal("test-dsh-input")
+        try:
+            await websocket.send(json.dumps({"type": "input", "data": "hello hub\r"}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not lines:
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual(lines, [("test-dsh-input", "hello hub")])
+            self.assertIn("hello hub", session.read_raw().text, "the DSH echo never reached the screen")
+            self.module.hub._on_core_tick()
+            await asyncio.sleep(0.15)
+            self.module.hub._on_core_tick()
+            self.assertEqual(lines, [("test-dsh-input", "hello hub")],
+                             "the same input was delivered twice")
+        finally:
+            await websocket.close()
+            self.module.hub.sessions.pop("test-dsh-input", None)
+
+    async def test_a_browser_osc_reply_never_reaches_a_text_session(self):
+        # §8/gaps 3+16: the core strips OSC terminal replies from socket input before it records it.
+        # A text session makes that observable: the hub echoes every character it lets through into
+        # the ring, so a reply that survived the strip would be visible there and in the echo.
+        import session_manager
+        lines = []
+        session = session_manager.AgentSession(
+            session_id="test-dsh-osc", profile_id="dsh", profile_name="DSH", kind="virtual",
+            title="OSC strip", cwd=str(self.directory), command="", args=[],
+        )
+        session.engine = "dsh"
+        session.status = "running"
+        session.core = self.module.hub._ensure_core()
+        session.start_virtual(asyncio.get_running_loop(),
+                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        self.module.hub.sessions[session.session_id] = session
+        websocket, _replay = await self.open_terminal("test-dsh-osc")
+        try:
+            await websocket.send(json.dumps({"type": "input",
+                                             "data": "\x1b]11;rgb:0000/0000/0000\x07"}))
+            await websocket.send(json.dumps({"type": "input", "data": "hi\r"}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not lines:
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual(lines, [("test-dsh-osc", "hi")])
+            ring = session.read_raw().text
+            self.assertNotIn("rgb:0000", ring, "a browser OSC reply reached the session's screen")
+            self.assertNotIn("\x1b]11", ring, "a browser OSC reply was echoed into the session")
+        finally:
+            await websocket.close()
+            self.module.hub.sessions.pop("test-dsh-osc", None)
+
+    async def test_a_permanent_close_closes_the_socket_normally(self):
+        # W7: a close ends the pane's socket with 1000 through the core, not by silence.
+        from websockets.exceptions import ConnectionClosed
+        websocket, _replay = await self.open_terminal()
+        try:
+            closed = await self.module.hub.close_session("test-tui", source="console")
+            self.assertTrue(closed["found"])
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    await asyncio.wait_for(websocket.recv(), timeout=max(0.1, deadline - time.monotonic()))
+                except ConnectionClosed as exc:
+                    self.assertEqual(exc.rcvd.code, 1000, "the pane's socket did not close normally")
+                    break
+        finally:
             await websocket.close()
 
 

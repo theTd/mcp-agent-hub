@@ -12,10 +12,11 @@ step 3b that behaviour lives in the offline oracle (decision `oracle-to-tools`,
 - ``HubTerminalScreen``/``HubTerminalStream`` through the session's ``stream.feed``;
 - ``read_screen``/``read_scrollback``/``read_raw``/``read_raw_tail``/``seed_history`` (the seam's
   reply shapes, design §5.2), ``trim_history_text`` and ``resume_banner``;
-- ``attach_ws_queue`` for the replay frame, so the golden is the frame the hub handed a newly
-  attached console rather than a second copy of that expression;
-- ``OSC_TERMINAL_REPLY_RE``/``strip_osc_terminal_replies`` (the hub's, still in ``server.py``'s input
-  path) for the browser→PTY input cases, and the oracle's ``OSC_COLOR_QUERY_RE`` for the ring.
+- the socket's replay frame (the joined ring with one more ``OSC_COLOR_QUERY_RE`` pass, §6.4), so
+  the golden is what the core's socket sends a newly attached console;
+- ``OSC_TERMINAL_REPLY_RE``/``strip_osc_terminal_replies`` (the rule the core's socket applies to
+  browser input, mirrored here from ``session_manager``) for the browser→PTY input cases, and the
+  oracle's ``OSC_COLOR_QUERY_RE`` for the ring.
 
 The submit-diagnostic tail and the resumed seed are no longer mirrored expressions: both are seam
 calls (``read_raw_tail``, ``seed_history``) and the tail's bound is the imported
@@ -27,9 +28,9 @@ a golden ends in whatever the hub's rendered text ends in (usually no newline, b
 
 ``session``  screen_final.txt, screen_at_resize.txt (when the corpus resizes), scrollback_250.txt,
              raw.txt (W9-trimmed raw history, as ``_scrollback_blob`` writes it), raw_tail.txt
-             (``_capture_submit_diagnostic``'s last 65536 chars), replay.txt (what
-             ``attach_ws_queue`` hands a new console: the whole ``raw_history`` join with one more
-             OSC colour-query strip), and the same files under ``resumed/`` for a session that starts
+             (``_capture_submit_diagnostic``'s last 65536 chars), replay.txt (what the core's
+             socket sends a new console: the whole ``raw_history`` join with one more OSC
+             colour-query strip), and the same files under ``resumed/`` for a session that starts
              from the archived history plus the resume banner (``_make_resumed_session``, :4864),
              with ``resume_count`` read from meta.json.
 ``trigger``  a session fed enough output to cross ``max_history_bytes + HISTORY_TRIM_SLACK_BYTES``
@@ -179,15 +180,13 @@ def trimmed_raw(session: PyteOracleSession) -> str:
 
 
 def replay_frame(session: PyteOracleSession) -> str:
-    """The replay the hub sends a newly attached console: ``attach_ws_queue``'s own snapshot.
+    """The replay the core's socket sends a newly attached console (§6.4).
 
     It is the join of ``raw_history`` and *then* one more ``OSC_COLOR_QUERY_RE`` pass, which is not
-    the same string as the per-chunk-stripped history when a query is split across two chunks.  No
-    running loop is needed: the queue it registers is detached again immediately.
+    the same string as the per-chunk-stripped history when a query is split across two chunks. The
+    oracle computes it; nothing of the hub's socket path is involved.
     """
-    replay, queue = session.attach_ws_queue()
-    session.detach_ws_queue(queue)
-    return replay
+    return session.replay_frame()
 
 
 def feed_session(session: PyteOracleSession, case: Case) -> Optional[str]:
@@ -294,7 +293,8 @@ def render_trim(case: Case) -> Dict[str, str]:
 
 
 def render_input(case: Case) -> Dict[str, str]:
-    # ws_pty_endpoint strips each browser message before it reaches the PTY (server.py:1308).
+    # The core's socket strips each browser message before it reaches the PTY (§6.4); this is the
+    # same rule, imported rather than copied so the goldens move with it.
     return {"stripped.txt": "".join(strip_osc_terminal_replies(chunk) for chunk in case.chunks)}
 
 

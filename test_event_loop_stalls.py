@@ -171,7 +171,7 @@ class TerminalDrainTickTests(unittest.IsolatedAsyncioTestCase):
         for index in range(50):
             session_id = f"tick-{index}"
             sess = AgentSession(session_id, "pwsh", "Pwsh", "tui", "tick", str(root), "cmd.exe", [],
-                                core=hub.core, sockets=hub._terminal_sockets(session_id))
+                                core=hub.core)
             sess.engine = "pwsh"
             sess.status = "running"
             hub.sessions[session_id] = sess

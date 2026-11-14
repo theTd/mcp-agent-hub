@@ -54,8 +54,7 @@ class DshRestartRecoveryTests(unittest.IsolatedAsyncioTestCase):
         # A DSH session has no process but still owns a screen and a ring in the core (`attach_text`):
         # the watcher writes its step and tool lines into that screen.
         self.sess = AgentSession("dsh-restart", "dsh", "DSH", "tui", "Test", str(self.root), "", [],
-                                 core=self.hub._ensure_core(),
-                                 sockets=self.hub._terminal_sockets("dsh-restart"))
+                                 core=self.hub._ensure_core())
         self.sess.engine = "dsh"
         self.sess.pty = None
         self.sess.dsh_spec = {"tier": "flash"}

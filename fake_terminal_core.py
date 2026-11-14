@@ -8,8 +8,8 @@ ring is the text the test feeds, and the only ordering rule is arrival order.
 
 What it keeps faithful, because the hub's behaviour depends on it:
 
-- `spawn`/`attach_text` replace a dead incarnation of the same id and hand its sockets the prefix
-  or seed frame first (`rtc-sinks-per-id`), so a resume test can check old bytes, banner, new bytes;
+- `spawn`/`attach_text` replace a dead incarnation of the same id (`rtc-sinks-per-id`); the id's
+  fan-out and its sockets are the core's, so nothing crosses the call;
 - an id's incarnation counter drops the predecessor's queued records when the id is re-created, as
   the core's table insert does, so a death that was not drained before a same-id reattach is lost;
 - `attach_text` gives a text session pid 0 (no process), like the real core;
@@ -19,15 +19,18 @@ What it keeps faithful, because the hub's behaviour depends on it:
 - `drain` returns queued records and clears them, so `_on_core_tick` sees exactly what the core would
   publish, and only the current incarnation's records can mark its death drained; it can withhold a
   death record for N drains (`withhold_death_records`), which the fixed core may do for one;
+- a record carries the console's `resize_requests` and `input_requests` in arrival order and its
+  `socket_drops`, taken once by the drain that reports them (§5.2), and the core never applies a
+  resize or writes a text session's input;
 - `retire` refuses a live id, one whose death record has not been drained (`rtc-retire`) and one
   whose resume is in flight (the coming core contract), and it can be made busy (`TimeoutError`);
-- `take_frames` is non-blocking; a detached or retired handle reports `closed` at its first take,
-  and `detach_queue` can miss its deadline with `TimeoutError` (the coming registry contract).
+- the listener surface: `ws_port`, `ws_listening()`, a one-use `ws_ticket(...)` URL per call and
+  `close_sockets(session_id)`, which counts the sockets the test opened (`open_socket`).
 
 Test-only knobs: `set_exit`, `die`, `late_code`, `set_last_output_at`, `set_write_timeouts`,
-`block_detach`, `block_retire`, `resume_in_flight`, `read_timeouts`, `snapshot_delay`,
-`shutdown_delay`, `withhold_death_records`, `calls` (with `snapshot_budgets`, `kill_graces`,
-`detach_calls`, `retire_calls`).
+`request_resize`, `request_input`, `note_socket_drops`, `open_socket`, `block_retire`,
+`resume_in_flight`, `read_timeouts`, `snapshot_delay`, `shutdown_delay`, `withhold_death_records`,
+`calls` (with `snapshot_budgets`, `kill_graces`, `close_socket_calls`, `retire_calls`).
 """
 
 from __future__ import annotations
@@ -36,17 +39,8 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
-class FakeTerminalQueue:
-    """One attached socket's bounded frame queue (`FrameQueue`), in arrival order."""
-
-    def __init__(self) -> None:
-        self.frames: List[bytes] = []
-        self.closed = False
-        self.dropped = 0
-
-
 class FakeTerminalSession:
-    """One session's state: the raw ring, the screen text, the keystrokes and its sockets."""
+    """One session's state: the raw ring, the screen text, the keystrokes and its console sockets."""
 
     def __init__(self, session_id: str, pid: int = 4242, cols: int = 120, rows: int = 36) -> None:
         self.session_id = session_id
@@ -79,7 +73,12 @@ class FakeTerminalSession:
         self.flags: Dict[str, Any] = {}
         self.seed_history: Optional[str] = None
         self.ws_prefix: Optional[str] = None
-        self.queues: List[FakeTerminalQueue] = []
+        # The console's requests, in arrival order, taken once by the next drain record (§5.2).
+        self.resize_requests: List[Dict[str, Any]] = []
+        self.input_requests: List[str] = []
+        self.socket_drops: List[Tuple[int, int]] = []
+        # Console sockets of this id: `close_sockets` asks them to close and reports how many.
+        self.open_sockets = 0
 
 
 class FakeTerminal:
@@ -89,17 +88,18 @@ class FakeTerminal:
         self.sessions: Dict[str, FakeTerminalSession] = {}
         # (incarnation, record): `drain` drops a record whose incarnation is no longer current.
         self.records: List[Tuple[int, Dict[str, Any]]] = []
-        self.handles: Dict[int, Tuple[str, FakeTerminalQueue]] = {}
-        self._next_handle = 1
         self.retired: List[str] = []
         self.retire_calls: List[str] = []
         self.kill_calls: List[Tuple[str, int]] = []
-        self.detach_calls: List[int] = []
+        self.close_socket_calls: List[str] = []
         self.snapshot_budgets: List[int] = []
         self.kill_graces: List[int] = []
         self.shut_down = False
-        # The coming core contracts: a busy registry (`detach_queue`) and a resume in flight.
-        self.block_detach = 0
+        # The listener surface (§6.4): a port, the accept thread's flag and the tickets minted.
+        self.ws_port_value = 45999
+        self.listening = True
+        self.ticket_calls: List[str] = []
+        # The coming core contracts: a resume in flight, and a busy session table.
         self.block_retire = 0
         self.resume_in_flight: Set[str] = set()
         # The core's table read deadline: the next N session reads raise TimeoutError, as a table
@@ -155,20 +155,41 @@ class FakeTerminal:
         """The next `count` `write` calls miss the queue deadline and queue nothing."""
         self.sessions[session_id].write_timeouts = int(count)
 
+    def request_resize(self, session_id: str, cols: Any, rows: Any, propagate: bool = True) -> None:
+        """One console size request, as the socket's resize frame records it (§5.2).
+
+        The core never applies a resize: it keeps the request in arrival order and marks the session
+        dirty, so this queues a record whose `resize_requests` carries it to the hub. The values are
+        kept as given, so a test can script the hostile request the hub must survive.
+        """
+        state = self.sessions[session_id]
+        state.resize_requests.append({"cols": cols, "rows": rows, "propagate": bool(propagate)})
+        self.records.append((state.generation, self._record(state)))
+
+    def request_input(self, session_id: str, text: str) -> None:
+        """Typed text for a session with no PTY: queued for the hub's echo, never written anywhere."""
+        state = self.sessions[session_id]
+        state.input_requests.append(str(text))
+        self.records.append((state.generation, self._record(state)))
+
+    def note_socket_drops(self, session_id: str, handle: int, dropped: int) -> None:
+        """One console socket's cumulative loss, as the core reports it on the next record."""
+        state = self.sessions[session_id]
+        state.socket_drops.append((int(handle), int(dropped)))
+        self.records.append((state.generation, self._record(state)))
+
+    def open_socket(self, session_id: str, count: int = 1) -> None:
+        """A console socket the test attached to this id, for `close_sockets` to count."""
+        self.sessions[session_id].open_sockets += int(count)
+
     def output(self, session_id: str, text: str) -> None:
-        """Output as the reader files it: the ring grows, the revision moves, a record is queued,
-        and every attached socket gets the same bytes."""
+        """Output as the reader files it: the ring grows, the revision moves, a record is queued."""
         state = self.sessions[session_id]
         state.ring += text
         state.ring_bytes = len(state.ring.encode("utf-8", "replace"))
         state.rev += 1
-        # The same chunk the ring took goes to every attached socket (`rtc-sinks-per-id`).
-        self._deliver(state, text)
         self.records.append((state.generation, self._record(
             state, screen_text=state.screen_text if state.watched else None)))
-
-    def frames_of(self, handle: int) -> List[bytes]:
-        return self.handles[handle][1].frames
 
     def inputs_of(self, session_id: str) -> List[str]:
         return self.sessions[session_id].inputs
@@ -190,12 +211,9 @@ class FakeTerminal:
             state.ring = seed_history
             state.ring_bytes = len(seed_history.encode("utf-8", "replace"))
             state.rev = 1
-        # A new incarnation: the predecessor's fan-out is handed over, the rest of it is not.
-        if previous is not None:
-            state.queues = previous.queues
+        # A new incarnation: the predecessor's fan-out is the core's to hand over, so the hub only
+        # records what an attached socket would see first (the banner) for a later assertion.
         self._next_generation(state)
-        if ws_prefix:
-            self._deliver(state, ws_prefix)
         self.sessions[session_id] = state
         self.records.append((state.generation, self._record(state)))
         return {"pid": state.pid, "cols": state.cols, "rows": state.rows, "elapsed_ms": 0.0}
@@ -216,11 +234,7 @@ class FakeTerminal:
             state.ring = seed_history
             state.ring_bytes = len(seed_history.encode("utf-8", "replace"))
             state.rev = 1
-        if previous is not None:
-            state.queues = previous.queues
         self._next_generation(state)
-        if seed:
-            self._deliver(state, seed)
         self.sessions[session_id] = state
         self.records.append((state.generation, self._record(state)))
         return {"pid": 0, "cols": state.cols, "rows": state.rows}
@@ -231,7 +245,6 @@ class FakeTerminal:
         state.ring_bytes = len(state.ring.encode("utf-8", "replace"))
         state.rev += 1
         state.screen_rev += 1
-        self._deliver(state, text)
         self.records.append((state.generation, self._record(
             state, screen_text=state.screen_text if state.watched else None)))
         return state.rev
@@ -292,6 +305,11 @@ class FakeTerminal:
                 continue
             if record.get("alive") is False:
                 state.death_drained = True
+            # §5.2: the record carries what the console asked for since the last drain, in order,
+            # taken once; the core itself never applies a resize or writes a text session's input.
+            record["resize_requests"], state.resize_requests = state.resize_requests, []
+            record["input_requests"], state.input_requests = state.input_requests, []
+            record["socket_drops"], state.socket_drops = state.socket_drops, []
             out.append(record)
         if held:
             self.withhold_death_records -= 1
@@ -332,26 +350,37 @@ class FakeTerminal:
     def replay(self, session_id: str, deadline_ms: Optional[int] = None) -> str:
         return self.sessions[session_id].ring
 
-    def attach_queue(self, session_id: str, max_bytes: Optional[int] = None) -> Tuple[str, int]:
-        state = self.sessions[session_id]
-        handle = self._next_handle
-        self._next_handle += 1
-        queue = FakeTerminalQueue()
-        state.queues.append(queue)
-        self.handles[handle] = (session_id, queue)
-        return state.ring, handle
+    @property
+    def ws_port(self) -> int:
+        """The loopback port the console's sockets are served on (§6.4)."""
+        return int(self.ws_port_value)
 
-    def take_frames(self, handle: int) -> Tuple[List[bytes], int, bool]:
-        _session_id, queue = self.handles[handle]
-        frames, queue.frames = queue.frames, []
-        return frames, queue.dropped, queue.closed
+    def ws_listening(self) -> bool:
+        """False once the accept thread has ended; the hub's `/health` reports it."""
+        return bool(self.listening)
 
-    def detach_queue(self, handle: int) -> bool:
-        self.detach_calls.append(handle)
-        if self.block_detach > 0:
-            self.block_detach -= 1
-            raise TimeoutError(f"detach_queue({handle}) missed the registry deadline")
-        return self.handles.pop(handle, None) is not None
+    def ws_ticket(self, session_id: str, ttl_ms: Optional[int] = None) -> Dict[str, Any]:
+        """One single-use ticket per call; `KeyError` for an id this core does not have."""
+        if session_id not in self.sessions:
+            raise KeyError(session_id)
+        self.ticket_calls.append(session_id)
+        token = f"ticket-{len(self.ticket_calls)}"
+        return {
+            "url": f"ws://127.0.0.1:{self.ws_port_value}/ws/pty/{session_id}?ticket={token}",
+            "expires_at": time.time() + (int(ttl_ms) if ttl_ms else 30000) / 1000.0,
+        }
+
+    def close_sockets(self, session_id: str) -> int:
+        """Asks every console socket of the id to close with 1000 and reports how many it asked."""
+        self.close_socket_calls.append(session_id)
+        state = self.sessions.get(session_id)
+        if state is None:
+            return 0
+        closed, state.open_sockets = state.open_sockets, 0
+        return closed
+
+    def socket_count(self) -> int:
+        return sum(state.open_sockets for state in self.sessions.values())
 
     def retire(self, session_id: str) -> bool:
         self.retire_calls.append(session_id)
@@ -368,8 +397,8 @@ class FakeTerminal:
         if not state.death_drained:
             raise ValueError(f"session {session_id}'s exit record has not been drained")
         del self.sessions[session_id]
-        for queue in state.queues:
-            queue.closed = True
+        # The core's retire closes the id's sockets too (§5.2), without counting them for the hub.
+        state.open_sockets = 0
         self.retired.append(session_id)
         return True
 
@@ -448,7 +477,3 @@ class FakeTerminal:
             "raw_rev": state.rev,
             "screen_text": screen_text,
         }
-
-    def _deliver(self, state: FakeTerminalSession, text: str) -> None:
-        for queue in state.queues:
-            queue.frames.append(text.encode("utf-8"))
