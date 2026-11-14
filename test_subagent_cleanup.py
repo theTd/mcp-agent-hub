@@ -148,7 +148,7 @@ class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(sess.session_id, self.hub.sessions)
 
     async def test_http_setting_validation_is_atomic_and_old_clients_preserve_timeout(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             for value in (None, True, -1, 1.5, "60", {}, []):
                 response = await client.post("/api/routing-guide", json={
                     "global_routing_instructions": "must not save", "subagent_idle_timeout_minutes": value})
