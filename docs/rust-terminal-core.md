@@ -327,6 +327,10 @@ exceeds 2 s, a spawn over the bound is logged with its measured time, and the re
 | `scrollback` | session_id, max_lines | text, rev | 50 ms | `get_full_scrollback_text` (`:2516`) |
 | `raw` | session_id | text, bytes, rev | 50 ms | `"".join(raw_history)` (`:4454`) |
 | `raw_tail` | session_id, max_chars | text | 50 ms | `raw_ansi_tail` (`:10194`); a character count, because the hub's tail is `"".join(raw_history)[-65536:]`, and it is cut on a character boundary |
+| `attach_queue` *(temporary: step 4 deletes it, the `FrameQueue` stays)* | session_id, max_bytes (`CoreOptions::sink_queue_bytes`, 2 MB, when null) | replay, handle | 50 ms | `attach_ws_queue`'s replay half (`:2425`): the raw ring with OSC colour queries stripped (`replay-shape`) |
+| `take_frames` *(temporary)* | handle | frames (bytes, in order), `dropped_bytes` (that queue's cumulative count), `closed` | no wait: a non-blocking take, the registry read bounded at 50 ms | `ws_pty_endpoint`'s sender task (`server.py:1308`) |
+| `detach_queue` *(temporary)* | handle | bool: `true` when it detached, `false` for a handle never issued or already detached | 50 ms | `detach_ws_queue` (`:2441`) |
+| `retire` | session_id | bool: `false` for an unknown id; `ValueError` for a live one and for one whose exit record has not been drained | 50 ms for the table read; releasing the last reference can wait for the console-close deadline, and the fan-out close waits for a delivery in flight (bounded by `deliver`'s no-block contract) | nothing removed a session before: every ended session kept its 512 KiB ring and its screen for the hub's lifetime |
 | `watch_screen` / `unwatch` | session_id, max_lines, interval_ms | ok | 50 ms | generic-engine tool-line polling (`:2345`), now bounded by `interval_ms` |
 | `ws_ticket` | session_id, ttl_ms | url, expires_at | 1 ms | nothing (the ticket is new, §6.4) |
 | `close_sockets` | session_id | count | 50 ms | `close_ws_frontends` (`:2415`, W7: normal close, code 1000) |
@@ -351,7 +355,33 @@ that were attached before the resume, in stream order after the predecessor's la
 
 `subscribe`/`unsubscribe` are gone: no Python object holds a terminal queue any more. The console
 attaches straight to the core's socket (§6.4), and `close_sockets` is the only fan-out call the hub
-still makes (on archive, `:5631`/`:5733`).
+still makes (on archive, `:5631`/`:5733).
+
+**The temporary bridge (`attach_queue`/`take_frames`/`detach_queue`, step 3b-core).** Until step 4 moves
+the console sockets into the core, Python's `/ws/pty` endpoint still owns the socket and polls the id's
+`FrameQueue` (step 3b-hub swaps `AgentSession`'s seam bodies for these calls and polled `take_frames` on
+the 50 ms drain tick). Handles are unique per core and belong to the **session id**, not to one
+incarnation: `attach_queue` registers on the id's fan-out through `attach_sink` (so the replay and the
+registration are one step, Q11), a handle taken before a resume keeps receiving after the predecessor's
+last bytes and the separator (`take_over`, §5.4), and `detach_queue` works across the resume. The replay
+is exactly what `attach_ws_queue` sends today (`replay-shape`). `dropped_bytes` is that queue's
+**cumulative** count, not a per-take delta, so a caller that skips a poll cannot lose a drop. `closed`
+turns true when `retire` removes the id, which is where the Python socket closes with code 1000 as
+`close_ws_frontends` does. A handle never issued, or one already detached, raises `KeyError`; a handle of
+a retired id keeps answering (`closed = true`) until it is detached. Step 4 deletes all three calls and
+keeps the queue: its socket thread drains it and writes the replay and `replay_end` before the first
+frame.
+
+**`retire`.** Removes an ended session from the table, so its ring and its screen stop living for the
+hub's lifetime: `false` for an unknown id, `ValueError` for a live one (the hub kills first) and for one
+whose **exit record** no drain has reported yet — that record (exit code, `crashed`) is the one thing
+that cannot be re-created once the session is gone, so the hub drains it (within one 50 ms tick) and
+retires on the next attempt. A code learned after the death record (SF3) gates the same way. Every queue
+attached to the id is closed (`take_frames` reports `closed`), the fan-out is retired, and the table's
+reference is released **before** that close so an `attach_sink` racing the call cannot have its owner
+`Arc` dropped while it holds the delivery lock (`Session::drop` asserts it in test builds). A later
+`spawn`/`attach_text` of the same id builds a fresh fan-out: nothing is carried over from the incarnation
+`retire` removed.
 
 ### 5.3 How Python learns about output, screens and exits
 
@@ -367,8 +397,9 @@ interval, however much output arrived:
   `loop.call_soon_threadsafe(hub._on_core_tick)`. One wakeup for all sessions.
 - `hub._on_core_tick` runs on the loop and makes a single `core.drain()` call, which returns only the
   sessions whose flags were set and clears them: `(session_id, last_output_at, bytes_total,
-  chunks_total, screen_rev, alive, exit_code, dropped_bytes, screen_text)` — `screen_text` only for a
-  watched session whose `screen_rev` changed.
+  chunks_total, screen_rev, raw_rev, alive, exit_code, dropped_bytes, screen_text)` — `raw_rev` is the
+  ring's revision (`raw`'s reply carries the same number, and `_scrollback_blob`'s change gate reads it
+  without joining the ring), and `screen_text` only for a watched session whose `screen_rev` changed.
 - Exits are detected on the process handle, not on the output pipe. The write end of the console's
   output pipe belongs to conhost, which lives as long as we hold the HPCON, so a session that exits by
   itself never ends the reader's read. Each session therefore has one reaper thread (512 KiB stack: its
@@ -424,8 +455,17 @@ registers the sink and hands back the batch it took in one gap between two deliv
 one-directional: the id's delivery lock, then a session's text lock; the sink list only under delivery.
 
 `FrameSink::deliver` runs on the session's reader thread under that lock, so it may not block and may not
-write a socket itself: it pushes onto the socket's own bounded queue (`FrameQueue`), and the socket's own
-thread writes the replay and `replay_end` before the first queued frame (§6.4). One sink's panic costs
+write a socket itself: it pushes onto the socket's own bounded queue (`FrameQueue`,
+`conpty_session/src/frame_queue.rs`), and the socket's own thread writes the replay and `replay_end`
+before the first queued frame (§6.4). The queue holds whole frames in arrival order up to its cap
+(`CoreOptions::sink_queue_bytes`, 2 MB; `attach_queue` may override it), drops the **oldest whole frames**
+on overflow — a frame larger than the whole cap is dropped by itself, so a reader never gets half a frame
+— and counts every dropped byte in its own `dropped_bytes`, so one slow client's loss is its own and not
+the session's. `deliver` holds the queue's mutex only for the append, never across a consumer's work.
+Step 4 adds the consumer: the socket's thread drains the queue and writes the frames, the per-handle count
+moves into the drain record instead of being summed per session (§12.6), and a client that accepts nothing
+for 30 s is closed with code 1000. Until then `Core::take_frames` (with `attach_queue`/`detach_queue`, §5.2)
+is that consumer, and `close` discards what a retired id's socket will never read. One sink's panic costs
 that sink and nothing else: `deliver` is wrapped in `catch_unwind`, the panicking sink is detached and
 counted in `stats.panics` and logged once with its handle, the other sinks still get the frame, and the
 session keeps running. No lock in the delivery path skips its work on poison, so `attach_sink` can never
@@ -854,8 +894,8 @@ imported by the hub after step 3, and it is deleted with its `requirements.in` e
 | 0. Freeze behaviour, offline | a temporary dump in `_on_pty_output` records a few minutes of raw chunks per engine (the five PTY engines: claude, codex, omp, kimi, agy); `pyte` renders them and the dumps are frozen into `tools/fixtures/terminal/` (chunk stream, screen, scrollback 250, `raw` after trim, `raw_tail`); the dump is deleted. `pyte` is used only here, offline, and deleted at step 6 | fixtures committed; the dump is gone from the tree | files only, no runtime change | S, 1–2 d |
 | 1. Extension skeleton | `terminal-core/` crate (`hub_terminal_core`, `cdylib`, `panic="unwind"`, abi3 gate §7.3): module, `Core`, threads, `spawn`/`write`/`resize`/`kill` via system ConPTY, one reader thread, no parser yet; `terminal_core.py` wrapper with the missing-module message | `cargo test` on CI; a manual `--selftest` binary spawns `cmd.exe`, echoes bytes, resizes, kills the tree; abi3 import works on 3.11–3.14 | branch only; nothing references it | M, 4–6 d |
 | 2. Parse, history, coalescing | `vte` 0.15 + pyte's screen model in `terminal-core/terminal_stream`, W8 carry, OSC strips, W9 ring with golden fixtures, UTF-8 carry, `screen`/`scrollback`/`raw`/`raw_tail`, batches + the ticker, `drain`; step 2c fixes the screen-model divergences the review found (DECSTBM, DECOM, save/restore, zero-width, combining), orders delivery per sink, and deletes `csi_marker.rs`; step 2d makes the delivery state (lock, sinks, handles) belong to the session id, which step 4's sockets attach to | `cargo test` **and** `cargo test --features conpty_session/test-hooks` in `terminal-core/` (the delivery-order, resume-handover and panic-isolation cases need the hooks; neither the hooks nor their call sites exist in a release build): `terminal_stream/tests/fixture_corpus` parses all 33 cases under `tools/fixtures/terminal/`, byte for byte, and fails when any golden a case calls for is missing; the 8 `screen_exceptions.jsonl` rows are exactly the NFC difference, and a stale row fails the gate; coalescing preserves bytes and order; `delivery_order.rs` pins per-sink order and atomic attach, `sink_handover.rs` the resume handover, and both pass 20 runs in a row with the hooks on | branch only | M, 5-7 d |
-| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
-| 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; the socket sink is a bounded `FrameQueue` drained by the socket's own thread, which writes the replay and `replay_end` before the first frame; per-socket `dropped_bytes` reported per handle in the drain record rather than summed per session, and `attach_sink`'s replay render measured under the delivery lock (≈1.5 ms at the 512 KiB cap) before deciding whether to move it out; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
+| 3. PTY ownership in Python | 3a (done): every terminal read and write in the hub goes through `AgentSession`'s seam methods, one per core call, still backed by pywinpty/pyte, with no behaviour change (§4.1; `test_terminal_seam` fails on a direct `screen`/`stream`/`raw_history`/`pty` access outside `AgentSession`). 3b-core (done) delivered the calls the swap needs: the per-socket `FrameQueue` (`conpty_session/src/frame_queue.rs`) with the temporary `attach_queue`/`take_frames`/`detach_queue` bridge for the Python `/ws/pty` socket, `retire` (an ended session leaves the table, gated on its exit record), `raw_rev` in the drain record for the seam's `raw_revision`, and `attach_sink` releasing its owner `Arc` after the delivery lock; `seam-coverage.md` maps every seam method to its core call and reply field. 3b-hub swaps the seam's bodies for the core: `_read_loop`, `_on_pty_output`, `HubTerminalScreen`, `HubTerminalStream`, `trim_history_text`, `_strip_saved_lines_erase`, `unwrap_windows_cmd_shim` and pywinpty all deleted; every `screen` call site reads the core; `is_process_alive`/pid/`last_output_at` come from the drain; `attach_text`/`feed` for DSH virtual sessions; `tools/*.py` fakes replace `FakePty` | the full Python suite on the branch, with the ported tests from §10; `test_tui_delivery` and `test_session_approvals` unchanged in their assertions | branch only | L, 6–9 d |
+| 4. Terminal sockets in the core | WS listener, ticket call + `GET /api/sessions/{id}/terminal-ticket`, replay/`replay_end`, input+OSC strip, `close_sockets`, console `ptySocketUrl` becomes a ticket fetch; the socket thread drains the `FrameQueue` step 3b-core built (it writes the replay and `replay_end` before the first frame) and **deletes the three pull calls** (`attach_queue`/`take_frames`/`detach_queue`), while `FrameQueue` and `retire` stay; per-socket `dropped_bytes` reported per handle in the drain record rather than summed per session, and `attach_sink`'s replay render measured under the delivery lock (≈1.5 ms at the 512 KiB cap) before deciding whether to move it out; `ws_pty_endpoint`, `attach_ws_queue`, `detach_ws_queue`, `adopt_ws_frontends`, `register_ws_closer`, `close_ws_frontends`, `push_ws_frame` deleted | `test_hub_persistence.py`'s WS case against the core socket; a manual console check per engine (replay, reconnect, input, resize, resume banner) | branch only | M, 4–6 d |
 | 5. Packaging and the required import | `payload.txt` + release script produce and embed the `.pyd`; privacy gate covers it; `bootstrap.ps1` `Check-Imports` knows the resources dir; `.gitignore` entry; pywinpty removed, `requirements.lock` regenerated | portable build starts on a machine with no cargo; a fresh from-source checkout fails with the documented message and starts after the two build commands | branch only; the merge is the cut-over | S, 2–3 d |
 | 6. Cut-over merge and load test | merge; run §11 against `master` (recorded before the merge) on an idle machine; tune flush windows, ring sizes and the drain interval; delete `tools/fixtures`'s pyte oracle and the `pyte` dependency entry | §11's pass criteria; a full suite run on `master` after the merge | revert the merge | M, 2–4 d |
 

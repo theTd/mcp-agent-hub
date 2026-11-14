@@ -16,13 +16,33 @@
 //! `into_inner`, so a sink that panicked can never make registration silently stop registering.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use terminal_stream::FrameSink;
 
 use crate::session::Session;
+
+thread_local! {
+    /// How many delivery locks this thread holds: `Session::drop`'s debug assertion needs "does *this*
+    /// thread hold it", because another session's delivery running at the same time is normal.
+    static DELIVERY_HELD_HERE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The delivery lock's guard. It counts itself in the thread's depth so a drop can tell whether it is
+/// running inside a delivery, which is the one place a session's teardown must not happen (`retire` made
+/// the owner `Arc` reachable as the last reference).
+pub struct DeliveryGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) {
+        DELIVERY_HELD_HERE.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
 
 struct SinkEntry {
     handle: u64,
@@ -47,6 +67,9 @@ pub struct SinkFanout {
     /// The incarnation that owns the id now, set by each handover under the delivery lock. `Weak`,
     /// because the fan-out outlives the incarnations it describes and must not keep one alive.
     owner: Mutex<Weak<Session>>,
+    /// Set once the id is retired: nothing is delivered to the sinks it still lists, and no replay is
+    /// taken from an owner that is about to be released.
+    closed: AtomicBool,
 }
 
 impl Default for SinkFanout {
@@ -57,6 +80,7 @@ impl Default for SinkFanout {
             // Handle 0 is never handed out, so `Option<u64>` can say "no sink to skip".
             next_sink: AtomicU64::new(1),
             owner: Mutex::new(Weak::new()),
+            closed: AtomicBool::new(false),
         }
     }
 }
@@ -65,8 +89,41 @@ impl SinkFanout {
     /// Takes the delivery lock; every frame and every registration happens under it. Returns a guard
     /// rather than running a closure, because the caller has other locks to take in the fixed order
     /// `delivery → text`.
-    pub fn lock_delivery(&self) -> MutexGuard<'_, ()> {
-        self.delivery.lock().unwrap_or_else(|error| error.into_inner())
+    pub fn lock_delivery(&self) -> DeliveryGuard<'_> {
+        DELIVERY_HELD_HERE.with(|depth| depth.set(depth.get() + 1));
+        DeliveryGuard {
+            _guard: self.delivery.lock().unwrap_or_else(|error| error.into_inner()),
+        }
+    }
+
+    /// Whether **this thread** is inside a delivery lock right now (0 outside one). `Session::drop`
+    /// asserts on it: another session's delivery running at the same time is normal.
+    #[cfg(debug_assertions)]
+    pub fn delivery_held_here(&self) -> bool {
+        DELIVERY_HELD_HERE.with(|depth| depth.get() > 0)
+    }
+
+    /// Retires the id (§ `Core::retire`): from here on a frame is dropped and counted instead of handed
+    /// to a sink, and the sinks the fan-out still lists are returned so the caller drops them with no
+    /// lock held. `FrameSink::deliver` and a sink's `Drop` may take the queue's mutex or wait on a
+    /// socket, so neither may run under the delivery lock.
+    pub fn close(&self) -> Vec<Arc<dyn FrameSink>> {
+        let _delivery = self.lock_delivery();
+        self.closed.store(true, Ordering::Release);
+        let sinks = std::mem::take(
+            &mut *self
+                .sinks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+        .into_iter()
+        .map(|entry| entry.sink)
+        .collect();
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone_from(&Weak::new());
+        sinks
     }
 
     /// Registers a sink and returns its handle. The caller holds the delivery lock, so the handle is
@@ -122,6 +179,12 @@ impl SinkFanout {
     /// a `Drop` that reaches back into the session cannot deadlock on this lock.
     pub fn fan_out(&self, session_id: &str, frame: &[u8], skip: Option<u64>) -> Delivery {
         let mut delivery = Delivery::default();
+        if self.closed.load(Ordering::Acquire) {
+            // The id was retired: its sinks are closed or released, so the bytes are dropped and
+            // counted the way a superseded incarnation's are.
+            delivery.dropped = frame.len() as u64;
+            return delivery;
+        }
         let mut removed = Vec::new();
         {
             let mut sinks = self.sinks.lock().unwrap_or_else(|error| error.into_inner());
@@ -226,5 +289,45 @@ mod tests {
         let b = second.register(Arc::new(Fixed(0)));
         assert!(a < b);
         assert!(second.detach(a), "a handle registered before the takeover detaches after it");
+    }
+
+    /// `retire`'s half of the fan-out: the sinks are handed back for a lock-free drop, the list is
+    /// empty afterwards, and a frame is dropped and counted instead of delivered.
+    #[test]
+    fn closing_the_fanout_releases_its_sinks_and_drops_later_frames() {
+        let fanout = SinkFanout::default();
+        let first = Arc::new(Fixed(7));
+        let second = Arc::new(Fixed(9));
+        let first_handle = fanout.register(first.clone());
+        fanout.register(second.clone());
+
+        let released = fanout.close();
+        assert_eq!(released.len(), 2, "every attached sink is handed back");
+        assert!(
+            !fanout.detach(first_handle),
+            "a closed fan-out lists no sink to detach"
+        );
+        let delivery = fanout.fan_out("s", b"xyz", None);
+        assert_eq!(delivery.dropped, 3, "a retired id's frame is dropped and counted");
+        assert!(delivery.panicked.is_empty());
+        assert!(!delivery.superseded);
+    }
+
+    /// The probe `Session::drop` asserts on: held inside a delivery on this thread, free outside one.
+    #[test]
+    fn the_delivery_lock_counts_itself() {
+        let fanout = SinkFanout::default();
+        assert!(!fanout.delivery_held_here());
+        {
+            let _delivery = fanout.lock_delivery();
+            assert!(fanout.delivery_held_here());
+        }
+        assert!(!fanout.delivery_held_here());
+        // A poison in the delivery lock does not make the guard skip its count.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _delivery = fanout.lock_delivery();
+            panic!("poison the delivery lock");
+        }));
+        assert!(!fanout.delivery_held_here());
     }
 }

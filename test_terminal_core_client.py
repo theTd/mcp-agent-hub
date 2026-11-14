@@ -1,7 +1,8 @@
 """The hub's client contract with the Rust terminal core, through ``terminal_core.py``.
 
-Covers docs/rust-terminal-core.md §5.2 (calls and deadlines), §5.3 (drain clears its flags, the 50 ms
-notify window, natural exits) and §7.3 (the missing-module message).
+Covers docs/rust-terminal-core.md §5.2 (calls, deadlines, the temporary `attach_queue`/`take_frames`/
+`detach_queue` bridge and `retire`), §5.3 (drain clears its flags, the 50 ms notify window, natural
+exits) and §7.3 (the missing-module message).
 
 The live cases need the built extension beside this file (``hub_terminal_core.pyd``). They **fail**, not
 skip, when it is missing or broken: a green suite on an unbuilt tree is a gate that cannot see a broken
@@ -464,6 +465,163 @@ class TextSessionTests(unittest.TestCase):
                     return record
             time.sleep(0.02)
         self.fail(f"no drain record matched; records seen: {seen}")
+
+
+class QueueBridgeTests(unittest.TestCase):
+    """§5.2's temporary socket bridge (`attach_queue`/`take_frames`/`detach_queue`) and `retire`.
+
+    The bridge is what step 3b-hub's `/ws/pty` endpoint polls until step 4 moves the socket into the
+    core: the handle must deliver the session's bytes in order, survive a resume, report `closed` when
+    the id is retired, and answer `KeyError` once it is detached.
+    """
+
+    def setUp(self):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
+        self.notify_calls = []
+        self.logs = []
+        self.core = Core(notify=lambda: self.notify_calls.append(time.monotonic()), log=self.logs.append)
+
+    def tearDown(self):
+        try:
+            self.core.kill_all(2000)
+        finally:
+            self.core.shutdown()
+
+    def spawn(self, session, argv=None, cols=100, rows=30, **kwargs):
+        return self.core.spawn(session, argv or ["cmd.exe"], cols=cols, rows=rows, **kwargs)
+
+    def wait_for(self, session, needle, timeout=15.0):
+        end = time.time() + timeout
+        tail = ""
+        while time.time() < end:
+            tail = self.core.raw_tail(session, 64 * 1024)
+            if needle in tail:
+                return tail
+            time.sleep(0.02)
+        self.fail(f"{needle!r} never reached raw_tail; tail was {tail[-400:]!r}")
+
+    def take_until(self, handle, needle, timeout=10.0):
+        """Polls `take_frames` the way the socket's drain tick will, returning the stream so far."""
+        end = time.time() + timeout
+        text = ""
+        dropped = 0
+        closed = False
+        while time.time() < end:
+            frames, dropped, closed = self.core.take_frames(handle)
+            for frame in frames:
+                self.assertIsInstance(frame, bytes, "a frame is the socket's bytes")
+                text += frame.decode("utf-8", "replace")
+            if needle in text or closed:
+                return text, dropped, closed
+            time.sleep(0.02)
+        self.fail(f"{needle!r} never reached the queue; saw {text[-400:]!r}")
+
+    def drain_until(self, predicate, timeout=5.0):
+        end = time.time() + timeout
+        seen = []
+        while time.time() < end:
+            for record in self.core.drain():
+                seen.append(record)
+                if predicate(record):
+                    return record
+            time.sleep(0.02)
+        self.fail(f"no drain record matched; records seen: {seen}")
+
+    def test_frames_reach_a_socket_and_detaching_stops_them(self):
+        self.spawn("bridge")
+        self.wait_for("bridge", ">")
+        replay, handle = self.core.attach_queue("bridge")
+        self.assertIsInstance(replay, str)
+        self.assertIsInstance(handle, int)
+        self.assertGreater(handle, 0)
+
+        self.core.write("bridge", "echo queue-ok\r\n")
+        text, dropped, closed = self.take_until(handle, "queue-ok")
+        self.assertIn("queue-ok", text)
+        self.assertEqual(dropped, 0)
+        self.assertFalse(closed)
+
+        # The queue is a sink of the id, so a detach stops delivery and answers False afterwards.
+        self.assertTrue(self.core.detach_queue(handle))
+        self.assertFalse(self.core.detach_queue(handle))
+        with self.assertRaises(KeyError):
+            self.core.take_frames(handle)
+        with self.assertRaises(KeyError):
+            self.core.take_frames(424242)
+        with self.assertRaises(KeyError):
+            self.core.attach_queue("no-such-session")
+        with self.assertRaises(ValueError):
+            self.core.attach_queue("bridge", 0)
+
+    def test_a_handle_survives_a_resume_and_sees_the_banner(self):
+        self.spawn("carry")
+        self.wait_for("carry", ">")
+        _replay, handle = self.core.attach_queue("carry")
+        self.core.write("carry", "echo OLD-MARK\r\n")
+        self.take_until(handle, "OLD-MARK")
+        code = self.core.kill("carry", 2000)
+        self.assertIsNotNone(code)
+        self.drain_until(lambda record: record["session_id"] == "carry" and not record["alive"])
+
+        # A resume under the same id: the sink was registered on the id, so it keeps its handle and gets
+        # the separator, then the new process's output.
+        self.spawn("carry", seed_history="ARCHIVED-MARK\r\n", ws_prefix="RESUME-MARK")
+        text, _dropped, _closed = self.take_until(handle, "RESUME-MARK")
+        self.assertIn("RESUME-MARK", text)
+        self.core.write("carry", "echo NEW-MARK\r\n")
+        text, _dropped, _closed = self.take_until(handle, "NEW-MARK")
+        self.assertIn("NEW-MARK", text)
+        self.assertLess(text.find("RESUME-MARK"), text.find("NEW-MARK"), text)
+        self.assertTrue(self.core.detach_queue(handle))
+
+    def test_retire_keeps_the_exit_record_and_starts_fresh(self):
+        self.spawn("retire")
+        self.wait_for("retire", ">")
+        self.assertFalse(self.core.retire("no-such-session"))
+        with self.assertRaises(ValueError) as caught:
+            self.core.retire("retire")
+        self.assertIn("still running", str(caught.exception))
+
+        self.core.write("retire", "echo legacy-marker\r\n")
+        self.wait_for("retire", "legacy-marker")
+        _replay, handle = self.core.attach_queue("retire")
+        code = self.core.kill("retire", 2000)
+        self.assertIsNotNone(code)
+
+        # The death has not been drained, so the exit record is still the hub's only copy: refused.
+        with self.assertRaises(ValueError) as caught:
+            self.core.retire("retire")
+        self.assertIn("exit record", str(caught.exception))
+        dead = self.drain_until(lambda record: record["session_id"] == "retire" and not record["alive"])
+        self.assertEqual(dead["exit_code"], code)
+
+        self.assertTrue(self.core.retire("retire"))
+        with self.assertRaises(KeyError):
+            self.core.screen("retire")
+        self.assertEqual(self.core.stats()["sessions"], 0)
+        _frames, _dropped, closed = self.core.take_frames(handle)
+        self.assertTrue(closed, "a retired id's queue reports closed so the socket can close with 1000")
+        self.assertTrue(self.core.detach_queue(handle))
+        self.assertFalse(self.core.detach_queue(handle))
+
+        # A respawn of the same id after retire starts fresh: no predecessor to carry over, no ring.
+        self.spawn("retire")
+        self.wait_for("retire", ">")
+        replay, fresh = self.core.attach_queue("retire")
+        self.assertNotIn("legacy-marker", replay)
+        _frames, _dropped, closed = self.core.take_frames(fresh)
+        self.assertFalse(closed)
+        self.assertTrue(self.core.detach_queue(fresh))
+
+    def test_the_drain_record_carries_the_raw_revision(self):
+        self.core.attach_text("virtual", cols=40, rows=6)
+        self.core.feed("virtual", "hello")
+        record = self.drain_until(lambda entry: entry["session_id"] == "virtual")
+        raw = self.core.raw("virtual")
+        self.assertGreater(record["raw_rev"], 0)
+        self.assertEqual(record["raw_rev"], raw["rev"], "raw_revision is the raw reply's revision")
+        self.assertTrue(record["alive"])
 
 
 class ReplyStripTests(unittest.TestCase):

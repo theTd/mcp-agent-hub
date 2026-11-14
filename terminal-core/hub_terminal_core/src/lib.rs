@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 
 use conpty_session::{CoreError, CoreOptions, SessionFlags, SpawnRequest, TextRequest};
 use terminal_stream::strip_terminal_replies;
@@ -43,6 +43,9 @@ const STATS_DEADLINE: Duration = Duration::from_millis(5);
 fn core_error(error: CoreError) -> PyErr {
     match error {
         CoreError::UnknownSession(id) => PyKeyError::new_err(id),
+        CoreError::UnknownQueue(handle) => {
+            PyKeyError::new_err(format!("unknown queue handle: {handle}"))
+        }
         CoreError::Invalid(message) => PyValueError::new_err(message),
         CoreError::Deadline(message) => PyTimeoutError::new_err(message),
         CoreError::Spawn(message) | CoreError::Internal(message) => PyRuntimeError::new_err(message),
@@ -85,6 +88,9 @@ fn options_from_dict(opts: Option<HashMap<String, u64>>) -> CoreOptions {
         }
         if let Some(value) = opts.get("write_queue_bytes") {
             options.write_queue_bytes = *value as usize;
+        }
+        if let Some(value) = opts.get("sink_queue_bytes") {
+            options.sink_queue_bytes = *value as usize;
         }
         if let Some(value) = opts.get("drain_interval_ms") {
             options.drain_interval = Duration::from_millis(*value);
@@ -318,6 +324,7 @@ impl Core {
                 dict.set_item("crashed", record.crashed)?;
                 dict.set_item("degraded", record.degraded)?;
                 dict.set_item("screen_rev", record.screen_rev)?;
+                dict.set_item("raw_rev", record.raw_rev)?;
                 dict.set_item("screen_text", record.screen_text)?;
                 out.push(dict);
             }
@@ -429,6 +436,61 @@ impl Core {
         guarded(|| {
             let deadline = Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_WRITE_DEADLINE_MS));
             py.detach(|| self.inner.replay(&session_id, deadline))
+                .map_err(core_error)
+        })
+    }
+
+    /// **Temporary (step 4 deletes it).** `attach_queue(session_id, max_bytes=None) -> (replay, handle)`:
+    /// registers the socket's bounded queue on the id's fan-out and returns the replay to write before
+    /// the first frame (Q11: one step inside `attach_sink`). The handle is unique per core and survives
+    /// a resume of the id. `KeyError` for an unknown id, `ValueError` for a cap below 1.
+    #[pyo3(signature = (session_id, max_bytes=None))]
+    fn attach_queue(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        max_bytes: Option<usize>,
+    ) -> PyResult<(String, u64)> {
+        guarded(|| {
+            py.detach(|| self.inner.attach_queue(&session_id, max_bytes))
+                .map_err(core_error)
+        })
+    }
+
+    /// **Temporary (step 4 deletes it).** `take_frames(handle) -> (frames, dropped_bytes, closed)`:
+    /// non-blocking, takes and clears what is queued. `dropped_bytes` is this queue's cumulative count
+    /// (not per take), `closed` means the id was retired and the socket should close with code 1000.
+    /// `KeyError` for a handle never issued or already detached.
+    fn take_frames<'py>(
+        &self,
+        py: Python<'py>,
+        handle: u64,
+    ) -> PyResult<(Bound<'py, PyList>, u64, bool)> {
+        guarded(|| {
+            let taken = py
+                .detach(|| self.inner.take_frames(handle))
+                .map_err(core_error)?;
+            let frames = PyList::empty(py);
+            for frame in taken.frames {
+                frames.append(PyBytes::new(py, &frame))?;
+            }
+            Ok((frames, taken.dropped_bytes, taken.closed))
+        })
+    }
+
+    /// **Temporary (step 4 deletes it).** `detach_queue(handle) -> bool`: closes the queue, unregisters
+    /// the sink and forgets the handle; `false` the second time (and for a handle never issued).
+    fn detach_queue(&self, py: Python<'_>, handle: u64) -> bool {
+        py.detach(|| self.inner.detach_queue(handle))
+    }
+
+    /// `retire(session_id) -> bool`: removes an ended session from the table. `false` for an unknown id;
+    /// `ValueError` for a live one and for one whose exit record has not been drained (the next drain
+    /// carries it, then the hub retires). Attached queues report `closed`; a later spawn of the id
+    /// starts fresh.
+    fn retire(&self, py: Python<'_>, session_id: String) -> PyResult<bool> {
+        guarded(|| {
+            py.detach(|| self.inner.retire(&session_id))
                 .map_err(core_error)
         })
     }
