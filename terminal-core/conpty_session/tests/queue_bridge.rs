@@ -34,6 +34,7 @@ fn core() -> Arc<Core> {
         Box::new(|_line: &str| {}),
         CoreOptions::default(),
     )
+    .expect("core")
 }
 
 fn text_request(id: &str, seed: Option<&str>) -> TextRequest {
@@ -216,7 +217,8 @@ fn the_queue_cap_and_its_drop_count_belong_to_one_socket() {
             sink_queue_bytes: 120,
             ..CoreOptions::default()
         },
-    );
+    )
+    .expect("core");
     core.attach_text(text_request("cap", None)).expect("attach_text");
     let (_replay, small) = core.attach_queue("cap", Some(120)).expect("the explicit cap");
     let (_replay, wide) = core.attach_queue("cap", Some(16 * 1024)).expect("a wide cap");
@@ -531,7 +533,8 @@ fn the_owner_arc_is_released_after_the_delivery_lock() {
             tick_interval: Duration::from_secs(10),
             ..CoreOptions::default()
         },
-    );
+    )
+    .expect("core");
     core.attach_text(text_request("owner", None)).expect("incarnation 1");
     let old = core.session_for_test("owner").expect("incarnation 1 in the table");
     core.kill("owner", Duration::from_millis(100)).expect("kill 1");

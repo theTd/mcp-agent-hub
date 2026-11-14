@@ -28,6 +28,7 @@ fn core() -> std::sync::Arc<Core> {
             ..CoreOptions::default()
         },
     )
+    .expect("core")
 }
 
 fn request(id: &str, argv: &[&str]) -> SpawnRequest {
@@ -282,7 +283,8 @@ fn shutdown_does_not_wait_for_a_notify_in_flight() {
             tick_interval: Duration::from_millis(5),
             ..CoreOptions::default()
         },
-    );
+    )
+    .expect("core");
     core.spawn(request("notify", &["cmd.exe", "/c", "echo tick & ping -n 5 127.0.0.1"]))
         .expect("spawn");
     started_rx

@@ -34,6 +34,7 @@ fn core() -> Arc<Core> {
         Box::new(|_line: &str| {}),
         CoreOptions::default(),
     )
+    .expect("core")
 }
 
 fn text_request(id: &str, seed: Option<&str>) -> TextRequest {

@@ -53,6 +53,7 @@ fn start_core(logs: Arc<Mutex<Vec<String>>>) -> Arc<Core> {
             ..CoreOptions::default()
         },
     )
+    .expect("the core starts")
 }
 
 fn environment() -> HashMap<String, String> {

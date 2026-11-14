@@ -8,7 +8,11 @@ The live cases need the built extension beside this file (``hub_terminal_core.py
 skip, when it is missing or broken: a green suite on an unbuilt tree is a gate that cannot see a broken
 build (review nit).
 """
+import base64
 import importlib.util
+import os
+import socket
+import struct
 import subprocess
 import sys
 import textwrap
@@ -17,6 +21,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlsplit
 
 HERE = Path(__file__).resolve().parent
 EXTENSION = HERE / "hub_terminal_core.pyd"
@@ -690,6 +695,208 @@ class GilTeardownTests(unittest.TestCase):
     @live_core
     def test_dropping_the_last_reference_returns_while_the_gil_is_held(self):
         self.run_probe("drop")
+
+
+class _Refused(Exception):
+    """The handshake answered with an HTTP error instead of `101 Switching Protocols`."""
+
+    def __init__(self, status, head):
+        super().__init__(f"{status}: {head.splitlines()[0] if head else ''}")
+        self.status = status
+
+
+class _WsClient:
+    """Just enough WebSocket for a console pane's two directions (RFC 6455, no extensions).
+
+    stdlib only: the suite may not install anything (RULES.md), and this is the shape of what the
+    browser does anyway — a masked text frame out, unmasked frames and a close code in.
+    """
+
+    def __init__(self, url, timeout=5.0):
+        parsed = urlsplit(url)
+        if parsed.scheme != "ws":
+            raise AssertionError(f"not a ws url: {url}")
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        self.buffer = b""
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}:{parsed.port}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(request.encode("ascii"))
+        self.opened = self._read_head()
+        status = int(self.opened.split(" ", 2)[1])
+        if status != 101:
+            self.sock.close()
+            raise _Refused(status, self.opened)
+
+    def _read_head(self):
+        while b"\r\n\r\n" not in self.buffer:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise AssertionError("the handshake ended without a response")
+            self.buffer += chunk
+        head, _, self.buffer = self.buffer.partition(b"\r\n\r\n")
+        return head.decode("latin-1")
+
+    def _read_exact(self, count):
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise AssertionError("the socket closed mid-frame")
+            self.buffer += chunk
+        taken, self.buffer = self.buffer[:count], self.buffer[count:]
+        return taken
+
+    def read_message(self, timeout=5.0):
+        """One `(opcode, payload)` frame; the server's frames are never masked."""
+        self.sock.settimeout(timeout)
+        first, second = self._read_exact(2)
+        opcode = first & 0x0F
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._read_exact(8))[0]
+        if second & 0x80:
+            raise AssertionError("a server frame must not be masked")
+        return opcode, self._read_exact(length)
+
+    def read_text_until(self, needle, timeout=5.0):
+        end = time.time() + timeout
+        seen = ""
+        while needle not in seen:
+            remaining = end - time.time()
+            if remaining <= 0:
+                raise AssertionError(f"{needle!r} never arrived; saw {seen[-400:]!r}")
+            opcode, payload = self.read_message(remaining)
+            if opcode == 1:
+                seen += payload.decode("utf-8", "replace")
+            elif opcode == 8:
+                raise AssertionError(f"closed before {needle!r}: {payload!r}")
+        return seen
+
+    def send_text(self, text):
+        payload = text.encode("utf-8")
+        mask = os.urandom(4)
+        header = bytearray([0x81])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 1 << 16:
+            header.append(0x80 | 126)
+            header += struct.pack("!H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack("!Q", length)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def read_close(self, timeout=5.0):
+        end = time.time() + timeout
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                raise AssertionError("the socket was never closed")
+            opcode, payload = self.read_message(remaining)
+            if opcode == 8:
+                return struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1005
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class TerminalSocketTests(unittest.TestCase):
+    """§6.4 through the extension: the listener, the ticket, the wire order, input and the close.
+
+    This is the surface step 4b moves the hub's console onto (`ws_port`/`ws_ticket`/`close_sockets`),
+    so the wire contract is proven from Python over a real loopback socket, not only from Rust.
+    """
+
+    def setUp(self):
+        if Core is None:
+            self.fail(f"hub_terminal_core is not built or does not load: {IMPORT_ERROR}")
+        self.logs = []
+        self.core = Core(log=self.logs.append)
+        self.clients = []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.close()
+        try:
+            self.core.kill_all(2000)
+        finally:
+            self.core.shutdown()
+
+    def connect(self, session):
+        client = _WsClient(self.core.ws_ticket(session)["url"])
+        self.clients.append(client)
+        return client
+
+    def drain_requests(self, timeout=5.0):
+        """Every `resize_requests`/`input_requests` entry the drains carry within `timeout`."""
+        resizes, typed = [], []
+        end = time.time() + timeout
+        while time.time() < end and (not resizes or not typed):
+            for record in self.core.drain():
+                resizes.extend(record["resize_requests"])
+                typed.extend(record["input_requests"])
+            time.sleep(0.02)
+        return resizes, typed
+
+    @live_core
+    def test_a_real_socket_serves_a_session_end_to_end(self):
+        self.core.attach_text("live", cols=40, rows=8)
+        self.assertGreater(self.core.ws_port, 0)
+        self.assertTrue(self.core.ws_listening())
+
+        client = self.connect("live")
+        seen = client.read_text_until("replay_end")
+        self.assertIn("replay_end", seen)
+        self.core.feed("live", "hello socket\r\n")
+        self.assertIn("hello socket", client.read_text_until("hello socket"))
+
+        # Both request kinds travel on the drain record; the hub applies them (4b).
+        client.send_text('{"type":"resize","cols":100,"rows":40,"propagate":true}')
+        client.send_text('{"type":"input","data":"typed"}')
+        resizes, typed = self.drain_requests()
+        self.assertEqual(resizes, [{"cols": 100, "rows": 40, "propagate": True}])
+        self.assertEqual(typed, ["typed"], "a text session's input must come back on the record")
+
+        self.assertEqual(self.core.close_sockets("live"), 1)
+        self.assertEqual(client.read_close(), 1000, "the hub's close is 1000")
+        end = time.time() + 5.0
+        while self.core.socket_count() and time.time() < end:
+            time.sleep(0.02)
+        self.assertEqual(self.core.socket_count(), 0)
+
+    @live_core
+    def test_the_ticket_is_checked_at_the_handshake_and_never_logged(self):
+        self.core.attach_text("ticketed", cols=40, rows=8)
+        url = self.core.ws_ticket("ticketed")["url"]
+        token = url.split("ticket=", 1)[1]
+        tampered = url[:-1] + ("A" if url[-1] != "A" else "B")
+        with self.assertRaises(_Refused) as caught:
+            _WsClient(tampered)
+        self.assertEqual(caught.exception.status, 401, "a bad ticket is an HTTP 401, not a socket")
+
+        client = _WsClient(url)
+        self.clients.append(client)
+        client.read_text_until("replay_end")
+        with self.assertRaises(_Refused) as caught:
+            _WsClient(url)
+        self.assertEqual(caught.exception.status, 401, "a ticket works once")
+        self.assertEqual(self.core.socket_count(), 1, "only the honest socket exists")
+
+        logged = "\n".join(self.logs)
+        self.assertIn("401", logged, "the refused handshake was not logged")
+        self.assertNotIn(token, logged, "the ticket reached a log line")
 
 
 if __name__ == "__main__":
