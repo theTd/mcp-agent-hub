@@ -121,6 +121,64 @@ class TicketEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(body["expires_in"], 1, body)
             self.assertLessEqual(body["expires_in"], 30, body)
 
+    async def test_a_delayed_mint_does_not_hold_the_loop(self):
+        # kimi 4b #3: `ws_ticket` reads the core's session table, which a spawn/retire/snapshot can
+        # hold past its deadline. The route awaits it in a worker, so the loop keeps beating; a mint
+        # on the loop shows up as one long gap here.
+        core = self.hub.core
+        ticket = core.ws_ticket
+        held = []
+
+        def slow_ticket(session_id, ttl_ms=None):
+            held.append(session_id)
+            time.sleep(0.15)
+            return ticket(session_id, ttl_ms)
+
+        core.ws_ticket = slow_ticket
+        loop = asyncio.get_running_loop()
+        worst = 0.0
+        done = asyncio.Event()
+
+        async def beat():
+            nonlocal worst
+            last = loop.time()
+            while not done.is_set():
+                await asyncio.sleep(0.005)
+                now = loop.time()
+                worst = max(worst, now - last)
+                last = now
+
+        beating = asyncio.create_task(beat())
+        await asyncio.sleep(0)
+        try:
+            response = await self.client.get("/api/sessions/starting/terminal-ticket")
+        finally:
+            done.set()
+            await asyncio.wait([beating])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(held, ["starting"], "the mint did not run")
+        self.assertLess(worst, 0.08, f"the ticket mint held the loop for {worst:.3f}s")
+
+    async def test_a_table_deadline_answers_a_retryable_503(self):
+        # Gaps 8: the core's session table can miss its read deadline. That is the hub being busy,
+        # not a fault: the console retries any non-404 answer on its backoff, so answer 503.
+        self.hub.core.read_timeouts = 1
+        response = await self.client.get("/api/sessions/starting/terminal-ticket")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.headers.get("retry-after"), "1")
+        self.assertTrue(response.json().get("detail"), "a 503 without a message")
+        self.assertEqual(self.hub.core.ticket_calls, [], "a busy table still minted a ticket")
+
+    async def test_a_hub_without_a_core_answers_its_decided_404(self):
+        # F14: the hub builds its core lazily. With none built the route answers 404 without
+        # building one, so a health-only hub never starts the terminal core.
+        self.hub.core = None
+        try:
+            response = await self.client.get("/api/sessions/starting/terminal-ticket")
+        finally:
+            self.hub.core = FakeTerminal()
+        self.assertEqual(response.status_code, 404, response.text)
+
     async def test_every_call_mints_a_fresh_single_use_ticket(self):
         first = (await self.client.get("/api/sessions/starting/terminal-ticket")).json()["url"]
         second = (await self.client.get("/api/sessions/starting/terminal-ticket")).json()["url"]

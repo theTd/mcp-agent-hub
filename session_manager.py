@@ -428,6 +428,15 @@ SHUTDOWN_RECONCILE_GAP_SEC = 0.05
 # this far before the deadline, so `db.close` still gets one commit batch (it keeps 0.2 s of its own).
 SHUTDOWN_FINAL_ROW_RESERVE_SEC = 0.6
 SHUTDOWN_STORE_RESERVE_SEC = 0.3
+# r3-kimi 1: a session the stop's snapshot reads could not cover is archived from this one, so no
+# archive or forced final row reads the core on the loop. Empty text and revision 0 make every
+# persisted column keep what an earlier write stored (the upserts keep non-empty values only).
+EMPTY_SNAPSHOT = {
+    "screen_text": "",
+    "scrollback_text": "",
+    "raw_text": "",
+    "raw_rev": 0,
+}
 # rtc-retire: a refused retire is retried on this timer, so a quiet id (no first-class DSH session
 # ever publishes a record) is not stranded in the core's table for the hub's life. The attempt cap
 # counts the timer's own attempts only: a busy drain publishes records of its own, and counting those
@@ -440,6 +449,16 @@ RETIRE_RETRY_SLOW_SEC = 5.0
 # A retire goes after the row write it may be waiting for (r2-kimi 5): the code the core learned late
 # belongs to that row, and after `retire` there is nothing left to read it from.
 LATE_CODE_WRITE_WAIT_SEC = 1.0
+# r4b #2: the console's resize and typed input are applied by one consumer per session, so no drain
+# tick ever waits on the core. A consumer with nothing for `IDLE_SEC x IDLE_TICKS` ends itself (the
+# next record creates a new one), and a close or the stop gives what the id already queued this long
+# before it cancels the consumer and goes on to `close_sockets`/`retire`.
+REQUEST_CONSUMER_IDLE_SEC = 1.0
+REQUEST_CONSUMER_IDLE_TICKS = 10
+REQUEST_CONSUMER_DRAIN_SEC = 0.5
+# The one value a queue carries to end its consumer; it holds no request and is compared by
+# identity, so no console request can be mistaken for it.
+_REQUESTS_CLOSED = object()
 # The core may withhold a death record for one tick (contract 5), and a resume's spawn drops whatever
 # record the table still holds for the id: `_end_predecessor` drains again, one drain interval apart,
 # until the predecessor's death has been applied, then proceeds without it.
@@ -2487,13 +2506,17 @@ class AgentSession:
         except Exception:
             self._watched_rows = None
 
-    def _finish_read(self, exit_code: Optional[int], crashed: bool = False,
-                     scan: bool = True) -> None:
+    def _finish_read(self, exit_code: Optional[int], crashed: bool = False) -> None:
         """The exit path, run from the drain handler that saw the death record (§5.3).
 
-        It is `_finish_read`'s body unchanged: the scrollback snapshot into `final_response`, the
-        named end reason, and the one lifecycle callback. The core publishes the death record after
-        the session's last byte, so this runs exactly where the reader thread used to run it.
+        It is `_finish_read`'s body unchanged: the named end reason and the one lifecycle callback.
+        The core publishes the death record after the session's last byte, so this runs exactly
+        where the reader thread used to run it.
+
+        r3-kimi 4/7: the 80-row snapshot into `final_response` is the callback's now, not this
+        method's: a drain record is applied on the loop, and that read is a core call. Nothing here
+        blocks, and the callback (`_on_session_exit`) takes the snapshot in a worker before it
+        writes the final row, so the row still carries it.
 
         `exit_code` is kept as the core reported it: a failed `GetExitCodeProcess` leaves `None`,
         and `crashed` marks a reader panic. Neither may become a clean 0 for any engine (F1).
@@ -2507,17 +2530,6 @@ class AgentSession:
         self.ended_at = time.time()
         self.exit_code = exit_code
         self._died_crashed = bool(crashed)
-        # Snapshot sanitized terminal output into final_response only if no higher-priority response was recorded
-        if scan:
-            try:
-                scrollback = self.read_scrollback(max_lines=80).text
-                clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-                if clean_lines and not self.final_response_from_previous_turn:
-                    self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
-            except Exception:
-                # F15: a failed death snapshot is a diagnostic, not a silence: the drain handler's
-                # own try cannot see it, so the session id goes to the log here.
-                logger.exception("terminal core: exit snapshot of %s failed", self.session_id)
 
         # Archive spec §1.4/§2: the process's end gets a named reason. A user termination already
         # decided its status in terminate(); the death record must not overwrite it.
@@ -2532,6 +2544,43 @@ class AgentSession:
             # V-5: a user termination already has its one lifecycle event; do not queue a second one.
             # A7: carry this object, so the manager can tell it apart from a later resume's object.
             self.on_exit_cb(self, self.exit_code)
+
+    @staticmethod
+    def _tidy_screen_text(text: str, engine: str) -> str:
+        """The 10 sanitized lines of a raw snapshot, on the caller's thread (r3-kimi 4/7)."""
+        clean_lines = sanitize_tui_screen_text(text, max_lines=10, engine=engine)
+        return "\n".join(clean_lines) if clean_lines else ""
+
+    async def _snapshot_final_response_async(self) -> None:
+        """`final_response` from the terminal's own last lines, 80 rows read in a worker.
+
+        r3-kimi 4/7: a death record is applied on the loop, so the read that fed `final_response`
+        blocked the loop for the core's deadline whenever the console was busy. F15: a failed read
+        is a diagnostic, not a silence, so the session id goes to the log here.
+        """
+        try:
+            raw = await asyncio.to_thread(self.read_scrollback, 80)
+            text = await asyncio.to_thread(self._tidy_screen_text, raw.text, self.engine)
+        except Exception:
+            logger.exception("terminal core: exit snapshot of %s failed", self.session_id)
+            return
+        if text and not self.final_response_from_previous_turn:
+            self.set_final_response(text, "terminal_turn_snapshot")
+
+    async def _death_snapshot_async(self) -> Dict[str, Any]:
+        """The death's final-row snapshot, every read in a worker (r3-kimi 4/7).
+
+        The final row needs the screen text, the scrollback and the raw ring; all three are core
+        calls and the exit callback runs on the loop. `_read_session_snapshot` is the same read the
+        stop makes for an id `snapshot_all` missed, so the row keeps exactly the fields it wrote
+        before. A failed read leaves `EMPTY_SNAPSHOT`'s empty values, which store nothing: the row
+        keeps what an earlier persist wrote.
+        """
+        try:
+            return await asyncio.to_thread(HubSessionManager._read_session_snapshot, self)
+        except Exception:
+            logger.exception("terminal core: final-row snapshot of %s failed", self.session_id)
+            return dict(EMPTY_SNAPSHOT)
 
     def apply_core_record(self, record: Dict[str, Any]) -> str:
         """Applies one `drain()` record's counters (§5.3); names what the record did.
@@ -2586,6 +2635,45 @@ class AgentSession:
             except Exception:
                 logger.exception("tui tool-line callback failed for %s", self.session_id)
 
+    def _plan_virtual_input(self, text: str) -> Tuple[str, List[str]]:
+        """The DSH echo and the finished lines for one typed text, edited on the caller's thread.
+
+        `write_input`'s echo emulation, split out so the drain consumer can run it on the loop and
+        still hand the core one `feed`: the line buffer is the hub's, the bytes are the core's.
+        """
+        echo_parts: List[str] = []
+        lines: List[str] = []
+        for ch in text:
+            if ch in ("\r", "\n"):
+                echo_parts.append("\r\n")
+                line = self._virtual_line_buf.strip()
+                self._virtual_line_buf = ""
+                if line:
+                    lines.append(line)
+            elif ch in ("\x7f", "\b"):
+                if self._virtual_line_buf:
+                    self._virtual_line_buf = self._virtual_line_buf[:-1]
+                    echo_parts.append("\b \b")
+            else:
+                self._virtual_line_buf += ch
+                echo_parts.append(ch)
+        return "".join(echo_parts), lines
+
+    def _virtual_input_sync(self, text: str) -> bool:
+        """The echo and the line callbacks, on the caller's thread (every non-drain caller).
+
+        The console's socket input reaches the hub as a drain record's `input_requests`, and the
+        consumer applies that through `write_input_async`; the REST and MCP input paths call
+        `write_input` directly and stay synchronous.
+        """
+        if self.on_virtual_line_cb is None:
+            return False
+        echo, lines = self._plan_virtual_input(text)
+        self.emit_virtual_ansi(echo)
+        for line in lines:
+            self.on_virtual_line_cb(self.session_id, line)
+        return True
+
     def write_input(self, text: str):
         """`write` (§5.2): the whole text or nothing, then the DSH echo for a process-less session.
 
@@ -2604,36 +2692,67 @@ class AgentSession:
             except (KeyError, RuntimeError):
                 logger.exception("write to %s failed", self.session_id)
                 return False
-        if self.on_virtual_line_cb is not None:
-            for ch in text:
-                if ch in ("\r", "\n"):
-                    self.emit_virtual_ansi("\r\n")
-                    line = self._virtual_line_buf.strip()
-                    self._virtual_line_buf = ""
-                    if line:
-                        self.on_virtual_line_cb(self.session_id, line)
-                elif ch in ("\x7f", "\b"):
-                    if self._virtual_line_buf:
-                        self._virtual_line_buf = self._virtual_line_buf[:-1]
-                        self.emit_virtual_ansi("\b \b")
-                else:
-                    self._virtual_line_buf += ch
-                    self.emit_virtual_ansi(ch)
-            return True
-        return False
+        return self._virtual_input_sync(text)
+
+    async def write_input_async(self, text: str) -> bool:
+        """`write_input` for the drain consumer (r4b #2): its blocking core call leaves the loop.
+
+        A process session's `write` waits on the core's queue deadline and a text session's echo
+        waits on `feed`; both run in a worker. The line buffer and the line callbacks stay here,
+        on the loop, because a line callback schedules asyncio work and is not thread-safe.
+        """
+        if self.has_process and self._alive:
+            try:
+                await asyncio.to_thread(self._core().write, self.session_id, text)
+                return True
+            except TimeoutError:
+                logger.warning("write to %s timed out (queue full); input not delivered",
+                               self.session_id)
+                return False
+            except (KeyError, RuntimeError):
+                logger.exception("write to %s failed", self.session_id)
+                return False
+        if self.on_virtual_line_cb is None:
+            return False
+        echo, lines = self._plan_virtual_input(text)
+        if echo:
+            try:
+                await asyncio.to_thread(self.emit_virtual_ansi, echo)
+            except (KeyError, RuntimeError, TimeoutError):
+                logger.exception("terminal core: the echo of %s failed", self.session_id)
+        for line in lines:
+            self.on_virtual_line_cb(self.session_id, line)
+        return True
+
+    def _resize_target(self, cols: int, rows: int) -> Tuple[int, int]:
+        """The console's size after the 20/5 clamp, which is hub policy (design §6.4)."""
+        return max(20, int(cols)), max(5, int(rows))
+
+    def _has_core_grid(self) -> bool:
+        """Whether the core holds a grid for this id (a process, or a DSH job/spec)."""
+        return self.core is not None and bool(self.has_process or self.dsh_job_id or self.dsh_spec)
+
+    def _finish_resize(self, cols: int, rows: int) -> Tuple[int, int]:
+        """Records the size the hub decided and re-watches the generic tool-line scan (F12)."""
+        with self._lock:
+            self.cols = cols
+            self.rows = rows
+            rows_changed = self._watched_rows is not None and self._watched_rows != rows
+        if rows_changed:
+            # F12: the watched snapshot must cover the rows the pane shows now, or a tool line that
+            # only became visible after the pane grew never reaches `_on_tui_tool_detected`.
+            self._watch_rows()
+        return self.cols, self.rows
 
     def resize(self, cols: int, rows: int) -> Tuple[int, int]:
         """`resize`: applies the 20/5 clamp, then the core's PTY and screen; returns the applied size.
 
-        The clamp stays here because it is hub policy (design §6.4): the core refuses below 20x5
-        defensively and never propagates a size. A console that is closing or closed refuses
-        (`ValueError`) and a busy one misses its deadline (`TimeoutError`); either way the hub keeps
-        the size it decided, which is the size a refit would ask for again.
+        A console that is closing or closed refuses (`ValueError`) and a busy one misses its
+        deadline (`TimeoutError`); either way the hub keeps the size it decided, which is the size a
+        refit would ask for again.
         """
-        with self._lock:
-            target_cols = max(20, int(cols))
-            target_rows = max(5, int(rows))
-        if self.core is not None and (self.has_process or self.dsh_job_id or self.dsh_spec):
+        target_cols, target_rows = self._resize_target(cols, rows)
+        if self._has_core_grid():
             try:
                 applied = self.core.resize(self.session_id, target_cols, target_rows)
                 target_cols, target_rows = int(applied[0]), int(applied[1])
@@ -2641,15 +2760,21 @@ class AgentSession:
                 pass
             except TimeoutError:
                 logger.debug("resize of %s missed its deadline", self.session_id)
-        with self._lock:
-            self.cols = target_cols
-            self.rows = target_rows
-            rows_changed = self._watched_rows is not None and self._watched_rows != target_rows
-        if rows_changed:
-            # F12: the watched snapshot must cover the rows the pane shows now, or a tool line that
-            # only became visible after the pane grew never reaches `_on_tui_tool_detected`.
-            self._watch_rows()
-        return self.cols, self.rows
+        return self._finish_resize(target_cols, target_rows)
+
+    async def resize_async(self, cols: int, rows: int) -> Tuple[int, int]:
+        """`resize` with the core call in a worker (r4b #2: the drain consumer never blocks)."""
+        target_cols, target_rows = self._resize_target(cols, rows)
+        if self._has_core_grid():
+            try:
+                applied = await asyncio.to_thread(
+                    self.core.resize, self.session_id, target_cols, target_rows)
+                target_cols, target_rows = int(applied[0]), int(applied[1])
+            except (KeyError, ValueError):
+                pass
+            except TimeoutError:
+                logger.debug("resize of %s missed its deadline", self.session_id)
+        return self._finish_resize(target_cols, target_rows)
 
     # ---- The terminal seam (design §5.2) ------------------------------------------------
     # Every read and write of terminal state in the hub goes through these. Step 3b swapped what is
@@ -2814,13 +2939,9 @@ class AgentSession:
         """
         was_alive = self.is_process_alive()
         self.ended_at = time.time()
-        try:
-            scrollback = self.read_scrollback(max_lines=80).text
-            clean_lines = sanitize_tui_screen_text(scrollback, max_lines=10, engine=self.engine)
-            if clean_lines and not self.final_response_from_previous_turn:
-                self.set_final_response("\n".join(clean_lines), "terminal_turn_snapshot")
-        except Exception:
-            pass
+        # r3-kimi 4/7: the same 80-row snapshot as the death path, in a worker: `_close_session`
+        # awaits this on the loop, and the read waits on the core like any other.
+        await self._snapshot_final_response_async()
         if was_alive:
             # R14: a live process always ends as terminated, even when telemetry had already marked it
             # completed. V-5: remember the cause so the death record does not also emit an `exited` event.
@@ -3180,6 +3301,10 @@ class HubSessionManager:
         # handles per session id, so both parts are the key; the count is a diagnostic only and is
         # never added to the ring's `dropped_bytes`.
         self._socket_drops: Dict[Tuple[str, int], int] = {}
+        # r4b #2: one ordered consumer per session applies the console's queued resize/input, so the
+        # drain tick only queues. Both are touched on the loop only.
+        self._terminal_request_queues: Dict[str, "asyncio.Queue"] = {}
+        self._terminal_request_consumers: Dict[str, "asyncio.Task"] = {}
         self.default_cols: int = 120
         self.default_rows: int = 36
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
@@ -3446,6 +3571,9 @@ class HubSessionManager:
         Blocking (the §5.2 registry deadline), so every caller runs it off the loop. The core's
         `retire` closes them as well; this is what reaches a socket before a retire that the core
         refuses and the hub retries, and what a stop does without retiring anything.
+
+        r4b #3: the socket diagnostics are the loop's (`_note_socket_drops` is called from the tick),
+        so this worker does not touch `_socket_drops`; the caller forgets them on the loop.
         """
         core = self.core
         if core is None:
@@ -3457,7 +3585,6 @@ class HubSessionManager:
             return 0
         if closed:
             logger.debug("terminal core: closed %d console socket(s) of %s", closed, session_id)
-        self._forget_socket_drops(session_id)
         return closed
 
     @staticmethod
@@ -3504,62 +3631,208 @@ class HubSessionManager:
                         # written; rewrite that row once, with no second lifecycle event. A
                         # superseded predecessor writes its own final row in `_end_predecessor`.
                         self._write_late_exit_code(session_id, sess)
-                elif (closed is not None and not closed._alive
-                      and record.get("exit_code") is not None and closed.exit_code is None):
-                    # r2-kimi 5: the id was already closed and its row written; the core refused the
-                    # retire until this record went out, so the code belongs to that row. It is
-                    # never routed to a successor: a resume drops the tombstone with its incarnation.
-                    closed.exit_code = record.get("exit_code")
-                    closed.end_reason = closed.classify_end_reason(closed.exit_code)
-                    closed.status = closed.end_reason
-                    self._write_late_exit_code(session_id, closed)
+                elif closed is not None:
+                    self._apply_closed_record(session_id, closed, record)
                 if session_id in self._retire_pending:
                     # Its exit record is in hand now, so `retire` will accept the id.
                     self._schedule(self._retire_ended_session(
                         session_id, self._retire_pending.get(session_id), retry="record"))
                 # §6.4: the console's resize and typed input are requests the core recorded and
-                # never applied; the hub's policy runs here, in arrival order. A socket's own loss
-                # is a diagnostic and stays out of the ring's `dropped_bytes` (§5.4).
-                self._apply_terminal_requests(session_id, sess, record)
+                # never applied; the hub's policy runs them in arrival order, off this loop. A
+                # socket's own loss is a diagnostic and stays out of the ring's `dropped_bytes`
+                # (§5.4). Queueing cannot fail: the consumer is created here, on the loop.
+                requests = record.get("resize_requests") or ()
+                texts = record.get("input_requests") or ()
+                if requests or texts:
+                    self._queue_terminal_requests(session_id, requests, texts)
                 self._note_socket_drops(session_id, record.get("socket_drops") or ())
             except Exception:
                 logger.exception("terminal core: drain record for %s failed", session_id)
         return len(records)
 
-    def _apply_terminal_requests(self, session_id: str, sess: Optional[AgentSession],
-                                 record: Dict[str, Any]) -> None:
-        """Applies one drain record's `resize_requests` and `input_requests` (§5.2, §6.4).
+    def _apply_closed_record(self, session_id: str, closed: AgentSession,
+                             record: Dict[str, Any]) -> None:
+        """Applies a drain record to an id the hub already closed and archived (r3-kimi 2, r2-kimi 5).
 
-        A resize is the console's unapplied size: the record keeps arrival order, so each request
-        goes through `resize_session_from_client` with the console path's own defaults (120x36, a
-        missing `propagate` is true), the 20/5 clamp, the single-window propagation and the F12
-        re-watch. Text reaches a session with no PTY as `input_requests` because the echo and the
-        line callback are the hub's (design §8, DSH); it is fed here, in order, exactly where the
-        socket path typed it before. One bad request costs that request only (master 3874299).
+        The close wrote the row and left the object as the id's tombstone, because the core refuses
+        to retire an id whose death record no drain has carried. That record can arrive one drain
+        later (contract 5), so it is the tombstone's to apply: the death state now (`_alive`,
+        crash flag), never a second lifecycle event or a second end reason, and the exit code it
+        carries (`None` included, which leaves a code a late record already wrote alone).
+
+        The row is then rewritten once, and `_await_late_code_write` makes the retire that follows
+        wait for it: a retire takes the core's id away, and the code has no other reader. Nothing is
+        routed to a successor; a resume drops the tombstone with its incarnation (r2-kimi 5).
         """
-        for request in record.get("resize_requests") or ():
-            try:
-                self.resize_session_from_client(
-                    session_id,
-                    int(request.get("cols", 120)),
-                    int(request.get("rows", 36)),
-                    propagate_background=bool(request.get("propagate", True)),
-                )
-            except Exception:
-                logger.exception("terminal core: resize request for %s failed", session_id)
-        texts = record.get("input_requests") or ()
-        if not texts:
+        code = record.get("exit_code")
+        if record.get("alive") is False and closed._alive:
+            # The death the close's kill published, withheld by the core until this drain.
+            closed._alive = False
+            closed._died_crashed = closed._died_crashed or bool(record.get("crashed"))
+            if code is not None:
+                closed.exit_code = code
+        elif code is not None and closed._alive is False and closed.exit_code is None:
+            # r2-kimi 5: the code the death record lacked, learned after the row was written.
+            closed.exit_code = code
+        else:
             return
+        closed.end_reason = closed.end_reason or closed.classify_end_reason(closed.exit_code)
+        closed.status = closed.end_reason or closed.status
+        self._write_late_exit_code(session_id, closed)
+
+    def _queue_terminal_requests(self, session_id: str, requests: Any, texts: Any) -> bool:
+        """Hands one drain record's requests to the id's consumer, in the record's order.
+
+        A resize is the console's unapplied size and text is a session with no PTY's typed input
+        (the echo and the line callback are the hub's, design §8). Both are applied by
+        `_terminal_request_consumer`, which awaits the blocking core calls in worker threads, so
+        this queue (and this tick) never waits on the core (r4b #2).
+
+        A record for an id the hub no longer lists queues nothing (omp 4b F4): the pane is gone and
+        its intent must not resize the panes that are still there. `_apply_*` re-checks at apply
+        time, for the window between this call and the consumer's turn.
+        """
+        if self.sessions.get(session_id) is None:
+            logger.debug("terminal core: %d request(s) for an unlisted id %s dropped",
+                         len(requests) + len(texts), session_id)
+            return False
+        queue = self._terminal_request_queues.get(session_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._terminal_request_queues[session_id] = queue
+        for request in requests:
+            queue.put_nowait(("resize", request))
+        for text in texts:
+            queue.put_nowait(("input", str(text)))
+        existing = self._terminal_request_consumers.get(session_id)
+        if existing is None or existing.done():
+            # A consumer that ended (its idle exit, or a close's cancel) has its map entry removed by
+            # its done callback, which runs a loop turn after the task ends; this check covers the
+            # one drain that can arrive inside that window, or its requests would wait for a new one.
+            if existing is not None:
+                self._terminal_request_consumers.pop(session_id, None)
+            task = self._schedule(self._terminal_request_consumer(session_id, queue))
+            if task is None:
+                # The hub is stopping: the stop has already drained or cancelled consumers and
+                # nothing it is about to archive may still reach the core.
+                queue.put_nowait(_REQUESTS_CLOSED)
+                self._terminal_request_queues.pop(session_id, None)
+                return True
+            self._terminal_request_consumers[session_id] = task
+
+            def finished(_done, key=session_id, tracked=task):
+                if self._terminal_request_consumers.get(key) is tracked:
+                    self._terminal_request_consumers.pop(key, None)
+
+            task.add_done_callback(finished)
+        return True
+
+    async def _terminal_request_consumer(self, session_id: str, queue: "asyncio.Queue") -> None:
+        """Applies one session's queued requests in arrival order, one at a time (r4b #2).
+
+        The consumer exists so a burst of console requests costs the loop nothing: each one's
+        blocking core call (`write`'s queue deadline, `feed`, `resize`'s table deadline) runs in a
+        worker, and `resize_session_from_client`'s fan-out, the session dict and the virtual line
+        callbacks stay on this loop. One request that raises costs that request only (master
+        3874299). The consumer ends at the sentinel the close and the stop enqueue, or at cancelling.
+        """
+        idle = 0
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=REQUEST_CONSUMER_IDLE_SEC)
+                idle = 0
+            except asyncio.TimeoutError:
+                idle += 1
+                if idle < REQUEST_CONSUMER_IDLE_TICKS or self._shutting_down:
+                    continue
+                # Nothing has arrived for a while, and the drain tick creates a consumer on demand,
+                # so this one can end and leave no task per quiet session.
+                if queue.empty():
+                    break
+                continue
+            if item is _REQUESTS_CLOSED:
+                queue.task_done()
+                break
+            kind, payload = item
+            try:
+                if kind == "resize":
+                    await self._apply_resize_request(session_id, payload)
+                elif kind == "input":
+                    await self._apply_input_request(session_id, payload)
+            except Exception:
+                logger.exception("terminal core: %s request for %s failed", kind, session_id)
+            finally:
+                queue.task_done()
+        # Apply what was already queued when a close or a stop asked for the end: those requests
+        # arrived before the session was dropped, and the core still has the id.
+        while not queue.empty():
+            item = queue.get_nowait()
+            if item is _REQUESTS_CLOSED:
+                queue.task_done()
+                continue
+            kind, payload = item
+            try:
+                if kind == "resize":
+                    await self._apply_resize_request(session_id, payload)
+                elif kind == "input":
+                    await self._apply_input_request(session_id, payload)
+            except Exception:
+                logger.exception("terminal core: %s request for %s failed at drain", kind, session_id)
+            finally:
+                queue.task_done()
+
+    async def _apply_resize_request(self, session_id: str, request: Any) -> bool:
+        """One console resize, with the console path's defaults (120x36, `propagate` true by default).
+
+        Returns False when the id left the hub's list before the request was applied (r4b F4):
+        propagation would otherwise resize every other pane for a session the user cannot see.
+        """
+        position = (max(20, int(request.get("cols", 120))), max(5, int(request.get("rows", 36))),
+                    bool(request.get("propagate", True)))
+        if self.sessions.get(session_id) is None:
+            logger.debug("terminal core: resize for an unlisted id %s dropped", session_id)
+            return False
+        await self.resize_session_from_client(
+            session_id, position[0], position[1], propagate_background=position[2])
+        return True
+
+    async def _apply_input_request(self, session_id: str, text: str) -> bool:
+        """One text request for the session the drain record was applied to, if it is still listed."""
+        sess = self.sessions.get(session_id)
         if sess is None:
             # The hub already closed this id; the core's text entry has no echo to feed.
-            logger.debug("terminal core: %d input requests for an unlisted id %s",
-                         len(texts), session_id)
+            logger.debug("terminal core: input for an unlisted id %s dropped", session_id)
+            return False
+        await sess.write_input_async(text)
+        return True
+
+    async def _finish_terminal_requests(self, session_id: str, timeout: float) -> None:
+        """Ends this id's consumer and settles what it still holds, bounded by `timeout`.
+
+        The stop calls this while its sessions are still listed, so their queued requests are
+        applied before `close_sockets` and `shutdown`. The close path calls it after the id left
+        the hub's list, so that queue applies nothing (omp 4b F4): what is finished there is the
+        consumer itself, past `timeout` by cancelling it, so no task outlives the close and no
+        wedged core call can hold it. The sentinel goes in before the wait, so a consumer that was
+        idle exits at once instead of waiting out its idle ticks.
+        """
+        queue = self._terminal_request_queues.pop(session_id, None)
+        if queue is not None:
+            queue.put_nowait(_REQUESTS_CLOSED)
+        task = self._terminal_request_consumers.get(session_id)
+        if task is None or task.done():
             return
-        for text in texts:
-            try:
-                sess.write_input(str(text))
-            except Exception:
-                logger.exception("terminal core: text input for %s failed", session_id)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=max(0.0, float(timeout)))
+        except asyncio.TimeoutError:
+            # The consumer's own turn did not finish inside the share this close or stop gave it.
+            # `shield` kept it from being cancelled by the deadline, so cancel it here: no task may
+            # outlive the close, and a wedged core call must not hold it.
+            task.cancel()
+            logger.warning("terminal core: %s's queued requests did not finish before its close",
+                           session_id)
+        except Exception:
+            logger.exception("terminal core: finishing the requests of %s failed", session_id)
 
     def _note_socket_drops(self, session_id: str, drops: Any) -> None:
         """Keeps one console socket's cumulative loss per `(session id, handle)` (§5.4).
@@ -3687,6 +3960,22 @@ class HubSessionManager:
         if core is None:
             self._clear_retire(session_id)
             return
+        held: Optional["asyncio.Lock"] = None
+        if retry != "direct":
+            # r3-kimi 3: the guard above reads the lock once, so a resume could install its
+            # successor while this retire was already past it, and the retire would then close the
+            # fan-out and socket set the successor had just taken over. Holding the resume lock
+            # across the core call closes that window from this side: no resume can start inside
+            # it. A locked resume defers instead (the check above), so this never waits on one.
+            lock = self._resume_lock(session_id)
+            if lock.locked():
+                if self._retire_pending.get(session_id) == incarnation:
+                    self._arm_retry_timer()
+                return
+            # `Lock.acquire` sets the flag before its first suspension point, so this cannot
+            # interleave with a resume's own acquisition.
+            await lock.acquire()
+            held = lock
         self._retire_inflight.add(session_id)
         try:
             await self._await_late_code_write(session_id)
@@ -3705,6 +3994,8 @@ class HubSessionManager:
             return
         finally:
             self._retire_inflight.discard(session_id)
+            if held is not None:
+                held.release()
         if self._incarnations.get(session_id) not in (None, incarnation):
             self._drop_stale_retire(session_id, incarnation)
             return
@@ -3770,8 +4061,16 @@ class HubSessionManager:
         if (self.sessions.get(session_id) is not session
                 and self._closed_sessions.get(session_id) is not session):
             return
-        self._finalize_session(session)
-        await self.persist_session(session, final=True)
+        # r3-kimi 4/7: `_last_screen_text` would read the core here, on the loop; the 80-row read
+        # runs in a worker, and the rest of the row is not this rewrite's business: empty text
+        # stores nothing, so the scrollback and the raw ring keep what the row already holds.
+        snapshot: Dict[str, Any] = dict(EMPTY_SNAPSHOT)
+        try:
+            snapshot["screen_text"] = (await asyncio.to_thread(session.read_screen, 80)).text
+        except Exception:
+            logger.exception("terminal core: screen of %s for its late code failed", session_id)
+        self._finalize_session(session, snapshot=snapshot)
+        await self.persist_session(session, final=True, snapshot=snapshot)
 
     async def _end_predecessor(self, session_id: str, old: Optional[AgentSession]) -> None:
         """kimi 5: an incarnation a resume is about to replace gets its own ending, once.
@@ -3825,7 +4124,7 @@ class HubSessionManager:
             except Exception:
                 pass
 
-    def resize_session_from_client(
+    async def resize_session_from_client(
         self,
         session_id: str,
         cols: int,
@@ -3837,6 +4136,11 @@ class HubSessionManager:
         When the console is in single-window mode (`propagate_background=True`), all live TUI
         sessions share the same single-pane viewport dimensions so background sessions stay sized
         to the main window instead of remaining at the initial 120x36 default.
+
+        Async since r4b #2: every core `resize` it makes can wait on the core's table/console
+        deadline, so each one runs in a worker while the session dict stays on the loop. The
+        target's request is applied before the propagation's, which is the arrival order the pane
+        sees.
         """
         c = max(20, int(cols or 120))
         r = max(5, int(rows or 36))
@@ -3844,7 +4148,7 @@ class HubSessionManager:
         self.default_rows = r
         target = self.sessions.get(session_id)
         if target is not None:
-            target.resize(c, r)
+            await target.resize_async(c, r)
         if propagate_background:
             for sid, sess in list(self.sessions.items()):
                 if sid == session_id or sess is None:
@@ -3852,7 +4156,7 @@ class HubSessionManager:
                 if sess.kind == "tui" and (
                     sess.is_process_alive() or sess.status in ("starting", "running", "waiting_parent")
                 ):
-                    sess.resize(c, r)
+                    await sess.resize_async(c, r)
 
     # ---- V2: transcript ownership ---------------------------------------------------------
 
@@ -5034,10 +5338,23 @@ class HubSessionManager:
     ):
         """Writes the row. `final` marks the exit/archive write, the only one that rebuilds the
         mailbox thread (A11) instead of leaving the stored one alone. `snapshot` is `snapshot_all`'s
-        reply for a session the shutdown archives after its process ended (§6.6)."""
+        reply for a session the shutdown archives after its process ended (§6.6).
+
+        r3-kimi 1/4: the 250-row read behind `scrollback_text` is a core call, so a final write (the
+        death/archive row) reads it in a worker before the write is queued: that row is where a slow
+        read would stall the stop, and the stop passes a snapshot anyway. An ordinary persist keeps
+        the read on its caller's thread, exactly as before: it runs inside a telemetry or question
+        write, whose ordering the hub already relies on, and the core bounds the read at its 50 ms
+        deadline.
+        """
         scrollback = None if snapshot is None else str(snapshot.get("scrollback_text") or "")
         if scrollback is None:
-            scrollback = session.read_scrollback(max_lines=250).text
+            if final or not session.is_process_alive():
+                # A dead session's ring cannot change any more, and its 250-row read now happens
+                # while an exit callback runs on the loop: send it to a worker there too.
+                scrollback = (await asyncio.to_thread(session.read_scrollback, 250)).text
+            else:
+                scrollback = session.read_scrollback(250).text
         await self.db.upsert_session(
             session.to_dict(),
             scrollback_text=scrollback,
@@ -5131,6 +5448,10 @@ class HubSessionManager:
         if snapshot is not None:
             text = str(snapshot.get("raw_text") or "")
             revision = int(snapshot.get("raw_rev") or 0)
+            if not text:
+                # r3-kimi 1: an empty snapshot (the stop's reads missed this id) stores nothing,
+                # so the column keeps the text an earlier persist wrote (NULL is kept too).
+                return None
         else:
             raw_read = session.read_raw()
             text = raw_read.text
@@ -6418,11 +6739,15 @@ class HubSessionManager:
                 logger.exception("terminal core: drain after closing %s failed", session_id)
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
         # of leaving the server side open and silent for the rest of the hub's life. Off the loop:
-        # the call waits on the core's socket registry.
+        # the call waits on the core's socket registry. r4b #2: the id left the hub's list above, so
+        # its consumer applies nothing of what it still holds (omp 4b F4); this only ends the
+        # consumer, bounded, by cancelling it, so no task outlives the close.
+        await self._finish_terminal_requests(session_id, REQUEST_CONSUMER_DRAIN_SEC)
         try:
             await asyncio.to_thread(self._close_terminal_sockets, session_id)
         except Exception:
             logger.exception("terminal core: closing the sockets of %s failed", session_id)
+        self._forget_socket_drops(session_id)
         # rtc-retire: the session is gone for good, so its ring and screen leave the core's table.
         await self._retire_ended_session(session_id, self._incarnations.get(session_id, 0))
         if terminated:
@@ -6481,9 +6806,17 @@ class HubSessionManager:
         # r2-kimi 2: the core may withhold a death record for one tick (contract 5), so one drain is
         # not enough: a second, one drain interval later, still runs before `_shutting_down`, and a
         # death it applies keeps its own classification and its ordinary lifecycle event.
+        # r4b F5/kimi 4: the budget starts here, so the reconcile drains spend it instead of running
+        # before it; a reconciling drain is bounded by what is left, and a second one is skipped
+        # when the first already spent its share.
+        deadline = time.monotonic() + SHUTDOWN_MAX_SEC
         for attempt in range(SHUTDOWN_RECONCILE_DRAINS):
             if attempt:
-                await asyncio.sleep(SHUTDOWN_RECONCILE_GAP_SEC)
+                remaining = deadline - time.monotonic() - SHUTDOWN_SNAPSHOT_MAX_SEC
+                if remaining <= 0:
+                    logger.warning("Shutdown skipped its second reconcile drain: budget spent")
+                    break
+                await asyncio.sleep(min(SHUTDOWN_RECONCILE_GAP_SEC, remaining))
             try:
                 self._on_core_tick()
             except Exception:
@@ -6491,10 +6824,22 @@ class HubSessionManager:
                 break
         self._shutting_down = True
         self.db.stop_accepting()
-        deadline = time.monotonic() + SHUTDOWN_MAX_SEC
         if self._retry_timer is not None:
             self._retry_timer.cancel()
             self._retry_timer = None
+        # r4b #2: what the panes asked for before the stop is still each session's, so every
+        # consumer applies its queue now (bounded, inside the shared budget) and ends. The tasks
+        # are cancelled below with the other producers, so nothing of this reaches the core after
+        # its stop. The kill and the final rows still get their own share.
+        queued_ids = [sid for sid in list(self._terminal_request_consumers)]
+        if queued_ids:
+            drain_by = time.monotonic() + max(0.05, min(
+                SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
+                deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC
+                - SHUTDOWN_ARCHIVE_RESERVE_SEC))
+            for session_id in queued_ids:
+                await self._finish_terminal_requests(
+                    session_id, max(0.0, drain_by - time.monotonic()))
         # kimi 4: a death that happened just before this shutdown already scheduled its
         # finalization (native transcript drain, final row, one lifecycle event). Those tasks run
         # their body instead of being cancelled and meeting a `_shutting_down` early return; only
@@ -6562,6 +6907,12 @@ class HubSessionManager:
                             snapshots[sess.session_id] = task.result()
                         except Exception:
                             logger.exception("Shutdown could not snapshot %s", sess.session_id)
+            # r3-kimi 1/4: every archive and forced-final-row path below gets a snapshot, so not one
+            # of them reads the core. A session whose reads missed (the share ran out, or the core's
+            # table was busy) gets an empty one: its live reads are what would stall the same stop
+            # again, and the stored row keeps what earlier persists already wrote (COALESCE).
+            for sess in sessions:
+                snapshots.setdefault(sess.session_id, dict(EMPTY_SNAPSHOT))
         # F5: the kill is bounded by what is left of the one budget, not by a fresh 2 s; the
         # core's own grace and the wait share it, so the archive still gets its share. R5a: the
         # grace stays under the wait, so a kill that uses all of it cannot outlive the stop's own
@@ -6600,6 +6951,8 @@ class HubSessionManager:
                                        timeout=close_share)
             except asyncio.TimeoutError:
                 logger.error("Timed out closing the console's terminal sockets")
+            for sess in sessions:
+                self._forget_socket_drops(sess.session_id)
         archived = 0
         remaining = list(sessions)
         try:
@@ -11999,6 +12352,14 @@ class HubSessionManager:
                     self._user_terminated.discard(session_id)
             # Either a resume already owns this id or the session is gone: this exit is history.
             return
+        final_snapshot = dict(EMPTY_SNAPSHOT)
+        if sess is not None and not sess.terminated_by_user:
+            # r3-kimi 4/7: the death's own snapshot, in a worker, before the transcript drain and
+            # the row that stores it, which is where `_finish_read` used to take it. A user
+            # termination already took its snapshot in `terminate`. The same reads serve the final
+            # row below, so that row costs the loop no core call at all.
+            await sess._snapshot_final_response_async()
+            final_snapshot = await sess._death_snapshot_async()
         if sess is not None and sess.engine in ("codex", "claude", "omp", "kimi", "agy") and not sess.terminated_by_user:
             # Engines can flush the last JSONL row just after the PTY closes. Let the existing
             # watcher drain it before classifying/persisting the exit and releasing ownership.
@@ -12029,13 +12390,14 @@ class HubSessionManager:
                 # F1/F2: a death the core gave no code for stays None; a code the death record
                 # lacked was already written by the late record, and never becomes a clean 0 here.
                 sess.exit_code = exit_code
-            self._finalize_session(sess)
+            self._finalize_session(sess, snapshot=final_snapshot)
             # A7: the object is the live one, so its status follows its own end state (the PTY reader
             # normally did this already; doing it here keeps the callback self-contained).
             if sess.end_reason:
                 sess.status = sess.end_reason
             # The final record writes the scrollback and the mailbox thread once, here (spec §3, A11).
-            await self.persist_session(sess, force_scrollback=True, final=True)
+            await self.persist_session(sess, force_scrollback=True, final=True,
+                                       snapshot=final_snapshot)
             end_reason = sess.end_reason or "exited"
         ev_type = "crashed" if end_reason == "crashed" else "exited"
         await self.record_worker_event(

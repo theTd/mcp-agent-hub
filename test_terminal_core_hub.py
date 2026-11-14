@@ -169,12 +169,15 @@ class HubOnCoreTests(_ManagerCase):
         self.assertIn(self.session.status, ("exited", "crashed"), self.session.status)
 
         # A7's exit path: the scheduled task records the one lifecycle event for the live object.
-        for _ in range(200):
-            await asyncio.sleep(0)
-            if self.session.ended_at is not None:
+        # The final write reads the core off the loop (r3-kimi 1/4), so the wait needs real time,
+        # not just loop turns, and `ended_at` is set before that read: the event is the real signal.
+        events = []
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            events = self.hub.get_worker_events("hub-core-probe")
+            if [e for e in events if e["type"] in ("exited", "crashed")]:
                 break
         self.assertIsNotNone(self.session.ended_at, "the exit callback never ran")
-        events = self.hub.get_worker_events("hub-core-probe")
         self.assertTrue([e for e in events if e["type"] in ("exited", "crashed")],
                         [(e["type"], e["status"]) for e in events])
 
