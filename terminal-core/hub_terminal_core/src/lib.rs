@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule};
 
 use conpty_session::{CoreError, CoreOptions, SessionFlags, SpawnRequest, TextRequest};
 use terminal_stream::strip_terminal_replies;
@@ -47,9 +47,6 @@ const DEFAULT_TICKET_TTL_MS: u64 = 30_000;
 fn core_error(error: CoreError) -> PyErr {
     match error {
         CoreError::UnknownSession(id) => PyKeyError::new_err(id),
-        CoreError::UnknownQueue(handle) => {
-            PyKeyError::new_err(format!("unknown queue handle: {handle}"))
-        }
         CoreError::Invalid(message) => PyValueError::new_err(message),
         CoreError::Deadline(message) => PyTimeoutError::new_err(message),
         CoreError::Spawn(message) | CoreError::Internal(message) => PyRuntimeError::new_err(message),
@@ -511,52 +508,6 @@ impl Core {
             py.detach(|| self.inner.replay(&session_id, deadline))
                 .map_err(core_error)
         })
-    }
-
-    /// **Temporary (step 4 deletes it).** `attach_queue(session_id, max_bytes=None) -> (replay, handle)`:
-    /// registers the socket's bounded queue on the id's fan-out and returns the replay to write before
-    /// the first frame (Q11: one step inside `attach_sink`). The handle is unique per core and survives
-    /// a resume of the id. `KeyError` for an unknown id, `ValueError` for a cap below 1.
-    #[pyo3(signature = (session_id, max_bytes=None))]
-    fn attach_queue(
-        &self,
-        py: Python<'_>,
-        session_id: String,
-        max_bytes: Option<usize>,
-    ) -> PyResult<(String, u64)> {
-        guarded(|| {
-            py.detach(|| self.inner.attach_queue(&session_id, max_bytes))
-                .map_err(core_error)
-        })
-    }
-
-    /// **Temporary (step 4 deletes it).** `take_frames(handle) -> (frames, dropped_bytes, closed)`:
-    /// non-blocking, takes and clears what is queued. `dropped_bytes` is this queue's cumulative count
-    /// (not per take), `closed` means the id was retired and the socket should close with code 1000.
-    /// `KeyError` for a handle never issued or already detached.
-    fn take_frames<'py>(
-        &self,
-        py: Python<'py>,
-        handle: u64,
-    ) -> PyResult<(Bound<'py, PyList>, u64, bool)> {
-        guarded(|| {
-            let taken = py
-                .detach(|| self.inner.take_frames(handle))
-                .map_err(core_error)?;
-            let frames = PyList::empty(py);
-            for frame in taken.frames {
-                frames.append(PyBytes::new(py, &frame))?;
-            }
-            Ok((frames, taken.dropped_bytes, taken.closed))
-        })
-    }
-
-    /// **Temporary (step 4 deletes it).** `detach_queue(handle) -> bool`: closes the queue, unregisters
-    /// the sink and forgets the handle; `false` the second time (and for a handle never issued). It never
-    /// reports a missed deadline as `false`: the registry has no deadline, so a `false` means the handle
-    /// was already gone (review F4).
-    fn detach_queue(&self, py: Python<'_>, handle: u64) -> PyResult<bool> {
-        guarded(|| Ok(py.detach(|| self.inner.detach_queue(handle))))
     }
 
     /// `retire(session_id) -> bool`: removes an ended session from the table. `false` for an unknown id;

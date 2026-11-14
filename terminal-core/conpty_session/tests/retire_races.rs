@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use conpty_session::{Core, CoreError, CoreOptions, SessionFlags, TextRequest};
+use conpty_session::{Core, CoreError, CoreOptions, FrameQueue, SessionFlags, TextRequest};
 use terminal_stream::FrameSink;
 
 const DEADLINE: Duration = Duration::from_millis(500);
@@ -64,11 +64,11 @@ fn wait_dead(core: &Core, id: &str, within: Duration) -> bool {
     false
 }
 
-/// Takes everything queued on `handle` until a quiet window of 40 ms follows at least one frame, or
+/// Takes everything queued on `queue` until a quiet window of 40 ms follows at least one frame, or
 /// `within` passes. The quiet window only means "nothing more is coming" after something came: the
 /// ticker's flush is scheduled, so a loaded machine can spend 40 ms before the first frame lands
 /// (review omp 10 / kimi 6).
-fn collect(core: &Core, handle: u64, within: Duration) -> (String, u64, bool) {
+fn collect(queue: &FrameQueue, within: Duration) -> (String, u64, bool) {
     let end = Instant::now() + within;
     let mut text = String::new();
     let mut dropped = 0;
@@ -76,7 +76,7 @@ fn collect(core: &Core, handle: u64, within: Duration) -> (String, u64, bool) {
     let mut stable_since = Instant::now();
     let mut heard = false;
     while Instant::now() < end {
-        let taken = core.take_frames(handle).expect("take_frames");
+        let taken = queue.take();
         dropped = taken.dropped_bytes;
         closed = taken.closed;
         for frame in taken.frames {
@@ -202,10 +202,13 @@ fn a_resume_inside_its_claim_refuses_retire_and_keeps_delivering() {
 
     // The live successor is on an open fan-out: its output reaches the id's sockets and no queue is told
     // to close over a session that is still running.
-    let (_replay, handle) = core.attach_queue("claimed", None).expect("attach_queue");
+    let queue = Arc::new(FrameQueue::new(CoreOptions::default().sink_queue_bytes));
+    let (_replay, handle) = core
+        .attach_sink("claimed", Arc::clone(&queue) as Arc<dyn FrameSink>)
+        .expect("attach_sink");
     core.feed("claimed", "NEW-OUTPUT", DEADLINE)
         .expect("feed the successor");
-    let (text, dropped, closed) = collect(&core, handle, Duration::from_secs(2));
+    let (text, dropped, closed) = collect(&queue, Duration::from_secs(2));
     let screen = core
         .screen("claimed", 10, DEADLINE)
         .expect("the live successor's screen");
@@ -219,7 +222,7 @@ fn a_resume_inside_its_claim_refuses_retire_and_keeps_delivering() {
         "the live successor's socket got {text:?} (dropped {dropped}, closed {closed})"
     );
     assert!(!closed, "a live session's queue never reports closed");
-    assert!(core.detach_queue(handle), "the handle still detaches");
+    assert!(core.detach_sink("claimed", handle).expect("detach_sink"));
 
     // And the id is retirable once it really has ended: kill, drain the exit record, retire.
     core.kill("claimed", Duration::from_millis(200))
@@ -244,9 +247,12 @@ fn a_resume_after_a_completed_retire_builds_a_fresh_fanout() {
 
     core.attach_text(text_request("fresh", Some("BANNER")))
         .expect("incarnation 2");
-    let (replay, handle) = core.attach_queue("fresh", None).expect("attach_queue");
+    let queue = Arc::new(FrameQueue::new(CoreOptions::default().sink_queue_bytes));
+    let (replay, handle) = core
+        .attach_sink("fresh", Arc::clone(&queue) as Arc<dyn FrameSink>)
+        .expect("attach_sink");
     core.feed("fresh", "AFTER", DEADLINE).expect("feed the successor");
-    let (text, dropped, closed) = collect(&core, handle, Duration::from_secs(2));
+    let (text, dropped, closed) = collect(&queue, Duration::from_secs(2));
     assert!(!closed, "a fresh incarnation's queue is open");
     assert_eq!(dropped, 0, "nothing was dropped");
     assert!(
@@ -257,7 +263,7 @@ fn a_resume_after_a_completed_retire_builds_a_fresh_fanout() {
         !text.contains("OLD"),
         "a retire ends the id's history: no predecessor bytes survived it: {text:?}"
     );
-    assert!(core.detach_queue(handle));
+    assert!(core.detach_sink("fresh", handle).expect("detach_sink"));
     core.kill("fresh", Duration::from_millis(200)).expect("kill 2");
     core.shutdown();
 }

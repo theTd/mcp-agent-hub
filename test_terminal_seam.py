@@ -11,6 +11,7 @@ import unittest
 
 import server
 import session_manager
+import terminal_core
 
 FIELDS = ("screen", "stream", "raw_history", "raw_history_bytes", "raw_history_rev", "pty",
           "ws_queues", "ws_handles")
@@ -109,8 +110,9 @@ class TerminalSeamScanTests(unittest.TestCase):
                      "_release_orphan_handles"):
             self.assertFalse(hasattr(session_manager.HubSessionManager, name), name)
         self.assertFalse(hasattr(server, "ws_pty_endpoint"))
-        # The three pull calls stay in the core for a later unit, but the hub may not call them.
+        # Step 4 removes the temporary pull bridge from the extension as well as from the hub.
         for name in ("attach_queue", "take_frames", "detach_queue"):
+            self.assertFalse(hasattr(terminal_core.Core, name), name)
             self.assertNotIn(name, Path(session_manager.__file__).read_text(encoding="utf-8"))
             self.assertNotIn(name, Path(server.__file__).read_text(encoding="utf-8"))
 
