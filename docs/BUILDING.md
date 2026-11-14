@@ -10,6 +10,10 @@ pnpm install --frozen-lockfile
 pnpm build:portable
 ```
 
+便携版构建还会编译 Rust 终端核心（缓存在 `terminal-core/target`，与 `desktop/src-tauri/target` 分开），并把
+`hub_terminal_core.pyd` 放到 `desktop/portable/` 再打进 EXE；核心与 EXE 使用同样的路径重映射，因为只设
+`strip = "symbols"` 时 `.pyd` 里仍会留下 Cargo registry 路径。
+
 需要 Node.js、pnpm、Rust MSVC 工具链和 Windows WebView2 开发环境。首次构建会编译 Rust 依赖，后续构建会使用 `desktop/src-tauri/target` 的增量缓存。
 
 默认构建使用一个 Cargo 任务以控制资源占用；机器资源充足时可以提高并行度：
