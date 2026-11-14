@@ -1,7 +1,10 @@
 """Record one live engine session as a terminal corpus chunk stream (design doc §9 steps 0 and 2a).
 
-The corpus is the input the pyte oracle renders in ``tools/render_terminal_fixtures.py``.  The default
-backend runs the engine on the **system** ConPTY through ``conpty_record_tap`` — the same spawn,
+The corpus is what the fixture gates compare; a new case's goldens can only come from the core now
+(step 6 deleted the pyte oracle and its renderer, ``tools/render_terminal_fixtures.py``).  The
+recorder's own live screen is a text session in the core, so a prompt it detects is a prompt the
+real hub would see.  The default backend runs the engine on the **system** ConPTY through
+``conpty_record_tap`` — the same spawn,
 command-line, job and ``ReadFile`` code the Rust core runs — so the fixtures come from the producer the
 core will use, not from the ``conpty.dll`` pywinpty bundles.  ``--backend pywinpty`` keeps the step-0
 transport reachable until pywinpty is deleted in step 5.
@@ -95,9 +98,9 @@ from session_manager import (  # noqa: E402
     HubSessionManager,
     unwrap_windows_cmd_shim,
 )
-# `oracle-to-tools`: the pyte screen and stream left the hub in step 3b and live with the fixture
-# renderer, which is the only other thing that renders a recorded stream through them.
-from tools.pyte_oracle import HubTerminalScreen, HubTerminalStream  # noqa: E402
+# The recorder's own live screen is a text session in the core: the same parser the hub runs, with a
+# screen and no process, fed the text the pipe produced (step 6 deleted the pyte oracle).
+from terminal_core import Core  # noqa: E402
 from winpty import PtyProcess  # noqa: E402
 
 # The default backend: the core's own spawn/read code as a headless tap (conpty_record_tap.rs).
@@ -721,8 +724,11 @@ class Recorder:
         self.mcp_disabled: List[str] = []
         self.mcp_files: List[str] = []
         self._lock = threading.Lock()
-        self._screen = HubTerminalScreen(cols, rows)
-        self._stream = HubTerminalStream(self._screen)
+        # The screen the prompt rules read: a text session in the core, the hub's own parser. The
+        # core's clamp floors are the hub's (20x5), so a smaller --cols/--rows is raised to them.
+        self.core = Core(notify=lambda: None, log=lambda line: None)
+        self._core_id = f"recorder-{uuid.uuid4().hex}"
+        self.core.attach_text(self._core_id, cols=max(20, cols), rows=max(5, rows))
         # The screen sees the same text the hub will: one incremental decoder, so a character split
         # across two reads is fed once the second half arrives.
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -741,12 +747,10 @@ class Recorder:
     def _screen_text(self) -> str:
         with self._lock:
             try:
-                lines = [line.rstrip() for line in self._screen.display]
+                text = self.core.screen(self._core_id, self.rows)["text"]
             except Exception:
-                lines = []
-        while lines and not lines[-1]:
-            lines.pop()
-        return "\n".join(lines[-self.rows:])
+                text = ""
+        return text
 
     def _settle_screen(self, focus: Optional[Callable[[str], str]] = None) -> bool:
         """Waits until the screen has not changed for ``CONSUMER_SETTLE_SEC``; False on the bound.
@@ -835,9 +839,10 @@ class Recorder:
             self.bytes_total += len(data)
             try:
                 if text:
-                    self._stream.feed(text)
+                    self.core.feed(self._core_id, text)
             except Exception:
-                # K4: one bad sequence costs only itself; the corpus keeps the bytes regardless.
+                # The core's parser cannot fail; a retired session would, and the corpus keeps the
+                # bytes regardless.
                 pass
         self._last_chunk_at = now
 
@@ -924,7 +929,7 @@ class Recorder:
             # The prompt detection reads this screen, so it must follow the PTY or it keeps guessing
             # at the old width (120x36) after the child has repainted for 140x44.
             try:
-                self._screen.resize(RESIZE_ROWS, RESIZE_COLS)
+                self.core.resize(self._core_id, RESIZE_COLS, RESIZE_ROWS)
             except Exception:
                 pass
             self.cols, self.rows = RESIZE_COLS, RESIZE_ROWS
@@ -1063,7 +1068,7 @@ class Recorder:
             "pty": "system-conpty" if self.backend == "system" else "pywinpty",
             "windows_build": windows_build(),
             "read_buffer_bytes": TAP_READ_BYTES if self.backend == "system" else None,
-            # Which resume the ``resumed/`` goldens model (render_terminal_fixtures.py).
+            # Which resume the ``resumed/`` goldens model (the corpus gate).
             "resume_count": 1,
             "launch": {
                 "command": Path(cmd_list[0]).name,
@@ -1096,7 +1101,19 @@ class Recorder:
             },
         }
         self._write_case(chunks, meta)
+        self._release_core()
         return meta
+
+    def _release_core(self) -> None:
+        """Ends the recorder's text session and its threads before the tool's process exits."""
+        try:
+            self.core.kill_all(2000)
+        except Exception:
+            pass
+        try:
+            self.core.shutdown()
+        except Exception:
+            pass
 
     def _shutdown(self, reader: threading.Thread) -> Optional[int]:
         pty = self.pty

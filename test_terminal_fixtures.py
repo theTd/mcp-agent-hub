@@ -1,33 +1,22 @@
-"""Terminal corpus fixtures: the goldens re-render, pin today's behaviour and carry no personal data.
+"""Terminal corpus fixtures: layout, bytes, privacy, and the relations between the committed goldens.
 
-Run: ``py -3.15 -B test_terminal_fixtures.py`` from the repository root.
-
-The goldens were rendered from exactly the committed bytes by ``tools/render_terminal_fixtures.py``
-with today's Python code; step 2's Rust parser and history ring must reproduce them byte for byte, so
-this test is the parity gate.  It also guards the *oracle* itself: the renderer must use the hub's own
-objects (``AgentSession``, ``trim_history_text``, ``resume_banner``, the screen and stream classes, the
-socket's replay frame), because a copy of one of them would render goldens nobody compares against the
-hub anymore.
-
-The privacy check reads the host markers from the environment at test time and never stores them: a
-fixture that carries the current user name, machine name, profile path, an absolute path, an e-mail
-address, a UUID or a ``session_<hex>`` handle fails instead of being committed.
-
-Line endings: goldens are compared with ``newline=""``, so a golden's own ``\\r\\n`` is preserved and
-the check is byte-exact rather than whatever the platform's universal-newline reader would give.
+The goldens under ``tools/fixtures/terminal/`` are the spec. They were rendered by the pyte oracle
+(``tools/pyte_oracle.py``, deleted at step 6) and are now compared
+against the Rust core by the corpus gate, ``terminal-core/terminal_stream/tests/fixture_corpus``:
+that harness feeds every case through ``TerminalStream`` and requires the screen, scrollback, raw,
+replay and trim files to match byte for byte (screen rows through ``screen_exceptions.jsonl``, which
+is empty). This file checks what does not need a screen model: the case layout and metadata, the
+recorded sizes, the scrubbed bytes, the privacy scan, and the relations between committed files.
 """
-
 import base64
-import inspect
+import codecs
 import json
 import os
 import re
-import unittest
 from pathlib import Path
+import unittest
 
 import session_manager
-from tools import pyte_oracle
-from tools import render_terminal_fixtures as renderer
 
 FIXTURES_ROOT = Path(__file__).resolve().parent / "tools" / "fixtures" / "terminal"
 LIVE_CASES = ("live-agy", "live-claude", "live-codex", "live-codex-scrolled-paste", "live-kimi",
@@ -63,6 +52,13 @@ EDGE_CASES = (
     "edge-w9-trim-mid-character",
 )
 MAX_CORPUS_BYTES = 2 * 1024 * 1024
+# The design's 80-line screen read (§4) and `_capture_submit_diagnostic`'s character tail.
+SCREEN_LINES = 80
+RAW_TAIL_CHARS = session_manager.SUBMIT_DIAGNOSTIC_TAIL_CHARS
+# The core's W9 constants (`terminal_stream/src/history.rs`, `TRUNCATED_PREFIX`/`BANNER_LINE_MAX_BYTES`).
+# Only the assertions about a golden's over-cap bound read them; no golden is computed from them.
+TRUNCATED_PREFIX = "\x1b[90m[较早的输出已截断]\x1b[0m\r\n"
+BANNER_LINE_MAX_BYTES = 128
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
 UUID_RE = re.compile(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION_ID_RE = re.compile(r"(?i)session_[0-9a-f]{6,}")
@@ -73,20 +69,89 @@ PLACEHOLDER_RE = re.compile(r"<[A-Za-z][A-Za-z0-9_]{0,30}>")
 PLACEHOLDER_NAME_RE = re.compile(r"<[A-Z][A-Z0-9_]{1,20}>")
 
 
+def read_text_exact(path):
+    """Golden bytes as they are: universal-newline translation would hide a CRLF the hub rendered."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def read_chunk_records(path):
+    return [json.loads(line) for line in read_text_exact(path).splitlines() if line.strip()]
+
+
+def decode_chunks(meta, records):
+    """The chunk texts the hub's reader would have produced.
+
+    ``text``: already exactly what ``pty.read`` returned.  ``utf8_bytes``: base64 pipe bytes; one
+    incremental decoder reproduces the core's carry, so every text chunk is the text up to the end
+    of that read and the number of chunks stays what was recorded.
+    """
+    encoding = str(meta.get("chunk_encoding") or "text")
+    if encoding == "text":
+        return [str(record["chunk"]) for record in records]
+    if encoding != "utf8_bytes":
+        raise SystemExit(f"unknown chunk_encoding {encoding!r}")
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    texts = []
+    for record in records:
+        payload = base64.b64decode(str(record["chunk"]))
+        texts.append(decoder.decode(payload, final=False))
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        texts.append(tail)
+    return texts
+
+
+class Case:
+    """One fixture folder: its meta, and its chunk stream as the hub's reader saw it."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.meta = json.loads(read_text_exact(path / "meta.json"))
+        self.chunks = decode_chunks(self.meta, read_chunk_records(path / "chunks.jsonl"))
+
+    @property
+    def kind(self):
+        return str(self.meta.get("kind") or "session")
+
+    @property
+    def engine(self):
+        return str(self.meta.get("engine") or "generic")
+
+    @property
+    def cols(self):
+        return int(self.meta.get("cols") or 120)
+
+    @property
+    def rows(self):
+        return int(self.meta.get("rows") or 36)
+
+    @property
+    def resume_count(self):
+        """Which resume the ``resumed/`` goldens model; meta.json records it, nothing is hardcoded."""
+        return int(self.meta.get("resume_count") or 1)
+
+    @property
+    def resize(self):
+        value = self.meta.get("resize")
+        return value if isinstance(value, dict) else None
+
+
 def case_dirs():
-    return renderer.case_dirs(FIXTURES_ROOT)
+    return sorted(path for path in FIXTURES_ROOT.iterdir()
+                  if path.is_dir() and (path / "meta.json").is_file())
 
 
 def case_meta(name):
-    return json.loads(renderer.read_text_exact(FIXTURES_ROOT / name / "meta.json"))
+    return json.loads(read_text_exact(FIXTURES_ROOT / name / "meta.json"))
 
 
 def case(name):
-    return renderer.Case(FIXTURES_ROOT / name)
+    return Case(FIXTURES_ROOT / name)
 
 
 def golden(name, path):
-    return renderer.read_text_exact(FIXTURES_ROOT / name / path)
+    return read_text_exact(FIXTURES_ROOT / name / path)
 
 
 def corpus_bytes(meta, records):
@@ -107,10 +172,44 @@ def case_texts():
             records = [json.loads(line) for line in raw.splitlines() if line.strip()]
             # The stream as the hub will see it: base64 chunks are the pipe's bytes, decoded with
             # the renderer's UTF-8 carry, so a byte corpus is scanned like a text one.
-            yield path, "".join(renderer.decode_chunks(case_meta(path.parent.name), records))
+            yield path, "".join(decode_chunks(case_meta(path.parent.name), records))
         elif path.suffix == ".json":
             # The JSON file's own text escapes the separators; the decoded values carry them plainly.
             yield path, json.dumps(json.loads(raw), ensure_ascii=False)
+
+
+def generated_chunks(generator):
+    """The corpus a ``trigger`` case's generator block describes: numbered lines, whole-line chunks.
+
+    Deterministic and dependency-free, so the Rust corpus gate regenerates the same bytes from the
+    same block instead of trusting a 600 KB file it cannot read.
+    """
+    template = str(generator["line_format"])
+    terminator = str(generator.get("line_terminator") or "\r\n")
+    first = int(generator.get("first_index") or 0)
+    count = int(generator["count"])
+    chunk_bytes = int(generator.get("chunk_bytes") or 4096)
+    chunks = []
+    pending = ""
+    pending_bytes = 0
+    for index in range(first, first + count):
+        line = template.format(i=index) + terminator
+        size = len(line.encode("utf-8"))
+        if pending and pending_bytes + size > chunk_bytes:
+            chunks.append(pending)
+            pending, pending_bytes = "", 0
+        pending += line
+        pending_bytes += size
+    if pending:
+        chunks.append(pending)
+    return chunks
+
+
+def trigger_seed(case_):
+    """The resume seed a ``trigger`` case starts from: archived lines, then the separator."""
+    spec = case_.meta.get("seed") if isinstance(case_.meta.get("seed"), dict) else {}
+    archived = str(spec.get("archived_repeat") or "") * int(spec.get("archived_count") or 0)
+    return f"{archived}{session_manager.resume_banner(case_.resume_count)}"
 
 
 class TerminalFixtureLayoutTests(unittest.TestCase):
@@ -122,7 +221,7 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
     def test_meta_describes_the_corpus(self):
         for path in case_dirs():
             meta = case_meta(path.name)
-            records = renderer.read_chunk_records(path / "chunks.jsonl")
+            records = read_chunk_records(path / "chunks.jsonl")
             self.assertIn(meta["kind"], ("session", "trim", "input", "trigger"), path.name)
             self.assertTrue(records, f"{path.name}: empty corpus")
             self.assertIn("chunk_encoding", meta, path.name)
@@ -144,7 +243,7 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
         for name in LIVE_CASES:
             meta = case_meta(name)
             recorded = meta["recorder"]
-            records = renderer.read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
+            records = read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
             self.assertEqual(recorded["chunk_count"], len(records), name)
             self.assertLessEqual(corpus_bytes(meta, records), MAX_CORPUS_BYTES, name)
             self.assertTrue(recorded["exit"]["stop_reason"], name)
@@ -163,7 +262,7 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
             self.assertEqual(meta["chunk_encoding"], "utf8_bytes", name)
             self.assertEqual(meta["read_buffer_bytes"], 8192, name)
             self.assertRegex(str(meta["windows_build"]), r"^\d+\.\d+\.\d+(\.\d+)?$", name)
-            records = renderer.read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
+            records = read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")
             joined = b"".join(base64.b64decode(str(record["chunk"])) for record in records)
             joined.decode("utf-8")  # a byte corpus that is not one UTF-8 stream would render as U+FFFD
         # live-agy is still the step-0 pywinpty capture: agy's own MCP config points at the live hub
@@ -179,7 +278,7 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
             scrub = meta.get("scrub") or {}
             self.assertGreaterEqual(scrub.get("runs") or 0, 2, name)
             self.assertEqual(scrub.get("chunks"),
-                             len(renderer.read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")), name)
+                             len(read_chunk_records(FIXTURES_ROOT / name / "chunks.jsonl")), name)
             self.assertNotIn("chars_before", scrub, f"{name}: cumulative block keeps a stale char count")
             last_run = scrub.get("last_run") or {}
             self.assertIsInstance(last_run.get("replacements"), int, name)
@@ -190,64 +289,13 @@ class TerminalFixtureLayoutTests(unittest.TestCase):
                 self.assertIsInstance(rule.get("count"), int, name)
 
 
-class TerminalFixtureOracleTests(unittest.TestCase):
-    def test_the_renderer_uses_the_oracles_objects(self):
-        # `oracle-to-tools`: the pyte model left the hub in step 3b, so the renderer's objects are the
-        # oracle module's own, imported (never copied) by the renderer and the recorder alike.
-        self.assertIs(renderer.PyteOracleSession, pyte_oracle.PyteOracleSession)
-        self.assertIs(renderer.trim_history_text, pyte_oracle.trim_history_text)
-        self.assertIs(renderer.OSC_COLOR_QUERY_RE, pyte_oracle.OSC_COLOR_QUERY_RE)
-        self.assertIs(renderer.resume_banner, session_manager.resume_banner)
-        self.assertIs(renderer.strip_osc_terminal_replies, session_manager.strip_osc_terminal_replies)
-        self.assertIs(renderer.OSC_TERMINAL_REPLY_RE, session_manager.OSC_TERMINAL_REPLY_RE)
-        self.assertIs(renderer.HISTORY_TRIM_SLACK_BYTES, session_manager.HISTORY_TRIM_SLACK_BYTES)
-        self.assertIs(renderer.RESUME_SCROLLBACK_MAX_BYTES,
-                      session_manager.RESUME_SCROLLBACK_MAX_BYTES)
-        self.assertEqual(pyte_oracle.PyteOracleSession.feed_output.__module__, "tools.pyte_oracle")
-        # The screen and stream the goldens are rendered on are the oracle's, not look-alikes.
-        session = renderer.new_session("generic", 60, 12)
-        self.assertIsInstance(session.screen, pyte_oracle.HubTerminalScreen)
-        self.assertIsInstance(session.stream, pyte_oracle.HubTerminalStream)
-        # ... and the hub itself carries no pyte state any more: the terminal is the core's.
-        for name in ("HubTerminalScreen", "HubTerminalStream", "trim_history_text", "OSC_COLOR_QUERY_RE"):
-            self.assertFalse(hasattr(session_manager, name), name)
-
-    def test_the_replay_golden_is_the_frame_the_core_s_socket_sends(self):
-        # §6.4: the ring as it stands, then one more colour-query strip — the same text `attach_sink`
-        # renders for a newly attached socket, which is what the golden pins.
-        session = renderer.new_session("generic", 60, 12)
-        session.raw_history = ["a\x1b]11;?\x07c"]
-        self.assertEqual(renderer.replay_frame(session), session.replay_frame())
-        self.assertEqual(renderer.replay_frame(session), "ac")
-
-    def test_the_seam_names_the_hub_uses_are_the_ones_the_renderer_calls(self):
-        # Both were literals before step 3a; now each is a seam call, so they are pinned by name.
-        diagnostic = " ".join(inspect.getsource(
-            session_manager.HubSessionManager._capture_submit_diagnostic).split())
-        self.assertIn("session.read_raw_tail(SUBMIT_DIAGNOSTIC_TAIL_CHARS)", diagnostic)
-        self.assertEqual(renderer.RAW_TAIL_CHARS, session_manager.SUBMIT_DIAGNOSTIC_TAIL_CHARS)
-        resumed = " ".join(inspect.getsource(
-            session_manager.HubSessionManager._make_resumed_session).split())
-        self.assertIn('seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)',
-                      resumed)
-        self.assertIn("sess.seed_history(seed)", resumed)
-        self.assertEqual(renderer.resume_seed("old", 2), "old" + session_manager.resume_banner(2))
-        self.assertEqual(renderer.resume_seed("", 2), session_manager.resume_banner(2))
-
-
 class TerminalFixtureGoldenTests(unittest.TestCase):
-    def test_goldens_rerender_identically_with_todays_code(self):
-        failures = []
-        for path in case_dirs():
-            failures.extend(renderer.check_case(path))
-        self.assertEqual(failures, [], "goldens differ from a fresh render:\n" + "\n".join(failures))
-
     def test_every_session_case_has_its_replay_frame(self):
         for path in case_dirs():
             meta = case_meta(path.name)
             if meta["kind"] == "session":
                 self.assertTrue((path / "replay.txt").is_file(), path.name)
-                self.assertTrue((path / renderer.RESUMED_DIR / "replay.txt").is_file(), path.name)
+                self.assertTrue((path / "resumed" / "replay.txt").is_file(), path.name)
 
     def test_replay_is_the_join_until_a_query_is_split(self):
         # No colour query in this corpus: the replay is the untrimmed join, identical to raw.
@@ -260,7 +308,8 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         self.assertNotEqual(raw, replay)
         self.assertIn("\x1b]1", raw)
         self.assertNotIn("\x1b]1", replay)
-        self.assertEqual(replay, pyte_oracle.OSC_COLOR_QUERY_RE.sub("", raw))
+        self.assertLess(len(replay), len(raw))
+        # The corpus gate compares both files against the core's own ring and replay.
 
     def test_the_in_loop_trigger_collapses_the_ring_and_keeps_the_tail(self):
         name = "edge-w9-inloop-trigger"
@@ -278,29 +327,30 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
         self.assertGreater(record["bytes_before"] + len(chunks[index].encode("utf-8")),
                            max_bytes + slack, record)
         self.assertLessEqual(record["bytes_after"], max_bytes, record)
-        # The in-loop result: the ring is trim(seed + chunks up to the trigger) plus what followed.
-        seed = renderer.trigger_seed(text)
-        joined = seed + "".join(chunks)
-        expected = (pyte_oracle.trim_history_text(seed + "".join(chunks[:index + 1]), max_bytes)
-                    + "".join(chunks[index + 1:]))
-        self.assertEqual(golden(name, "raw.txt"), expected)
-        # The collapse cuts the front only, so the submit-diagnostic tail is unchanged.
-        self.assertEqual(golden(name, "raw_tail.txt"), joined[-renderer.RAW_TAIL_CHARS:])
+        # The committed history is the collapsed ring: its bytes are what the record counted, and the
+        # collapse cuts the front only, so the submit-diagnostic tail is unchanged.
+        raw = golden(name, "raw.txt")
+        self.assertEqual(record["final_bytes"], len(raw.encode("utf-8")), record)
+        joined = trigger_seed(text) + "".join(chunks)
+        self.assertEqual(golden(name, "raw_tail.txt"), joined[-RAW_TAIL_CHARS:])
         # Every chunk after the collapse appends one entry again; nothing else merges them.
         self.assertEqual(record["final_entries"], 1 + len(chunks) - index - 1, record)
-        self.assertEqual(record["final_bytes"], len(expected.encode("utf-8")), record)
+        # The corpus gate re-runs the collapse through the core's ring and compares raw.txt exactly.
 
     def test_the_trigger_corpus_matches_the_generator_its_meta_describes(self):
-        # Step 2's Rust test regenerates chunks.jsonl from the same block; it must be exact.
+        # The corpus gate regenerates chunks.jsonl from the same block; it must be exact.
         meta = case_meta("edge-w9-inloop-trigger")
-        generated = renderer.generated_chunks(meta["generator"])
+        generated = generated_chunks(meta["generator"])
         self.assertEqual(generated, case("edge-w9-inloop-trigger").chunks)
         total = len("".join(generated).encode("utf-8"))
         self.assertGreaterEqual(total, 600 * 1024)
         self.assertLessEqual(total, 640 * 1024)
 
     def test_the_w9_banner_cases_pin_the_hub_rule(self):
-        prefix = pyte_oracle.HISTORY_TRUNCATED_PREFIX
+        # The prefix is not recomputed here: the budget-zero golden is exactly the prefix the trim
+        # writes, so it is the committed copy of it.
+        prefix = golden("edge-w9-trim-budget-zero", "trimmed.txt")
+        self.assertEqual(prefix, TRUNCATED_PREFIX)
         # The banner's own opening, including the two leading bytes the block may restore; built from
         # the hub's separator so the corpus' resume count (1 or 2) does not matter.
         banner = session_manager.resume_banner(1).split("第")[0]
@@ -326,7 +376,7 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
                 self.assertNotIn("已恢复", trimmed, name)
             # The rule: the banner is kept whole when the budget's own cut (before the hub moves it
             # to a line break) falls before the end of the newest banner line, and dropped when the
-            # cut is at or past that end.  Only the cut is computed here; the trim is the hub's.
+            # cut is at or past that end.  Only the cut is computed here; the trim is the core's.
             raw_cut = len(raw) - budget
             marker_start = len(text[:found + 2].encode("utf-8"))
             banner_end = raw.index(b"\n", marker_start) + 1
@@ -336,15 +386,19 @@ class TerminalFixtureGoldenTests(unittest.TestCase):
                 # The cut is inside the banner line, so keeping it goes over the cap by less than it.
                 self.assertGreater(raw_cut, banner_start, name)
                 self.assertGreater(over, 0, name)
-                self.assertLess(over, pyte_oracle.HISTORY_BANNER_LINE_MAX_BYTES, name)
+                self.assertLess(over, BANNER_LINE_MAX_BYTES, name)
             else:
                 self.assertLessEqual(over, 0, name)
             if name == "edge-w9-banner-lead-crlf":
                 self.assertTrue(trimmed.startswith(prefix + "\r\n"), name)
 
-    def test_a_budget_below_the_prefix_returns_the_prefix(self):
-        name = "edge-w9-trim-budget-zero"
-        self.assertEqual(golden(name, "trimmed.txt"), pyte_oracle.HISTORY_TRUNCATED_PREFIX)
+
+class TerminalFixtureHubStateTests(unittest.TestCase):
+    def test_the_hub_carries_no_pyte_state_of_its_own(self):
+        # `oracle-to-tools` then step 6: the terminal is the core's, and the oracle is gone.
+        for name in ("HubTerminalScreen", "HubTerminalStream", "trim_history_text",
+                     "OSC_COLOR_QUERY_RE"):
+            self.assertFalse(hasattr(session_manager, name), name)
 
 
 class TerminalFixturePrivacyTests(unittest.TestCase):
