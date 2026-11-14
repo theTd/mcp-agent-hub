@@ -20,10 +20,12 @@ use std::time::{Duration, Instant};
 use terminal_stream::FrameSink;
 
 use crate::conpty::{self, SpawnSpec};
+use crate::frame_queue::{FrameQueue, Frames};
 use crate::session::{
-    DrainRecord, RawReply, ResizeError, ScreenReply, Session, SessionFlags, SessionOptions,
-    SessionSnapshot, TextReply, TickFlags,
+    lock_deadline, DrainRecord, RawReply, ResizeError, ScreenReply, Session, SessionFlags,
+    SessionOptions, SessionSnapshot, TextReply, TickFlags,
 };
+use crate::sink_fanout::SinkFanout;
 
 /// Calls this step's Python layer makes. `drain_interval` is the 50 ms notify window; `tick_interval`
 /// is how often the ticker looks (§5.3) and flushes due batches (§5.4).
@@ -32,6 +34,8 @@ pub struct CoreOptions {
     /// Default session flags: a `spawn`'s `flags` dict overrides what it names.
     pub flags: SessionFlags,
     pub write_queue_bytes: usize,
+    /// One socket queue's cap (§5.4's 2 MB of unsent frames); `attach_queue` may override it.
+    pub sink_queue_bytes: usize,
     pub drain_interval: Duration,
     pub tick_interval: Duration,
 }
@@ -41,6 +45,7 @@ impl Default for CoreOptions {
         Self {
             flags: SessionFlags::default(),
             write_queue_bytes: 1024 * 1024,
+            sink_queue_bytes: terminal_stream::SINK_QUEUE_BYTES,
             drain_interval: Duration::from_millis(50),
             tick_interval: Duration::from_millis(5),
         }
@@ -102,6 +107,8 @@ pub struct Stats {
 #[derive(Debug, Clone)]
 pub enum CoreError {
     UnknownSession(String),
+    /// A queue handle this core never issued, or one whose entry `detach_queue` removed.
+    UnknownQueue(u64),
     Spawn(String),
     Invalid(String),
     Deadline(String),
@@ -112,6 +119,7 @@ impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CoreError::UnknownSession(id) => write!(f, "unknown session: {id}"),
+            CoreError::UnknownQueue(handle) => write!(f, "unknown queue handle: {handle}"),
             CoreError::Spawn(message)
             | CoreError::Invalid(message)
             | CoreError::Deadline(message)
@@ -119,6 +127,10 @@ impl std::fmt::Display for CoreError {
         }
     }
 }
+
+/// §5.2's deadline for the temporary bridge and `retire`: the queue registry and the table write are
+/// short, so 50 ms is the same bound the other table reads use.
+const BRIDGE_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Bounded wait for a read lock, so a writer (a spawn inserting a session) cannot hold the hub's loop.
 fn read_deadline<'a, T>(lock: &'a RwLock<T>, deadline: Duration) -> Option<RwLockReadGuard<'a, T>> {
@@ -137,8 +149,44 @@ fn read_deadline<'a, T>(lock: &'a RwLock<T>, deadline: Duration) -> Option<RwLoc
     }
 }
 
+/// `read_deadline`'s writer twin: `retire` inserts no session, but a spawn's insert must not make it
+/// wait past its deadline.
+fn write_deadline<'a, T>(
+    lock: &'a RwLock<T>,
+    deadline: Duration,
+) -> Option<std::sync::RwLockWriteGuard<'a, T>> {
+    let end = Instant::now() + deadline;
+    loop {
+        match lock.try_write() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= end {
+                    return None;
+                }
+                thread::sleep(Duration::from_micros(200));
+            }
+        }
+    }
+}
+
+/// One Python socket's registration (§5.2's temporary bridge): the queue it drains, and where the sink
+/// sits so a detach needs neither the session table nor the id's current incarnation.
+struct AttachedQueue {
+    session_id: String,
+    fanout: Arc<SinkFanout>,
+    /// `None` while the registration is still in flight (the entry exists first, so a failed or racing
+    /// retire can never leave a registered sink nobody can detach).
+    sink_handle: Option<u64>,
+    queue: Arc<FrameQueue>,
+}
+
 pub struct Core {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
+    /// Step 3b's temporary bridge (§5.2): the Python socket's queue per handle. Handles are unique per
+    /// core, not per id, because `take_frames`/`detach_queue` name the queue alone.
+    queues: Mutex<HashMap<u64, AttachedQueue>>,
+    next_queue_handle: AtomicU64,
     /// Returns whether the wakeup actually ran: the binding's `try_attach` skips it at interpreter
     /// teardown, and a skipped call must not be counted as a notify (nit 7).
     notify: Box<dyn Fn() -> bool + Send + Sync>,
@@ -168,6 +216,9 @@ impl Core {
         let panics = Arc::new(AtomicU64::new(0));
         let core = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
+            queues: Mutex::new(HashMap::new()),
+            // Handle 0 is never handed out, so a missing handle and a real one are distinguishable.
+            next_queue_handle: AtomicU64::new(1),
             notify,
             log: Arc::from(log),
             opts,
@@ -215,11 +266,17 @@ impl Core {
                 // §5.4: the ticker is the one place a session's batch is flushed on its time window (the
                 // reader only flushes a batch that already reached 32 KiB). A spawn's write lock makes a
                 // tick skip its flush; the next tick is 5 ms away.
+                //
+                // The table lock is released before any flush: `flush_frames` waits for the id's delivery
+                // lock, and a slow `deliver` would otherwise hold the table against a spawn insert or a
+                // `retire` for as long as it is slow.
                 let now = Instant::now();
-                if let Ok(map) = self.sessions.try_read() {
-                    for session in map.values() {
-                        let _ = catch_unwind(AssertUnwindSafe(|| session.flush_frames(now)));
-                    }
+                let sessions: Vec<Arc<Session>> = match self.sessions.try_read() {
+                    Ok(map) => map.values().cloned().collect(),
+                    Err(_) => Vec::new(),
+                };
+                for session in sessions {
+                    let _ = catch_unwind(AssertUnwindSafe(|| session.flush_frames(now)));
                 }
                 let urgent = self.tick.urgent.swap(false, Ordering::AcqRel);
                 let pending = self.tick.pending.swap(false, Ordering::AcqRel);
@@ -582,6 +639,151 @@ impl Core {
 
     pub fn detach_sink(&self, id: &str, handle: u64) -> Result<bool, CoreError> {
         Ok(self.session(id)?.detach_sink(handle))
+    }
+
+    /// **Temporary (step 4 deletes it).** Registers a bounded [`FrameQueue`] on the id's fan-out — the
+    /// `FrameSink` step 4's socket thread drains itself — and returns the replay that belongs with the
+    /// registration plus the queue's handle. The replay snapshot and the registration are one step
+    /// inside `attach_sink` (Q11): every byte is in the replay or in the queue's frames, never both.
+    ///
+    /// `max_bytes` overrides §5.4's 2 MB (`CoreOptions::sink_queue_bytes`). Handles are unique per core
+    /// and survive a resume of the id: the queue is registered on the **id's** fan-out (`take_over`
+    /// carries it), so a handle taken before a resume keeps receiving after the predecessor's last bytes
+    /// and the separator.
+    pub fn attach_queue(
+        &self,
+        id: &str,
+        max_bytes: Option<usize>,
+    ) -> Result<(String, u64), CoreError> {
+        let session = self.session(id)?;
+        let cap = max_bytes.unwrap_or(self.opts.sink_queue_bytes);
+        if cap == 0 {
+            return Err(CoreError::Invalid(
+                "attach_queue needs a byte cap >= 1".into(),
+            ));
+        }
+        let queue = Arc::new(FrameQueue::new(cap));
+        let fanout = session.fanout();
+        let handle = self.next_queue_handle.fetch_add(1, Ordering::Relaxed);
+        // The entry goes in before the registration, so a retire that lands in between closes this queue
+        // (it reports `closed`) instead of leaving a registered sink no handle can reach.
+        {
+            let mut queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
+                .ok_or_else(|| CoreError::Deadline("queue table busy, nothing attached".into()))?;
+            queues.insert(
+                handle,
+                AttachedQueue {
+                    session_id: id.to_string(),
+                    fanout: Arc::clone(&fanout),
+                    sink_handle: None,
+                    queue: Arc::clone(&queue),
+                },
+            );
+        }
+        let (replay, sink_handle) = session.attach_sink(Arc::clone(&queue) as Arc<dyn FrameSink>);
+        let mut queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
+            .ok_or_else(|| CoreError::Deadline("queue table busy, nothing attached".into()))?;
+        let orphaned = match queues.get_mut(&handle) {
+            // The normal case: the entry is still here, so a later detach can unregister the sink.
+            Some(entry) if !entry.queue.is_closed() => {
+                entry.sink_handle = Some(sink_handle);
+                false
+            }
+            // A detach or retire emptied the entry while the registration was in flight: unregister the
+            // sink instead of holding a queue nobody polls.
+            _ => true,
+        };
+        drop(queues);
+        if orphaned {
+            fanout.detach(sink_handle);
+        }
+        Ok((replay, handle))
+    }
+
+    /// **Temporary (step 4 deletes it).** Non-blocking: the frames queued since the last take, in
+    /// arrival order, this queue's **cumulative** dropped bytes, and whether it is closed (the id was
+    /// retired) — which is what lets the Python socket close with code 1000 as `close_ws_frontends`
+    /// does today. A detached or never-issued handle is `KeyError`.
+    pub fn take_frames(&self, handle: u64) -> Result<Frames, CoreError> {
+        let queue = {
+            let queues = lock_deadline(&self.queues, BRIDGE_DEADLINE)
+                .ok_or_else(|| CoreError::Deadline("queue table busy, nothing taken".into()))?;
+            queues
+                .get(&handle)
+                .map(|entry| Arc::clone(&entry.queue))
+                .ok_or(CoreError::UnknownQueue(handle))?
+        };
+        // The registry lock is released before the queue's own: a taker must not stall another socket's
+        // take or a session's retire.
+        Ok(queue.take())
+    }
+
+    /// **Temporary (step 4 deletes it).** Closes the queue, unregisters the sink and forgets the handle:
+    /// `true` when this call detached it, `false` for a handle that was never issued or is already
+    /// detached (a second detach). Works across a resume, like `detach_sink`.
+    pub fn detach_queue(&self, handle: u64) -> bool {
+        let entry = match lock_deadline(&self.queues, BRIDGE_DEADLINE) {
+            Some(mut queues) => queues.remove(&handle),
+            None => None,
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        entry.queue.close();
+        if let Some(sink_handle) = entry.sink_handle {
+            entry.fanout.detach(sink_handle);
+        }
+        true
+    }
+
+    /// Removes an ended session from the table, so its ring (512 KiB + slack) and its 3000-row screen stop
+    /// living for the hub's lifetime. `Ok(false)` for an unknown id; `ValueError` for a live one (the hub
+    /// kills first) and for an end whose record has not been drained yet — the exit record is the one
+    /// report that cannot be re-created, so `retire` never drops it (the next drain carries it, then the
+    /// hub retires).
+    ///
+    /// Every queue attached to the id is closed (`take_frames` reports `closed`) and the fan-out is
+    /// retired; a later `spawn`/`attach_text` of the same id builds a fresh fan-out, so it carries
+    /// nothing over from the incarnation this call removed.
+    pub fn retire(&self, id: &str) -> Result<bool, CoreError> {
+        let (session, fanout) = {
+            let mut sessions = write_deadline(&self.sessions, BRIDGE_DEADLINE)
+                .ok_or_else(|| CoreError::Deadline(format!("session table busy, {id} not retired")))?;
+            let Some(session) = sessions.get(id).cloned() else {
+                return Ok(false);
+            };
+            if let Some(reason) = session.retire_refusal() {
+                return Err(CoreError::Invalid(format!(
+                    "session {id} cannot be retired: {reason}"
+                )));
+            }
+            sessions.remove(id);
+            let fanout = session.fanout();
+            (session, fanout)
+        };
+        // The table's reference goes first, so the incarnation is released here (pipes, a console close
+        // helper) instead of waiting behind the fan-out. That is also what makes an `attach_sink`
+        // racing this call able to hold the last reference: it drops its owner with no delivery lock
+        // held (`Session::drop` asserts that in test builds).
+        drop(session);
+        self.close_queues_of(id);
+        // No lock from here on: closing a fan-out hands back its sinks and a sink's `Drop` may wait on a
+        // socket.
+        drop(fanout.close());
+        Ok(true)
+    }
+
+    /// Closes every queue registered for `id` and keeps its entry: `take_frames` must still answer
+    /// `closed = true` until the socket detaches (§5.2 `retire`).
+    fn close_queues_of(&self, id: &str) {
+        let Some(queues) = lock_deadline(&self.queues, BRIDGE_DEADLINE) else {
+            return;
+        };
+        for entry in queues.values() {
+            if entry.session_id == id {
+                entry.queue.close();
+            }
+        }
     }
 
     /// §5.2's `snapshot_all`: every session's archive-ready state inside one budget.

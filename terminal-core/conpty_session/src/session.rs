@@ -114,6 +114,9 @@ pub struct DrainRecord {
     pub degraded: bool,
     /// Bumped once per read that reached the parser, so a reader can tell screens apart.
     pub screen_rev: u64,
+    /// The raw ring's revision (`_scrollback_blob`'s change gate, the seam's `raw_revision`): the same
+    /// number `raw`'s reply carries, available without joining the ring.
+    pub raw_rev: u64,
     /// Only for a watched session whose `screen_rev` changed and whose interval is due.
     pub screen_text: Option<String>,
 }
@@ -582,6 +585,15 @@ pub struct Session {
     chunks_total: AtomicU64,
     /// The stream's `screen_rev`, mirrored so `drain` reads atomics only (§5.3).
     screen_rev: AtomicU64,
+    /// The ring's `raw_rev`, mirrored for the same reason: the seam's `raw_revision` must not join the
+    /// ring (`_scrollback_blob`'s change gate).
+    raw_rev: AtomicU64,
+    /// `true` once a drain reported this incarnation's death record. `retire` refuses before that, so
+    /// the exit record (code, `crashed`) cannot be dropped with the session.
+    death_reported: AtomicBool,
+    /// `true` when an exit code was learned after the death record went out and no drain has carried it
+    /// yet (SF3): `retire` waits for it the same way.
+    code_pending: AtomicBool,
     dropped_bytes: AtomicU64,
     last_output_ms: AtomicU64,
     dirty: AtomicBool,
@@ -651,6 +663,9 @@ impl Session {
             output_ended: AtomicBool::new(false),
             bytes_total: AtomicU64::new(0),
             screen_rev: AtomicU64::new(0),
+            raw_rev: AtomicU64::new(0),
+            death_reported: AtomicBool::new(false),
+            code_pending: AtomicBool::new(false),
             chunks_total: AtomicU64::new(0),
             dropped_bytes: AtomicU64::new(0),
             last_output_ms: AtomicU64::new(0),
@@ -1108,6 +1123,7 @@ impl Session {
             batch.push(frame, now);
         }
         let rev = stream.screen_rev();
+        let raw_rev = stream.raw_rev();
         let processed = frame.len() as u64;
         let ring_dropped = stream.ring_dropped_bytes();
         drop(guard);
@@ -1120,6 +1136,7 @@ impl Session {
             Ordering::Relaxed,
         );
         self.screen_rev.store(rev, Ordering::Relaxed);
+        self.raw_rev.store(raw_rev, Ordering::Relaxed);
         self.bytes_total.fetch_add(processed, Ordering::Relaxed);
         self.chunks_total.fetch_add(1, Ordering::Relaxed);
         self.last_output_ms.store(now_unix_ms(), Ordering::Relaxed);
@@ -1174,6 +1191,11 @@ impl Session {
             .compare_exchange(-1, code, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
+            // A code learned after the death record went out is a record of its own, and `retire` must
+            // not drop it (§5.3 SF3).
+            if self.death_reported.load(Ordering::Acquire) {
+                self.code_pending.store(true, Ordering::Release);
+            }
             self.dirty.store(true, Ordering::Release);
             self.tick.pending.store(true, Ordering::Release);
         }
@@ -1635,6 +1657,11 @@ impl Session {
     /// Never returns a handle it did not register: a sink that panicked earlier leaves a poisoned sink
     /// list behind, and `register` recovers it with `into_inner`.
     pub fn attach_sink(&self, sink: Arc<dyn FrameSink>) -> (String, u64) {
+        // The owner `Arc<Session>` taken for the replay is released **after** the delivery lock: once
+        // `retire` exists, an attach through a predecessor can hold the last reference to the owner, and
+        // dropping it here would run `Session::drop` (pipes, console close helper) under the lock that
+        // every delivery needs. So it is parked outside the locked block and dropped below.
+        let owner_slot;
         let (replay, handle, delivery) = {
             let _delivery = self.fanout.lock_delivery();
             // The replay, and the pending batch that goes with it, must come from the incarnation whose
@@ -1654,15 +1681,15 @@ impl Session {
             // The pending batch already reached the other sinks, except when the frame that carried it
             // was taken by a sink that has since detached; `skip` is this sink, whose replay holds those
             // bytes.
-            let delivery = match pending {
-                Some(frame) => match owner {
-                    Some(owner) => owner.fan_out(&frame, Some(handle)),
-                    None => self.fan_out(&frame, Some(handle)),
-                },
-                None => Delivery::default(),
+            let delivery = match (pending, &owner) {
+                (Some(frame), Some(owner)) => owner.fan_out(&frame, Some(handle)),
+                (Some(frame), None) => self.fan_out(&frame, Some(handle)),
+                (None, _) => Delivery::default(),
             };
+            owner_slot = owner;
             (replay, handle, delivery)
         };
+        drop(owner_slot);
         self.report_delivery(delivery);
         (replay, handle)
     }
@@ -1864,10 +1891,12 @@ impl Session {
             return None;
         }
         let last_ms = self.last_output_ms.load(Ordering::Relaxed);
-        Some(DrainRecord {
+        let alive = self.alive.load(Ordering::Acquire);
+        let exit_code = self.exit_code();
+        let record = DrainRecord {
             session_id: self.id.clone(),
-            alive: self.alive.load(Ordering::Acquire),
-            exit_code: self.exit_code(),
+            alive,
+            exit_code,
             pid: self.pid,
             bytes_total: self.bytes_total.load(Ordering::Relaxed),
             chunks_total: self.chunks_total.load(Ordering::Relaxed),
@@ -1880,8 +1909,37 @@ impl Session {
             crashed: self.crashed.load(Ordering::Acquire),
             degraded: self.degraded.load(Ordering::Acquire),
             screen_rev: self.screen_rev.load(Ordering::Relaxed),
+            raw_rev: self.raw_rev.load(Ordering::Relaxed),
             screen_text: self.watched_screen(Instant::now()),
-        })
+        };
+        // This record is the report `retire` waits for: the death (code, crashed) is in it, and a code
+        // learned after the death record is carried by the first record that has one.
+        if !alive {
+            self.death_reported.store(true, Ordering::Release);
+        }
+        if exit_code.is_some() {
+            self.code_pending.store(false, Ordering::Release);
+        }
+        Some(record)
+    }
+
+    /// Why this incarnation must not leave the table yet, or `None` when the hub has everything it can
+    /// still get from it. The exit record is the one report that cannot be re-created once the session
+    /// is gone, so `retire` refuses until a drain has carried it — and until a code learned after it has
+    /// gone out too (§5.2 `retire`, §5.3 SF3).
+    pub(crate) fn retire_refusal(&self) -> Option<&'static str> {
+        if self.alive() {
+            return Some("it is still running; kill it first");
+        }
+        if !self.death_reported.load(Ordering::Acquire) || self.code_pending.load(Ordering::Acquire) {
+            return Some("its exit record has not been drained yet");
+        }
+        None
+    }
+
+    /// The id's delivery state; `Core::attach_queue` keeps it so a handle detaches without the table.
+    pub(crate) fn fanout(&self) -> Arc<SinkFanout> {
+        Arc::clone(&self.fanout)
     }
 
     pub fn alive(&self) -> bool {
@@ -1912,6 +1970,16 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Once `retire` takes the table's reference away before it closes the fan-out, a drop under the
+        // id's delivery lock is reachable (an `attach_sink` through the predecessor holding the last
+        // owner `Arc`), and it would close pipes and wait on a console helper while every delivery
+        // waits. `attach_sink` therefore drops the owner after the lock; this catches a regression.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            !self.fanout.delivery_held_here(),
+            "session {} dropped while its delivery lock was held",
+            self.id
+        );
         // Unblocks the writer thread and lets it exit; the pipes close with `Resources`. No `log` call
         // here: this can run on the Python GC thread during interpreter teardown.
         self.writer.close();

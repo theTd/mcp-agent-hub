@@ -7,6 +7,8 @@
 pub mod command_line;
 pub mod conpty;
 pub mod core;
+/// One console socket's bounded queue (§5.4): step 4's socket sink, drained from Python until then.
+mod frame_queue;
 pub mod handles;
 pub mod job;
 pub mod job_tree;
@@ -21,6 +23,7 @@ pub mod test_hooks;
 pub use core::{
     Core, CoreError, CoreOptions, SpawnReply, SpawnRequest, Stats, TextRequest,
 };
+pub use frame_queue::{FrameQueue, Frames};
 pub use session::{
     DrainRecord, RawReply, ScreenReply, SessionFlags, SessionSnapshot, TextReply,
 };
