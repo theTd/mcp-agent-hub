@@ -147,7 +147,7 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.hub.build_resume_launch(claude_record)["env"]["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "55")
 
     async def test_http_and_mcp_forward_the_threshold(self):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             preview = await client.post("/api/launch-preview",
                                         json={"profile_id": "codex", "compaction_threshold": "300k"})
             self.assertTrue(preview.json()["ok"])

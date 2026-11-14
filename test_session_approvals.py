@@ -368,7 +368,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_preview_create_and_invalid_values(self):
         self.profile("codex", True)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             preview = await client.post("/api/launch-preview", json={"profile_id": "codex", "cwd": str(self.root), "bypass_approvals": False})
             self.assertTrue(preview.json()["high_risk_approval"])
             self.assertEqual(preview.json()["approval_source"], "session")
@@ -406,7 +406,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_d13_http_and_mcp_forward_approval_mode(self):
         self.profile("codex", False)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://127.0.0.1:4444") as client:
             preview = (await client.post("/api/launch-preview", json={
                 "profile_id": "codex", "cwd": str(self.root), "approval_mode": "ask"})).json()
             self.assertEqual((preview["approval_mode"], preview["approval_source"]), ("ask", "session"))
