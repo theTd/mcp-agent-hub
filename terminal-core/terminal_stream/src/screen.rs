@@ -21,22 +21,25 @@
 //! clears the target. `get_clean_screen_text` renders `Screen.display` on every read, which materialises
 //! every row anyway, and no corpus case runs IL/DL at all.
 //!
-//! Combining marks are appended to the previous cell as pyte does, but without its NFC pass
-//! (`unicodedata.normalize`): no recording in the corpus carries a combining mark, and the normalisation
-//! tables would be a new dependency. A composed pair therefore renders as base + mark here.
+//! Combining marks are appended to the previous cell and the cell is NFC-composed, like pyte's
+//! `unicodedata.normalize("NFC", cell.data + mark)`: `unicode-normalization` supplies the tables (decision
+//! `nfc-compose`). A pair with no precomposed form keeps its marks as separate code points, as pyte's does.
 
 use std::collections::{BTreeSet, VecDeque};
 
+use unicode_normalization::UnicodeNormalization;
 use vte::{Params, Perform};
 
 use crate::width::{char_width, is_combining};
 
-/// A cell's text: `'\0'` marks a wide character's stub, which renders as nothing in a history row and
-/// as one space in the screen renderer (pyte's `HubTerminalScreen.display` papers the stub over).
+/// A cell's text: `'\0'` marks pyte's empty string (`data == ""`), which is a wide character's stub cell
+/// and renders as nothing in a history row and as one space in the screen renderer, unless a combining
+/// mark has landed on it (pyte then stores the mark there and the safe `display` yields it).
 const STUB: char = '\0';
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Cell {
+    /// The first character of the cell's text, or `STUB` when the text starts with a mark or is empty.
     ch: char,
     /// 0 = none; otherwise `index + 1` into `Screen::marks`.
     marks: u32,
@@ -92,7 +95,8 @@ pub struct Screen {
     saved_columns: Option<usize>,
     savepoints: Vec<Savepoint>,
     tabstops: BTreeSet<usize>,
-    /// Combining marks folded into a cell, addressed by `Cell::marks`.
+    /// A cell's text after its first character, addressed by `Cell::marks`: the NFC-folded marks that the
+    /// base did not compose into a single character.
     marks: Vec<Box<str>>,
 }
 
@@ -242,7 +246,7 @@ impl Screen {
                 continue;
             }
             let cell = row.cells.get(x).copied().unwrap_or(BLANK);
-            if cell.is_stub() {
+            if cell.is_stub() && cell.marks == 0 {
                 // pyte's safe renderer yields one space for an empty cell, so the stub occupies a column.
                 out.push(' ');
                 continue;
@@ -257,13 +261,13 @@ impl Screen {
         out
     }
 
-    /// A history row as `get_full_scrollback_text` renders it: every column contributes its cell's text,
-    /// so a wide character's stub contributes nothing at all.
+    /// A history row as `get_full_scrollback_text` renders it: every column contributes its `Char.data`, so
+    /// a wide character's stub contributes nothing until a mark lands on it, and then the mark.
     fn raw_row(&self, row: &Row) -> String {
         let mut out = String::with_capacity(self.cols);
         for x in 0..self.cols {
             let cell = row.cells.get(x).copied().unwrap_or(BLANK);
-            if cell.is_stub() {
+            if cell.is_stub() && cell.marks == 0 {
                 continue;
             }
             self.push_cell_text(&mut out, cell);
@@ -271,8 +275,12 @@ impl Screen {
         out
     }
 
+    /// A cell's text as pyte's `Char.data` holds it: its first character (`STUB` is `""`, so it contributes
+    /// nothing) followed by the marks folded into it.
     fn push_cell_text(&self, out: &mut String, cell: Cell) {
-        out.push(cell.ch);
+        if !cell.is_stub() {
+            out.push(cell.ch);
+        }
         if cell.marks != 0 {
             if let Some(marks) = self.marks.get((cell.marks - 1) as usize) {
                 out.push_str(marks);
@@ -663,11 +671,12 @@ impl Screen {
         }
     }
 
-    /// pyte folds a combining mark into the cell to the left, or the previous row's last cell.
+    /// pyte folds a combining mark into the cell to the left, or the previous row's last cell: the cell's
+    /// text becomes `unicodedata.normalize("NFC", cell.data + mark)`.
     ///
-    /// Only the marks are stored: the cell's own character is printed once by `push_cell_text`, and pyte
-    /// holds the base and the marks in one string. pyte additionally NFC-composes that string, which
-    /// needs `unicodedata.normalize`; the marks are kept unnormalised (`screen_exceptions.jsonl`).
+    /// The cell keeps only that text's first character in `ch` and the rest in `marks`; a pair with no
+    /// precomposed form therefore stays several code points. A stub cell's text is `""`, so a mark after a
+    /// wide character becomes the cell's whole text, exactly as pyte stores it.
     fn combine(&mut self, ch: char) {
         let (x, y) = if self.x > 0 {
             (self.x - 1, self.y)
@@ -683,14 +692,26 @@ impl Screen {
             return;
         };
         let mut text = String::new();
+        if !cell.is_stub() {
+            text.push(cell.ch);
+        }
         if cell.marks != 0 {
             if let Some(marks) = self.marks.get((cell.marks - 1) as usize) {
                 text.push_str(marks);
             }
         }
         text.push(ch);
-        self.marks.push(text.into_boxed_str());
-        cell.marks = self.marks.len() as u32;
+        let composed: String = text.nfc().collect();
+        let mut parts = composed.chars();
+        let base = parts.next().unwrap_or(STUB);
+        let rest: &str = parts.as_str();
+        cell.ch = base;
+        cell.marks = if rest.is_empty() {
+            0
+        } else {
+            self.marks.push(rest.to_string().into_boxed_str());
+            self.marks.len() as u32
+        };
     }
 }
 
@@ -912,5 +933,59 @@ mod tests {
         // already is.
         let screen = screen(4, 1, 10, "ab\x1b[?1049hcd\x1b[?1049l");
         assert_eq!(screen.screen_text(0), "abcd");
+    }
+
+    // The expected strings below are Python 3.15's (`unicodedata.unidata_version` is 17.0.0), through the
+    // hub's pre-seam `HubTerminalScreen` and `get_clean_screen_text`/`get_full_scrollback_text`
+    // renderers. Each test quotes the command that produced its cell text.
+
+    #[test]
+    fn a_combining_mark_composes_with_its_base() {
+        // py -3.15 -c "import unicodedata; print(ascii(unicodedata.normalize('NFC','e\u0301')))"
+        // -> '\xe9' (U+00E9)
+        let screen = screen(4, 1, 10, "e\u{301}");
+        assert_eq!(screen.screen_text(0), "\u{e9}");
+        assert_eq!(screen.scrollback_text(10), "\u{e9}");
+        assert_eq!(screen.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn two_marks_compose_in_canonical_order() {
+        // py -3.15 -c "import unicodedata; print(ascii(unicodedata.normalize('NFC','e\u0302\u0301')))"
+        // -> '\u1ebf' (U+1EBF): e composes with the circumflex, then that character with the acute.
+        let screen = screen(4, 1, 10, "e\u{302}\u{301}");
+        assert_eq!(screen.screen_text(0), "\u{1ebf}");
+        assert_eq!(screen.scrollback_text(10), "\u{1ebf}");
+    }
+
+    #[test]
+    fn a_mark_without_a_precomposed_form_stays_a_separate_code_point() {
+        // py -3.15 -c "import unicodedata; print(ascii(unicodedata.normalize('NFC','q\u0301')))"
+        // -> 'q\u0301' (U+0071 U+0301): there is no precomposed q-acute.
+        let screen = screen(4, 1, 10, "q\u{301}");
+        assert_eq!(screen.screen_text(0), "q\u{301}");
+        assert_eq!(screen.scrollback_text(10), "q\u{301}");
+    }
+
+    #[test]
+    fn a_mark_after_a_wide_character_lands_on_its_stub_cell() {
+        // py -3.15 -c "import unicodedata; print(ascii(unicodedata.normalize('NFC','\u4e2d\u0301')))"
+        // -> '\u4e2d\u0301'. pyte stores the mark in the stub cell (its data was ""), so `display` skips it
+        // with the wide character's second column and the mark is invisible on screen, while the history
+        // renderer joins every cell's data and keeps it.
+        let on_screen = screen(4, 1, 10, "\u{4e2d}\u{301}");
+        assert_eq!(on_screen.screen_text(0), "\u{4e2d}");
+        let scrolled = screen(4, 1, 10, "\u{4e2d}\u{301}\r\n");
+        assert_eq!(scrolled.screen_text(0), "");
+        assert_eq!(scrolled.scrollback_text(10), "\u{4e2d}\u{301}");
+    }
+
+    #[test]
+    fn a_mark_composes_onto_a_cell_that_already_holds_a_composed_character() {
+        // py -3.15 -c "import unicodedata; print(ascii(unicodedata.normalize('NFC','\u00e9\u0302')))"
+        // -> '\xe9\u0302': the composition table has ê + acute (U+1EBF), not é + circumflex, so the cell
+        // keeps both code points. This is row 1 of `edge-screen-combining` in the corpus.
+        let screen = screen(4, 1, 10, "\u{e9}\u{302}");
+        assert_eq!(screen.screen_text(0), "\u{e9}\u{302}");
     }
 }
