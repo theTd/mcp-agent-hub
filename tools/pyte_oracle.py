@@ -316,8 +316,6 @@ class PyteOracleSession:
         self.raw_history_rev = 0
         # W8: a resumed session's ESC[3J, kept across a sequence split over two chunks.
         self._esc3j_carry = ""
-        # The registration `attach_ws_queue` makes; only the replay is read here.
-        self._replay_queues: List[object] = []
 
     # ---- the producer, as `AgentSession._on_pty_output` was -------------------------------
 
@@ -431,17 +429,13 @@ class PyteOracleSession:
         self.raw_history_rev = 1
         self._esc3j_carry = ""
 
-    def attach_ws_queue(self) -> Tuple[str, object]:
-        """The replay a new console got: the joined ring, then one more colour-query strip."""
+    def replay_frame(self) -> str:
+        """The replay the console's socket sends on connect (§6.4).
+
+        The joined ring with one more colour-query strip; the core renders it inside `attach_sink`,
+        and this oracle is the offline golden's copy of that same computation.
+        """
         replay = "".join(self.raw_history)
         if "\x1b]" in replay:
             replay = OSC_COLOR_QUERY_RE.sub("", replay)
-        queue: Dict[str, Any] = {}
-        self._replay_queues.append(queue)
-        return replay, queue
-
-    def detach_ws_queue(self, queue: object) -> None:
-        try:
-            self._replay_queues.remove(queue)  # type: ignore[arg-type]
-        except ValueError:
-            pass
+        return replay

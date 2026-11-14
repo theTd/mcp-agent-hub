@@ -416,6 +416,9 @@ SHUTDOWN_CORE_STOP_MAX_SEC = 1.5
 # of the stop is bounded by what is left of the one 8 s budget, never by a fresh timeout.
 SHUTDOWN_KILL_MAX_SEC = 2.0
 SHUTDOWN_ARCHIVE_RESERVE_SEC = 1.0
+# W7 at the stop: one batch of `close_sockets` calls, off the loop and inside the shared budget, so
+# every open pane is told its socket ended before the process ends.
+SHUTDOWN_CLOSE_SOCKETS_MAX_SEC = 0.5
 # r2-kimi 2: a death that preceded the stop can be published one drain later (core contract 5). The stop
 # drains this many times, one drain interval apart, before it decides any reason, so such a death still
 # takes the ordinary exit path instead of being archived as an interruption.
@@ -726,8 +729,6 @@ KILL_GRACE_MS = 1500
 # a generic engine's watched screen may be rendered for the tool-line scan (§5.6).
 TERMINAL_HISTORY_ROWS = 3000
 TOOL_LINE_SCAN_INTERVAL_MS = 250
-# `/ws/pty`'s queue held 500 frames under asyncio before the swap; the core bounds the bytes.
-WS_QUEUE_MAX_FRAMES = 500
 
 
 class ScreenRead(NamedTuple):
@@ -2163,135 +2164,6 @@ def _dsh_end_unrecorded(job: Dict[str, Any], last_turn_completed_at: Optional[fl
     return float(last_turn_completed_at) < ended_at - DSH_END_RECORD_SLACK_SEC
 
 
-class TerminalSockets:
-    """The console sockets attached to one session id: the `/ws/pty` bridge of step 3b.
-
-    They belong to the id, never to one incarnation (`rtc-sinks-per-id`): the core's handle, the
-    Python queue and the closer stay in this one structure while a resume replaces the session
-    object behind them, so a socket that connected before the resume keeps receiving (§6.4 A1).
-    Step 4 deletes the whole structure with the core's own socket.
-    """
-
-    __slots__ = ("handles", "closers", "dropped", "overflow", "pending", "orphans", "slow",
-                 "detach_inflight")
-
-    def __init__(self) -> None:
-        self.handles: Dict[asyncio.Queue, int] = {}
-        self.closers: Dict[asyncio.Queue, Callable[[], Any]] = {}
-        # `take_frames`' cumulative drop count per handle (bytes the core's own queue lost), to log
-        # a slow client once.
-        self.dropped: Dict[int, int] = {}
-        # Frames this side had to drop because they exceeded the socket's window (F13), per handle;
-        # kept apart from `dropped`, whose unit is bytes and whose source is the core.
-        self.overflow: Dict[int, int] = {}
-        # Frames taken from a handle whose Python queue was full, by handle, in arrival order: the
-        # next tick offers them again instead of silently dropping the rest of the batch (F13).
-        self.pending: Dict[int, List[str]] = {}
-        # Handles whose `detach_queue` has to be retried off the loop (F7/F8): a closed fan-out and
-        # a busy registry both leave the core's sink registered until the detach succeeds.
-        self.orphans: Set[int] = set()
-        self.detach_inflight: Set[int] = set()
-        # Handles whose slow-client warning was already logged.
-        self.slow: Set[int] = set()
-
-
-def release_terminal_handle(core: Core, handle: int) -> bool:
-    """`detach_queue(handle)` once; True when the handle is gone from the core or need not be.
-
-    The coming core raises `TimeoutError` on a busy registry and keeps the sink registered, so a
-    miss is retried later (F8); `KeyError`/`False` mean never issued or already detached, which is
-    normal teardown. Blocking (registry deadline): the retries run off the loop.
-    """
-    try:
-        core.detach_queue(handle)
-    except KeyError:
-        return True
-    except TimeoutError:
-        return False
-    except Exception:
-        logger.debug("detach_queue(%s) failed", handle, exc_info=True)
-        return True
-    return True
-
-
-def drain_terminal_frames(core: Core, session_id: str, sockets: TerminalSockets) -> None:
-    """The bridge's consumer: move each attached socket's frames onto its queue (§5.2, step 4 removes it).
-
-    `take_frames` is non-blocking and reports the queue's cumulative drop count and whether the id
-    was retired; a closed queue closes its socket with code 1000, which is what the hub's own
-    `close_ws_frontends` does when it drops the session, and the handle is then detached exactly
-    once (F7).
-    """
-    for handle, backlog in list(sockets.pending.items()):
-        q = next((q for q, h in sockets.handles.items() if h == handle), None)
-        if q is None:
-            sockets.pending.pop(handle, None)
-            continue
-        rest = _offer_frames(sockets, session_id, handle, q, backlog)
-        if rest:
-            sockets.pending[handle] = rest
-        else:
-            sockets.pending.pop(handle, None)
-    for q, handle in list(sockets.handles.items()):
-        try:
-            frames, dropped, closed = core.take_frames(handle)
-        except KeyError:
-            # Detached between the snapshot and this call: the socket is already gone.
-            sockets.handles.pop(q, None)
-            sockets.closers.pop(q, None)
-            sockets.dropped.pop(handle, None)
-            sockets.overflow.pop(handle, None)
-            sockets.pending.pop(handle, None)
-            continue
-        if dropped > sockets.dropped.get(handle, 0):
-            sockets.dropped[handle] = dropped
-            logger.warning("terminal socket of %s dropped %d bytes (slow client)", session_id, dropped)
-        rest = _offer_frames(sockets, session_id, handle,
-                             q, [frame.decode("utf-8", "replace") for frame in frames])
-        if rest:
-            sockets.pending[handle] = rest
-        if closed:
-            sockets.handles.pop(q, None)
-            sockets.dropped.pop(handle, None)
-            sockets.overflow.pop(handle, None)
-            sockets.pending.pop(handle, None)
-            # The core keeps a retired id's handle until it is detached (§5.2), so the closed sink
-            # is released here, once; a busy registry leaves it to the manager's off-loop retry.
-            if not release_terminal_handle(core, handle):
-                sockets.orphans.add(handle)
-            closer = sockets.closers.pop(q, None)
-            if closer is not None:
-                try:
-                    closer()
-                except Exception:
-                    logger.debug("closing the socket of %s failed", session_id, exc_info=True)
-
-
-def _offer_frames(sockets: TerminalSockets, session_id: str, handle: int, q: asyncio.Queue,
-                  frames: List[str]) -> List[str]:
-    """Puts what fits on the socket's queue and returns the rest, counting what cannot be kept (F13).
-
-    A full queue is the sender falling behind, not a reason to lose bytes silently: the remainder
-    waits for the next tick, and only a backlog past the socket's own window is dropped. That loss is
-    counted per handle in `overflow` (frames, kept apart from the core's byte count) and logged once.
-    """
-    for index, frame in enumerate(frames):
-        try:
-            q.put_nowait(frame)
-        except asyncio.QueueFull:
-            rest = frames[index:]
-            if len(rest) > WS_QUEUE_MAX_FRAMES:
-                overflow = len(rest) - WS_QUEUE_MAX_FRAMES
-                rest = rest[-WS_QUEUE_MAX_FRAMES:]
-                sockets.overflow[handle] = sockets.overflow.get(handle, 0) + overflow
-                if handle not in sockets.slow:
-                    sockets.slow.add(handle)
-                    logger.warning("terminal socket of %s dropped %d frames (client too far behind)",
-                                   session_id, sockets.overflow[handle])
-            return rest
-    return []
-
-
 class AgentSession:
     """Represents a single managed Sub-Agent session (TUI via ConPTY, Web GUI, or Win32 Desktop GUI)."""
 
@@ -2315,9 +2187,6 @@ class AgentSession:
         # replaced can never be mistaken for the live session's own exit.
         on_exit_cb: Optional[Callable[["AgentSession", Optional[int]], None]] = None,
         on_tui_tool_cb: Optional[Callable[[str, str, str], None]] = None,
-        # The id's socket registry (§6.4 A1): the manager shares one per session id, so a resume
-        # keeps the sockets the previous incarnation served; standalone tests get their own.
-        sockets: Optional[TerminalSockets] = None,
     ):
         self.session_id = session_id
         self.core = core
@@ -2439,9 +2308,6 @@ class AgentSession:
         # The seed the next spawn/attach_text starts its ring with (A1), consumed once.
         self._seed_history: Optional[str] = None
 
-        # One handle, one queue and one closer per open browser socket (W7): the whole bridge state
-        # lives on the id (§6.4 A1), so a resume leaves the sockets of the replaced object working.
-        self.sockets = sockets if sockets is not None else TerminalSockets()
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -2719,63 +2585,6 @@ class AgentSession:
                 self.on_tui_tool_cb(self.session_id, tool_name, tool_arg)
             except Exception:
                 logger.exception("tui tool-line callback failed for %s", self.session_id)
-
-    def register_ws_closer(self, q: asyncio.Queue, closer: Callable[[], Any]) -> None:
-        """W7: the server registers how to close the browser socket that owns this queue."""
-        self.sockets.closers[q] = closer
-
-    def close_ws_frontends(self) -> None:
-        """W7: normal-close every browser socket still attached to this session (normal code 1000)."""
-        hooks = list(self.sockets.closers.values())
-        self.sockets.closers.clear()
-        for closer in hooks:
-            try:
-                closer()
-            except Exception:
-                pass
-
-    def attach_ws_queue(self) -> tuple:
-        """Q11: the replay and the live queue of one console socket, from `attach_queue`.
-
-        The core registers the socket's bounded queue on the id's fan-out in the same step it takes
-        the replay, so a chunk is either inside the replay or in the queue — never both, never
-        neither. The handle belongs to the session id, so a resume needs no re-attachment; the drain
-        tick moves what is queued into this `asyncio.Queue`, which the `/ws/pty` sender writes.
-        """
-        replay, handle = self._core().attach_queue(self.session_id)
-        q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX_FRAMES)
-        self.sockets.handles[q] = handle
-        return replay, q
-
-    def detach_ws_queue(self, q: asyncio.Queue) -> bool:
-        """`detach_queue(handle)`: the socket is gone, so the core drops its queue too.
-
-        The handle is forgotten only once the call succeeded or the core says it never had it; a
-        busy registry (`TimeoutError`) keeps it in `orphans`, which the manager drains off the loop
-        on its next tick (F8). Already-detached is normal teardown, not a failure.
-        """
-        handle = self.sockets.handles.pop(q, None)
-        self.sockets.closers.pop(q, None)
-        if handle is None:
-            return True
-        self.sockets.dropped.pop(handle, None)
-        self.sockets.overflow.pop(handle, None)
-        self.sockets.pending.pop(handle, None)
-        if release_terminal_handle(self._core(), handle):
-            self.sockets.orphans.discard(handle)
-            return True
-        self.sockets.orphans.add(handle)
-        return False
-
-    def drain_ws_frames(self) -> None:
-        """The bridge's consumer for a standalone session; the manager drains by id instead.
-
-        An attach can carry a fan-out that is already closed (a retired id), and only a take says
-        so: the first drain right after an attach closes that socket and detaches its handle.
-        """
-        if not self.sockets.handles:
-            return
-        drain_terminal_frames(self._core(), self.session_id, self.sockets)
 
     def write_input(self, text: str):
         """`write` (§5.2): the whole text or nothing, then the DSH echo for a process-less session.
@@ -3367,9 +3176,10 @@ class HubSessionManager:
         self.global_routing_instructions: str = ""
         self.subagent_idle_timeout_minutes = DEFAULT_SUBAGENT_IDLE_TIMEOUT_MINUTES
         self.sessions: Dict[str, AgentSession] = {}
-        # The `/ws/pty` bridge's queues per session id (§6.4 A1, step 4 deletes the bridge): a socket
-        # attached before a resume keeps its handle and queue, so only the id can own them.
-        self.terminal_sockets: Dict[str, TerminalSockets] = {}
+        # One console socket's cumulative loss, by `(session id, handle)` (§5.4). The core numbers
+        # handles per session id, so both parts are the key; the count is a diagnostic only and is
+        # never added to the ring's `dropped_bytes`.
+        self._socket_drops: Dict[Tuple[str, int], int] = {}
         self.default_cols: int = 120
         self.default_rows: int = 36
         # V2: one transcript file belongs to exactly one hub session. Two watchers must never tail
@@ -3630,12 +3440,25 @@ class HubSessionManager:
             self.core = Core(notify=self._notify_core_tick, log=self._log_core_line)
         return self.core
 
-    def _terminal_sockets(self, session_id: str) -> TerminalSockets:
-        """The bridge registry of one id, shared by every incarnation a resume builds (§6.4 A1)."""
-        sockets = self.terminal_sockets.get(session_id)
-        if sockets is None:
-            sockets = self.terminal_sockets[session_id] = TerminalSockets()
-        return sockets
+    def _close_terminal_sockets(self, session_id: str) -> int:
+        """`close_sockets` (W7): every console socket of the id is asked to close with 1000.
+
+        Blocking (the §5.2 registry deadline), so every caller runs it off the loop. The core's
+        `retire` closes them as well; this is what reaches a socket before a retire that the core
+        refuses and the hub retries, and what a stop does without retiring anything.
+        """
+        core = self.core
+        if core is None:
+            return 0
+        try:
+            closed = int(core.close_sockets(session_id))
+        except Exception:
+            logger.exception("terminal core: closing the sockets of %s failed", session_id)
+            return 0
+        if closed:
+            logger.debug("terminal core: closed %d console socket(s) of %s", closed, session_id)
+        self._forget_socket_drops(session_id)
+        return closed
 
     @staticmethod
     def _log_core_line(line: str) -> None:
@@ -3657,7 +3480,7 @@ class HubSessionManager:
             pass
 
     def _on_core_tick(self) -> int:
-        """One `drain()`, applied record by record, then the bridge's frames and pending retires.
+        """One `drain()`, applied record by record, then what a record asks the hub to do.
 
         Each record costs its own session and nothing else (§6.3, master `3874299`): an exception
         while applying one is logged against that session and the next record still applies.
@@ -3694,27 +3517,70 @@ class HubSessionManager:
                     # Its exit record is in hand now, so `retire` will accept the id.
                     self._schedule(self._retire_ended_session(
                         session_id, self._retire_pending.get(session_id), retry="record"))
+                # §6.4: the console's resize and typed input are requests the core recorded and
+                # never applied; the hub's policy runs here, in arrival order. A socket's own loss
+                # is a diagnostic and stays out of the ring's `dropped_bytes` (§5.4).
+                self._apply_terminal_requests(session_id, sess, record)
+                self._note_socket_drops(session_id, record.get("socket_drops") or ())
             except Exception:
                 logger.exception("terminal core: drain record for %s failed", session_id)
-        for session_id, sockets in list(self.terminal_sockets.items()):
-            if sockets.orphans:
-                # F8: a handle whose `detach_queue` missed its deadline is retried off the loop.
-                self._schedule(self._release_orphan_handles(session_id, sockets))
-            if not sockets.handles and not sockets.orphans and session_id not in self.sessions:
-                # F7: the id is gone and no socket of it is left; its registry entry goes with it.
-                self.terminal_sockets.pop(session_id, None)
-                continue
-            if not sockets.handles:
-                continue
-            try:
-                drain_terminal_frames(core, session_id, sockets)
-            except Exception:
-                logger.exception("terminal core: socket drain for %s failed", session_id)
-        if any(sockets.orphans for sockets in self.terminal_sockets.values()):
-            # This tick's drain may have left an orphan; a closed sink publishes no further notify,
-            # so the retry has to come from the timer.
-            self._arm_retry_timer()
         return len(records)
+
+    def _apply_terminal_requests(self, session_id: str, sess: Optional[AgentSession],
+                                 record: Dict[str, Any]) -> None:
+        """Applies one drain record's `resize_requests` and `input_requests` (§5.2, §6.4).
+
+        A resize is the console's unapplied size: the record keeps arrival order, so each request
+        goes through `resize_session_from_client` with the console path's own defaults (120x36, a
+        missing `propagate` is true), the 20/5 clamp, the single-window propagation and the F12
+        re-watch. Text reaches a session with no PTY as `input_requests` because the echo and the
+        line callback are the hub's (design §8, DSH); it is fed here, in order, exactly where the
+        socket path typed it before. One bad request costs that request only (master 3874299).
+        """
+        for request in record.get("resize_requests") or ():
+            try:
+                self.resize_session_from_client(
+                    session_id,
+                    int(request.get("cols", 120)),
+                    int(request.get("rows", 36)),
+                    propagate_background=bool(request.get("propagate", True)),
+                )
+            except Exception:
+                logger.exception("terminal core: resize request for %s failed", session_id)
+        texts = record.get("input_requests") or ()
+        if not texts:
+            return
+        if sess is None:
+            # The hub already closed this id; the core's text entry has no echo to feed.
+            logger.debug("terminal core: %d input requests for an unlisted id %s",
+                         len(texts), session_id)
+            return
+        for text in texts:
+            try:
+                sess.write_input(str(text))
+            except Exception:
+                logger.exception("terminal core: text input for %s failed", session_id)
+
+    def _note_socket_drops(self, session_id: str, drops: Any) -> None:
+        """Keeps one console socket's cumulative loss per `(session id, handle)` (§5.4).
+
+        The key needs both: the core numbers handles per session id, so two ids' handles collide.
+        The loss is that socket's own and is never added to the ring's `dropped_bytes`; a socket
+        that detached reports its final count once, so the newest number is the truth.
+        """
+        for handle, dropped in drops:
+            key = (session_id, int(handle))
+            dropped = int(dropped)
+            if dropped <= self._socket_drops.get(key, 0):
+                continue
+            self._socket_drops[key] = dropped
+            logger.warning("terminal socket %s of %s dropped %d bytes (slow client)",
+                           handle, session_id, dropped)
+
+    def _forget_socket_drops(self, session_id: str) -> None:
+        """Drops the diagnostics of an id that left the core for good (retire, stop)."""
+        for key in [key for key in self._socket_drops if key[0] == session_id]:
+            self._socket_drops.pop(key, None)
 
     def _next_incarnation(self, session_id: str) -> int:
         """Bumps and returns an id's incarnation; installing one cancels a pending retire (F3).
@@ -3845,15 +3711,16 @@ class HubSessionManager:
         self._clear_retire(session_id)
         # The core no longer holds the id (removed, or never had it): its tombstone has no reader.
         self._closed_sessions.pop(session_id, None)
+        self._forget_socket_drops(session_id)
         if retired:
             logger.debug("terminal core: retired %s", session_id)
 
     def _arm_retry_timer(self) -> None:
-        """Arms the one background retry timer (a refused retire, an orphaned handle).
+        """Arms the one background retry timer for a refused retire.
 
-        Both wait on a core call that missed its deadline, not on a new drain record: a quiet id
-        publishes none, and a retired sink's notify may never come. A backed-off drop is only due at
-        its own time, so the timer takes the earliest one (r2-kimi 6).
+        A refused retire waits on a core call that missed its deadline, not on a new drain record: a
+        quiet id publishes none. A backed-off drop is only due at its own time, so the timer takes
+        the earliest one (r2-kimi 6).
         """
         loop = self._loop
         if loop is None or loop.is_closed() or self._shutting_down or self._retry_timer is not None:
@@ -3861,8 +3728,6 @@ class HubSessionManager:
         now = time.monotonic()
         delays = [max(0.0, self._retire_backoff.get(session_id, now) - now)
                   for session_id in self._retire_pending]
-        if any(sockets.orphans for sockets in self.terminal_sockets.values()):
-            delays.append(RETIRE_RETRY_INTERVAL_SEC)
         delay = min(delays) if delays else RETIRE_RETRY_INTERVAL_SEC
         self._retry_timer = loop.call_later(delay, self._retry_timer_fire)
 
@@ -3876,30 +3741,7 @@ class HubSessionManager:
             # fire-now loop while it runs; a refusal refines the time in `_queue_retire_retry`.
             self._retire_backoff[session_id] = now + self._retire_retry_delay(session_id)
             self._schedule(self._retire_ended_session(session_id, incarnation, retry="timer"))
-        orphans = [(sid, sockets) for sid, sockets in list(self.terminal_sockets.items())
-                   if sockets.orphans]
-        for session_id, sockets in orphans:
-            self._schedule(self._release_orphan_handles(session_id, sockets))
-        if self._retire_pending or orphans:
-            self._arm_retry_timer()
-
-    async def _release_orphan_handles(self, session_id: str, sockets: "TerminalSockets") -> None:
-        """Detaches handles whose `detach_queue` missed the registry deadline (F8), off the loop."""
-        core = self.core
-        if core is None:
-            sockets.orphans.clear()
-            return
-        for handle in list(sockets.orphans):
-            if handle in sockets.detach_inflight:
-                continue
-            sockets.detach_inflight.add(handle)
-            try:
-                ok = await asyncio.to_thread(release_terminal_handle, core, handle)
-            finally:
-                sockets.detach_inflight.discard(handle)
-            if ok:
-                sockets.orphans.discard(handle)
-        if sockets.orphans:
+        if self._retire_pending:
             self._arm_retry_timer()
 
     def _write_late_exit_code(self, session_id: str, session: AgentSession) -> None:
@@ -3982,21 +3824,6 @@ class HubSessionManager:
                 await asyncio.wait([task], timeout=NATIVE_TRANSCRIPT_DRAIN_SEC + 0.5)
             except Exception:
                 pass
-
-    def pump_terminal_frames(self, session_id: str) -> None:
-        """One bridge drain for an id, run right after an attach (F6).
-
-        A fan-out that was already closed reports `closed` only at its first take, and a retired
-        id publishes no further notify; taking now closes that socket with 1000 at once.
-        """
-        core = self.core
-        sockets = self.terminal_sockets.get(session_id)
-        if core is None or sockets is None or not sockets.handles:
-            return
-        try:
-            drain_terminal_frames(core, session_id, sockets)
-        except Exception:
-            logger.exception("terminal core: attach pump for %s failed", session_id)
 
     def resize_session_from_client(
         self,
@@ -5729,7 +5556,6 @@ class HubSessionManager:
             core=self._ensure_core(),
             on_exit_cb=self._exit_callback,
             on_tui_tool_cb=self._tool_callback,
-            sockets=self._terminal_sockets(session_id),
         )
         sess.engine = engine
         sess.turn_id = str(record.get("turn_id") or sess.turn_id)
@@ -6591,8 +6417,12 @@ class HubSessionManager:
             except Exception:
                 logger.exception("terminal core: drain after closing %s failed", session_id)
         # W7: the pane the console is about to remove still owns a socket; end it normally instead
-        # of leaving the server side open and silent for the rest of the hub's life.
-        sess.close_ws_frontends()
+        # of leaving the server side open and silent for the rest of the hub's life. Off the loop:
+        # the call waits on the core's socket registry.
+        try:
+            await asyncio.to_thread(self._close_terminal_sockets, session_id)
+        except Exception:
+            logger.exception("terminal core: closing the sockets of %s failed", session_id)
         # rtc-retire: the session is gone for good, so its ring and screen leave the core's table.
         await self._retire_ended_session(session_id, self._incarnations.get(session_id, 0))
         if terminated:
@@ -6756,6 +6586,20 @@ class HubSessionManager:
                 self._on_core_tick()
             except Exception:
                 logger.exception("Shutdown could not drain the terminal core's exit records")
+        if core is not None and sessions:
+            # W7: every open pane is about to lose its session, so each socket is closed with 1000
+            # now. One batch off the loop, inside what is left of the shared budget after the kill's
+            # share and before the final rows'. `retire` is not run here; the stop tears the core
+            # down itself.
+            close_share = max(0.05, min(SHUTDOWN_CLOSE_SOCKETS_MAX_SEC,
+                                        deadline - time.monotonic() - SHUTDOWN_FINAL_ROW_RESERVE_SEC))
+            closers = [asyncio.to_thread(self._close_terminal_sockets, sess.session_id)
+                       for sess in sessions]
+            try:
+                await asyncio.wait_for(asyncio.gather(*closers, return_exceptions=True),
+                                       timeout=close_share)
+            except asyncio.TimeoutError:
+                logger.error("Timed out closing the console's terminal sockets")
         archived = 0
         remaining = list(sessions)
         try:
@@ -6767,7 +6611,6 @@ class HubSessionManager:
                         end_reason=reasons[sess.session_id],
                         snapshot=snapshots.get(sess.session_id),
                     ))
-                    sess.close_ws_frontends()
                     remaining.remove(sess)
                     archived += 1
         except (asyncio.TimeoutError, PersistenceUnavailable):
@@ -6800,7 +6643,7 @@ class HubSessionManager:
             self.sessions.clear()
             self._closed_sessions.clear()
             self._late_code_writes.clear()
-            self.terminal_sockets.clear()
+            self._socket_drops.clear()
             with self._transcript_lock:
                 self._claimed_transcripts.clear()
             self._notify_waiters()
@@ -13978,7 +13821,6 @@ class HubSessionManager:
             core=self._ensure_core(),
             on_exit_cb=self._exit_callback,
             on_tui_tool_cb=self._tool_callback,
-            sockets=self._terminal_sockets(session_id),
         )
         sess.effective_model = effective_model
         sess.effective_thinking_level = effective_thinking

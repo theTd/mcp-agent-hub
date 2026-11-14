@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from contextlib import AsyncExitStack, asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -30,7 +30,6 @@ from session_manager import (
     hub_port,
     resolve_session_approval_fields,
 )
-from terminal_core import strip_osc_terminal_replies
 from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
 from agent_guidance import SERVER_INSTRUCTIONS
@@ -1306,96 +1305,38 @@ async def api_click_window(session_id: str, req: Request):
     return {"ok": True}
 
 
-@app.websocket("/ws/pty/{session_id}")
-async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    sess = hub.sessions.get(session_id)
-    if not sess:
-        await websocket.close(code=1008)
-        return
+@app.get("/api/sessions/{session_id}/terminal-ticket")
+async def api_terminal_ticket(session_id: str):
+    """§6.4: one single-use ticket for the console's terminal socket, minted by the core.
 
-    # Q11: the core registers this socket's queue on the session id's fan-out in the same step it
-    # takes the replay, so a chunk is either inside the replay or in the queue — never lost, never
-    # sent twice. The drain tick moves `take_frames` into the queue in order.
+    The console cannot reach the core's listener without it, and the token is a bearer credential:
+    it travels only in this response body (never in a URL the hub serves, so never in an access-log
+    line) and is never logged here. A fresh ticket per call, never cached, because a ticket is
+    single use and a suspended tab's has expired.
+
+    A session the hub no longer lists, or one whose core entry is gone (retired, closed for good),
+    is a 404 before anything is minted. A listed session that already ended but whose core entry
+    still exists does get a ticket: its pane attaches the terminal and shows the final replay, as
+    the socket always allowed (`mountPaneBody`). A starting session (no first alive record yet) and
+    a DSH text session do too.
+    """
+    if hub.sessions.get(session_id) is None:
+        return not_found(f"找不到会话 {session_id}")
+    core = hub.core
+    if core is None:
+        # F14: the hub builds its core lazily, but a health-polled or never-launched hub has no
+        # terminal to serve. Answering 404 keeps the console's not-found path; no core is built here.
+        return not_found(f"找不到会话 {session_id}")
     try:
-        replay, q = sess.attach_ws_queue()
+        ticket = core.ws_ticket(session_id)
     except KeyError:
-        # F6: the id has no core entry (a failed spawn still listed, a desktop-GUI session, an id
-        # a retire removed). An unhandled raise here is uvicorn's 1011 and the browser reconnects in
-        # a loop; an ended id closes normally, one the core never had is "unknown".
-        ended = sess.ended_at is not None or not sess.is_process_alive()
-        await websocket.close(code=1000 if ended else 1008)
-        return
-    except TimeoutError:
-        # The registry was busy past its deadline: "try again later", never an abnormal close.
-        await websocket.close(code=1013)
-        return
-
-    # W7: removing a session from the live list closes its sockets with a normal code instead of
-    # leaving the server side open and silent. The handle belongs to the session id, so a resume
-    # never re-registers anything here.
-    def _close_on_archive() -> None:
-        try:
-            asyncio.create_task(websocket.close(code=1000))
-        except Exception:
-            pass
-
-    sess.register_ws_closer(q, _close_on_archive)
-    # An attach can land on a fan-out that is already closed (a retired id), and only a take says
-    # so: `pump_terminal_frames` takes once now, so such a socket closes with 1000 immediately
-    # instead of waiting for a core notify that may never come.
-    hub.pump_terminal_frames(session_id)
-    if replay:
-        await websocket.send_text(replay)
-    # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal
-    # query responses xterm generates while parsing this replay and keeps forwarding the live ones.
-    await websocket.send_text(json.dumps({"type": "replay_end"}))
-
-    async def sender():
-        try:
-            while True:
-                data = await q.get()
-                await websocket.send_text(data)
-        except Exception:
-            pass
-
-    sender_task = asyncio.create_task(sender())
-    try:
-        while True:
-            raw_msg = await websocket.receive_text()
-            # A1: a resume replaces the AgentSession object under the same session id (the sockets
-            # are handed over to the new object), so every input frame must go to the session that
-            # is live under this id now, not to the object this socket connected to.
-            live = hub.sessions.get(session_id)
-            try:
-                msg = json.loads(raw_msg)
-            except Exception:
-                msg = None
-            if isinstance(msg, dict):
-                mtype = msg.get("type")
-                try:
-                    if mtype == "input" and live is not None:
-                        cleaned_input = strip_osc_terminal_replies(str(msg.get("data") or ""))
-                        if cleaned_input:
-                            live.write_input(cleaned_input)
-                    elif mtype == "resize":
-                        hub.resize_session_from_client(
-                            session_id,
-                            int(msg.get("cols", 120)),
-                            int(msg.get("rows", 36)),
-                            propagate_background=bool(msg.get("propagate", True)),
-                        )
-                except Exception:
-                    pass
-            elif live is not None:
-                cleaned_raw = strip_osc_terminal_replies(raw_msg)
-                if cleaned_raw:
-                    live.write_input(cleaned_raw)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        sess.detach_ws_queue(q)
-        sender_task.cancel()
+        # The hub still lists the id, but the core's entry is gone: a closed pane, not a retry.
+        return not_found(f"找不到会话 {session_id}")
+    expires_at = float(ticket.get("expires_at") or 0.0)
+    return {
+        "url": str(ticket.get("url") or ""),
+        "expires_in": max(0, int(math.ceil(expires_at - time.time()))),
+    }
 
 
 # ============================================================================
@@ -1409,6 +1350,13 @@ _HUB_SHUTDOWN_TOKEN = os.environ.pop("HUB_SHUTDOWN_TOKEN", "")
 
 @app.get("/health")
 async def api_health():
+    # §6.4: the terminal listener's own state, so a dead accept thread is visible before a pane
+    # fails. Null until the core exists: health polls must never build it (F14's lazy start).
+    core = hub.core
+    terminal_ws = {
+        "listening": bool(core.ws_listening()) if core is not None else None,
+        "port": int(core.ws_port) if core is not None else None,
+    }
     return {
         "ok": True,
         "status": "healthy",
@@ -1418,6 +1366,7 @@ async def api_health():
         "hub_port": hub_port(),
         "started_at": HUB_STARTED_AT,
         "persistence": hub.db.status(),
+        "terminal_ws": terminal_ws,
     }
 
 

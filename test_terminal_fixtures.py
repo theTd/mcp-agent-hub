@@ -5,8 +5,8 @@ Run: ``py -3.15 -B test_terminal_fixtures.py`` from the repository root.
 The goldens were rendered from exactly the committed bytes by ``tools/render_terminal_fixtures.py``
 with today's Python code; step 2's Rust parser and history ring must reproduce them byte for byte, so
 this test is the parity gate.  It also guards the *oracle* itself: the renderer must use the hub's own
-objects (``AgentSession``, ``trim_history_text``, ``resume_banner``, the screen and stream classes,
-``attach_ws_queue``), because a copy of one of them would render goldens nobody compares against the
+objects (``AgentSession``, ``trim_history_text``, ``resume_banner``, the screen and stream classes, the
+socket's replay frame), because a copy of one of them would render goldens nobody compares against the
 hub anymore.
 
 The privacy check reads the host markers from the environment at test time and never stores them: a
@@ -212,13 +212,13 @@ class TerminalFixtureOracleTests(unittest.TestCase):
         for name in ("HubTerminalScreen", "HubTerminalStream", "trim_history_text", "OSC_COLOR_QUERY_RE"):
             self.assertFalse(hasattr(session_manager, name), name)
 
-    def test_the_replay_golden_is_the_hubs_own_attach_frame(self):
+    def test_the_replay_golden_is_the_frame_the_core_s_socket_sends(self):
+        # §6.4: the ring as it stands, then one more colour-query strip — the same text `attach_sink`
+        # renders for a newly attached socket, which is what the golden pins.
         session = renderer.new_session("generic", 60, 12)
         session.raw_history = ["a\x1b]11;?\x07c"]
-        direct, queue = session.attach_ws_queue()
-        session.detach_ws_queue(queue)
-        self.assertEqual(renderer.replay_frame(session), direct)
-        self.assertEqual(direct, "ac")
+        self.assertEqual(renderer.replay_frame(session), session.replay_frame())
+        self.assertEqual(renderer.replay_frame(session), "ac")
 
     def test_the_seam_names_the_hub_uses_are_the_ones_the_renderer_calls(self):
         # Both were literals before step 3a; now each is a seam call, so they are pinned by name.

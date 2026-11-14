@@ -182,8 +182,7 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         await self.hub.start()
         # A DSH session has no process but still owns a screen and a ring in the core (`attach_text`).
         self.sess = AgentSession("dsh-gate", "dsh", "DSH", "tui", "Test", str(self.root), "", [],
-                                 core=self.hub._ensure_core(),
-                                 sockets=self.hub._terminal_sockets("dsh-gate"))
+                                 core=self.hub._ensure_core())
         self.sess.engine = "dsh"
         self.sess.dsh_spec = {"tier": "flash"}
         self.sess.profile_snapshot = {"engine": "dsh", "cwd": str(self.root), "dsh_spec": self.sess.dsh_spec}
