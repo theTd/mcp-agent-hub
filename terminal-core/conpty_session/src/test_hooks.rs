@@ -241,3 +241,73 @@ pub(crate) fn hold_socket_write(mut closing: impl FnMut() -> bool) {
         .unwrap_or_else(|error| error.into_inner()) = false;
     WRITE_INSIDE_CHANGED.notify_all();
 }
+
+/// `true` while `Core::drain` is parked between collecting its records and taking the socket drops:
+/// the window a drop has to fall into to be lost (review omp 11 / kimi 4).
+static HOLD_DRAIN: Mutex<bool> = Mutex::new(false);
+/// `true` while a drain sits in the gate.
+static DRAIN_INSIDE: Mutex<bool> = Mutex::new(false);
+/// Wakes the drain when the test opens the gate.
+static DRAIN_RELEASED: Condvar = Condvar::new();
+/// Wakes `wait_until_drain_held` when a drain enters or leaves the gate.
+static DRAIN_INSIDE_CHANGED: Condvar = Condvar::new();
+
+/// Parks the next drain between its record collection and the socket-drop take.
+pub fn hold_drain_before_drops() {
+    *HOLD_DRAIN.lock().unwrap_or_else(|error| error.into_inner()) = true;
+}
+
+/// Opens the gate again.
+pub fn release_drain_before_drops() {
+    *HOLD_DRAIN.lock().unwrap_or_else(|error| error.into_inner()) = false;
+    DRAIN_RELEASED.notify_all();
+}
+
+/// Waits until a drain is parked inside the gate. `false` when none entered within `timeout`.
+pub fn wait_until_drain_held(timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    let mut inside = DRAIN_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    loop {
+        if *inside {
+            return true;
+        }
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        inside = DRAIN_INSIDE_CHANGED
+            .wait_timeout(inside, remaining)
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|error| error.into_inner().0);
+    }
+}
+
+/// Called by `drain` after its records are collected and before the drops are taken, so a test can land
+/// a socket drop in exactly the window that used to mark it reported with no record to carry it.
+pub(crate) fn drain_before_drops_gate() {
+    {
+        let held = HOLD_DRAIN.lock().unwrap_or_else(|error| error.into_inner());
+        if !*held {
+            return;
+        }
+    }
+    *DRAIN_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = true;
+    DRAIN_INSIDE_CHANGED.notify_all();
+    let end = Instant::now() + HOLD_LIMIT;
+    let mut held = HOLD_DRAIN.lock().unwrap_or_else(|error| error.into_inner());
+    while *held && Instant::now() < end {
+        held = DRAIN_RELEASED
+            .wait_timeout(held, Duration::from_millis(5))
+            .map(|(guard, _)| guard)
+            .unwrap_or_else(|error| error.into_inner().0);
+    }
+    drop(held);
+    *DRAIN_INSIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = false;
+    DRAIN_INSIDE_CHANGED.notify_all();
+}

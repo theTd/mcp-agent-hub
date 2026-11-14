@@ -6,8 +6,13 @@
 //! subject, so a case costs milliseconds; the input case spawns a headless `cmd.exe`, which is what the
 //! PTY write contract needs.
 
+use std::io::Write;
+#[cfg(feature = "test-hooks")]
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "test-hooks")]
+use std::sync::MutexGuard;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,9 +33,11 @@ const FEED_DEADLINE: Duration = Duration::from_millis(50);
 
 /// The write gate, the stall limit and the injected panic are process-wide test seams, and cargo runs
 /// this binary's tests in parallel threads: the cases that use them take this lock so one case's gate
-/// cannot park (or unpark) another's socket.
+/// cannot park (or unpark) another's socket. Only the hook-enabled cases use a seam.
+#[cfg(feature = "test-hooks")]
 static SERIAL: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "test-hooks")]
 fn serialized() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -569,7 +576,8 @@ fn a_failed_accept_keeps_the_listener_serving() {
     let refused = tungstenite::connect(url.as_str());
     assert!(refused.is_err(), "the injected failure served a connection anyway");
 
-    // The listener survived: the same ticket (never consumed) is served on the next attempt.
+    // The listener survived: `connect` mints a fresh ticket for the next attempt. The ticket the
+    // injected failure's connection carried was never read, so it was never consumed.
     let mut ws = connect(&core, "accept");
     let opened = read_until(&mut ws, "{\"type\":\"replay_end\"}", Duration::from_secs(5));
     assert!(
@@ -996,5 +1004,477 @@ fn the_ticket_never_reaches_a_log_line() {
         !logged.contains(&token),
         "the ticket reached a log line: {logged}"
     );
+    core.shutdown();
+}
+
+/// A raw TCP connection to the core's listener, with nothing written on it.
+fn raw_connect(core: &Core) -> TcpStream {
+    let address: std::net::SocketAddr = format!("127.0.0.1:{}", core.ws_port())
+        .parse()
+        .expect("a loopback address");
+    let stream = TcpStream::connect_timeout(&address, IO_TIMEOUT).expect("the raw connect");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("a read timeout");
+    stream
+}
+
+/// The first HTTP line each peer answered within `timeout`; an empty string for a peer that said
+/// nothing (a handshake still waiting for its request). All peers are polled together, so N silent
+/// peers cost one timeout, not N.
+#[cfg(feature = "test-hooks")]
+fn read_statuses(peers: &mut [TcpStream], timeout: Duration) -> Vec<String> {
+    let mut seen: Vec<String> = peers.iter().map(|_| String::new()).collect();
+    let mut done: Vec<bool> = peers.iter().map(|_| false).collect();
+    for peer in peers.iter() {
+        peer.set_nonblocking(true).expect("nonblocking");
+    }
+    let end = Instant::now() + timeout;
+    let mut buffer = [0u8; 256];
+    while Instant::now() < end && done.iter().any(|settled| !settled) {
+        for (index, peer) in peers.iter_mut().enumerate() {
+            if done[index] {
+                continue;
+            }
+            match peer.read(&mut buffer) {
+                Ok(0) => done[index] = true,
+                Ok(count) => {
+                    seen[index].push_str(&String::from_utf8_lossy(&buffer[..count]));
+                    done[index] = seen[index].contains('\n');
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => done[index] = true,
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    seen
+}
+
+/// The `/ws/pty/<id>` upgrade request a browser sends, for the peers that speak HTTP by hand.
+fn upgrade_request(url: &str) -> String {
+    let target = url.strip_prefix("ws://").expect("a ws url");
+    let (authority, path) = target.split_once('/').expect("host and path");
+    format!(
+        "GET /{path} HTTP/1.1\r\nHost: {authority}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+}
+
+/// Brief item 1: the handshake runs off the accept thread, so a peer that connects and says nothing —
+/// or dribbles its request — cannot stop a console attach. On `ba88183` the accept thread ran the
+/// silent peer's handshake and this `connect` timed out.
+#[test]
+fn a_silent_or_dribbling_peer_does_not_block_a_console_attach() {
+    let core = core();
+    core.attach_text(text_request("slow-peer", 40, 8)).expect("attach_text");
+
+    let silent = raw_connect(&core);
+    let mut dribbling = raw_connect(&core);
+    let (url, _) = core.ws_ticket("slow-peer", Duration::from_secs(30)).expect("ticket");
+    let request = upgrade_request(&url);
+    let writer = thread::spawn(move || {
+        for byte in request.as_bytes() {
+            if dribbling.write_all(&[*byte]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Keep the connection (and its slot) open while the attach below has to be served.
+        thread::sleep(Duration::from_secs(1));
+    });
+
+    let mut ws = connect(&core, "slow-peer");
+    let opened = read_until(&mut ws, "{\"type\":\"replay_end\"}", Duration::from_secs(2));
+    assert!(
+        opened.contains("replay_end"),
+        "a hanging handshake blocked the console attach: {opened:?}"
+    );
+    assert!(core.ws_listening(), "the listener is serving while the peers hang");
+    drop(silent);
+    join_within(writer, Duration::from_secs(10), "the dribbling peer");
+    core.shutdown();
+}
+
+/// Brief item 1: the handshake cap refuses the excess at once (HTTP 503) instead of queueing it, and
+/// the listener serves again once the slots are free.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_flood_of_half_open_handshakes_is_refused_at_the_cap() {
+    let core = core();
+    core.attach_text(text_request("cap", 40, 8)).expect("attach_text");
+    // More peers than the listener's handshake cap, none of which sends a byte.
+    let mut peers: Vec<TcpStream> = (0..24).map(|_| raw_connect(&core)).collect();
+    let statuses = read_statuses(&mut peers, Duration::from_secs(2));
+    let refused = statuses.iter().filter(|line| line.contains("503")).count();
+    assert!(refused >= 1, "not one peer over the cap was refused: {statuses:?}");
+    assert!(core.ws_listening(), "a full cap stopped the listener");
+    drop(peers);
+
+    // The slots come back as the peers leave, and the listener serves a real attach again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while core.ws_pending_handshakes() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut ws = connect(&core, "cap");
+    let opened = read_until(&mut ws, "{\"type\":\"replay_end\"}", Duration::from_secs(5));
+    assert!(opened.contains("replay_end"), "the listener stopped serving: {opened:?}");
+    core.shutdown();
+}
+
+/// §5.4/§6.4, brief item 2: the replay is a write like any other. A peer that completes the handshake
+/// and then takes nothing must be closed after the stall limit; before this fix the watchdog only
+/// looked at a non-empty frame queue, so the replay blocked a thread forever.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_peer_that_takes_no_replay_is_closed_after_the_stall_limit() {
+    let _serial = serialized();
+    let core = core();
+    attach_with_a_large_ring(&core, "stalled-replay");
+    core.set_socket_stall_limit(Duration::from_millis(200));
+
+    // The handshake is all this client ever reads: the replay stays in tungstenite's buffer and in the
+    // stream's own buffers, and the write path makes no progress.
+    let (url, _) = core.ws_ticket("stalled-replay", Duration::from_secs(30)).expect("ticket");
+    let (ws, _response) = tungstenite::connect(url.as_str()).expect("the handshake is accepted");
+    // The 101 is written before the attach registers the socket, so the registration is polled for.
+    let registered = Instant::now() + Duration::from_secs(2);
+    while core.socket_count() == 0 && Instant::now() < registered {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(core.socket_count(), 1);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while core.socket_count() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        core.socket_count(),
+        0,
+        "a peer that took none of its replay kept its socket past the stall limit"
+    );
+    drop(ws);
+    core.shutdown();
+}
+
+/// Brief item 3: `close_sockets` and `shutdown` wake a socket blocked in a write and stay inside their
+/// budgets; before this fix the blocked write ignored both and shutdown spent its whole budget on it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_close_and_a_shutdown_wake_a_blocked_write() {
+    let _serial = serialized();
+    let core = core();
+    attach_with_a_large_ring(&core, "blocked-write");
+
+    let open_blocked = |core: &Core| {
+        let (url, _) = core
+            .ws_ticket("blocked-write", Duration::from_secs(30))
+            .expect("ticket");
+        let (ws, _response) =
+            tungstenite::connect(url.as_str()).expect("the handshake is accepted");
+        // Past one write slice, so the server's replay write is parked on this peer.
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(core.socket_count(), 1);
+        ws
+    };
+
+    let peer = open_blocked(&core);
+    let started = Instant::now();
+    assert_eq!(core.close_sockets("blocked-write"), 1);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "close_sockets waited for the blocked write: {:?}",
+        started.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while core.socket_count() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(core.socket_count(), 0, "the blocked socket survived its close request");
+    drop(peer);
+
+    let peer = open_blocked(&core);
+    let started = Instant::now();
+    core.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown outlived its socket budget: {:?}",
+        started.elapsed()
+    );
+    assert!(!core.ws_listening(), "the accept thread ended");
+    assert_eq!(core.socket_count(), 0);
+    drop(peer);
+}
+
+/// A session whose ring holds several megabytes, so its replay cannot fit any socket buffer: the peer
+/// that never reads must block the writer.
+#[cfg(feature = "test-hooks")]
+fn attach_with_a_large_ring(core: &Core, id: &str) {
+    core.attach_text(TextRequest {
+        session_id: id.to_string(),
+        cols: 40,
+        rows: 8,
+        flags: SessionFlags {
+            raw_cap_bytes: 6 * 1024 * 1024,
+            raw_slack_bytes: 64 * 1024,
+            ..SessionFlags::default()
+        },
+        seed_history: None,
+        seed: None,
+    })
+    .expect("attach_text");
+    let line = format!("{}\n", "x".repeat(1023));
+    for _ in 0..4096 {
+        core.feed(id, &line, FEED_DEADLINE).expect("feed");
+    }
+}
+
+/// Brief item 5: refused handshakes log the first and every hundredth of each status (the accept loop's
+/// cadence), the status is the one the wire carries, and the token never appears.
+#[test]
+fn refused_handshakes_are_logged_at_the_accept_cadence() {
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&lines);
+    let core = core_with_options(
+        CoreOptions::default(),
+        Arc::new(move |line: &str| {
+            collected
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(line.to_string())
+        }),
+    );
+    core.attach_text(text_request("cadence", 40, 8)).expect("attach_text");
+    let (url, _) = core.ws_ticket("cadence", Duration::from_secs(30)).expect("ticket");
+    let mut tampered = url.clone();
+    let last = tampered.pop().expect("a token");
+    tampered.push(if last == 'A' { 'B' } else { 'A' });
+
+    let refusals = |lines: &Arc<Mutex<Vec<String>>>| {
+        lines
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|line| line.contains("console socket refused"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..3 {
+        let _ = tungstenite::connect(tampered.as_str());
+    }
+    let logged = wait_for_log(&lines, "console socket refused", Duration::from_secs(3));
+    let first = refusals(&lines);
+    assert_eq!(first.len(), 1, "three refusals wrote {} lines: {logged}", first.len());
+    assert!(first[0].contains("401"), "the wrong status was logged: {}", first[0]);
+
+    for _ in 0..97 {
+        let _ = tungstenite::connect(tampered.as_str());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while refusals(&lines).len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let at_hundred = refusals(&lines);
+    assert_eq!(at_hundred.len(), 2, "the hundredth refusal was not logged: {at_hundred:?}");
+    assert!(at_hundred[1].contains("100"), "the line does not name the count: {}", at_hundred[1]);
+
+    // A valid ticket for another id is the one 403, and it logs its own first line.
+    let elsewhere = url.replacen("/ws/pty/cadence", "/ws/pty/elsewhere", 1);
+    let refusal = tungstenite::connect(elsewhere.as_str()).expect_err("another id must be refused");
+    match refusal {
+        WsError::Http(response) => assert_eq!(response.status().as_u16(), 403),
+        other => panic!("expected an HTTP refusal, got {other}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !refusals(&lines).iter().any(|line| line.contains("403")) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let all = refusals(&lines);
+    assert_eq!(
+        all.iter().filter(|line| line.contains("403")).count(),
+        1,
+        "the 403 refusal was not logged with its status: {all:?}"
+    );
+    assert!(
+        !all.iter().any(|line| line.contains("ticket=")),
+        "a refusal line carried the token: {all:?}"
+    );
+    core.shutdown();
+}
+
+/// Brief item 6/5: a non-string `data` (Python wrote `str(data)`) is ignored and logged once per
+/// socket; the string frames around it are untouched.
+#[test]
+fn a_non_string_data_frame_is_ignored_and_logged_once() {
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&lines);
+    let core = core_with_options(
+        CoreOptions::default(),
+        Arc::new(move |line: &str| {
+            collected
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(line.to_string())
+        }),
+    );
+    core.attach_text(text_request("odd-data", 40, 8)).expect("attach_text");
+    let mut ws = connect(&core, "odd-data");
+    read_until(&mut ws, "{\"type\":\"replay_end\"}", Duration::from_secs(2));
+
+    ws.send(Message::text(r#"{"type":"input","data":7}"#)).expect("numeric data");
+    ws.send(Message::text(r#"{"type":"input","data":[]}"#)).expect("array data");
+    ws.send(Message::text(r#"{"type":"input","data":"kept"}"#)).expect("string data");
+
+    let record = drain_until(&core, |record| !record.input_requests.is_empty())
+        .expect("the string frame never reached a drain record");
+    assert_eq!(record.input_requests, vec!["kept".to_string()], "{record:?}");
+    assert!(
+        core.drain().iter().all(|record| record.input_requests.is_empty()),
+        "the non-string frames were delivered as input"
+    );
+    wait_for_log(&lines, "was not a string", Duration::from_secs(2));
+    let logged = lines.lock().unwrap_or_else(|error| error.into_inner()).join("\n");
+    assert_eq!(
+        logged.matches("was not a string").count(),
+        1,
+        "the frame was logged once per socket, not once per frame: {logged}"
+    );
+    core.shutdown();
+}
+
+/// Brief item 7: a drop that lands between a drain's record collection and its socket-drop take has no
+/// record to ride in. It must stay unreported, so the next drain carries it; before this fix the take
+/// marked every socket and the count was lost.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_drop_that_lands_during_a_drain_is_not_marked_reported() {
+    let _serial = serialized();
+    let core = core_with_options(
+        CoreOptions {
+            sink_queue_bytes: 512,
+            ..CoreOptions::default()
+        },
+        Arc::new(|_line: &str| {}),
+    );
+    core.attach_text(text_request("drain-a", 40, 8)).expect("attach a");
+    core.attach_text(text_request("drain-b", 40, 8)).expect("attach b");
+    conpty_session::test_hooks::hold_socket_writes();
+    let mut socket_b = connect(&core, "drain-b");
+    read_until(&mut socket_b, "{\"type\":\"replay_end\"}", Duration::from_secs(2));
+    assert!(
+        conpty_session::test_hooks::wait_until_socket_write_held(Duration::from_secs(2)),
+        "the socket never parked its write"
+    );
+
+    // A is the only session with output when the drain collects its records.
+    core.feed("drain-a", "A\n", FEED_DEADLINE).expect("feed a");
+    conpty_session::test_hooks::hold_drain_before_drops();
+    let drainer = {
+        let core = Arc::clone(&core);
+        thread::spawn(move || core.drain())
+    };
+    assert!(
+        conpty_session::test_hooks::wait_until_drain_held(Duration::from_secs(3)),
+        "the drain never parked between its records and its drops"
+    );
+    // The drop lands now, after the scan: B has no record in this drain.
+    for index in 0..40 {
+        core.feed(
+            "drain-b",
+            &format!("frame {index} padded out to a few dozen bytes\r\n"),
+            FEED_DEADLINE,
+        )
+        .expect("feed b");
+    }
+    conpty_session::test_hooks::release_drain_before_drops();
+    let records = join_within(drainer, Duration::from_secs(5), "the drain");
+    assert!(
+        records.iter().any(|record| record.session_id == "drain-a"),
+        "the drain carried no record for A: {records:?}"
+    );
+    assert!(
+        !records.iter().any(|record| record.session_id == "drain-b"),
+        "B had no reason to be in this drain: {records:?}"
+    );
+
+    // The count is still unreported: the next record for B carries it.
+    let record = drain_until(&core, |record| {
+        record.session_id == "drain-b" && !record.socket_drops.is_empty()
+    })
+    .expect("B's drop was marked reported with no record to carry it");
+    assert!(record.socket_drops[0].1 > 0, "{record:?}");
+    conpty_session::test_hooks::release_socket_writes();
+    core.shutdown();
+}
+
+/// Brief item 5 (kimi 5): the Python log runs with no core lock held. A callback that calls back into
+/// the core would deadlock the request backlog (which holds its mutex while appending) if the log ran
+/// under it; before this fix the overflow logged inside the lock.
+#[test]
+fn a_log_callback_may_call_back_into_the_core() {
+    let slot: Arc<Mutex<Option<Arc<Core>>>> = Arc::new(Mutex::new(None));
+    let target = Arc::clone(&slot);
+    let log = Arc::new(move |_line: &str| {
+        let core = target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(core) = core {
+            // Both take a lock the caller could be holding: the registry and the drain path.
+            let _ = core.socket_count();
+            let _ = core.drain();
+        }
+    });
+    let core = core_with_options(CoreOptions::default(), log);
+    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&core));
+    core.attach_text(text_request("reentrant", 40, 8)).expect("attach_text");
+
+    // One more than the backlog cap (1024) overflows it and logs.
+    let run = {
+        let core = Arc::clone(&core);
+        thread::spawn(move || {
+            for _ in 0..1100 {
+                let _ = core.request_resize("reentrant", 80, 20, false);
+            }
+        })
+    };
+    join_within(run, Duration::from_secs(5), "the overflowing resize loop");
+    core.shutdown();
+}
+
+/// Brief item 5 (kimi 5), the ticker's path: `check_stalls` decides under the registry lock and logs
+/// after it. A callback that reads the registry would block the ticker forever if the log ran inside.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_stall_log_runs_without_the_registry_lock() {
+    let _serial = serialized();
+    let slot: Arc<Mutex<Option<Arc<Core>>>> = Arc::new(Mutex::new(None));
+    let target = Arc::clone(&slot);
+    let log = Arc::new(move |_line: &str| {
+        let core = target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(core) = core {
+            let _ = core.socket_count();
+        }
+    });
+    let core = core_with_options(CoreOptions::default(), log);
+    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&core));
+    core.set_socket_stall_limit(Duration::from_millis(150));
+    core.attach_text(text_request("stall-log", 40, 8)).expect("attach_text");
+    conpty_session::test_hooks::hold_socket_writes();
+    let mut ws = connect(&core, "stall-log");
+    read_until(&mut ws, "{\"type\":\"replay_end\"}", Duration::from_secs(2));
+    assert!(
+        conpty_session::test_hooks::wait_until_socket_write_held(Duration::from_secs(2)),
+        "the socket never parked its write"
+    );
+    core.feed("stall-log", "a frame the socket will not take\n", FEED_DEADLINE)
+        .expect("feed");
+    // The close reaches the peer only if the ticker survived its own log call.
+    let (code, _) = read_to_close(&mut ws, Duration::from_secs(5));
+    assert_eq!(code, 1000, "the stalled socket was not closed");
+    conpty_session::test_hooks::release_socket_writes();
     core.shutdown();
 }

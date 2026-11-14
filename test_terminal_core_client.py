@@ -163,12 +163,20 @@ class CoreClientTests(unittest.TestCase):
     def test_natural_exit_is_reported_without_kill(self):
         """B1: a child that exits by itself is reported, with its code, without `kill`."""
         self.spawn(["cmd.exe", "/c", "echo natural-exit & exit 7"])
+        # The 1 s bound belongs to the death report, not to the spawn: on a loaded machine `cmd.exe`
+        # can take a while to start and to print, and that delay is not the reaper's. Wait for the
+        # first sign of life generously, then hold the report itself to a second.
+        self.drain_until(
+            lambda record: record["session_id"] == self.session
+            and (record["bytes_total"] > 0 or not record["alive"]),
+            timeout=10.0,
+        )
         started = time.monotonic()
         dead = self.drain_until(
             lambda record: record["session_id"] == self.session and not record["alive"],
             timeout=1.0,
         )
-        self.assertLess(time.monotonic() - started, 1.0, "the death record took more than 1 s")
+        self.assertLess(time.monotonic() - started, 1.0, "the death record took more than 1 s after output")
         self.assertEqual(dead["exit_code"], 7, dead)
         self.assertFalse(dead["crashed"], dead)
         self.assertGreater(dead["bytes_total"], 0, dead)

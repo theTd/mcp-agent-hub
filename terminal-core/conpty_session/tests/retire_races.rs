@@ -64,14 +64,17 @@ fn wait_dead(core: &Core, id: &str, within: Duration) -> bool {
     false
 }
 
-/// Takes everything queued on `handle` for a quiet window of `within`, reporting the text, the queue's
-/// own drop count and whether it said `closed`.
+/// Takes everything queued on `handle` until a quiet window of 40 ms follows at least one frame, or
+/// `within` passes. The quiet window only means "nothing more is coming" after something came: the
+/// ticker's flush is scheduled, so a loaded machine can spend 40 ms before the first frame lands
+/// (review omp 10 / kimi 6).
 fn collect(core: &Core, handle: u64, within: Duration) -> (String, u64, bool) {
     let end = Instant::now() + within;
     let mut text = String::new();
     let mut dropped = 0;
     let mut closed = false;
     let mut stable_since = Instant::now();
+    let mut heard = false;
     while Instant::now() < end {
         let taken = core.take_frames(handle).expect("take_frames");
         dropped = taken.dropped_bytes;
@@ -79,8 +82,9 @@ fn collect(core: &Core, handle: u64, within: Duration) -> (String, u64, bool) {
         for frame in taken.frames {
             text.push_str(std::str::from_utf8(&frame).expect("a frame is text"));
             stable_since = Instant::now();
+            heard = true;
         }
-        if stable_since.elapsed() >= Duration::from_millis(40) {
+        if heard && stable_since.elapsed() >= Duration::from_millis(40) {
             break;
         }
         thread::sleep(Duration::from_millis(5));
