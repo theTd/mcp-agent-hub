@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import httpx
 from starlette.testclient import TestClient, WebSocketDenialResponse
+from starlette.websockets import WebSocketDisconnect
 
 from loopback_request_guard import REFUSAL_TEXT
 from session_manager import HubSessionManager
@@ -57,15 +58,24 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
         test sees exactly its own refusal lines."""
         return patch("loopback_request_guard._monotonic", lambda: seconds)
 
-    def websocket(self, path="/ws/pty/missing", **headers):
-        """Enter the handshake; raises `WebSocketDenialResponse` instead of accepting on a refusal.
+    def websocket(self, path="/ws/any", **headers):
+        """Enter the handshake; raises `WebSocketDenialResponse` on a refusal.
+
+        The hub app serves no WebSocket route any more (the console's terminal sockets are the core's,
+        behind a ticket minted over HTTP), so a handshake the guard hands on reaches the router, which
+        closes it unaccepted: `WebSocketDisconnect`, never the guard's 403 denial.
 
         The client's context manager is deliberately not entered: that would run the app lifespan and
         start real storage, and the handshake needs none of it.
         """
         return TestClient(self.server.app).websocket_connect(path, headers=headers)
 
-    async def test_foreign_host_is_refused_on_api_mcp_and_pty(self):
+    def assert_websocket_handed_on(self, **headers):
+        with self.assertRaises(WebSocketDisconnect):
+            with self.websocket(**headers):
+                pass
+
+    async def test_foreign_host_is_refused_on_api_mcp_and_websocket(self):
         api = await self.request(**FOREIGN_HOST)
         self.assertEqual(api.status_code, 403)
         self.assertTrue(api.headers["content-type"].startswith("text/plain"))
@@ -135,13 +145,11 @@ class LoopbackGuardTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(host=host):
                 self.assertEqual((await self.request(host=host)).status_code, 200)
 
-    async def test_a_websocket_without_origin_passes_the_handshake(self):
-        with self.websocket(**LOOPBACK_HOST):
-            pass
+    async def test_a_websocket_without_origin_passes_the_guard(self):
+        self.assert_websocket_handed_on(**LOOPBACK_HOST)
 
-    async def test_a_websocket_from_the_hubs_own_page_passes_the_handshake(self):
-        with self.websocket(**LOOPBACK_HOST, **HUB_ORIGIN):
-            pass
+    async def test_a_websocket_from_the_hubs_own_page_passes_the_guard(self):
+        self.assert_websocket_handed_on(**LOOPBACK_HOST, **HUB_ORIGIN)
 
     async def test_the_mcp_endpoint_is_reached_without_an_origin(self):
         # Only the guard's own answer (403, plain text) counts as a refusal: whatever the stack behind it
