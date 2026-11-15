@@ -51,14 +51,17 @@ class DshRestartRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
         await self.hub.start()
-        self.sess = AgentSession("dsh-restart", "dsh", "DSH", "tui", "Test", str(self.root), "", [])
+        # A DSH session has no process but still owns a screen and a ring in the core (`attach_text`):
+        # the watcher writes its step and tool lines into that screen.
+        self.sess = AgentSession("dsh-restart", "dsh", "DSH", "tui", "Test", str(self.root), "", [],
+                                 core=self.hub._ensure_core())
         self.sess.engine = "dsh"
         self.sess.pty = None
         self.sess.dsh_spec = {"tier": "flash"}
         self.sess.dsh_job_id = "old-job"
         self.sess.status = "running"
         self.sess.profile_snapshot = {"engine": "dsh", "cwd": str(self.root), "dsh_spec": self.sess.dsh_spec}
-        self.sess._loop = asyncio.get_running_loop()
+        self.sess.start_virtual(asyncio.get_running_loop())
         self.hub.sessions[self.sess.session_id] = self.sess
         self.prep = patch("session_manager.prepare_dsh_workspace", return_value=dict(READY))
         self.prep.start()
@@ -133,6 +136,9 @@ class DshRestartRecoveryTests(unittest.IsolatedAsyncioTestCase):
                      "conversation_ref": {"dsh_job_id": "old-job", "dsh_token": "token"}}, **extra)
 
     async def resume(self, job, record=None):
+        # The hub restarted: the incarnation this record belongs to is gone, not live in the core.
+        self.sess.kill(300)
+        self.hub._on_core_tick()
         response = httpx.Response(200, json={"ok": True, "job": dict({"id": "old-job"}, **job)})
         watch = AsyncMock()
         with patch.object(self.hub, "build_resume_launch", return_value={"cwd": str(self.root)}), \

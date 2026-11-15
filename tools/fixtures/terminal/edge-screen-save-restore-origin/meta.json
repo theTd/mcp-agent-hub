@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "save/restore with DECOM: a savepoint taken with origin off does not turn origin off again on ESC 8, so the ESC[?6h sent after the save still holds and ESC[H homes to the region's top row; ESC 8 with an empty stack resets DECOM and homes instead",
+  "resume_count": 1
+}

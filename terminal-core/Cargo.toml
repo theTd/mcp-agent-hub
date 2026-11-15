@@ -1,0 +1,14 @@
+# The terminal core is its own workspace: desktop/src-tauri sets `panic = "abort"` for the app, and a
+# dependency compiled with abort would turn every caught panic back into a hub kill (docs §6.3, §7.3).
+[workspace]
+members = ["terminal_stream", "conpty_session", "hub_terminal_core"]
+resolver = "2"
+
+[profile.release]
+# §6.3: the extension's panics are caught per thread and become one crashed session, so release must
+# unwind. The binding crate's test `release_profile` asserts this through `cargo metadata`.
+panic = "unwind"
+opt-level = 2
+lto = "thin"
+strip = "symbols"
+codegen-units = 1

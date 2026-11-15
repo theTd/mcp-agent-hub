@@ -180,11 +180,13 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
         await self.hub.start()
-        self.sess = AgentSession("dsh-gate", "dsh", "DSH", "tui", "Test", str(self.root), "", [])
+        # A DSH session has no process but still owns a screen and a ring in the core (`attach_text`).
+        self.sess = AgentSession("dsh-gate", "dsh", "DSH", "tui", "Test", str(self.root), "", [],
+                                 core=self.hub._ensure_core())
         self.sess.engine = "dsh"
         self.sess.dsh_spec = {"tier": "flash"}
         self.sess.profile_snapshot = {"engine": "dsh", "cwd": str(self.root), "dsh_spec": self.sess.dsh_spec}
-        self.sess._loop = asyncio.get_running_loop()
+        self.sess.start_virtual(asyncio.get_running_loop())
         self.hub.sessions[self.sess.session_id] = self.sess
         self.prep = patch("session_manager.prepare_dsh_workspace", return_value=copy.deepcopy(BLOCKED))
         self.prepare = self.prep.start()
@@ -259,6 +261,9 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_only_checks_even_if_repair_would_be_blocked(self):
         import httpx
+        # The predecessor this record belongs to is archived, not live: the resume attaches afresh.
+        self.sess.kill(300)
+        self.hub._on_core_tick()
         record = {"cwd": str(self.root), "profile_snapshot": self.sess.profile_snapshot,
                   "conversation_ref": {"dsh_job_id": "old-job"}, "final_response": "previous"}
         response = httpx.Response(200, json={"ok": True, "job": {"id": "old-job", "status": "done"}})

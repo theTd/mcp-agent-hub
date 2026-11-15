@@ -10,20 +10,8 @@ from unittest.mock import patch
 import httpx
 
 from agent_guidance import CLEANUP_HINT, SERVER_INSTRUCTIONS
+from fake_terminal_core import FakeTerminal
 from session_manager import AgentSession, HubSessionManager
-
-
-class FakePty:
-    def __init__(self):
-        self.alive = True
-        self.stops = 0
-
-    def isalive(self):
-        return self.alive
-
-    def terminate(self, force=False):
-        self.stops += 1
-        self.alive = False
 
 
 class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -35,6 +23,8 @@ class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.profiles.write_text('{"profiles":{},"global_routing_instructions":"keep"}', encoding="utf-8")
         with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
             self.hub = HubSessionManager(self.profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        self.fake = FakeTerminal()
+        self.hub.core = self.fake
         await self.hub.start()
         with patch("session_manager.HubSessionManager", return_value=self.hub):
             self.server = importlib.import_module("server")
@@ -47,24 +37,32 @@ class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     def session(self, sid="fixture", source="agent", status="completed", alive=True):
-        sess = AgentSession(sid, "codex", "Codex", "tui", sid, str(self.root), "unused", [])
+        sess = AgentSession(sid, "codex", "Codex", "tui", sid, str(self.root), "unused", [], core=self.fake)
         sess.engine = "codex"
         sess.profile_snapshot = {"launch_source": source, "engine": "codex", "cwd": str(self.root)}
-        sess.pty = FakePty() if alive else None
+        if alive:
+            # A live process is one the core has and the drain record reported as alive.
+            self.fake.spawn(sid, ["fixture"])
         sess.status = status
         sess.completion_reported = status == "completed"
         sess.set_final_response("saved answer", "native_transcript")
         if sess._inactive_since is not None:
             sess._inactive_since -= 3601
         self.hub.sessions[sid] = sess
+        if alive:
+            self.hub._on_core_tick()
         return sess
+
+    def kills(self, sess):
+        """How many times the hub asked the core to end this session's tree."""
+        return sum(1 for session_id, _grace in self.fake.kill_calls if session_id == sess.session_id)
 
     async def test_timeout_kills_once_archives_and_preserves_answer(self):
         sess = self.session()
         self.assertEqual(self.hub.subagent_idle_timeout_minutes, 60)
         self.assertEqual(await self.hub.cleanup_idle_subagents(), 1)
         self.assertEqual(await self.hub.cleanup_idle_subagents(), 0)
-        self.assertEqual(sess.pty.stops, 1)
+        self.assertEqual(self.kills(sess), 1)
         self.assertNotIn(sess.session_id, self.hub.sessions)
         await self.hub.db.flush()
         record = await self.hub.db.get_session_record(sess.session_id)
@@ -171,12 +169,12 @@ class SubagentCleanupTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             self.hub.begin_new_turn(sess, status="running")
         self.assertEqual(await cleanup, 0)
-        self.assertTrue(sess.pty.alive)
+        self.assertTrue(sess.is_process_alive())
 
     async def test_manual_and_automatic_close_race_emits_one_event(self):
         sess = self.session()
         await asyncio.gather(self.hub.cleanup_idle_subagents(), self.hub.close_session(sess.session_id, source="mcp"))
-        self.assertEqual(sess.pty.stops, 1)
+        self.assertEqual(self.kills(sess), 1)
         self.assertEqual(len(self.hub.get_worker_events(session_id=sess.session_id)), 1)
 
     async def test_background_sweep_and_shutdown(self):

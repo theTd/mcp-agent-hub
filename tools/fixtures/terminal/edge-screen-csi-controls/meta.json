@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "bytes inside a CSI that pyte took for its final byte: a C0 control runs where it arrives and the sequence goes on (CR, SO, BS inside a marker CSI, BS in a CSI cut by a read boundary), DEL is ignored, and an ESC abandons the sequence and may start a non-CSI escape (ESC 7 / ESC 8)",
+  "resume_count": 1
+}

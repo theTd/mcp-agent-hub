@@ -1,0 +1,23 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.8
+     ▀▀▀▀▀▀       <EMAIL>               (<PLAN>)
+▀▀▀▀▀▀▀▀      <S  Gemini 4 Argon (Low)
+   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change
+  nothing
+
+● Ran (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)
+
+  There are 3 files in this folder:
+
+  alalpha.txt
+  bebeta.txt
+  • gamma.md
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                              auto · Gemini 4 Argon · low

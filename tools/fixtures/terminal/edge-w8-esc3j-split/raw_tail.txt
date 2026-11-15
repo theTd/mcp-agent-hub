@@ -1,0 +1,3 @@
+archived line
+before[2J[3Jafter
+tail

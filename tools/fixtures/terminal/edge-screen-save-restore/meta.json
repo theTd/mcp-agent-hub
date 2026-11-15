@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "save/restore with DECAWM: ESC[?7l ESC 7 ESC[?7h ESC 8 leaves autowrap on, so the 25th character wraps to the next row; a restore that clears the mode overwrites the 24th cell instead",
+  "resume_count": 1
+}

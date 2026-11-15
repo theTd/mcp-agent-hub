@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "DECOM: ESC[?6h from row 3 homes the cursor, and so does ESC[?6l, so X and Y land on row 0 instead of overwriting rows 2 and 3",
+  "resume_count": 1
+}

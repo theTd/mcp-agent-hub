@@ -221,20 +221,12 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads((await tail.read_batch())[0][1]), {"kind": "text"})
 
 
-class _TestPty:
-    pid = None
-    exitstatus = 0
-    def __init__(self):
-        self.alive = True
-        self.inputs = []
-    def isalive(self):
-        return self.alive
-    def write(self, text):
-        self.inputs.append(text)
-    def setwinsize(self, rows, cols):
-        pass
-    def terminate(self, force=False):
-        self.alive = False
+def is_replay_end(frame) -> bool:
+    """The core's marker is `{"type":"replay_end"}` (no space); the console parses it as JSON."""
+    try:
+        return json.loads(frame).get("type") == "replay_end"
+    except Exception:
+        return False
 
 
 class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -272,10 +264,24 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             on_exit_cb=self.module.hub._exit_callback,
         )
         self.session.engine = "codex"
-        self.session.pty = _TestPty()
         self.session._loop = asyncio.get_running_loop()
         self.session.status = "running"
         self.module.hub.sessions[self.session.session_id] = self.session
+        # The terminal is the hub's real core (step 3b): a live cmd.exe behind this session, so the
+        # `/ws/pty` bridge, the input path and the archive read the same core the hub runs on.
+        # F14: `start()` builds the Core lazily now, so a harness that wants a real terminal asks
+        # for the hub's one Core here.
+        self.session.core = self.module.hub._ensure_core()
+        self.module.hub.core.spawn(self.session.session_id, ["cmd.exe"],
+                                   cwd=str(self.directory), cols=120, rows=36)
+        # The core publishes the spawn's first record from its own ticker, so one tick straight
+        # after `spawn` may see nothing and leave the session without pid or liveness. Wait for the
+        # record instead: a test that reads `is_process_alive` must not race the core's thread.
+        deadline = time.monotonic() + 3.0
+        while not self.session.has_process and time.monotonic() < deadline:
+            self.module.hub._on_core_tick()
+            await asyncio.sleep(0.02)
+        self.assertTrue(self.session.has_process, "the core never published the spawn record")
         await self.module.hub.persist_session(self.session)
         await self.module.hub.db.flush()
 
@@ -286,19 +292,36 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.socket.close()
         self.temporary.cleanup()
 
-    async def connect_terminal(self):
+    async def connect_terminal(self, session_id="test-tui"):
+        websocket, _replay = await self.open_terminal(session_id)
+        return websocket
+
+    async def open_terminal(self, session_id="test-tui"):
+        """§6.4's path: a ticket from the hub, then the core's socket, read through its marker.
+
+        The console does exactly this (`terminalTicket` then `new WebSocket(url)`); the replay comes
+        first (one frame, or none for an empty ring), then one `replay_end`, then live output.
+        """
         from websockets.asyncio.client import connect
-        websocket = await connect(f"ws://127.0.0.1:{self.port}/ws/pty/test-tui", proxy=None)
+        response = await self.client.get(f"/api/sessions/{session_id}/terminal-ticket")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(str(body.get("url", "")).startswith("ws://127.0.0.1:"), body)
+        self.assertGreater(body.get("expires_in"), 0, body)
+        self.assertLessEqual(body.get("expires_in"), 30, body)
+        websocket = await connect(body["url"], proxy=None)
+        replay = []
         while True:
-            frame = await asyncio.wait_for(websocket.recv(), timeout=1)
-            if frame == '{"type": "replay_end"}':
-                return websocket
+            frame = await asyncio.wait_for(websocket.recv(), timeout=2)
+            if is_replay_end(frame):
+                return websocket, "".join(replay)
+            replay.append(frame)
 
     async def test_mcp_and_console_launches_have_distinct_sources(self):
         from unittest.mock import AsyncMock
         with patch.object(self.module.hub, "create_session", new_callable=AsyncMock,
                           return_value=self.session) as create:
-            await self.module.spawn_subagent("pwsh", wait_seconds=0)
+            await self.module.spawn_subagent("pwsh", leaf_worker=False, wait_seconds=0)
             self.assertEqual(create.call_args.kwargs["launch_source"], "agent")
             create.reset_mock()
             response = await self.client.post("/api/sessions", json={
@@ -345,10 +368,13 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.1)
             self.assertLess(worst, 0.5)
             await websocket.send(json.dumps({"type": "input", "data": "terminal-input-probe"}))
-            deadline = time.monotonic() + 0.5
-            while not self.session.pty.inputs and time.monotonic() < deadline:
-                await asyncio.sleep(0.005)
-            self.assertIn("terminal-input-probe", self.session.pty.inputs)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if "terminal-input-probe" in self.session.read_raw().text:
+                    break
+                await asyncio.sleep(0.01)
+            # The console's keystrokes reached the terminal core: conhost echoed them back.
+            self.assertIn("terminal-input-probe", self.session.read_raw().text)
             print(f"\nHTTP + WebSocket under 5s SQLite lock: {probes} rounds, worst={worst*1000:.1f} ms", flush=True)
         finally:
             lock.rollback()
@@ -377,6 +403,8 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         session.status = "running"
         session.dsh_job_id = job_id
         session._loop = asyncio.get_running_loop()
+        session.core = self.module.hub._ensure_core()
+        self.module.hub.core.attach_text(session.session_id, cols=120, rows=36)
         self.module.hub.sessions[session.session_id] = session
         websocket = await self.connect_terminal()
         with patch.object(session_manager, "dsh_url", lambda path: f"http://127.0.0.1:{self.port}" + path.replace("/_dsh/dsh-crew", "/_test_dsh")):
@@ -409,17 +437,28 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         print(f"\n1000 DSH log lines: {rounds} HTTP/WebSocket rounds, worst={worst*1000:.1f} ms", flush=True)
 
     async def test_scrollback_marks_commit_not_admission(self):
+        # The shell's own prompt must already be in the ring: after this, only this test's bytes
+        # move the revision, which is what the two assertions compare.
+        previous = None
+        for _ in range(200):
+            text = self.session.read_raw().text
+            if text == previous:
+                break
+            previous = text
+            await asyncio.sleep(0.05)
         lock = sqlite3.connect(self.directory / "hub_state.db", timeout=0.1)
         lock.execute("BEGIN IMMEDIATE")
-        self.session._on_pty_output("persist-after-commit\r\n")
+        # The seam's byte path into the core (`feed`) moves the ring's revision.
+        self.session.emit_virtual_ansi("persist-after-commit\r\n")
+        self.module.hub._on_core_tick()
         old_rev = self.session._scrollback_rev_written
         await self.module.hub.persist_session(self.session, force_scrollback=True)
         self.assertEqual(self.session._scrollback_rev_written, old_rev)
-        self.assertNotEqual(self.session.raw_history_rev, old_rev)
+        self.assertNotEqual(self.session.raw_revision, old_rev)
         lock.rollback()
         lock.close()
         await self.module.hub.db.flush()
-        self.assertEqual(self.session._scrollback_rev_written, self.session.raw_history_rev)
+        self.assertEqual(self.session._scrollback_rev_written, self.session.raw_revision)
         self.assertGreater(self.session._scrollback_written_at, 0)
 
     async def test_overload_returns_503_without_publishing_or_changing_state(self):
@@ -585,6 +624,146 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([m["content"] for m in record["parent_messages"] if m["direction"] == "parent"], ["accepted answer"])
         finally:
             lock.close()
+
+    async def test_health_reports_the_real_terminal_listener(self):
+        # §6.4: the listener's own state, from the real core (a fake core's case is in
+        # test_terminal_ticket_endpoint, and the no-core nulls are there too).
+        core = self.module.hub.core
+        response = await self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["terminal_ws"],
+                         {"listening": True, "port": core.ws_port})
+        self.assertGreater(core.ws_port, 0)
+        self.assertTrue(core.ws_listening())
+
+    async def test_a_ticket_connect_replays_the_ring_before_the_marker(self):
+        # §6.4: the socket's first frames are the ring as it stands, then one `replay_end`, then
+        # live output as raw text. The console's replay buffering and its 1.5 s fallback depend on
+        # exactly that order, so the two halves are checked apart.
+        self.assertTrue(self.session.write_input("echo TICKET-REPLAY-PROBE\r\n"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if "TICKET-REPLAY-PROBE" in self.session.read_raw().text:
+                break
+            await asyncio.sleep(0.02)
+        self.assertIn("TICKET-REPLAY-PROBE", self.session.read_raw().text)
+
+        websocket, replay = await self.open_terminal()
+        try:
+            self.assertIn("TICKET-REPLAY-PROBE", replay, "the replay lost the ring it stands for")
+            self.assertTrue(self.session.write_input("echo LIVE-AFTER-MARKER\r\n"))
+            seen = ""
+            deadline = time.monotonic() + 5
+            while "LIVE-AFTER-MARKER" not in seen and time.monotonic() < deadline:
+                frame = await asyncio.wait_for(websocket.recv(), timeout=2)
+                self.assertFalse(is_replay_end(frame),
+                                 "a second replay marker arrived after the first")
+                seen += frame
+            self.assertIn("LIVE-AFTER-MARKER", seen, "live output never followed the marker")
+        finally:
+            await websocket.close()
+
+    async def test_a_quiet_session_resizes_through_the_drain_not_the_socket(self):
+        # gaps 4: the socket only records the request. The hub applies it on the drain record with
+        # its own clamp and propagation, and the PTY prints nothing for it.
+        websocket, _replay = await self.open_terminal()
+        try:
+            await websocket.send(json.dumps({"type": "resize", "cols": 96, "rows": 24,
+                                             "propagate": False}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and (self.session.cols, self.session.rows) != (96, 24):
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual((self.session.cols, self.session.rows), (96, 24),
+                             "the resize request never reached the session")
+            screen = self.session.read_screen()
+            self.assertEqual((screen.cols, screen.rows), (96, 24),
+                             "the core never applied the hub's size")
+        finally:
+            await websocket.close()
+
+    async def test_dsh_socket_input_is_echoed_and_delivered_once(self):
+        # gaps 9: a session with no PTY gets its socket input back as an ordered drain request; the
+        # hub's own echo and line callback do the work, and the core writes nothing anywhere.
+        import session_manager
+        lines = []
+        session = session_manager.AgentSession(
+            session_id="test-dsh-input", profile_id="dsh", profile_name="DSH", kind="virtual",
+            title="Text input", cwd=str(self.directory), command="", args=[],
+        )
+        session.engine = "dsh"
+        session.status = "running"
+        session.core = self.module.hub._ensure_core()
+        session.start_virtual(asyncio.get_running_loop(),
+                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        self.module.hub.sessions[session.session_id] = session
+        websocket, _replay = await self.open_terminal("test-dsh-input")
+        try:
+            await websocket.send(json.dumps({"type": "input", "data": "hello hub\r"}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not lines:
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual(lines, [("test-dsh-input", "hello hub")])
+            self.assertIn("hello hub", session.read_raw().text, "the DSH echo never reached the screen")
+            self.module.hub._on_core_tick()
+            await asyncio.sleep(0.15)
+            self.module.hub._on_core_tick()
+            self.assertEqual(lines, [("test-dsh-input", "hello hub")],
+                             "the same input was delivered twice")
+        finally:
+            await websocket.close()
+            self.module.hub.sessions.pop("test-dsh-input", None)
+
+    async def test_a_browser_osc_reply_never_reaches_a_text_session(self):
+        # §8/gaps 3+16: the core strips OSC terminal replies from socket input before it records it.
+        # A text session makes that observable: the hub echoes every character it lets through into
+        # the ring, so a reply that survived the strip would be visible there and in the echo.
+        import session_manager
+        lines = []
+        session = session_manager.AgentSession(
+            session_id="test-dsh-osc", profile_id="dsh", profile_name="DSH", kind="virtual",
+            title="OSC strip", cwd=str(self.directory), command="", args=[],
+        )
+        session.engine = "dsh"
+        session.status = "running"
+        session.core = self.module.hub._ensure_core()
+        session.start_virtual(asyncio.get_running_loop(),
+                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
+        self.module.hub.sessions[session.session_id] = session
+        websocket, _replay = await self.open_terminal("test-dsh-osc")
+        try:
+            await websocket.send(json.dumps({"type": "input",
+                                             "data": "\x1b]11;rgb:0000/0000/0000\x07"}))
+            await websocket.send(json.dumps({"type": "input", "data": "hi\r"}))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not lines:
+                self.module.hub._on_core_tick()
+                await asyncio.sleep(0.02)
+            self.assertEqual(lines, [("test-dsh-osc", "hi")])
+            ring = session.read_raw().text
+            self.assertNotIn("rgb:0000", ring, "a browser OSC reply reached the session's screen")
+            self.assertNotIn("\x1b]11", ring, "a browser OSC reply was echoed into the session")
+        finally:
+            await websocket.close()
+            self.module.hub.sessions.pop("test-dsh-osc", None)
+
+    async def test_a_permanent_close_closes_the_socket_normally(self):
+        # W7: a close ends the pane's socket with 1000 through the core, not by silence.
+        from websockets.exceptions import ConnectionClosed
+        websocket, _replay = await self.open_terminal()
+        try:
+            closed = await self.module.hub.close_session("test-tui", source="console")
+            self.assertTrue(closed["found"])
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    await asyncio.wait_for(websocket.recv(), timeout=max(0.1, deadline - time.monotonic()))
+                except ConnectionClosed as exc:
+                    self.assertEqual(exc.rcvd.code, 1000, "the pane's socket did not close normally")
+                    break
+        finally:
+            await websocket.close()
 
 
 if __name__ == "__main__":

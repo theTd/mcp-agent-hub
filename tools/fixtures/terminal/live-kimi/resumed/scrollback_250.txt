@@ -1,0 +1,64 @@
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                    │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                    │
+ │  ▐█████▌  Send /help for help information.                                                                         │
+ │                                                                                                                    │
+ │  Directory: <SCRATCH>                                        │
+ │  Session:   <UUID>                                                           │                                     │
+ │  Model:     K3.1 Pro                                                                                               │
+ │  Version:   2.6.0                                                                                                  │
+ │  MCP:       1 failed, 4 connected                                                                                  │
+ │                                                                                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                        │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                        │
+ │  ▐█████▌  Send /help for help information.                                                                                             │
+ │                                                                                                                                        │
+ │  Directory: <SCRATCH>                                                            │
+ │  Session:   <UUID>                                                                               │
+ │  Model:     K3.1 Pro                                                                                                                   │
+ │  Version:   2.6.0                                                                                                                      │
+ │  MCP:       1 failed, 4 connected                                                                                                      │
+ │                                                                                                                                        │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+   MCP server "mc163market" failed: fetch failed
+   MCP server "playwright" connected · 25 tools (http)
+   MCP server "mc-engine-kb" connected · 16 tools (http)
+   MCP server "blockbench" connected · 17 tools (http)
+
+ ❯ [Hub Session: session_id=rtc-corpus-kimi-65dd6947] list the files in this folder and say how many there are; change nothing
+
+ ● I need respond to user asks list files in this folder and say how many; change nothing. Should comply read-only. I have directory
+   listing in instructions already: alpha.txt beta.txt gamma.txt. Perhaps use tools? Request straightforward. I can use Bash ls known
+   … (6 more lines, ctrl+o to expand)
+
+ ● Used Glob (*) · 3 files
+   beta.txt, gamma.txt, alpha.txt
+
+ ● Respond concise list 3 files change nothing.
+
+ ● There are 3 files in this folder:
+
+   • alpha.txt
+   • beta.txt
+   • gamma.txt
+
+   Nothing was changed.
+
+  Worked for 25s · done 7:03 PM
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                      │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  K3.1 Pro thinking: high  <SCRATCH>                    ctrl+o expand
+ Shutting down… (running shutdown hooks)                                                                             context: 3% (27.2k/1M)
+ Bye!
+
+ To resume this session: kimi -r <UUID>

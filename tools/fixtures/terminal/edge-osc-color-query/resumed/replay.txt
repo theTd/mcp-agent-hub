@@ -1,0 +1,6 @@
+prompt> 
+done
+
+[90m── 已恢复（第 1 次）──[0m
+prompt> 
+done

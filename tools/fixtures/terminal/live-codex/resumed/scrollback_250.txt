@@ -1,0 +1,44 @@
+  >_ OpenAI Codex (v0.167.0)
+     <SCRATCH>dex (v0.167.0)
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+› [Hub Session: session_id=rtc-corpus-codex-12eced85] list the files in this folder and say how many there are; change nothing
+
+
+• I’ll inspect the folder contents only and count the entries; I won’t modify anything.
+
+• Ran Get-ChildItem -Force | Select-Object -ExpandProperty Name
+  └ alpha.txt
+    beta.txt
+    gamma.txt
+
+• The folder contains 3 files:
+
+  • alpha.txt
+  • beta.txt
+  • gamma.txt
+
+  Worked for 19s • 18:52
+
+
+  Select Model and Effort
+
+
+› 1. GPT-6.1-Sol (current)  Latest workhorse model for coding and everyday work.
+  2. GPT-6-Astra            Frontier intelligence for the most demanding work.
+  3. GPT-6-Sol              Previous generation workhorse model.
+  4. GPT-6-Luna             Fast and affordable model for easier tasks.
+  5. GPT-5.6-Sol            Older generation workhorse model.
+  6. GPT-6.1 Terra          GPT-6.1 Terra Codex model.
+  7. GPT-5.6-Terra          Older balanced model for straightforward work.
+  8. GPT-5.6-Luna           Older fast and efficient model.
+↓
+  enter select · esc back

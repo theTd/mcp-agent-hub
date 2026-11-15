@@ -1,0 +1,2 @@
+# Terminal goldens are byte-exact (CRLF, lone CR, escape bytes): git must never rewrite their line endings.
+tools/fixtures/terminal/** -text

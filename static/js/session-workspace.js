@@ -1075,8 +1075,59 @@ function createTerminal(sessionId) {
     t.ws.send(JSON.stringify({ type: 'resize', cols, rows, propagate }));
   };
   t.sendResize = sendResize;
-  const connect = () => {
-    const ws = new WebSocket(hubApi.ptySocketUrl(sessionId));
+  // The two ways a pane loses its terminal (a ticket fetch that fails, a socket that closes) share
+  // one decision and one backoff. A 404 is not a reconnect: the hub no longer lists the id or the
+  // core's entry is gone, so the pane is closed and its session list is refreshed.
+  const terminalClosed = () => {
+    term.write('\r\n\x1b[90m── 终端连接已关闭 ──\x1b[0m\r\n');
+    emit('sessions:refresh-request');
+  };
+  const reconnect = () => {
+    if (t.disposed) return;
+    const session = state.sessions.find((x) => x.session_id === sessionId);
+    if (!session || !isLive(session)) {
+      terminalClosed();
+      return;
+    }
+    if (t.retries === 0) term.write('\r\n\x1b[90m── 终端连接已断开，正在重连… ──\x1b[0m\r\n');
+    t.retries += 1;
+    const delay = Math.min(10000, 1000 * 2 ** (t.retries - 1));
+    t.retryTimer = setTimeout(() => { if (!t.disposed) connect(); }, delay);
+  };
+  // One attempt identity per ticket fetch: a ticket is single use, and a response that lands after
+  // the pane was removed or after a newer attempt started must open nothing and schedule nothing.
+  let attemptSeq = 0;
+  const connect = async () => {
+    const attempt = ++attemptSeq;
+    clearTimeout(t.retryTimer);
+    let ticket;
+    try {
+      ticket = await hubApi.terminalTicket(sessionId);
+    } catch (err) {
+      if (t.disposed || attempt !== attemptSeq) return;
+      if (err?.status === 404) {
+        // A closed pane, not a hub restart: refresh what the sidebar believes, then say it once.
+        refreshPaneHead(sessionId);
+        terminalClosed();
+        return;
+      }
+      reconnect();
+      return;
+    }
+    if (t.disposed || attempt !== attemptSeq) return;
+    const url = ticket?.url;
+    if (!url) {
+      // A hub that answers without a URL cannot be connected to; take the reconnect path.
+      reconnect();
+      return;
+    }
+    let ws;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      reconnect();
+      return;
+    }
     t.ws = ws;
     ws.onopen = () => {
       // The server replays the whole history on every connect, so start from a clean screen.
@@ -1120,17 +1171,12 @@ function createTerminal(sessionId) {
       term.write(data);
     };
     ws.onclose = () => {
+      // A socket a newer attempt already replaced (a retry that fired while this one was closing)
+      // must not schedule a second reconnect.
+      if (t.ws !== ws) return;
       t.wsOpen = false;
       refreshPaneHead(sessionId);
-      if (t.disposed) return;
-      const session = state.sessions.find((x) => x.session_id === sessionId);
-      if (!session || !isLive(session)) {
-        term.write('\r\n\x1b[90m── 终端连接已关闭 ──\x1b[0m\r\n');
-        return;
-      }
-      if (t.retries === 0) term.write('\r\n\x1b[90m── 终端连接已断开，正在重连… ──\x1b[0m\r\n');
-      t.retries += 1;
-      t.retryTimer = setTimeout(() => { if (!t.disposed) connect(); }, Math.min(10000, 1000 * 2 ** (t.retries - 1)));
+      reconnect();
     };
   };
   term.onData((data) => {

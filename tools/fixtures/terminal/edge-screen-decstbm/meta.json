@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "DECSTBM full height: ESC[1;6r on a 6-row screen covers every row, so the scroll at the last row moves all six and sends 'a' to history; reading the raw parameters as 0-based leaves row 0 out of the region",
+  "resume_count": 1
+}

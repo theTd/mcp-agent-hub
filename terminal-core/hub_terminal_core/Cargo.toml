@@ -1,0 +1,23 @@
+[package]
+name = "hub_terminal_core"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 binding of the hub's terminal core (thin: Python types in, conpty_session calls out)"
+publish = false
+
+[lib]
+name = "hub_terminal_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Forwarded so `cargo test --features test-hooks` works from the workspace root and builds the same
+# test hooks in the plain crate.
+test-hooks = ["conpty_session/test-hooks"]
+
+[dependencies]
+conpty_session = { path = "../conpty_session" }
+terminal_stream = { path = "../terminal_stream" }
+# Pinned: 0.30.1 is the first release that knows CPython 3.15, and `abi3-py311` builds one artifact for
+# the portable bootstrap's 3.11-3.14 range plus the dev 3.15 (verified by importing the same .pyd on
+# 3.14 and 3.15; §7.3's abi3 gate). Bumping it is a deliberate step, not a range drift.
+pyo3 = { version = "=0.30.1", features = ["extension-module", "abi3-py311"] }

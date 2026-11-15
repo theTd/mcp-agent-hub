@@ -11,7 +11,6 @@ import tempfile
 import time
 
 import httpx
-from winpty import PtyProcess
 
 
 def check(condition, message):
@@ -150,18 +149,22 @@ def main():
             check(client.delete(base + "/api/profiles/" + dsh_profile["id"]).status_code == 200,
                   "isolated DSH test profile is removed")
 
-            pty = PtyProcess.spawn([str(python), "-I", "-c", "print('portable-pty-ok')"], cwd=str(root), env=api_env)
+            import sys
+            sys.path.insert(0, str(source))
+            from hub_terminal_core import Core
+            core = Core(log=lambda line: None)
+            session_id = "portable-core-check"
+            core.spawn(session_id, [str(python), "-I", "-c", "print('portable-core-ok')"], cwd=str(root), env=api_env)
             try:
                 output = ""
                 deadline = time.monotonic() + 15
-                while "portable-pty-ok" not in output and time.monotonic() < deadline:
-                    try:
-                        output += pty.read()
-                    except EOFError:
-                        break
-                check("portable-pty-ok" in output, "prepared Python can spawn and read a ConPTY session")
+                while "portable-core-ok" not in output and time.monotonic() < deadline:
+                    output = core.raw_tail(session_id, 64 * 1024)
+                    time.sleep(0.05)
+                check("portable-core-ok" in output, "prepared Python can spawn and read a ConPTY session through hub_terminal_core")
             finally:
-                pty.close(force=True)
+                core.kill(session_id, 2000)
+                core.shutdown()
             hook = subprocess.run([str(python), str(source / "engine_policies/claude_pre_tool_hook.py")], input=json.dumps({"hook_event_name": "PermissionRequest", "session_id": "portable-smoke", "tool_name": "Bash", "tool_input": {"command": "echo test"}}), text=True, env=api_env, cwd=root, capture_output=True, timeout=15)
             check(hook.returncode == 0 and (data / ".runtime_mcp_configs/claude_hooks_portable-smoke.jsonl").is_file(), "extracted Claude hook writes to the same data directory")
         finally:

@@ -1,0 +1,52 @@
+[package]
+name = "conpty_session"
+version = "0.1.0"
+edition = "2021"
+description = "Windows ConPTY sessions: command line parity, spawn, pipe I/O, job objects, session table"
+publish = false
+
+[dependencies]
+# Step 2's parser, screen, strips, ring and coalescing; the reader thread calls it per read.
+terminal_stream = { path = "../terminal_stream" }
+# Pinned to the exact version already resolved in desktop/src-tauri/Cargo.lock (0.62.2): the app and
+# the core then report the same Win32 binding generation, and a floating minor would drift silently.
+# ConPTY, pipes, jobs, ToolHelp and NeedCurrentDirectoryForExePath come from here; Cryptography is the
+# ticket key (`BCryptGenRandom`, §6.4).
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+# Step 4's terminal WebSocket (§6.4): RFC 6455 handshake, frames and the close handshake, blocking,
+# with no async runtime in the core. `handshake` is its default feature and the one the server needs.
+tungstenite = "=0.28.0"
+# The ticket's MAC (§6.4): HMAC-SHA256 over sha2 0.10.9, the version already in the lock (§7.4).
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.21.7"
+# The socket's input frames (§6.4 "Input", decision `json-reader`, owner 2026-11-15): pinned to the version
+# already in desktop/src-tauri/Cargo.lock, default features only (no `derive`, no `arbitrary_precision`).
+serde_json = "=1.0.154"
+
+[features]
+# Test-only hooks (`test_hooks`): a controllable console close and a held resize slot, plus the
+# crashed-session setter. The integration tests ask for them; a release build never does.
+test-hooks = []
+
+[[bin]]
+name = "selftest"
+path = "src/bin/selftest.rs"
+
+# §9 step 4's measurement, not part of the gate: `cargo run --release --bin replay_bench` reports the
+# cost of `attach_sink`'s replay render (the delivery lock is held across it).
+[[bin]]
+name = "replay_bench"
+path = "src/bin/replay_bench.rs"

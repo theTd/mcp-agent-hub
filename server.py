@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from contextlib import AsyncExitStack, asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -28,7 +28,6 @@ from session_manager import (
     default_profiles_path,
     hub_api_base_url,
     hub_port,
-    strip_osc_terminal_replies,
     resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
@@ -257,6 +256,23 @@ class RetiredToolMiddleware(Middleware):
 mcp.add_middleware(RetiredToolMiddleware())
 
 
+class LeafWorkerArgumentMiddleware(Middleware):
+    """Explain a spawn_subagent call without leaf_worker: the parent's tool list may predate the field."""
+
+    async def on_call_tool(self, context, call_next):
+        if context.message.name == "spawn_subagent" and "leaf_worker" not in (context.message.arguments or {}):
+            raise ToolError(
+                "spawn_subagent requires leaf_worker (true or false): true tells the worker to do the task "
+                "itself and never spawn subagents; false sends the task unchanged. If your tool list has no "
+                "leaf_worker field, it predates a hub update: reconnect the agent-hub MCP server to refresh "
+                "it, or pass the field anyway."
+            )
+        return await call_next(context)
+
+
+mcp.add_middleware(LeafWorkerArgumentMiddleware())
+
+
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
     """
@@ -294,6 +310,7 @@ async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Di
 @mcp.tool()
 async def spawn_subagent(
     agent_type: str,
+    leaf_worker: bool,
     task: Optional[str] = None,
     model: Optional[str] = None,
     thinking_level: Optional[str] = None,
@@ -312,6 +329,13 @@ async def spawn_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
+
+    ``leaf_worker`` is required, decide it on every spawn: true (the usual choice for a
+    self-contained job) puts a note before ``task`` telling the worker it is a leaf (do the task
+    itself, never spawn subagents or hand work to another agent); false, only for a worker meant
+    to dispatch others, sends the task unchanged. true needs a ``task``. The note is advice, not a
+    block: for Codex and Claude, add ``disabled_mcp_servers=["agent-hub"]`` to take the hub's tools
+    away too.
 
     ``approval_mode`` decides who approves the worker's risky actions:
     - omitted (the default): the engine's own auto-approval reviewer where it has one (Codex
@@ -342,6 +366,7 @@ async def spawn_subagent(
         bypass_approvals=bypass_approvals,
         approval_mode=approval_mode,
         compaction_threshold=compaction_threshold,
+        leaf_worker=leaf_worker,
         extra_args=extra_args,
         mcp_servers=mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
@@ -367,9 +392,16 @@ async def spawn_subagent(
 async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True) -> Dict[str, Any]:
     """Start several subagents and return one group wait handle (all_settled by default).
 
-    Each spec takes spawn_subagent's fields; approval_mode follows the same default (auto)."""
+    Each spec takes spawn_subagent's fields, leaf_worker (true or false) required in every spec;
+    approval_mode follows the same default (auto)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
+    for spec in specs:
+        if type(spec.get("leaf_worker")) is not bool:
+            raise ValueError(
+                "each spec requires leaf_worker (true or false): true tells the worker to do the task "
+                "itself and never spawn subagents; false sends the task unchanged"
+            )
     sessions = []
     for spec in specs:
         item = dict(spec)
@@ -642,7 +674,7 @@ async def read_subagent_screen(
     transcript_summary = await hub.summarize_transcript(session_id=session_id)
     session = hub.sessions.get(session_id)
     if session:
-        raw_txt = session.get_clean_screen_text(max_lines=max_lines)
+        raw_txt = session.read_screen(max_lines=max_lines).text
         res: Dict[str, Any] = {
             "session_id": session.session_id,
             "profile_id": session.profile_id,
@@ -1188,6 +1220,7 @@ async def api_create_session(req: Request):
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
             auto_approval_rules=body.get("auto_approval_rules"),
+            leaf_worker=body.get("leaf_worker", False),
         )
     except ValueError as e:
         return bad_request(str(e))
@@ -1313,81 +1346,48 @@ async def api_click_window(session_id: str, req: Request):
     return {"ok": True}
 
 
-@app.websocket("/ws/pty/{session_id}")
-async def ws_pty_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    sess = hub.sessions.get(session_id)
-    if not sess:
-        await websocket.close(code=1008)
-        return
+@app.get("/api/sessions/{session_id}/terminal-ticket")
+async def api_terminal_ticket(session_id: str):
+    """§6.4: one single-use ticket for the console's terminal socket, minted by the core.
 
-    # Q11: snapshot the replay and register this socket's live queue in one atomic step, with the
-    # same lock the PTY reader uses for "append to history + snapshot the fan-out targets". A chunk
-    # is therefore either inside this replay or in the queue — never lost, never sent twice. The
-    # queue is registered first, so output produced while the replay is on the wire waits in order.
-    replay, q = sess.attach_ws_queue()
+    The console cannot reach the core's listener without it, and the token is a bearer credential:
+    it travels only in this response body (never in a URL the hub serves, so never in an access-log
+    line) and is never logged here. A fresh ticket per call, never cached, because a ticket is
+    single use and a suspended tab's has expired.
 
-    # W7: removing a session from the live list closes its sockets with a normal code instead of
-    # leaving the server side open and silent. The hook travels with the queue when a resume
-    # replaces the session object (AgentSession.adopt_ws_frontends).
-    def _close_on_archive() -> None:
-        try:
-            asyncio.create_task(websocket.close(code=1000))
-        except Exception:
-            pass
+    A session the hub no longer lists, or one whose core entry is gone (retired, closed for good),
+    is a 404 before anything is minted. A listed session that already ended but whose core entry
+    still exists does get a ticket: its pane attaches the terminal and shows the final replay, as
+    the socket always allowed (`mountPaneBody`). A starting session (no first alive record yet) and
+    a DSH text session do too.
 
-    sess.register_ws_closer(q, _close_on_archive)
-    if replay:
-        await websocket.send_text(replay)
-    # V3: an explicit end-of-replay marker. Output frames stay raw text; the console drops the terminal
-    # query responses xterm generates while parsing this replay and keeps forwarding the live ones.
-    await websocket.send_text(json.dumps({"type": "replay_end"}))
-
-    async def sender():
-        try:
-            while True:
-                data = await q.get()
-                await websocket.send_text(data)
-        except Exception:
-            pass
-
-    sender_task = asyncio.create_task(sender())
+    r4b #2/kimi 4b #3: the mint reads the core's session table, which can miss its 50 ms deadline
+    while a spawn, a retire or a snapshot holds it; the call and its ticket store run in a worker so
+    this route never holds the loop, and a deadline answers the retryable 503 the console's backoff
+    already waits out. Only a genuine core fault is a 500.
+    """
+    if hub.sessions.get(session_id) is None:
+        return not_found(f"找不到会话 {session_id}")
+    core = hub.core
+    if core is None:
+        # F14: the hub builds its core lazily, but a health-polled or never-launched hub has no
+        # terminal to serve. Answering 404 keeps the console's not-found path; no core is built here.
+        return not_found(f"找不到会话 {session_id}")
     try:
-        while True:
-            raw_msg = await websocket.receive_text()
-            # A1: a resume replaces the AgentSession object under the same session id (the sockets
-            # are handed over to the new object), so every input frame must go to the session that
-            # is live under this id now, not to the object this socket connected to.
-            live = hub.sessions.get(session_id)
-            try:
-                msg = json.loads(raw_msg)
-            except Exception:
-                msg = None
-            if isinstance(msg, dict):
-                mtype = msg.get("type")
-                try:
-                    if mtype == "input" and live is not None:
-                        cleaned_input = strip_osc_terminal_replies(str(msg.get("data") or ""))
-                        if cleaned_input:
-                            live.write_input(cleaned_input)
-                    elif mtype == "resize":
-                        hub.resize_session_from_client(
-                            session_id,
-                            int(msg.get("cols", 120)),
-                            int(msg.get("rows", 36)),
-                            propagate_background=bool(msg.get("propagate", True)),
-                        )
-                except Exception:
-                    pass
-            elif live is not None:
-                cleaned_raw = strip_osc_terminal_replies(raw_msg)
-                if cleaned_raw:
-                    live.write_input(cleaned_raw)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        sess.detach_ws_queue(q)
-        sender_task.cancel()
+        ticket = await asyncio.to_thread(core.ws_ticket, session_id)
+    except KeyError:
+        # The hub still lists the id, but the core's entry is gone: a closed pane, not a retry.
+        return not_found(f"找不到会话 {session_id}")
+    except TimeoutError:
+        # Gaps 8: the table missed its read deadline, which the old `/ws/pty` answered as 1013.
+        # The console retries any non-404 answer on its backoff, so say "busy", never 500.
+        return JSONResponse({"detail": "终端服务忙，请稍后重试"}, status_code=503,
+                            headers={"Retry-After": "1"})
+    expires_at = float(ticket.get("expires_at") or 0.0)
+    return {
+        "url": str(ticket.get("url") or ""),
+        "expires_in": max(0, int(math.ceil(expires_at - time.time()))),
+    }
 
 
 # ============================================================================
@@ -1401,6 +1401,13 @@ _HUB_SHUTDOWN_TOKEN = os.environ.pop("HUB_SHUTDOWN_TOKEN", "")
 
 @app.get("/health")
 async def api_health():
+    # §6.4: the terminal listener's own state, so a dead accept thread is visible before a pane
+    # fails. Null until the core exists: health polls must never build it (F14's lazy start).
+    core = hub.core
+    terminal_ws = {
+        "listening": bool(core.ws_listening()) if core is not None else None,
+        "port": int(core.ws_port) if core is not None else None,
+    }
     return {
         "ok": True,
         "status": "healthy",
@@ -1410,6 +1417,7 @@ async def api_health():
         "hub_port": hub_port(),
         "started_at": HUB_STARTED_AT,
         "persistence": hub.db.status(),
+        "terminal_ws": terminal_ws,
     }
 
 

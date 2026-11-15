@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 60,
+  "rows": 12,
+  "resize": null,
+  "chunk_encoding": "utf8_bytes",
+  "synthetic": true,
+  "note": "ConPTY bytes split inside a 3-byte CJK char and a 4-byte emoji; pywinpty's read completes the character inside the same chunk (it may exceed the read size), so today's transport carries nothing; the fixture models the core's planned 3-byte carry (design §5.4) and the decoded text is what both produce",
+  "resume_count": 1
+}

@@ -20,6 +20,16 @@ Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并�
 4. 停止时一个回合还没做完的终端类 Agent（状态为运行中、等主 Agent 回复或启动中），恢复时附带一条消息：说明 Hub 重启打断了上一回合、正在运行的命令或审批提示都已停止，请它从中断处继续，原来在等的审批要重新申请。这条消息在记录视图里以「你」显示。空闲的会话和 DSH 会话不带消息。
 5. 把每个会话的结果写到 `resume_on_start.result.json`（`ok`、`continued`、`status_at_stop`，失败时有 `error`）。恢复不了的会话照常留在「归档」里，原因写在记录上。
 
+## Host / Origin 校验
+
+Hub 只服务本机页面和本机客户端：`Host` 必须是 `127.0.0.1`、`localhost` 或 `[::1]`（端口任意，且只允许一个），带 `Origin`
+的请求必须来自 Hub 自己的页面（同协议、同端口，且只允许一个非空值），否则 HTTP 返回 403、WebSocket 在握手中被拒。没有
+`Origin` 的请求（MCP 客户端、桌面端、`wait_url`）不受影响。在 Hub 前面套代理时，启动前设置
+`HUB_ALLOWED_HOSTS=hub.example`、`HUB_ALLOWED_ORIGINS=https://hub.example` 之后再启动；主机条目写成
+`host[:port]` 均可（端口被忽略），空条目或写错的条目会在启动时打一条警告后被丢弃，不支持 `*`；两个变量都只在第一个
+请求前读取一次。被拒的请求在 `hub.log` 里每个 `(Host, Origin)` 组合每分钟最多一行、全局每分钟最多 20 行，超出的部分在
+下一个时间窗用一行 `N refusals not logged` 汇总；行内只有规范化后的主机/来源和经过 `%r` 转义的路径，没有查询串。
+
 ## 重启线上 Hub：给 Agent 的操作步骤
 
 只在 owner 明确要求时做。流程：写恢复请求 → 结束桌面 App → 备份 → 换 EXE → 用 explorer 启动 → 核对。依赖没变时停机约 30 秒；`desktop/portable/requirements.lock` 变了时，首次启动要新建 Python 环境，约 2–3 分钟。

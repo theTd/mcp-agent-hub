@@ -1,0 +1,110 @@
+{
+  "kind": "session",
+  "engine": "kimi",
+  "cols": 120,
+  "rows": 36,
+  "resize": {
+    "at_ms": 43692,
+    "chunk_index": 669,
+    "from": [
+      120,
+      36
+    ],
+    "to": [
+      140,
+      44
+    ]
+  },
+  "chunk_encoding": "utf8_bytes",
+  "pty": "system-conpty",
+  "windows_build": "10.0.26220.9836",
+  "read_buffer_bytes": 8192,
+  "resume_count": 1,
+  "launch": {
+    "command": "kimi.EXE",
+    "args": [
+      "-y"
+    ],
+    "task_mode": "pty_input"
+  },
+  "flags": {
+    "ephemeral": false,
+    "isolated_hub_port": 4599,
+    "env_keys": [
+      "KIMI_MODEL_THINKING_EFFORT"
+    ],
+    "mcp_disabled": [],
+    "mcp_files_inspected": 1
+  },
+  "session_files": {
+    "engine_session_id": null
+  },
+  "task": "[Hub Session: session_id=rtc-corpus-kimi-65dd6947] list the files in this folder and say how many there are; change nothing",
+  "recorder": {
+    "version": 2,
+    "recorded_at": "2026-11-13T19:04:12+0800",
+    "chunk_count": 687,
+    "bytes": 103080,
+    "max_chunk_bytes": 5438,
+    "events": [
+      {
+        "event": "spawn",
+        "at_ms": 0
+      },
+      {
+        "event": "keys",
+        "reason": "type_task",
+        "at_ms": 8581,
+        "bytes": 123
+      },
+      {
+        "event": "keys",
+        "reason": "type_task_submit",
+        "at_ms": 9381,
+        "bytes": 1
+      },
+      {
+        "event": "answer_settled",
+        "at_ms": 38667
+      },
+      {
+        "event": "idle_reached",
+        "at_ms": 88786
+      },
+      {
+        "event": "keys",
+        "reason": "exit",
+        "at_ms": 88786,
+        "bytes": 6
+      }
+    ],
+    "exit": {
+      "stop_reason": "exited",
+      "exit_code": 0,
+      "duration_ms": 96275
+    },
+    "read_error": null
+  },
+  "scrub": {
+    "rules": [
+      {
+        "label": "session_handle",
+        "count": 3
+      },
+      {
+        "label": "window_scratch",
+        "count": 17
+      }
+    ],
+    "replacements": 20,
+    "chunks": 687,
+    "chunk_encoding": "utf8_bytes",
+    "runs": 2,
+    "last_run": {
+      "rules": [],
+      "replacements": 0,
+      "chars_before": 91956,
+      "chars_after": 91956
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "kind": "trigger",
+  "engine": "generic",
+  "cols": 120,
+  "rows": 36,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "resume_count": 1,
+  "seed": {
+    "archived_repeat": "archived boot line\r\n",
+    "archived_count": 20
+  },
+  "generator": {
+    "name": "numbered_lines_v1",
+    "line_format": "line {i:05d} 中文测试 payload ab.cd.ef.gh.ij.kl.mn.op.qr.st.uv.wx.yz",
+    "line_terminator": "\r\n",
+    "first_index": 0,
+    "count": 8800,
+    "chunk_bytes": 4096,
+    "chunk_rule": "consecutive whole lines while the chunk stays <= chunk_bytes UTF-8 bytes",
+    "delay_ms": 10
+  },
+  "note": "633600 bytes fed through _on_pty_output on a resumed session, so raw_history_bytes crosses max + slack and the ring collapses in-loop; the generator block regenerates chunks.jsonl byte for byte"
+}

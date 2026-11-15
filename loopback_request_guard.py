@@ -4,7 +4,8 @@ The hub listens on 127.0.0.1, which the browser does not treat as a boundary:
 
 * DNS rebinding: a page at `http://attacker.example:4444` whose name is re-pointed to 127.0.0.1 is
   same-origin with the hub, so it can read `/api/...` answers and drive the MCP endpoint.
-* WebSockets ignore the same-origin policy outright, so any page can open `/ws/pty/<id>`.
+* WebSockets ignore the same-origin policy outright, so any page can open any WebSocket route the hub
+  serves (today none: the terminal sockets are the core's, behind a ticket minted over guarded HTTP).
 
 Both attacks arrive with a `Host` the browser was forced to build from the attacker's URL, and (for
 any cross-origin request, plus every WebSocket) an `Origin` naming the attacker's page. The guard

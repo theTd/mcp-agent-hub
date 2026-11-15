@@ -76,6 +76,9 @@ export const hubApi = {
   tuckWindow: (id, tuck) => request('POST', `/api/sessions/${enc(id)}/tuck`, { tuck }),
   clickWindow: (id, x, y) => request('POST', `/api/sessions/${enc(id)}/click`, { x, y }),
 
-  ptySocketUrl: (id) => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/pty/${enc(id)}`,
+  // The console's terminal socket is served by the terminal core, not by the hub, so the hub only
+  // hands out a one-use ticket (§6.4). Bounded like listSessions: a hung ticket must reach the
+  // pane's reconnect path instead of stalling the pane forever.
+  terminalTicket: (id) => request('GET', `/api/sessions/${enc(id)}/terminal-ticket`, undefined, { timeoutMs: 5000 }),
   mcpEndpointUrl: () => `${location.origin}/mcp`,
 };

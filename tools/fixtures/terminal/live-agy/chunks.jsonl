@@ -1,0 +1,287 @@
+{"delay_ms": 386, "chunk": "\u001b[1t"}
+{"delay_ms": 1, "chunk": "\u001b[c\u001b[?1004h\u001b[?9001h"}
+{"delay_ms": 1014, "chunk": "\u001b[?2026$p\u001b[?2027$p\u001b]11;?\u0007\u001b]7501;?\u0007"}
+{"delay_ms": 3, "chunk": "\u001b[?5W\u001b[?2004h\u001b[>4;2m\u001b[>5u\u001b[?u\u001b[0 q\r\u001b[J\n\u001b[6C▄▀▀▄        \u001b[1mAntigravity CLI 1.5.8\u001b[m\n\u001b[34D▀▀▀▀▀▀       <EMAIL>\n\u001b[35D▀▀▀▀▀▀▀▀      <SCRATCH><SCRATCH>\r\n   ▄▀▀    ▀▀▄\r\n  ▄▀▀      ▀▀▄\r\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n>\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n? for shortcuts\u001b[2A\u001b[13D\u001b[?25h"}
+{"delay_ms": 2087, "chunk": "\u001b[?25l\u001b[5A\t\t  Gemini 4 Argon (Low)\u001b[K\n\u001b[20D<SCRATCH><SCRATCH>\n\n\n\n\n\n\u001b[19C\u001b[2mGemini 4 Argon · low\u001b[m\r\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 785, "chunk": "\u001b[?25lAuto mode: edits & safe commands auto-approved (shift+tab to cycle)\n\n\u001b[24Cauto\u001b[2m · \u001b[m\u001b[2A\u001b[98D\u001b[?25h"}
+{"delay_ms": 144, "chunk": "\u001b[?25l\r\u001b[2A⣷  Generating...\r\n\n\n\nesc to cancel  \u001b[2A\u001b[13D\u001b[?25h"}
+{"delay_ms": 97, "chunk": "\u001b[?25l\r\u001b[2A⣯  Gene\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 177, "chunk": "\u001b[?25l\u001b[2A Genera\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 16, "chunk": "\u001b[?25l\r\u001b[2A⣟ \n\n\u001b[?25h"}
+{"delay_ms": 88, "chunk": "\u001b[?25l\r\u001b[2A⡿  Generat\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 113, "chunk": "\u001b[?25l\r\u001b[2A⢿  Generatin\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 116, "chunk": "\u001b[?25l\r\u001b[2A⣻  Generating\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 82, "chunk": "\u001b[?25l\r\u001b[2A⣽  Generating.\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 104, "chunk": "\u001b[?25l\r\u001b[2A⣾  Generating..\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 117, "chunk": "\u001b[?25l\r\u001b[2A⣷  Generating...\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\r\u001b[2A⣯  Generating\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[2A⣟  Generating.\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 124, "chunk": "\u001b[?25l\r\u001b[2A⡿  Generating...\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 93, "chunk": "\u001b[?25l\r\u001b[2A⢿ \n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[2A⣻ \n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[2A⣽ \n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[2A⣾ \n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[2A⣷ \n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[2A⣯  G\n\n\b\b\u001b[?25h"}
+{"delay_ms": 50, "chunk": "\u001b[?25l\u001b[6A\u001b[37C (<PLAN>)\n\n\n\n\u001b[53Den\r\n└ Tip: Press ctrl+b to send a long task to the background.\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 55, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 61, "chunk": "\u001b[?25l\u001b[3A\u001b[3Cne\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 18, "chunk": "\u001b[?25l\r\u001b[3A\u001b[K\n────────────────────────────────────────────────────────────\r\n\u001b[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change\u001b[m\u001b[K\r\n\u001b[1m  nothing\u001b[m\u001b[K\r\n⡿  Generating...\u001b[K\r\n└ Tip: Press ctrl+b to send a long task to the background.\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 83, "chunk": "\u001b[?25l\r\u001b[3A⢿  Gener\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣻  Genera\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 120, "chunk": "\u001b[?25l\r\u001b[3A⣽  Generat\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 95, "chunk": "\u001b[?25l\r\u001b[3A⣾  Generati\n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 54, "chunk": "\u001b[?25l\u001b[3A\u001b[4Ceratin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣷  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 129, "chunk": "\u001b[?25l\r\u001b[3A⣯  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 89, "chunk": "\u001b[?25l\r\u001b[3A⣟  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 79, "chunk": "\u001b[?25l\u001b[3A\u001b[9Cng\n\u001b[6DUse /btw to ask a question without breaking context.\n\n\u001b[57D\u001b[?25h"}
+{"delay_ms": 28, "chunk": "\u001b[?25l\r\u001b[3A⡿  Generating\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 347, "chunk": "\u001b[?25l\r\u001b[3A⢿  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 62, "chunk": "\u001b[?25l\r\u001b[3A⣽  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 98, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 183, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 134, "chunk": "\u001b[?25l\r\u001b[3A⣟  Ge\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 143, "chunk": "\u001b[?25l\r\u001b[3A⡿  Gen\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 70, "chunk": "\u001b[?25l\r\u001b[3A⢿  Gene\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 29, "chunk": "\u001b[?25l\r\u001b[3A⣻  Gener\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 50, "chunk": "\u001b[?25l\u001b[3A Genera\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 43, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 200, "chunk": "\u001b[?25l\r\u001b[3A⣾  Generati\n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 46, "chunk": "\u001b[?25l\r\u001b[3A⣷  Generatin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 126, "chunk": "\u001b[?25l\r\u001b[3A⣯  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 92, "chunk": "\u001b[?25l\r\u001b[3A⣟  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 98, "chunk": "\u001b[?25l\r\u001b[3A⡿  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 118, "chunk": "\u001b[?25l\r\u001b[3A⢿  Generatin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 82, "chunk": "\u001b[?25l\r\u001b[3A⣻  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 18, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 82, "chunk": "\u001b[?25l\u001b[3A\u001b[13C.\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 16, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⢿ \n\n\n\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣻  G\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣽  Ge\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣾  Gen\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣷  Gene\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 185, "chunk": "\u001b[?25l\r\u001b[3A⣯  Genera\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 21, "chunk": "\u001b[?25l\r\u001b[3A⣟  Generat\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⡿  Generati\n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 115, "chunk": "\u001b[?25l\r\u001b[3A⢿  Generatin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 74, "chunk": "\u001b[?25l\r\u001b[3A⣻  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 141, "chunk": "\u001b[?25l\r\u001b[3A⣽  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 103, "chunk": "\u001b[?25l\r\u001b[3A⣾  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣷  Generating\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[?25l\r\u001b[3A⣯  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 87, "chunk": "\u001b[?25l\r\u001b[3A⣟  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 67, "chunk": "\u001b[?25l\r\u001b[3A⡿  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 115, "chunk": "\u001b[?25l\r\u001b[3A⢿ \n\n\n\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\r\u001b[3A⣻ \n\n\n\u001b[?25h"}
+{"delay_ms": 97, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 124, "chunk": "\u001b[?25l\r\u001b[3A⣷  G\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 134, "chunk": "\u001b[?25l\r\u001b[3A⣯  Ge\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 93, "chunk": "\u001b[?25l\r\u001b[3A⣟  Gene\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 106, "chunk": "\u001b[?25l\r\u001b[3A⡿  Gener\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[?25l\r\u001b[3A⢿  Genera\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 33, "chunk": "\u001b[?25l\r\u001b[3A⣻  Generat\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 66, "chunk": "\u001b[?25l\u001b[3A\u001b[3Cnerati\n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 56, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⣾  Generatin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 107, "chunk": "\u001b[?25l\r\u001b[3A⣷  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 93, "chunk": "\u001b[?25l\r\u001b[3A⣯  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣟  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⡿  Generatin\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 108, "chunk": "\u001b[?25l\r\u001b[3A⢿  Generating.\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 91, "chunk": "\u001b[?25l\r\u001b[3A⣻  Generating..\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Generating...\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 84, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 106, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 91, "chunk": "\u001b[?25l\r\u001b[3A\u001b[K\n● \u001b[1mRunning\u001b[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)\r\n⣟  Running command...\u001b[K\r\n└ Tip: Use /btw to ask a question without breaking context.\u001b[K\r\n\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 12, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 64, "chunk": "\u001b[?25l\u001b[3A\t\tnd\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 33, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 67, "chunk": "\u001b[?25l\r\u001b[4A○ \n\u001b[17C..\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 33, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\u001b[3A\u001b[18C.\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 31, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 83, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 105, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 96, "chunk": "\u001b[?25l\r\u001b[3A⢿  R\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 106, "chunk": "\u001b[?25l\r\u001b[3A⣻  Ru\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 79, "chunk": "\u001b[?25l\u001b[3A\u001b[3Cnn\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 55, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 88, "chunk": "\u001b[?25l\r\u001b[3A⣾  Runn\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 109, "chunk": "\u001b[?25l\r\u001b[3A⣷  Runnin\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 102, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running \n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 68, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running c\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 86, "chunk": "\u001b[?25l\u001b[3A\u001b[5Cing co\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 46, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running com\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 244, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 3, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 104, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 102, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 181, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 59, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 90, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 150, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 91, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 98, "chunk": "\u001b[?25l\r\u001b[3A⣟  R\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[?25l\r\u001b[3A⡿  Ru\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⢿  Run\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 110, "chunk": "\u001b[?25l\r\u001b[3A⣻  Runni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 36, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 52, "chunk": "\u001b[?25l\u001b[3A Runnin\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 58, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running \n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 187, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running co\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 125, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running com\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 58, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 231, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 199, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 30, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 90, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 126, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 74, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[6n"}
+{"delay_ms": 511, "chunk": "\u001b[?25l\r\u001b[3A⣻ \n\n\n\u001b[?25h"}
+{"delay_ms": 11, "chunk": "\u001b[?25l\r\u001b[3A⣷  Ru\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 107, "chunk": "\u001b[?25l\r\u001b[3A⣯  Runn\n\n\n\u001b[5D\u001b[?25h"}
+{"delay_ms": 109, "chunk": "\u001b[?25l\r\u001b[3A⣟  Runni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 115, "chunk": "\u001b[?25l\r\u001b[3A⡿  Runnin\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running c\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running co\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 103, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running com\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 31, "chunk": "\u001b[?25l\u001b[3A\u001b[7Cg comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 66, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 83, "chunk": "\u001b[?25l\r\u001b[4A● \n\u001b[8C comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 22, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 12, "chunk": "\u001b[?25l\r\u001b[4A● \u001b[1mRan\u001b[m \u001b[4P\n\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 67, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 123, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 83, "chunk": "\u001b[?25l\r\u001b[3A⢿ \n\n\n\u001b[?25h"}
+{"delay_ms": 102, "chunk": "\u001b[?25l\r\u001b[3A⣻ \n\n\n\u001b[?25h"}
+{"delay_ms": 98, "chunk": "\u001b[?25l\r\u001b[3A⣽  R\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣾  Ru\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣷  Run\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 102, "chunk": "\u001b[?25l\r\u001b[3A⣯  Runni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 97, "chunk": "\u001b[?25l\r\u001b[3A⣟  Runnin\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running \n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running co\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running com\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 146, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 88, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 105, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 94, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 116, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 88, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 67, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 96, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 107, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 148, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 71, "chunk": "\u001b[?25l\r\u001b[3A⢿ \n\n\n\u001b[?25h"}
+{"delay_ms": 90, "chunk": "\u001b[?25l\r\u001b[3A⣻  R\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 125, "chunk": "\u001b[?25l\r\u001b[3A⣽  Ru\n\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 92, "chunk": "\u001b[?25l\r\u001b[3A⣾  Run\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 115, "chunk": "\u001b[?25l\r\u001b[3A⣷  Runni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 85, "chunk": "\u001b[?25l\r\u001b[3A⣯  Runnin\n\n\n\u001b[7D\u001b[?25h"}
+{"delay_ms": 67, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 121, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running \n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 95, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running c\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running com\n\n\n\u001b[12D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running comma\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 111, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 87, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 84, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\u001b[3A\u001b[15Cd.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 102, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running command.\n\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 105, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 130, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running command...\n\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 173, "chunk": "\u001b[?25l\r\u001b[3A⣷ \n\n\n\u001b[?25h"}
+{"delay_ms": 66, "chunk": "\u001b[?25l\r\u001b[3A⣯ \n\n\n\u001b[?25h"}
+{"delay_ms": 120, "chunk": "\u001b[?25l\r\u001b[3A⣟ \n\n\n\u001b[?25h"}
+{"delay_ms": 88, "chunk": "\u001b[?25l\r\u001b[3A⡿ \n\n\n\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⢿  R\n\n\n\b\b\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣻  Run\n\n\n\u001b[4D\u001b[?25h"}
+{"delay_ms": 21, "chunk": "\u001b[?25l\r\u001b[3A⣽ \n\n\n\u001b[?25h"}
+{"delay_ms": 78, "chunk": "\u001b[?25l\u001b[3A\u001b[4Cni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\r\u001b[3A⣾ \n\n\n\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣷  Runni\n\n\n\u001b[6D\u001b[?25h"}
+{"delay_ms": 117, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running\n\n\n\u001b[8D\u001b[?25h"}
+{"delay_ms": 83, "chunk": "\u001b[?25l\r\u001b[3A⣟  Running \n\n\n\u001b[9D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⡿  Running c\n\n\n\u001b[10D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⢿  Running co\n\n\n\u001b[11D\u001b[?25h"}
+{"delay_ms": 100, "chunk": "\u001b[?25l\r\u001b[3A⣻  Running comm\n\n\n\u001b[13D\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[3A⣽  Running comma\n\n\n\u001b[14D\u001b[?25h"}
+{"delay_ms": 101, "chunk": "\u001b[?25l\r\u001b[3A⣾  Running comman\n\n\n\u001b[15D\u001b[?25h"}
+{"delay_ms": 104, "chunk": "\u001b[?25l\r\u001b[3A⣷  Running command\n\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 96, "chunk": "\u001b[?25l\r\u001b[3A⣯  Running command..\n\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 86, "chunk": "\u001b[?25l\r\u001b[3A\u001b[K\n  There are \u001b[1m3\u001b[m files in\u001b[K\r\n⣯  Running command...\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 14, "chunk": "\u001b[?25l\u001b[3A\u001b[21Cthis folder\r\n⣟ \n\n\u001b[?25h"}
+{"delay_ms": 18, "chunk": "\u001b[?25l\u001b[3A\u001b[32C:\r\n\u001b[K\n  • [alpha.\u001b[K\r\n⣟  Running command...\u001b[K\r\n\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 15, "chunk": "\u001b[?25l\u001b[3A\u001b[9Ctxt](file://\n\n\n\u001b[21D\u001b[?25h"}
+{"delay_ms": 16, "chunk": "\u001b[?25l\u001b[3A\u001b[21C/D\r\n\t\tnd\n\n\u001b[16D\u001b[?25h"}
+{"delay_ms": 56, "chunk": "\u001b[?25l\r\u001b[2A⡿ \n\n\u001b[?25h"}
+{"delay_ms": 78, "chunk": "\u001b[?25l\u001b[3A\t\t\t<SCRATCH>\n\u001b[20Dd.\n\n\u001b[17D\u001b[?25h"}
+{"delay_ms": 25, "chunk": "\u001b[?25l\u001b[3A\u001b[35C<SCRATCH>\r\n⢿ \n\n\u001b[?25h"}
+{"delay_ms": 9, "chunk": "\u001b[?25l\u001b[3A\u001b[71C<SCRATCH>\n\u001b[67D..\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 24, "chunk": "\u001b[?25l\u001b[3A\u001b[83Ces\n\n\n\u001b[85D\u001b[?25h"}
+{"delay_ms": 58, "chunk": "\u001b[?25l\r\u001b[2A⣻  Running command..\n\n\u001b[18D\u001b[?25h"}
+{"delay_ms": 130, "chunk": "\u001b[?25l\u001b[3A\u001b[2C\u001b[4m\u001b]8;id=jk6007d81ed7159627;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\u001b[K\r\n⣽  Running command...\n\n\u001b[19D\u001b[?25h"}
+{"delay_ms": 3, "chunk": "\u001b[?25l\u001b[3A\u001b[2C\u001b[4m\u001b]8;id=jkfb50ff32529440d5;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\r\n  • [beta.txt](file:///<SCRATCH_DRIVE>\r\n⣽  Running command...\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\u001b[4A\u001b[2C\u001b[4m\u001b]8;id=jkb09f55c37012f4eb;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\t\t<SCRATCH>\n\n\n\u001b[36D\u001b[?25h"}
+{"delay_ms": 22, "chunk": "\u001b[?25l\u001b[4A\u001b[2C\u001b[4m\u001b]8;id=jk9c29087cbaf7c506;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[25C<SCRATCH>\n\n\n\u001b[47D\u001b[?25h"}
+{"delay_ms": 31, "chunk": "\u001b[?25l\r\u001b[2A⣾ \n\n\u001b[?25h"}
+{"delay_ms": 99, "chunk": "\u001b[?25l\r\u001b[2A⣷ \n\n\u001b[?25h"}
+{"delay_ms": 16, "chunk": "\u001b[?25l\u001b[4A\u001b[2C\u001b[4m\u001b]8;id=jk2d604c538521ef18;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[36C<SCRATCH>\n\n\n\u001b[71D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\u001b[4A\u001b[2C\u001b[4m\u001b]8;id=jke2ebfcad7425bd9b;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[60C<SCRATCH>\n\n\n\u001b[83D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\u001b[4A\u001b[2C\u001b[4m\u001b]8;id=jkfb9734c5a23f9705;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[9D\u001b[4m\u001b]8;id=jk18eed8b7a0e744ca;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\u001b[K\r\n  • [gamma\u001b[K\r\n⣷  Running command...\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\u001b[K\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\nesc to cancel\u001b[80X\u001b[80Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 50, "chunk": "\u001b[?25l\r\u001b[2A⣯ \n\n\u001b[?25h"}
+{"delay_ms": 33, "chunk": "\u001b[?25l\u001b[5A\u001b[2C\u001b[4m\u001b]8;id=jkd3936bbc0f0be0a1;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[9D\u001b[4m\u001b]8;id=jk76bb737b0ab976e6;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\n\b\b.md](file:///<SCRATCH>\n\n\n\u001b[44D\u001b[?25h"}
+{"delay_ms": 17, "chunk": "\u001b[?25l\u001b[5A\u001b[2C\u001b[4m\u001b]8;id=jkebf20fe0bcfe6b8a;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[9D\u001b[4m\u001b]8;id=jkb7625ac66b135b;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\n\u001b[34C<SCRATCH>\n\n\n\u001b[56D\u001b[?25h"}
+{"delay_ms": 16, "chunk": "\u001b[?25l\u001b[5A\u001b[2C\u001b[4m\u001b]8;id=jkd97aeb59bc2f9ac8;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[9D\u001b[4m\u001b]8;id=jk9f9de96ef525fe3d;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\n\u001b[46C<SCRATCH>\n\n\n\u001b[65D\u001b[?25h"}
+{"delay_ms": 60, "chunk": "\u001b[?25l\r\u001b[2A⣟ \n\n\u001b[?25h"}
+{"delay_ms": 79, "chunk": "\u001b[?25l\u001b[5A\u001b[2C\u001b[4m\u001b]8;id=jkb8c0c17a6c8be295;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\n\u001b[9D\u001b[4m\u001b]8;id=jk2b00f72ded6eb2ba;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\n\u001b[8D\u001b[4m\u001b]8;id=jkc48a949e00cf00a5;file:///<SCRATCH><SCRATCH>/gamma.md\u0007gamma.md\u001b[m\u001b]8;;\u0007\u001b[K\r\n⡿ \n\n\u001b[?25h"}
+{"delay_ms": 46, "chunk": "\u001b[?25l\u001b[2A Ru\n\n\b\b\b\u001b[?25h"}
+{"delay_ms": 49, "chunk": "\u001b[?25l\r\u001b[2A\u001b[K\n\n\n\n? for shortcuts\u001b[2A\u001b[13D\u001b[?25h"}
+{"delay_ms": 11326, "chunk": "\u001b[6n"}
+{"delay_ms": 512, "chunk": "\u001b[?25l\r\u001b[20A\u001b[J\n\u001b[6C▄▀▀▄        \u001b[1mAntigravity CLI 1.5.8\u001b[m\n\u001b[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)\n\u001b[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)\r\n   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>\r\n  ▄▀▀      ▀▀▄\r\n\n────────────────────────────────────────────────────────────\r\n\u001b[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change\u001b[m\r\n\u001b[1m  nothing\u001b[m\r\n\n● \u001b[1mRan\u001b[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)\r\n\n  There are \u001b[1m3\u001b[m files in this folder:\r\n\n  • \u001b[4m\u001b]8;id=jkb8c0c17a6c8be295;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jk2b00f72ded6eb2ba;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jkc48a949e00cf00a5;file:///<SCRATCH><SCRATCH>/gamma.md\u0007gamma.md\u001b[m\u001b]8;;\u0007\r\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n? for shortcuts\u001b[78X\u001b[78Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 22, "chunk": "\u001b[?25l\u001b[0 q\r\u001b[19A\u001b[J\u001b[A? for shortcuts\u001b[98X\u001b[98Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m"}
+{"delay_ms": 150, "chunk": "\u001b[2J\u001b[3J\u001b[H"}
+{"delay_ms": 3, "chunk": "\u001b[>4;2m\u001b[=5;1u\u001b[?u\u001b[0 q\u001b[J\n\u001b[6C▄▀▀▄        \u001b[1mAntigravity CLI 1.5.8\u001b[m\n\u001b[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)\n\u001b[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)\r\n   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>\r\n  ▄▀▀      ▀▀▄\r\n\n────────────────────────────────────────────────────────────\r\n\u001b[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing\u001b[m\r\n\n● \u001b[1mRan\u001b[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)\r\n\n  There are \u001b[1m3\u001b[m files in this folder:\r\n\n  • \u001b[4m\u001b]8;id=jk18e80d917be1b2f9;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jkde34b3f528e3044e;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jk3d4c0057c2b6bdf1;file:///<SCRATCH><SCRATCH>/gamma.md\u0007gamma.md\u001b[m\u001b]8;;\u0007\r\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n? for shortcuts\u001b[98X\u001b[98Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 20106, "chunk": "\u001b[?25l/e\u001b[K\r\n\n> /effort\u001b[26X\u001b[26C  \u001b[2mSet the reasoning effort\u001b[m\u001b[K\r\n  /exit\u001b[30X\u001b[30C\u001b[2mExit the CLI\u001b[m\r\n  /clay-mc-engine-kb-first           \u001b[2mMUST use before asserting anything about Minecraft China (NetEase MC163 / ModSDK) engine-native beh...\u001b[m\r\n  /help\u001b[30X\u001b[30C\u001b[2mShow available commands and keybindings\u001b[m\r\n  /open\u001b[30X\u001b[30C\u001b[2mOpen a file or view opened/edited files\u001b[m\r\n\u001b[2m   ↓ 58 more\u001b[m\r\n\n  \u001b[1m↑/↓\u001b[m Navigate · \u001b[1menter\u001b[m Select · \u001b[1mtab\u001b[m Complete\r\n? for shortcuts\u001b[98X\u001b[98Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[10A\u001b[4C\u001b[?25h"}
+{"delay_ms": 45, "chunk": "\u001b[?25l\r\n\n\n\u001b[J\u001b[3A\u001b[2C\u001b[K\r\n\nesc to cancel\u001b[100X\u001b[100Cauto\u001b[2m · Gemini 4 Argon · low\r\u001b[m\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 45, "chunk": "\u001b[?25l\r\u001b[19A\u001b[K\r\nResume with -c (or command below):\u001b[K\r\nagy --conversation=<UUID>\u001b[K\r\n\u001b[K\r\n\u001b[?5W\u001b[J\n\u001b[6C▄▀▀▄        \u001b[1mAntigravity CLI 1.5.8\u001b[m\n\u001b[34D▀▀▀▀▀▀       <EMAIL> (<PLAN>)\n\u001b[53D▀▀▀▀▀▀▀▀      Gemini 4 Argon (Low)\r\n   ▄▀▀    ▀▀▄     <SCRATCH><SCRATCH>\r\n  ▄▀▀      ▀▀▄\r\n\n────────────────────────────────────────────────────────────\r\n\u001b[1m> [Hub Session: session_id=rtc-corpus-agy-4a313c4c] list the files in this folder and say how many there are; change nothing\u001b[m\r\n\n● \u001b[1mRan\u001b[m (Get-ChildItem -File | Select-Object -ExpandProperty Name) (ctrl+o to expand)\r\n\n  There are \u001b[1m3\u001b[m files in this folder:\r\n\n  • \u001b[4m\u001b]8;id=jk18e80d917be1b2f9;file:///<SCRATCH><SCRATCH>/alpha.txt\u0007alpha.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jkde34b3f528e3044e;file:///<SCRATCH><SCRATCH>/beta.txt\u0007beta.txt\u001b[m\u001b]8;;\u0007\r\n  • \u001b[4m\u001b]8;id=jk3d4c0057c2b6bdf1;file:///<SCRATCH><SCRATCH>/gamma.md\u0007gamma.md\u001b[m\u001b]8;;\u0007\r\n\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n>\r\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\r\n? for shortcuts\u001b[98X\u001b[98Cauto\u001b[2m · Gemini 4 Argon · low\u001b[m\r\u001b[2A\u001b[2C\u001b[?25h"}
+{"delay_ms": 10, "chunk": "\u001b[>4m\u001b[<1u\r\n\n\u001b[J\u001b[?2004l\u001b[0 q"}
+{"delay_ms": 1, "chunk": "\r\nResume with -c (or command below):\r\nagy --conversation=<UUID>\r\n"}

@@ -1,0 +1,32 @@
+
+                                            ████████████
+                                               ██  ██       ▄▀▀▄ █▀▄▀▄ █▀▀▄
+                                               ██  ██       ▀▄▄▀ █ █ █ █▄▄▀
+                                               ▒▒  ██                  █
+                                                   ██       v18.20.0
+
+                        Tip: Hit a Codex rate limit? `/usage reset` spends a saved reset credit
+                                           to immediately restore your quota
+
+
+ [Hub Session: session_id=rtc-corpus-omp-0d8de07b] use your shell tool to run exactly this one command and nothing
+ else, then report what it printed: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+ '.\no-such-folder-rtc-live-capture-missing\child-rtc-live-capture-missing\grandchild-rtc-live-capture-missing\great-gr
+ andchild-rtc-live-capture-missing\deeper-rtc-live-capture-missing\deepest-rtc-live-capture-missing'
+
+
+  ⎋ Running the requested PowerShell Remove-Item
+
+╭─ Allow tool: bash ───────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Command: powershell.exe -NoProfile -NonInteractive -Command "Remove-Item -Recurse -Force -ErrorAction SilentlyConti… │
+│ ❯ Approve                                                                                                            │
+│   Approve bash for this session                                                                                      │
+│   Deny                                                                                                               │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ↑/↓ choose · ⏎ select · Ctrl+⏎/Ctrl+Q approve · ⎋ deny · Ctrl+O details · type to deny and steer                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⠼ 5s · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.9%/1M ⟲ · $0.00 ↓
+TPS 186 tok/s · TTFT 2.9s

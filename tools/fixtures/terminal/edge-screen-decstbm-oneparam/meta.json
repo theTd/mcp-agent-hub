@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "generic",
+  "cols": 24,
+  "rows": 6,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "DECSTBM one parameter and 'n;': ESC[3r keeps the bottom at row 5; ESC[4;6r then sets rows 3..5, and ESC[2;r has an empty bottom (0 to pyte), which is invalid and leaves 3..5 alone - reading '2;' as a missing argument would replace the region with rows 1..5",
+  "resume_count": 1
+}

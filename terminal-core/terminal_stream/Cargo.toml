@@ -1,0 +1,21 @@
+[package]
+name = "terminal_stream"
+version = "0.1.0"
+edition = "2021"
+description = "VT parsing, screen rendering, the W8/OSC strips and the W9 ring of the hub's terminal core"
+publish = false
+
+[dependencies]
+# Pinned: 0.15.0 is the parser alacritty_terminal 0.26.0 builds its Term on (doc §7.2), so the state
+# machine is the one the recommended crate ships. Only `Perform` is used: `Term`/`Grid` cannot reproduce
+# the hub's history rows and resize (see src/screen.rs).
+vte = "=0.15.0"
+# §7.4: the two OSC patterns. Compiled once; the strip only runs when the text holds "\x1b]".
+regex = "1.13.1"
+# pyte NFC-composes every combined cell (`unicodedata.normalize("NFC", base + mark)`); this crate supplies
+# the same tables (owner, decision `nfc-compose`, 0.1.x).
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+# §7.4: a system-ConPTY recording stores each `ReadFile` result as base64 (one chunk per read).
+base64 = "=0.21.7"

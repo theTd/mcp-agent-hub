@@ -1,0 +1,100 @@
+{
+  "kind": "session",
+  "engine": "omp",
+  "cols": 120,
+  "rows": 36,
+  "resize": null,
+  "chunk_encoding": "utf8_bytes",
+  "pty": "system-conpty",
+  "windows_build": "10.0.26220.9836",
+  "read_buffer_bytes": 8192,
+  "resume_count": 1,
+  "launch": {
+    "command": "omp.EXE",
+    "args": [
+      "--model=clay/deepseek-flash",
+      "--thinking=off",
+      "--approval-mode=write",
+      "--no-session",
+      "--no-title",
+      "deepest-rtc-live-capture-missing'"
+    ],
+    "task_mode": "positional"
+  },
+  "flags": {
+    "ephemeral": true,
+    "isolated_hub_port": 4599,
+    "env_keys": [
+      "PI_CODING_AGENT_DIR"
+    ],
+    "mcp_disabled": [],
+    "mcp_files_inspected": 0
+  },
+  "session_files": {
+    "engine_session_id": null
+  },
+  "task": "[Hub Session: session_id=rtc-corpus-omp-0d8de07b] use your shell tool to run exactly this one command and nothing else, then report what it printed: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue '.\\no-such-folder-rtc-live-capture-missing\\child-rtc-live-capture-missing\\grandchild-rtc-live-capture-missing\\great-grandchild-rtc-live-capture-missing\\deeper-rtc-live-capture-missing\\deepest-rtc-live-capture-missing'",
+  "consumer": {
+    "reads_at_chunk": 234,
+    "reason": "the OMP approval box is on screen here, before its denial",
+    "settled": true
+  },
+  "recorder": {
+    "version": 3,
+    "recorded_at": "2026-11-14T07:54:42+0800",
+    "chunk_count": 235,
+    "bytes": 55992,
+    "max_chunk_bytes": 2874,
+    "events": [
+      {
+        "event": "spawn",
+        "at_ms": 0
+      },
+      {
+        "event": "consumer_read",
+        "reason": "deny_box",
+        "at_ms": 11065,
+        "chunk_index": 234,
+        "settled": true
+      },
+      {
+        "event": "keys",
+        "reason": "deny_box",
+        "at_ms": 11065,
+        "bytes": 1
+      },
+      {
+        "event": "killed",
+        "at_ms": 13068
+      }
+    ],
+    "exit": {
+      "stop_reason": "box_denied",
+      "exit_code": 1,
+      "duration_ms": 13068
+    },
+    "read_error": null
+  },
+  "scrub": {
+    "rules": [
+      {
+        "label": "profile_path_4",
+        "count": 1
+      },
+      {
+        "label": "window_scratch",
+        "count": 50
+      }
+    ],
+    "replacements": 51,
+    "chunks": 235,
+    "chunk_encoding": "utf8_bytes",
+    "runs": 2,
+    "last_run": {
+      "rules": [],
+      "replacements": 0,
+      "chars_before": 46695,
+      "chars_after": 46695
+    }
+  }
+}

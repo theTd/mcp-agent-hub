@@ -1,0 +1,7 @@
+{
+  "kind": "input",
+  "engine": "generic",
+  "synthetic": true,
+  "note": "browser colour replies in one message: strip_osc_terminal_replies drops them",
+  "chunk_encoding": "text"
+}

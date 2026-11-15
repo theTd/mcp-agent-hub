@@ -1,0 +1,11 @@
+{
+  "kind": "session",
+  "engine": "codex",
+  "cols": 60,
+  "rows": 12,
+  "resize": null,
+  "chunk_encoding": "text",
+  "synthetic": true,
+  "note": "the colour query is split over three chunks, so the per-chunk strip keeps every fragment in raw.txt while replay.txt (the join, stripped once more by attach_ws_queue) carries none: the two goldens differ on purpose",
+  "resume_count": 1
+}

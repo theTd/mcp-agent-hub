@@ -1,0 +1,37 @@
+
+                                                      ████████████
+                                                         ██  ██       ▄▀▀▄ █▀▄▀▄ █▀▀▄
+                                                         ██  ██       ▀▄▄▀ █ █ █ █▄▄▀
+                                                         ▒▒  ██                  █
+                                                             ██       v18.20.0
+
+                                  Tip: Say `orchestrate` in your message to drive a multi-phase task with
+                                               parallel subagents — watch it glow as you type
+
+
+
+ [Hub Session: session_id=rtc-corpus-omp-6a290039] list the files in this folder and say how many there are; change nothing
+
+
+ Three files, no subdirectories:
+
+ ┌───────────┬──────┐
+ │ File      │ Size │
+ ├───────────┼──────┤
+ │ alpha.txt │ 6 B  │
+ ├───────────┼──────┤
+ │ beta.txt  │ 5 B  │
+ ├───────────┼──────┤
+ │ gamma.txt │ 6 B  │
+ └───────────┴──────┘
+
+ (The ./.. entries are directory links, not files.) Nothing modified.
+
+ Closing session…
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                               ⇧⇥ to change thinking effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ π · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.8%/1M ⟲ · $0.00 ↓
+TPS — tok/s · TTFT 6.7s

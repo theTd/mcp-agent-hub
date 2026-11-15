@@ -27,6 +27,7 @@
 - 内嵌程序资源、隔离 Python 环境、下载缓存：`%LOCALAPPDATA%\mcp-agent-hub-portable\portable`。
 - 便携版数据库、运行配置：上述 `portable\data` 目录。
 - Hub profiles：上述 `portable\data\agent_profiles.json`，不读取安装版的 profiles。
+- Hub 只接受本机 `Host`（`127.0.0.1`、`localhost`、`[::1]`，端口任意；重复或缺失的 `Host` 一律拒绝）和本机页面发来的 `Origin`（同一端口；空值、`null`、重复值一律拒绝），其他请求 403。要在前面套反向代理时，用 `HUB_ALLOWED_HOSTS`（逗号分隔，`host[:port]`，端口部分会被忽略）和 `HUB_ALLOWED_ORIGINS`（逗号分隔的完整 origin，如 `https://hub.example` 或 `https://hub.example/`）把代理加进白名单；写错的条目会在启动时打一条警告后丢弃，不支持 `*` 通配，两个变量默认只允许本机。
 - AI CLI 登录和历史：由各 CLI 按原有方式管理。
 
 默认优先使用 `4444`，占用时依次选择 `4445`～`4544`；不会连接该端口已有的其他 Hub。独立配置只支持可选的 `python`、`port` 字段，例如 `{"port":4500}`。显式指定的端口被占用时直接报错。`config.example.json` 的空对象表示自动选择端口和解释器。
