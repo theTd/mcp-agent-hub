@@ -93,7 +93,7 @@ checkout.
 ## Orchestrator handoff tools (2026-11-15, owner: decision page `orchestrator-handoff-1115`)
 
 The owner answered seven questions from `agent_hub_handoff.en.md`; two changed the default (auto-approve,
-collect). The other rows are medium decisions taken by the orchestrator while building them.
+collect). The other rows are medium decisions taken by the orchestrator while building them; the owner kept every one on decision page `orchestrator-medium-1115` (use cap 20, other engines refused, `(` `)` blocked, 200 000-character brief, briefs kept for sessions the stop cut off, compact profiles, git status in subfolders).
 
 | id | decision | alternative not taken | how to reverse |
 |---|---|---|---|
