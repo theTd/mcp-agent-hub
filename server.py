@@ -28,6 +28,7 @@ from session_manager import (
     default_profiles_path,
     hub_api_base_url,
     hub_port,
+    parent_interaction_view,
     resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
@@ -274,22 +275,33 @@ mcp.add_middleware(LeafWorkerArgumentMiddleware())
 
 
 @mcp.tool()
-async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
+async def list_agent_profiles(refresh_discovery: bool = False, view: str = "compact") -> Dict[str, Any]:
     """
-    List enabled profiles, engines, models and thinking levels.
+    List enabled profiles and routing guidance. Models and thinking levels are in
+    routing_guide_markdown; view="full" adds the engine catalog.
     Read routing_guide_markdown and each profile's when_to_use before choosing an agent.
     Profiles include defaults; engines_catalog excludes disabled profiles and models.
     Set refresh_discovery=true to refresh the installed engine catalog.
     """
     await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
+    if view not in {"compact", "full"}:
+        raise ValueError("view must be compact or full")
     base_url = hub_api_base_url()
-    return {
+    payload = {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "global_routing_instructions": hub.global_routing_instructions,
         "hub_console_url": f"{base_url}/",
         "engines_catalog": hub.get_mcp_engines_catalog(),
         "profiles": hub.get_mcp_enabled_profiles(),
     }
+    if view == "full":
+        return payload
+    profiles = {}
+    for pid, profile in payload["profiles"].items():
+        profiles[pid] = {key: profile.get(key) for key in ("id", "name", "engine", "default_model", "default_thinking_level", "when_to_use")}
+        if profile.get("env"):
+            profiles[pid]["env"] = profile["env"]
+    return {"routing_guide_markdown": payload["routing_guide_markdown"], "hub_console_url": payload["hub_console_url"], "profiles": profiles}
 
 
 @mcp.tool()
@@ -323,6 +335,8 @@ async def spawn_subagent(
     disabled_mcp_servers: Optional[List[str]] = None,
     strict_mcp_config: bool = False,
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
+    auto_approve_once_prefixes: Optional[List[str]] = None,
+    brief_markdown: Optional[str] = None,
     wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
     approval_mode: Optional[str] = None,
     compaction_threshold: Optional[Union[int, str]] = None,
@@ -357,6 +371,13 @@ async def spawn_subagent(
     ``compaction_threshold`` sets this session's auto-compaction point: ``"70%"`` of the context
     window or a token count (``200000``, ``"200k"``). omp takes both, claude only a percent (it can
     only compact earlier than its default), codex only tokens; other engines reject it.
+    ``auto_approve_once_prefixes`` (omp and agy only) names up to 32 command prefixes, each starting
+    with the program's absolute path: the hub answers approve once, never approve for the session,
+    for a high-risk command that starts with one. Each automatic approval leaves an
+    ``approval_auto_resolved`` event.
+    ``brief_markdown`` carries a task description longer than a few lines: the hub writes it under
+    its data folder, starts the task with a one-line pointer to the file, and deletes it when the
+    session closes (limit 200 000 characters).
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -372,6 +393,8 @@ async def spawn_subagent(
         disabled_mcp_servers=disabled_mcp_servers,
         strict_mcp_config=strict_mcp_config,
         auto_approval_rules=auto_approval_rules,
+        auto_approve_once_prefixes=auto_approve_once_prefixes,
+        brief_markdown=brief_markdown,
         task=task,
         cwd=cwd,
         title=title,
@@ -393,7 +416,10 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
     """Start several subagents and return one group wait handle (all_settled by default).
 
     Each spec takes spawn_subagent's fields, leaf_worker (true or false) required in every spec;
-    approval_mode follows the same default (auto)."""
+    approval_mode follows the same default (auto). A spec may also carry
+    auto_approve_once_prefixes (omp and agy, approve once for a high-risk command starting with
+    one) and brief_markdown (a task description longer than a few lines, written to a file the hub
+    deletes when the session closes)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
     for spec in specs:
@@ -470,7 +496,7 @@ async def get_subagent_status_and_trace(
         "turn_id": session.turn_id,
         "status": session.status,
         "current_activity": session.current_activity,
-        "pending_interaction": session.pending_interaction,
+        "pending_interaction": parent_interaction_view(session.pending_interaction),
     }
 
 
@@ -616,20 +642,35 @@ async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -
 
 
 @mcp.tool()
-async def respond_to_subagent(
+async def wait_for_hub(
+    wait_handle: str,
+    timeout_seconds: float = 50.0,
+    ask_coalesce_ms: int = 800,
+) -> Dict[str, Any]:
+    """Wait on a wait_handle or complete wait_url, returning waiting, ask, done or failed.
+
+    Hosts that cannot keep a background GET running (including shells capped at 10 seconds)
+    should use this tool. A timeout is a normal ``state=waiting`` result. When asking, ``requests``
+    contains every currently open request; answer all of them before waiting again.
+    """
+    handle = str(wait_handle or "").rstrip("/").rsplit("/", 1)[-1]
+    if not handle.startswith("wh_"):
+        raise ValueError("wait_handle must be a wh_... handle or wait_url")
+    if not 1 <= float(timeout_seconds) <= 300:
+        raise ValueError("timeout_seconds must be between 1 and 300")
+    if not 0 <= int(ask_coalesce_ms) <= 5000:
+        raise ValueError("ask_coalesce_ms must be between 0 and 5000")
+    return await hub.wait_inbox.wait(handle, timeout_seconds, ask_coalesce_ms=ask_coalesce_ms)
+
+
+async def _respond_to_subagent_impl(
     session_id: str,
     answer: Optional[str] = None,
     decision: Optional[str] = None,
     option_index: Optional[int] = None,
     custom_input: Optional[str] = None,
     request_id: Optional[str] = None,
-    wait_seconds: float = 8.0,  # deprecated compatibility field; never blocks
-    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Answer a question/approval once, or deliver ordinary feedback, by request_id.
-
-    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
-    """
     session = hub.sessions.get(session_id)
     if not session:
         raise ValueError(f"Session '{session_id}' not found in active sessions.")
@@ -650,6 +691,63 @@ async def respond_to_subagent(
         wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
     return {**_control_status(session, accepted=bool(action_result.get("ok", True))), **wait,
             "response": {key: action_result.get(key) for key in ("delivered", "response_state", "resolved_request_id", "idempotent") if key in action_result}}
+
+
+@mcp.tool()
+async def respond_to_subagent(
+    session_id: str,
+    answer: Optional[str] = None,
+    decision: Optional[str] = None,
+    option_index: Optional[int] = None,
+    custom_input: Optional[str] = None,
+    request_id: Optional[str] = None,
+    wait_seconds: float = 8.0,  # deprecated compatibility field; never blocks
+    ctx: Optional[Context] = None,
+) -> Dict[str, Any]:
+    """Answer a question/approval once, or deliver ordinary feedback, by request_id.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
+    """
+    return await _respond_to_subagent_impl(
+        session_id=session_id, answer=answer, decision=decision,
+        option_index=option_index, custom_input=custom_input, request_id=request_id,
+    )
+
+
+@mcp.tool()
+async def respond_to_subagents(
+    responses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Answer up to 50 pending requests independently and report each outcome.
+
+    Each item has session_id, request_id and the same answer fields as respond_to_subagent:
+    decision, option_index, answer or custom_input. One invalid item does not stop the others.
+    """
+    if len(responses) > 50:
+        raise ValueError("responses may contain at most 50 entries")
+    outcomes = []
+    wait_handles = []
+    for item in responses:
+        try:
+            if not isinstance(item, dict):
+                raise ValueError("response entry must be an object")
+            session_id = item.get("session_id")
+            request_id = item.get("request_id")
+            if not session_id or not request_id:
+                raise ValueError("session_id and request_id are required")
+            result = await _respond_to_subagent_impl(
+                session_id=str(session_id), request_id=str(request_id),
+                answer=item.get("answer"), decision=item.get("decision"),
+                option_index=item.get("option_index"), custom_input=item.get("custom_input"),
+            )
+            if result.get("wait_handle"):
+                wait_handles.append(result["wait_handle"])
+            outcomes.append({"session_id": session_id, "request_id": request_id, "ok": True, "result": result})
+        except Exception as exc:
+            outcomes.append({"session_id": item.get("session_id") if isinstance(item, dict) else None,
+                             "request_id": item.get("request_id") if isinstance(item, dict) else None,
+                             "ok": False, "error": str(exc)})
+    return {"responses": outcomes, "wait_handles": list(dict.fromkeys(wait_handles))}
 
 
 @mcp.tool()
@@ -733,9 +831,50 @@ async def read_subagent_screen(
 
 
 @mcp.tool()
-async def list_active_sessions(include_historical: bool = True, limit: int = 25) -> Dict[str, Any]:
-    """List live console sessions and persisted historical sessions."""
-    active = [s.to_dict() for s in hub.sessions.values()]
+async def list_active_sessions(
+    include_historical: bool = False,
+    limit: int = 25,
+    view: str = "compact",
+    wait_handle: Optional[str] = None,
+    session_ids: Optional[List[str]] = None,
+    status_filter: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """List sessions; compact is the default and full preserves the legacy payload."""
+    if view not in {"compact", "full"}:
+        raise ValueError("view must be compact or full")
+    active = []
+    for session in hub.sessions.values():
+        item = session.to_dict()
+        item.setdefault("effective_model", getattr(session, "effective_model", None) or getattr(session, "model", None))
+        active.append(item)
+    wanted = set(str(x) for x in session_ids or [])
+    if wait_handle:
+        handle = str(wait_handle).rstrip("/").rsplit("/", 1)[-1]
+        group_ids = set(hub.wait_inbox.session_ids_for(handle))
+        wanted = (wanted & group_ids) if wanted else group_ids
+    if wanted:
+        active = [s for s in active if s.get("session_id") in wanted]
+    if status_filter:
+        allowed = set(status_filter)
+        active = [s for s in active if s.get("status") in allowed]
+    def compact(s):
+            pending = s.get("pending_interaction") or {}
+            prompt = pending.get("prompt") or pending.get("command_or_prompt") or pending.get("command") or ""
+            final = s.get("final_response")
+            has_final = bool(s.get("has_final_response")) if "has_final_response" in s else bool(final)
+            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": has_final, "final_response_length": len(final or "") if final is not None else 0, "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
+            if pending:
+                entry["open_request"] = {"request_id": pending.get("request_id"), "kind": pending.get("kind"), "prompt": str(prompt)[:120]}
+            return entry
+    if view == "compact":
+        historical = []
+        if include_historical:
+            historical = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
+            if wanted:
+                historical = [s for s in historical if s.get("session_id") in wanted]
+            if status_filter:
+                historical = [s for s in historical if s.get("status") in allowed]
+        return {"global_seq": hub.global_seq, "active_count": len(active), "active_sessions": [compact(s) for s in active], "historical_sessions": [compact(s) for s in historical]}
     result: Dict[str, Any] = {
         "global_seq": hub.global_seq,
         "active_count": len(active),
@@ -746,6 +885,55 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
         # by list_archived_sessions.
         result["persisted_sessions"] = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
     return result
+
+
+@mcp.tool()
+async def collect_and_terminate(
+    wait_handle: Optional[str] = None,
+    session_ids: Optional[List[str]] = None,
+    only_completed: bool = True,
+    max_chars: int = 3000,
+) -> Dict[str, Any]:
+    """Collect final answers and close sessions; only_completed=False also closes running sessions."""
+    if bool(wait_handle) == bool(session_ids):
+        raise ValueError("provide exactly one of wait_handle or session_ids")
+    if max_chars < 0:
+        raise ValueError("max_chars must be non-negative")
+    if wait_handle:
+        handle = str(wait_handle).rstrip("/").rsplit("/", 1)[-1]
+        ids = hub.wait_inbox.session_ids_for(handle)
+    else:
+        ids = list(dict.fromkeys(str(x) for x in session_ids or []))
+    collected, skipped, cwd_dirs = [], [], set()
+    done_states = {"completed", "failed", "ended", "exited", "crashed", "terminated", "interrupted"}
+    for sid in ids:
+        try:
+            sess = hub.sessions.get(sid)
+            rec = sess.to_dict() if sess else await hub.db.get_session_record(sid)
+            if not rec:
+                skipped.append({"session_id": sid, "status": "missing"})
+                continue
+            status = rec.get("status")
+            if only_completed and status not in done_states:
+                skipped.append({"session_id": sid, "status": status})
+                continue
+            already_closed = sess is None
+            if already_closed:
+                full = rec.get("final_response") or ""
+            else:
+                info = await hub.get_subagent_final_response(sid)
+                full = info.get("final_response") or ""
+                await hub.close_session(sid, source="mcp")
+            if rec.get("cwd"):
+                cwd_dirs.add(str(rec["cwd"]))
+            entry = {"session_id": sid, "status": status, "final_response": full[:max_chars], "full_length": len(full), "truncated": len(full) > max_chars, "already_closed": already_closed}
+            if entry["truncated"]:
+                entry["hint"] = "Call get_subagent_final_response for the rest."
+            collected.append(entry)
+        except Exception as exc:
+            collected.append({"session_id": sid, "error": str(exc)})
+    from cwd_git_status import collect_git_status
+    return {"collected": collected, "skipped": skipped, "git_status": await collect_git_status(sorted(cwd_dirs))}
 
 
 @mcp.tool()
@@ -888,10 +1076,10 @@ async def api_list_historical_sessions(limit: int = Query(30)):
 
 
 @app.get("/api/wait/{wait_handle}")
-async def api_wait(wait_handle: str, timeout: float = Query(25.0, ge=0.1, le=120.0)):
+async def api_wait(wait_handle: str, timeout: float = Query(25.0, ge=0.1, le=300.0), ask_coalesce_ms: int = Query(800, ge=0, le=5000)):
     """Long-poll one opaque handle.  Repeating this URL is the complete parent protocol."""
     try:
-        return await hub.wait_inbox.wait(wait_handle, timeout)
+        return await hub.wait_inbox.wait(wait_handle, timeout, ask_coalesce_ms=ask_coalesce_ms)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -1220,6 +1408,8 @@ async def api_create_session(req: Request):
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
             auto_approval_rules=body.get("auto_approval_rules"),
+            auto_approve_once_prefixes=body.get("auto_approve_once_prefixes"),
+            brief_markdown=body.get("brief_markdown"),
             leaf_worker=body.get("leaf_worker", False),
         )
     except ValueError as e:

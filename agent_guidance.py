@@ -1,8 +1,9 @@
 """English instructions authored by the Hub for parent agents."""
 
 CLEANUP_HINT = (
-    "After collecting a result, terminate_subagent when no longer needed; completion leaves the "
-    "session open. Close started sessions before finishing unless handed off or cancelled. "
+    "After collecting a result, close the session: collect_and_terminate(wait_handle) collects and closes every "
+    "finished session in one call; terminate_subagent closes one. Completion leaves the session open. "
+    "Close started sessions before finishing unless handed off or cancelled. "
     "Results remain readable and resumable."
 )
 
@@ -10,17 +11,24 @@ WAIT_HANDLE_HINT = (
     "Waiting: spawn, send, resume and respond return at once with wait_url, one URL per session or spawn group "
     "for all its turns, with no cursor or session parameters. GET it; a timeout returns state=waiting. "
     "If you can run background commands, loop the GET inside one background command while the reply is waiting "
-    "and exit on anything else (ask, done, failed, an HTTP error), so a timeout never wakes you; "
-    "otherwise GET it again after each timeout. "
+    "and exit on anything else (ask, done, failed, an HTTP error), so a timeout never wakes you. "
+    "Hosts that cannot keep that background GET running, or cap synchronous waits (AGY: 10 seconds), "
+    "call wait_for_hub(wait_handle, timeout_seconds=8) instead, again after each state=waiting. "
     "States are waiting, ask, done, failed. Every ask is an open approval or question: answer it at once "
-    "with respond_to_subagent and its request_id (idempotent). After answering, and while any task is unfinished, "
-    "GET wait_url again; it returns the next ask or the result. "
+    "with respond_to_subagent and its request_id (idempotent), or respond_to_subagents for several. "
+    "An ask answer lists every open request in requests: answer every entry. "
+    "Never make a waiter skip, filter or dedupe asks by request_id; that hides the next request. "
+    "After answering, and while any task is unfinished, "
+    "wait again; it returns the next ask or the result. "
     "After a response with response_state=unconfirmed, GET wait_url; never inspect or resend. "
     "An answered request never comes back: if wait_url repeats one, call get_subagent_status_and_trace and report a hub fault. "
-    "Never make a waiter skip, filter or dedupe asks by request_id; that hides the next request. "
-    "Wait on wait_url only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
+    "Wait on wait_url or wait_for_hub only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
     + CLEANUP_HINT
 )
+
+# list_active_sessions is intentionally compact for routine orchestration; request the legacy payload only
+# when a diagnostic caller needs it.
+SESSION_LIST_HINT = "list_active_sessions returns a compact view by default; use view=\"full\" for the legacy payload."
 
 # Prepended to a spawn's task when the parent passes leaf_worker=true. Advice only: nothing blocks the
 # worker's agent-hub tools (for that, Codex and Claude take disabled_mcp_servers).
@@ -50,10 +58,18 @@ ROUTING_RULES = (
     "bypass_approvals is the legacy switch (true = bypass, false = the default); never pass both.",
     "A blocked Windows DSH sandbox_preparation prevents dispatch; skipped is unverified. Permission readiness does not prove access; inspect the reason.",
     WAIT_HANDLE_HINT,
+    SESSION_LIST_HINT,
     "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
-    "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet.",
+    "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet; to reduce approvals, spawn omp or agy with auto_approve_once_prefixes.",
+    "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never approve for the session, for a high-risk command that starts with one of these prefixes. "
+    "Each prefix starts with the program's absolute path. "
+    "A command with ; | & > <, a backtick, $(, ( or ) or a control character is never approved automatically. "
+    "At most 20 automatic approvals per session. "
+    "The arguments after the prefix are not checked, so name a specific program and subcommand, never a shell or interpreter alone (python.exe, cmd.exe /c, env). "
+    "Each automatic approval leaves an approval_auto_resolved event.",
+    "brief_markdown: for a task description longer than a few lines. The hub writes it to its data folder, starts the task with a one-line pointer to the file, and deletes it when the session closes. Limit: 200 000 characters.",
     "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
