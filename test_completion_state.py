@@ -271,7 +271,8 @@ class CompletionStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess.final_response, "Done anyway.")
         self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
 
-    async def test_agy_held_turn_end_is_released_after_the_limit(self):
+    async def test_agy_held_turn_end_waits_for_the_finish_however_long(self):
+        # Owner, 2026-11-15: no time limit; only the finish message or a new user turn ends it.
         sess, path, watch = await self.agy_session("brain-held")
         clock = {"offset": 0.0}
         real_time = time
@@ -294,18 +295,28 @@ class CompletionStateTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.6)
                 self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
 
-                # The finish never arrives; the hold limit passes on the watcher's own tick.
-                clock["offset"] = 31 * 60.0
+                # A day passes on the watcher's own ticks: the turn end is still held.
+                clock["offset"] = 24 * 3600.0
+                await asyncio.sleep(0.8)
+                self.assertEqual(sess.status, "running")
+                self.assertFalse(sess.final_response)
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+
+                # The finish arrives at last; the turn after it ends normally.
+                self.append(path, {"type": "SYSTEM_MESSAGE", "content": (
+                    "[Message] timestamp=2026-11-16T00:00:01Z sender=conversation-1/task-7 "
+                    'priority=MESSAGE_PRIORITY_HIGH content=Task id "conversation-1/task-7" '
+                    "finished with result:\nCommand exited with code 0.")})
+                self.append(path, self.agy_planner(content="The demo passed."))
                 await self.until(lambda: sess.status == "completed")
         finally:
             watch.cancel()
             await asyncio.gather(watch, return_exceptions=True)
 
-        self.assertEqual(sess.final_response, "I have launched task-7.")
+        self.assertEqual(sess.final_response, "The demo passed.")
         done = self.events(sess.session_id, "turn_completed")
         self.assertEqual(len(done), 1)
-        self.assertEqual(done[0]["data"]["outcome"], "background_task_unreported")
-        self.assertEqual(done[0]["data"]["task_ids"], ["conversation-1/task-7"])
+        self.assertNotIn("data", done[0])
 
 
 if __name__ == "__main__":

@@ -605,12 +605,6 @@ AGY_ERROR_TURN_END_SEC = 60.0
 AGY_BG_TASK_START_RE = re.compile(r"Tool is running as a background task with task id:\s*(\S+)")
 AGY_MESSAGE_SENDER_RE = re.compile(r"sender=(\S+)")
 AGY_BG_TASK_DONE_RE = re.compile(r"\bfinished with result\b")
-# A task id whose finish message never matches must not hold a turn end forever: another sender
-# format, a cancelled task or a tool output that quotes the start text leaves the id in the ledger,
-# and every later planner response of that session would stay "waiting" (the parent waits forever,
-# idle cleanup skips a running session). After this long the held planner text is reported as the
-# turn's end, with a warning, and the ledger is cleared.
-AGY_BG_TASK_HOLD_MAX_SEC = 30 * 60.0
 # The omp session file is the durable answer to "did the turn end"; the tail watcher only makes
 # it immediate. A finished turn whose last record the watcher never applied is completed from
 # the file's own tail this often, so one unreadable/lost record cannot strand the session.
@@ -11210,11 +11204,9 @@ class HubSessionManager:
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
         # agy tasks this turn handed to its own background runner and whose result has not come
-        # back yet, by the id its start row and its callback both name.
+        # back yet, by the id its start row and its callback both name. A turn end waits for them
+        # with no time limit (owner, 2026-11-15); only a new user turn clears the ledger.
         bg_tasks: Set[str] = set()
-        # (monotonic time, planner text, task ids) of a turn end this ledger is holding back, so a
-        # finish message that never matches cannot suppress it for good (AGY_BG_TASK_HOLD_MAX_SEC).
-        bg_hold: Optional[Tuple[float, str, Tuple[str, ...]]] = None
         # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
         error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
@@ -11270,7 +11262,6 @@ class HubSessionManager:
                         # its finish message would name an id nothing waits for any more, and the
                         # stale id must not suppress this turn's end.
                         bg_tasks.clear()
-                        bg_hold = None
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
                         turn_has_step = False
@@ -11400,14 +11391,11 @@ class HubSessionManager:
                             # completing here handed the parent the "I have launched ..." line as
                             # the answer before the callback started the very next step.
                             if bg_tasks:
-                                if bg_hold is None:
-                                    bg_hold = (time.monotonic(), content or "", tuple(sorted(bg_tasks)))
                                 session.current_activity = (
                                     f"Waiting for background task {', '.join(sorted(bg_tasks)[:3])}"
                                 )
                                 await self.persist_session(session)
                                 continue
-                            bg_hold = None  # nothing is holding this turn end back
                             final_text = content or ""
                             if final_text:
                                 if not turn_has_step:
@@ -11431,36 +11419,6 @@ class HubSessionManager:
                                     "content": final_text,
                                 },
                             )
-                if (bg_hold is not None
-                        and time.monotonic() - bg_hold[0] >= AGY_BG_TASK_HOLD_MAX_SEC):
-                    # The task's finish never matched (another sender format, a cancelled task, a
-                    # tool output quoting the start text): report the text this turn ended with and
-                    # let the ledger and the session go, instead of waiting forever.
-                    held_for = max(0.0, time.monotonic() - bg_hold[0])
-                    held_text, held_tasks = bg_hold[1], bg_hold[2]
-                    bg_hold = None
-                    bg_tasks.clear()
-                    logger.warning(
-                        "[%s] agy background task %s reported no result in %.0f s; releasing the "
-                        "turn end it held", session.session_id, ", ".join(held_tasks) or "?",
-                        held_for,
-                    )
-                    if held_text:
-                        session.set_final_response(held_text, "native_transcript")
-                    await self.record_worker_event(
-                        session.session_id,
-                        {
-                            "type": "turn_completed",
-                            "category": "turn_completed",
-                            "status": "turn_idle",
-                            "content": held_text,
-                            "data": {
-                                "outcome": "background_task_unreported",
-                                "task_ids": list(held_tasks),
-                                "held_seconds": round(held_for, 1),
-                            },
-                        },
-                    )
                 if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
                     err_txt = error_tail[0]
                     error_tail = None
