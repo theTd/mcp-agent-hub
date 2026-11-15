@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 from fake_terminal_core import FakeTerminal
 from session_manager import (
     AUTO_APPROVE_ONCE_MAX_USES,
+    CLIPPED_COMMAND_NOTE,
     AgentSession,
     HubSessionManager,
     command_starts_with_prefix,
@@ -23,6 +24,9 @@ from session_manager import (
 
 PREFIX = r"C:\tools\adb.exe shell"
 COMMAND = r"C:\tools\adb.exe shell getprop ro.build.version"
+# omp's own transcript start row is a display copy: every string argument is cut at 200
+# characters + `…`, so the `; Remove-Item …` tail never reaches the hub.
+CUT_COMMAND = (PREFIX + r" getprop ro.product." + "x" * 170)[:200] + "…"
 AGY_FULL = r"py -3 C:\work\remote.py --task CASTAWAYL --limit 10"
 AGY_SCREEN = r"py -3 C:\work\remote.py --task CASTAWAYL…"
 
@@ -117,6 +121,20 @@ class PrefixMatchTests(unittest.TestCase):
                         self.session(), self.interaction(source=source, truncated=truncated)
                     )
                 )
+
+    def test_a_cut_command_is_never_approved_even_marked_complete(self):
+        # A later caller that builds the metadata itself must not get past the cut text: the flag
+        # alone is not the guard (omp's own start row is a transcript record with a cut command).
+        for engine in ("omp", "agy"):
+            session = self.session()
+            session.engine = engine
+            with self.subTest(engine=engine):
+                self.assertIsNone(HubSessionManager._auto_approve_once_prefix_matches(
+                    session, self.interaction(COMMAND + "…", truncated=False)
+                ))
+                self.assertIsNone(HubSessionManager._auto_approve_once_prefix_matches(
+                    session, self.interaction(CUT_COMMAND, truncated=False)
+                ))
 
     def test_other_engines_and_unmatched_commands_never_match(self):
         session = self.session()
@@ -226,6 +244,45 @@ class AutoApproveOnceTests(HubCase):
         self.assertNotIn("auto_approval", interaction)
         self.assertIsNotNone(sess.pending_interaction)
         self.assertEqual(self.inputs, [])
+
+    async def test_a_cut_start_row_goes_to_the_parent_with_the_clipped_note(self):
+        """omp's start row alone: the call's command is a cut copy marked full by its source."""
+        sess = self.session("omp", [PREFIX])
+        work = self.root / "omp-cut-start"
+        work.mkdir()
+        path = work / "session.jsonl"
+        append_rows(path, {
+            "type": "custom", "customType": "tool_execution_start",
+            "data": {"toolCallId": "call-cut", "toolName": "bash",
+                     "args": {"command": CUT_COMMAND}},
+        })
+        watch = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            await self.until(lambda: "call-cut" in sess._open_transcript_tools)
+            parsed = {
+                "tool": "bash", "command": CUT_COMMAND,
+                "details": [f"Command: {CUT_COMMAND}"],
+                "options": ["Approve", "Approve for this session", "Deny"],
+                "selected_index": 0,
+            }
+            with patch.object(sess, "write_input", side_effect=self.inputs.append):
+                interaction = await self.hub._register_omp_screen_approval(sess, parsed)
+            await asyncio.sleep(0.3)
+            self.assertEqual(self.inputs, [])
+            self.assertNotIn("auto_approval", interaction)
+            self.assertIs(sess.pending_interaction, interaction)
+            self.assertEqual(interaction["metadata"]["command"], CUT_COMMAND)
+            self.assertEqual(interaction["metadata"]["command_source"], "transcript")
+            self.assertTrue(interaction["metadata"]["command_truncated"])
+            self.assertIn(CLIPPED_COMMAND_NOTE, interaction["prompt"])
+            self.assertEqual(sess.profile_snapshot.get("auto_approve_once_uses"), 0)
+            asks = [e for e in self.hub.get_worker_events(sess.session_id, 0)
+                    if e["type"] == "approval_request"]
+            self.assertEqual(len(asks), 1)
+            self.assertIn(CLIPPED_COMMAND_NOTE, asks[0]["content"])
+        finally:
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
 
     async def test_missing_complete_flag_goes_to_the_parent(self):
         sess = self.session("omp", [PREFIX])
@@ -406,20 +463,30 @@ class ParentViewTests(HubCase):
         self.assertIsNotNone(trace["pending_interaction"])
         self.assertNotIn("selected_index", trace["pending_interaction"]["metadata"])
 
-    async def test_persisted_record_keeps_the_cursor(self):
+    async def test_the_pending_interaction_keeps_the_cursor_in_memory_only(self):
         sess = self.session("omp")
         await self.register_omp_box(sess)
+        # The cursor is the hub's own state, kept on the live interaction (approve_session moves it).
+        self.assertEqual(sess.pending_interaction["metadata"]["selected_index"], 0)
+        # Nothing persisted carries it: the record keeps the parent view and the sessions table
+        # has no column for the interaction at all (only these fixed keys reach SQLite).
         record = HubSessionManager._record_from_session(sess)
-        self.assertEqual(record["pending_interaction"]["metadata"]["selected_index"], 0)
-        captured = {}
-
-        async def capture(record, **kwargs):
-            captured.update(record)
-
-        with patch.object(self.hub.db, "upsert_session", side_effect=capture):
-            await self.hub.persist_session(sess)
-        self.assertEqual(captured["pending_interaction"]["metadata"]["selected_index"], 0)
+        self.assertNotIn("selected_index", record["pending_interaction"]["metadata"])
         self.assertNotIn("selected_index", sess.to_dict()["pending_interaction"]["metadata"])
+
+    async def test_a_handle_made_after_the_request_does_not_show_the_cursor(self):
+        sess = self.session("omp")
+        await self.register_omp_box(sess)  # published before any handle exists
+        info = await self.hub.wait_inbox.ensure_for_sessions(
+            [sess.session_id], {sess.session_id: sess.turn_id}
+        )
+        ask = await self.hub.wait_inbox.wait(info["wait_handle"], 0.5)
+        self.assertEqual(ask["state"], "ask")
+        # No ask event exists for a handle made after the request, so this is the state provider's
+        # fallback entry: it must carry the parent view, not the raw interaction.
+        self.assertNotIn("selected_index", json.dumps(ask))
+        self.assertEqual(ask["requests"][0]["request_id"], sess.pending_interaction["request_id"])
+        self.assertEqual(ask["requests"][0]["kind"], "approval_request")
 
     async def test_omp_cursor_move_still_works(self):
         sess = self.session("omp")
@@ -441,6 +508,82 @@ class BriefMarkdownTests(HubCase):
 
     def brief_path(self, sess):
         return self.root / "briefs" / f"{sess.session_id}.md"
+
+    def kept_record(self):
+        return self.root / "briefs" / "kept-at-stop.json"
+
+    def new_hub(self):
+        profiles = self.root / "profiles.json"
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            return HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+
+    def cut_off_session(self):
+        """A live session holding a brief, as the graceful stop meets it."""
+        sess = self.session("omp")
+        self.hub._write_session_brief(sess.session_id, "resume reads me")
+        return sess
+
+    async def test_a_graceful_stop_keeps_and_records_the_brief_it_cut_off(self):
+        sess = self.cut_off_session()
+        path = self.brief_path(sess)
+        await self.hub.archive_all_sessions_on_shutdown()
+        self.assertTrue(path.exists())
+        record = json.loads(self.kept_record().read_text(encoding="utf-8"))
+        self.assertEqual(record["session_ids"], [sess.session_id])
+
+    async def test_the_next_start_keeps_it_and_the_one_after_removes_it(self):
+        sess = self.cut_off_session()
+        path = self.brief_path(sess)
+        await self.hub.archive_all_sessions_on_shutdown()
+
+        second = self.new_hub()
+        await second.start()
+        try:
+            self.assertTrue(path.exists())
+            self.assertFalse(self.kept_record().exists())
+        finally:
+            await second.archive_all_sessions_on_shutdown()
+
+        third = self.new_hub()
+        await third.start()
+        try:
+            self.assertFalse(path.exists())
+        finally:
+            await third.archive_all_sessions_on_shutdown()
+
+    async def test_a_resumed_session_that_closes_deletes_the_kept_brief(self):
+        sess = self.cut_off_session()
+        path = self.brief_path(sess)
+        await self.hub.archive_all_sessions_on_shutdown()
+
+        second = self.new_hub()
+        await second.start()
+        resumed = AgentSession(sess.session_id, "omp", "omp", "tui", "Resumed", str(self.root),
+                               "unused", [], core=self.fake)
+        resumed.status = "running"
+        resumed._loop = asyncio.get_running_loop()
+        self.fake.spawn(sess.session_id, ["fixture"])
+        second.sessions[sess.session_id] = resumed
+        try:
+            self.assertTrue(path.exists())
+            await second.close_session(sess.session_id, source="mcp")
+            self.assertFalse(path.exists())
+        finally:
+            await second.archive_all_sessions_on_shutdown()
+
+    async def test_a_missing_or_unreadable_record_keeps_no_extra_brief(self):
+        briefs = self.root / "briefs"
+        briefs.mkdir(parents=True, exist_ok=True)
+        ghost = briefs / "stale-session.md"
+        ghost.write_text("no reader", encoding="utf-8")
+        self.kept_record().write_text("{not json", encoding="utf-8")
+        second = self.new_hub()
+        await second.start()
+        try:
+            self.assertFalse(ghost.exists())
+            self.assertFalse(self.kept_record().exists())
+        finally:
+            await second.archive_all_sessions_on_shutdown()
 
     async def test_brief_written_and_the_pointer_comes_first(self):
         brief = "# Brief\n\nA long task description."
