@@ -3,6 +3,7 @@ import importlib
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -92,6 +93,24 @@ class SessionViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("engines_catalog", compact)
         self.assertIn("global_routing_instructions", full)
         self.assertIn("engines_catalog", full)
+
+    async def test_historical_compact_reads_persisted_final_response_flag(self):
+        from hub_database import HubDatabase
+        db = HubDatabase(Path(self.tmp.name) / "persisted.db")
+        db.upsert_session({
+            "session_id": "persisted", "profile_id": "omp", "profile_name": "OMP", "kind": "worker",
+            "title": "persisted", "cwd": self.tmp.name, "status": "completed", "created_at": 1,
+            "step_count": 1, "current_activity": "", "engine": "omp", "effective_model": "m",
+            "final_response": "stored answer", "final_response_source": "worker",
+        })
+        async def read_rows(**kwargs):
+            kwargs.pop("consistent", None)
+            return db.list_persisted_sessions(**kwargs)
+        with patch.object(self.server.hub.db, "list_persisted_sessions", new=AsyncMock(side_effect=read_rows)):
+            result = await self.server.list_active_sessions(include_historical=True)
+        entry = next(x for x in result["historical_sessions"] if x["session_id"] == "persisted")
+        self.assertTrue(entry["final_response_exists"])
+        self.assertEqual(entry["final_response_length"], 0)
 
 
 if __name__ == "__main__":

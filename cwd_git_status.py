@@ -39,16 +39,33 @@ async def _status(path: str, *, search_children: bool = True) -> Dict[str, objec
         is_nonrepo = "not a git repository" in first.lower()
         if not is_nonrepo or not search_children:
             return {"cwd": path, "ok": False, "error": first}
-        try:
-            children = sorted((p for p in Path(path).iterdir() if p.is_dir()), key=lambda p: (not ((p / ".git").exists() or (p / "HEAD").exists()), p.name.lower()))
-        except OSError:
-            children = []
-        roots = [p for p in children if (p / ".git").exists() or (p / "HEAD").exists()][:5]
+        roots = await asyncio.to_thread(_find_repository_children, path)
         return {"cwd": path, "ok": False, "error": "not a git repository", "repositories": [await _status(str(p), search_children=False) for p in roots]}
     except asyncio.TimeoutError:
         return {"cwd": path, "ok": False, "error": "git status timed out"}
     except Exception as exc:
         return {"cwd": path, "ok": False, "error": str(exc).splitlines()[0]}
+
+
+def _find_repository_children(path: str) -> list[Path]:
+    """Scan at most 500 entries, stopping after five repositories."""
+    roots = []
+    try:
+        for index, child in enumerate(Path(path).iterdir()):
+            if index >= 500:
+                break
+            try:
+                if not child.is_dir():
+                    continue
+                if (child / ".git").exists() or (child / "HEAD").exists():
+                    roots.append(child)
+                    if len(roots) >= 5:
+                        break
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(roots, key=lambda p: p.name.lower())
 
 
 async def collect_git_status(paths: Iterable[str]) -> Dict[str, Dict[str, object]]:

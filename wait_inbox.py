@@ -192,7 +192,7 @@ class WaitInbox:
             self._condition.notify_all()
         if handle:
             waiter = self._waiters.get(handle)
-            if waiter:
+            if waiter and not waiter[1].done():
                 waiter[1].set_result(True)
 
     async def publish_event(self, event: Dict[str, Any]) -> None:
@@ -303,6 +303,7 @@ class WaitInbox:
         entry.setdefault("command", event.get("command"))
         entry.setdefault("decisions", event.get("decisions") or event.get("options"))
         entry.setdefault("options", event.get("options") or event.get("decisions"))
+        entry.setdefault("result_id", event.get("result_id") or event.get("request_id"))
         return entry
 
     async def _snapshot(self, handle: str) -> Dict[str, Any]:
@@ -373,7 +374,7 @@ class WaitInbox:
         for row in rows:
             item = self._load(row["payload_json"], {})
             item["request_id"] = row["request_id"] or item.get("request_id")
-            item["result_id"] = row["result_id"] or item.get("result_id")
+            item["result_id"] = row["result_id"] or item.get("result_id") or item.get("request_id")
             if self._request_open(item, row["request_id"]):
                 asks.append(self._ask_entry(item))
         return asks
@@ -386,7 +387,8 @@ class WaitInbox:
                 raise WaitHandleError("unknown wait handle")
             prior = self._waiters.get(handle)
             if prior:
-                prior[1].set_result({"state": "superseded", "wait_handle": handle})
+                if not prior[1].done():
+                    prior[1].set_result({"state": "superseded", "wait_handle": handle})
             token = secrets.token_urlsafe(12)
             future = asyncio.get_running_loop().create_future()
             self._waiters[handle] = (token, future)
@@ -401,6 +403,9 @@ class WaitInbox:
                         remain = max(0.0, deadline - time.monotonic())
                         if remain:
                             await asyncio.sleep(min(ask_coalesce_ms / 1000.0, remain))
+                        current_waiter = self._waiters.get(handle)
+                        if not current_waiter or current_waiter[0] != token:
+                            return {"state": "superseded", "wait_handle": handle}
                         if future.done() and future.result() is not True:
                             return dict(future.result())
                         # Read a fresh snapshot even when the window used up the timeout: an ask
@@ -414,6 +419,11 @@ class WaitInbox:
                     await asyncio.wait_for(asyncio.shield(future), remain)
                 except asyncio.TimeoutError:
                     return {"wait_handle": handle, "state": "waiting"}
+                current_waiter = self._waiters.get(handle)
+                if not current_waiter or current_waiter[0] != token:
+                    if future.done() and isinstance(future.result(), dict):
+                        return dict(future.result())
+                    return {"state": "superseded", "wait_handle": handle}
                 if not future.done() or future.result() is True:
                     future = asyncio.get_running_loop().create_future()
                     self._waiters[handle] = (token, future)
@@ -426,5 +436,6 @@ class WaitInbox:
 
     async def close(self) -> None:
         for handle, waiter in list(self._waiters.items()):
-            waiter[1].set_result({"state": "superseded", "wait_handle": handle})
+            if not waiter[1].done():
+                waiter[1].set_result({"state": "superseded", "wait_handle": handle})
         self._waiters.clear()
