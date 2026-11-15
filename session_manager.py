@@ -212,6 +212,10 @@ AUTO_APPROVAL_MAX_TTL_SEC = 7 * 24 * 60 * 60
 AUTO_APPROVE_ONCE_MAX_PREFIXES = 32
 AUTO_APPROVE_ONCE_MAX_USES = 20
 AUTO_APPROVE_ONCE_ENGINES = ("omp", "agy")
+AUTO_APPROVE_ONCE_ENGINE_ERROR = (
+    "auto_approve_once_prefixes applies to omp and agy only, not {engine}: "
+    "its approvals would still come to you. Spawn without it, or use an omp or agy profile."
+)
 # `(` and `)` are blocked too: PowerShell runs `(...)` / `@(...)` in argument position, so
 # `tool.exe (Remove-Item x -Recurse)` would otherwise pass the plain shell-composition check.
 AUTO_APPROVE_ONCE_BLOCKED_TOKENS = (";", "|", "&", ">", "<", "`", "$(", "(", ")", "\n", "\r")
@@ -14912,6 +14916,8 @@ class HubSessionManager:
             raise ValueError("桌面 GUI 会话不支持 extra_args")
         if brief_text is not None and profile_id == "desktop-gui":
             raise ValueError("桌面 GUI 会话不支持 brief_markdown")
+        if auto_approve_once_prefixes and profile_id == "desktop-gui":
+            raise ValueError(AUTO_APPROVE_ONCE_ENGINE_ERROR.format(engine="desktop_gui"))
         if profile_id == "desktop-gui" and normalize_compaction_threshold(compaction_threshold):
             raise ValueError("桌面 GUI 会话不支持自动压缩阈值（compaction_threshold）")
         loop = asyncio.get_running_loop()
@@ -14959,6 +14965,10 @@ class HubSessionManager:
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
+        # Other engines never read the prefixes; refusing them keeps a parent from expecting
+        # approvals that will still come to it.
+        if auto_approve_once_prefixes and engine not in AUTO_APPROVE_ONCE_ENGINES:
+            raise ValueError(AUTO_APPROVE_ONCE_ENGINE_ERROR.format(engine=engine))
         # Q7: one reading of `kind` for the whole launch path; a stored null means tui, never None.
         kind = str(prof.get("kind") or "tui")
         work_dir = launch['cwd']

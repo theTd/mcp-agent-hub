@@ -28,6 +28,7 @@ from session_manager import (
     default_profiles_path,
     hub_api_base_url,
     hub_port,
+    parent_interaction_view,
     resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
@@ -333,6 +334,8 @@ async def spawn_subagent(
     disabled_mcp_servers: Optional[List[str]] = None,
     strict_mcp_config: bool = False,
     auto_approval_rules: Optional[List[Dict[str, Any]]] = None,
+    auto_approve_once_prefixes: Optional[List[str]] = None,
+    brief_markdown: Optional[str] = None,
     wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
     approval_mode: Optional[str] = None,
     compaction_threshold: Optional[Union[int, str]] = None,
@@ -367,6 +370,13 @@ async def spawn_subagent(
     ``compaction_threshold`` sets this session's auto-compaction point: ``"70%"`` of the context
     window or a token count (``200000``, ``"200k"``). omp takes both, claude only a percent (it can
     only compact earlier than its default), codex only tokens; other engines reject it.
+    ``auto_approve_once_prefixes`` (omp and agy only) names up to 32 command prefixes, each starting
+    with the program's absolute path: the hub answers approve once, never approve for the session,
+    for a high-risk command that starts with one. Each automatic approval leaves an
+    ``approval_auto_resolved`` event.
+    ``brief_markdown`` carries a task description longer than a few lines: the hub writes it under
+    its data folder, starts the task with a one-line pointer to the file, and deletes it when the
+    session closes (limit 200 000 characters).
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -382,6 +392,8 @@ async def spawn_subagent(
         disabled_mcp_servers=disabled_mcp_servers,
         strict_mcp_config=strict_mcp_config,
         auto_approval_rules=auto_approval_rules,
+        auto_approve_once_prefixes=auto_approve_once_prefixes,
+        brief_markdown=brief_markdown,
         task=task,
         cwd=cwd,
         title=title,
@@ -403,7 +415,10 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
     """Start several subagents and return one group wait handle (all_settled by default).
 
     Each spec takes spawn_subagent's fields, leaf_worker (true or false) required in every spec;
-    approval_mode follows the same default (auto)."""
+    approval_mode follows the same default (auto). A spec may also carry
+    auto_approve_once_prefixes (omp and agy, approve once for a high-risk command starting with
+    one) and brief_markdown (a task description longer than a few lines, written to a file the hub
+    deletes when the session closes)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
     for spec in specs:
@@ -480,7 +495,7 @@ async def get_subagent_status_and_trace(
         "turn_id": session.turn_id,
         "status": session.status,
         "current_activity": session.current_activity,
-        "pending_interaction": session.pending_interaction,
+        "pending_interaction": parent_interaction_view(session.pending_interaction),
     }
 
 
@@ -1391,6 +1406,8 @@ async def api_create_session(req: Request):
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
             auto_approval_rules=body.get("auto_approval_rules"),
+            auto_approve_once_prefixes=body.get("auto_approve_once_prefixes"),
+            brief_markdown=body.get("brief_markdown"),
             leaf_worker=body.get("leaf_worker", False),
         )
     except ValueError as e:

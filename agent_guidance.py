@@ -62,7 +62,14 @@ ROUTING_RULES = (
     "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
-    "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet.",
+    "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet; to reduce approvals, spawn omp or agy with auto_approve_once_prefixes.",
+    "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never approve for the session, for a high-risk command that starts with one of these prefixes. "
+    "Each prefix starts with the program's absolute path. "
+    "A command with ; | & > <, a backtick, $(, ( or ) or a control character is never approved automatically. "
+    "At most 20 automatic approvals per session. "
+    "The arguments after the prefix are not checked, so name a specific program and subcommand, never a shell or interpreter alone (python.exe, cmd.exe /c, env). "
+    "Each automatic approval leaves an approval_auto_resolved event.",
+    "brief_markdown: for a task description longer than a few lines. The hub writes it to its data folder, starts the task with a one-line pointer to the file, and deletes it when the session closes. Limit: 200 000 characters.",
     "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
