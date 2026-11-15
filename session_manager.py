@@ -8738,6 +8738,33 @@ class HubSessionManager:
             {"type": "error", "category": "lifecycle", "status": "failed", "content": reason},
         )
 
+    @classmethod
+    def _omp_new_transcripts(cls, session: AgentSession, omp_session_dir: Path) -> List[Path]:
+        """OMP session files in omp_session_dir created after this session's process, newest first.
+
+        omp writes its session file `<ts>_<uuid>.jsonl` directly in `--session-dir` and keeps the
+        session's artifacts beside it in `<ts>_<uuid>/` (tool logs, blobs and, since 2026-11-15, a
+        `changes.jsonl` tool-call log). Only the top level is read: the artifact log appears ~0.5 s
+        after the session file and is then often the newest `.jsonl`, and a watcher that claims it
+        never sees a step, a final answer or the end of the turn.
+        """
+        found: List[Tuple[float, Path]] = []
+        try:
+            entries = list(os.scandir(omp_session_dir))
+        except OSError:
+            return []
+        for entry in entries:
+            try:
+                if not entry.name.endswith(".jsonl") or not entry.is_file():
+                    continue
+                path = Path(entry.path)
+                if cls._conversation_created_after(path, session):
+                    found.append((entry.stat().st_mtime, path))
+            except OSError:
+                continue
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in found]
+
     async def _watch_omp_session(self, session: AgentSession, omp_session_dir: Path):
         """Live tails OMP's dedicated session JSONL file inside omp_session_dir for tool calls, thoughts, and final responses."""
         target_file: Optional[Path] = None
@@ -8757,10 +8784,7 @@ class HubSessionManager:
                     break
                 # This directory is created by the hub for this one session (`--session-dir`), so a
                 # cross-session attach is already impossible; claim it anyway so the rule is uniform.
-                files = sorted(omp_session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-                for candidate in files:
-                    if not self._conversation_created_after(candidate, session):
-                        continue
+                for candidate in self._omp_new_transcripts(session, omp_session_dir):
                     if await self._claim_transcript(session, candidate):
                         target_file = candidate
                         break
