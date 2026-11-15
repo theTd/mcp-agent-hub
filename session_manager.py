@@ -28,7 +28,7 @@ from PIL import Image
 # there is no Python PTY or parser behind it after step 3b.
 from terminal_core import Core
 
-from transcript_tail import TranscriptTail, read_complete_lines
+from transcript_tail import TranscriptTail, read_complete_lines, read_complete_records
 from transcript_feed import (
     FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, json_valued_arguments, tool_output_text,
     tool_title, interaction_view as transcript_interaction_view,
@@ -205,6 +205,20 @@ _ENV_KEY_INVALID_RE = re.compile(r"[\s=\x00]")
 AUTO_APPROVAL_MAX_RULES = 64
 AUTO_APPROVAL_MAX_USES = 10000
 AUTO_APPROVAL_MAX_TTL_SEC = 7 * 24 * 60 * 60
+# Approve-once-by-command-prefix (owner decision, 2026-11-15): a spawn may name command prefixes
+# the hub answers "approve once" for, and never "approve for the session". Strict on purpose: the
+# prefix names the program's absolute path, the command must be a complete transcript record, and
+# shell composition is never auto-approved.
+AUTO_APPROVE_ONCE_MAX_PREFIXES = 32
+AUTO_APPROVE_ONCE_MAX_USES = 20
+AUTO_APPROVE_ONCE_ENGINES = ("omp", "agy")
+# `(` and `)` are blocked too: PowerShell runs `(...)` / `@(...)` in argument position, so
+# `tool.exe (Remove-Item x -Recurse)` would otherwise pass the plain shell-composition check.
+AUTO_APPROVE_ONCE_BLOCKED_TOKENS = (";", "|", "&", ">", "<", "`", "$(", "(", ")", "\n", "\r")
+_AUTO_APPROVE_WINDOWS_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)")
+# A brief larger than this is a mistake, not a task description.
+BRIEF_MARKDOWN_MAX_CHARS = 200_000
+BRIEF_POINTER_LINE = "Read the full brief first: "
 AUTO_APPROVAL_SHELL_META_RE = re.compile(r"[;&|<>`]|\$\(|\b(?:bash|sh|cmd|powershell|pwsh)\s+-c\b", re.IGNORECASE)
 AUTO_APPROVAL_HARD_RISK_RE = re.compile(
     r"\b(?:rm|del|erase|rmdir|remove-item|format|diskpart|shutdown|restart-computer|"
@@ -287,6 +301,88 @@ def normalize_auto_approval_rules(raw_rules: Any) -> List[Dict[str, Any]]:
         })
         seen.add(rule_id)
     return normalized
+
+
+def _is_absolute_program_prefix(prefix: str) -> bool:
+    """True when `prefix` starts with the program's full path, never a bare PATH name."""
+    return bool(_AUTO_APPROVE_WINDOWS_ABSOLUTE_RE.match(prefix) or prefix.startswith("/"))
+
+
+def normalize_auto_approve_once_prefixes(raw_prefixes: Any) -> List[str]:
+    """Validate the spawn-time `approve once` command prefixes; a bad one is refused here.
+
+    Each entry must start with the program's absolute path (`C:\\tools\\adb.exe shell`,
+    `\\\\server\\share\\run.exe`, `/d/tools/run.sh`). A bare name would be resolved through PATH and
+    could run something else entirely, so it is refused. Shell syntax is refused in the prefix too:
+    a command that composes a shell is never auto-approved anyway.
+    """
+    if raw_prefixes is None:
+        return []
+    if not isinstance(raw_prefixes, list):
+        raise ValueError("auto_approve_once_prefixes must be a list of strings")
+    if len(raw_prefixes) > AUTO_APPROVE_ONCE_MAX_PREFIXES:
+        raise ValueError(
+            f"auto_approve_once_prefixes accepts at most {AUTO_APPROVE_ONCE_MAX_PREFIXES} prefixes"
+        )
+    normalized: List[str] = []
+    for raw in raw_prefixes:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("each auto_approve_once_prefixes entry must be a non-empty string")
+        prefix = raw.strip()
+        if any(ord(ch) < 32 or ord(ch) == 0x7F for ch in prefix):
+            raise ValueError(f"auto approve prefix {prefix!r} contains a control character")
+        if not _is_absolute_program_prefix(prefix):
+            raise ValueError(
+                f"auto approve prefix {prefix!r} must start with the program's absolute path "
+                "(for example 'C:\\\\tools\\\\adb.exe shell' or '/d/tools/run.sh'); a bare program "
+                "name would be resolved through PATH"
+            )
+        if any(token in prefix for token in AUTO_APPROVE_ONCE_BLOCKED_TOKENS):
+            raise ValueError(
+                f"auto approve prefix {prefix!r} contains shell syntax; such a command is never "
+                "auto-approved"
+            )
+        if prefix not in normalized:
+            normalized.append(prefix)
+    return normalized
+
+
+def command_starts_with_prefix(command: str, prefix: str) -> bool:
+    """`command` starts with `prefix` and the prefix ends at a word boundary."""
+    if not command or not prefix or not command.startswith(prefix):
+        return False
+    if len(command) == len(prefix):
+        return True
+    return command[len(prefix)].isspace()
+
+
+def normalize_brief_markdown(raw_brief: Any) -> Optional[str]:
+    """The spawn-time long task description, bounded to a size a session file can carry."""
+    if raw_brief is None:
+        return None
+    if not isinstance(raw_brief, str):
+        raise ValueError("brief_markdown must be a string")
+    if len(raw_brief) > BRIEF_MARKDOWN_MAX_CHARS:
+        raise ValueError(
+            f"brief_markdown is {len(raw_brief)} characters; the limit is {BRIEF_MARKDOWN_MAX_CHARS}"
+        )
+    return raw_brief
+
+
+def parent_interaction_view(interaction: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """An interaction as a parent agent receives it: engine cursor state stays inside the hub.
+
+    `metadata.selected_index` is omp's 0-based cursor position; the hub still needs it to move the
+    cursor for `approve_session` (see `_answer_omp_approval`), but it is not a parent-facing choice
+    and made `option_index` look 0/1-based.
+    """
+    if not isinstance(interaction, dict):
+        return interaction
+    view = dict(interaction)
+    metadata = dict(view.get("metadata") or {})
+    metadata.pop("selected_index", None)
+    view["metadata"] = metadata
+    return view
 
 
 def normalize_env_map(raw_env: Any, *, field_label: str = "环境变量（env）") -> Dict[str, str]:
@@ -494,6 +590,19 @@ AGY_RESUME_VERIFY_WINDOW_SEC = 30.0
 # network issue" on screen) it writes nothing more and sits idle at its prompt. An error row followed by
 # this long a silence ends the turn, so the parent's wait does not stay "running" for good.
 AGY_ERROR_TURN_END_SEC = 60.0
+# agy hands a long `run_command` to its own background task and ends the turn with "I have
+# launched ... and will wait for it": that planner response is not the end of the turn, the
+# task's callback is. The start row names the task; the callback is a SYSTEM_MESSAGE whose
+# sender is that task and whose text says it finished.
+AGY_BG_TASK_START_RE = re.compile(r"Tool is running as a background task with task id:\s*(\S+)")
+AGY_MESSAGE_SENDER_RE = re.compile(r"sender=(\S+)")
+AGY_BG_TASK_DONE_RE = re.compile(r"\bfinished with result\b")
+# The omp session file is the durable answer to "did the turn end"; the tail watcher only makes
+# it immediate. A finished turn whose last record the watcher never applied is completed from
+# the file's own tail this often, so one unreadable/lost record cannot strand the session.
+OMP_TURN_END_SWEEP_INTERVAL_SEC = 5.0
+OMP_TURN_END_TAIL_SCAN_BYTES = 1024 * 1024
+OMP_TURN_END_STOP_REASONS = ("stop", "end_turn", "stop_sequence")
 # The hub's anchor (time.time()) and the filesystem's birth time are different clock sources and can
 # round against each other; a dir born in the same tick as the spawn is still the new conversation.
 AGY_CONVERSATION_ANCHOR_SLACK_SEC = 0.05
@@ -1602,6 +1711,9 @@ def parse_omp_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
 # registered with the box's own text. omp writes the call before it draws the box; the watcher reads
 # the transcript every TRANSCRIPT_TAIL_INTERVAL_SEC.
 OMP_BOX_CALL_WAIT_SEC = 1.0
+# How long an agy command prompt waits for its own transcript record: agy writes the tool call
+# before it draws the prompt, and the watcher reads the file every TRANSCRIPT_TAIL_INTERVAL_SEC.
+AGY_BOX_CALL_WAIT_SEC = 1.0
 # omp's approval events (engine_policies/omp_approval_event_log.ts). omp writes the request just
 # before it draws the box, after the call is in its transcript: a request waits this long for the
 # box (its option rows) and for the call (the full command) before it is registered without them.
@@ -1654,6 +1766,31 @@ def tool_call_for_approval_box(
     if not fits or len({str(call.get("command") or "") for call in fits}) > 1:
         return None
     return fits[-1]
+
+
+def agy_transcript_command(screen_command: str, calls: List[Dict[str, Any]]) -> Optional[str]:
+    """The full command from agy's transcript when exactly one open call is this prompt's.
+
+    The screen text that is not cut must equal the call's command with whitespace ignored; a cut
+    copy must start exactly one open call. Two open calls of one planner response that both fit
+    means the record cannot say which one asks, so the screen copy stays.
+    """
+    screen = str(screen_command or "").strip()
+    if not screen:
+        return None
+    commands = [
+        str(call.get("command") or "").strip() for call in calls
+        if isinstance(call, dict) and str(call.get("command") or "").strip()
+    ]
+    if not screen_command_clipped(screen):
+        wanted = _without_whitespace(screen)
+        exact = [command for command in commands if _without_whitespace(command) == wanted]
+        return exact[0] if len({_without_whitespace(c) for c in exact}) == 1 else None
+    prefix = _without_whitespace(screen.split("…", 1)[0]).removesuffix("[")
+    if not prefix:
+        return None
+    fits = [command for command in commands if _without_whitespace(command).startswith(prefix)]
+    return fits[0] if len({_without_whitespace(c) for c in fits}) == 1 else None
 
 
 def parse_agy_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
@@ -2310,8 +2447,13 @@ class AgentSession:
         self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
         self._prompt_quiet_until: float = 0.0
         self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
+        # agy: every tool call of the current planner response; an approval prompt must fit one.
+        self._agy_response_tools: List[Dict[str, Any]] = []
         # omp runs tool calls side by side: every started call without a result yet, by call id.
         self._open_transcript_tools: Dict[str, Dict[str, Any]] = {}
+        # Byte offset past the last turn end this session accounted for (the watcher or the
+        # turn-end sweep). The sweep only completes a turn whose end row starts after it.
+        self._native_turn_end_offset: int = 0
         # omp's approval events: read offset; requests not resolved yet, by call id (in order); set
         # once the log shows the extension loaded; when a box no request covers was first seen.
         self._omp_approval_offset: int = 0
@@ -3112,7 +3254,7 @@ class AgentSession:
             "step_count": self.step_count,
             "current_activity": self.current_activity,
             "pending_question_id": self.pending_question_id,
-            "pending_interaction": self.pending_interaction,
+            "pending_interaction": parent_interaction_view(self.pending_interaction),
             "final_response": self.final_response,
             "final_response_source": self.final_response_source,
             # D2: true while the answer above still belongs to the turn before the current one.
@@ -3438,6 +3580,11 @@ class HubSessionManager:
             request = RestartResumeRequest.take(self.data_dir)
             live_at_stop = await self._normalize_archive_on_startup()
             await self.db.flush()
+            # Briefs of sessions closed, ended or unknown have no reader. A session the stop cut off
+            # (live_at_stop) keeps its brief: resume-on-start, or the parent's resume_subagent right
+            # after, continues it and may read the brief again. It goes at the next start, or when
+            # the resumed session closes.
+            self._prune_stale_briefs(keep=set(live_at_stop))
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
@@ -3445,6 +3592,7 @@ class HubSessionManager:
         self._schedule(asyncio.to_thread(dsh_tls_context))
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
+        self._schedule(self._omp_turn_end_sweep_loop())
         if request is not None:
             targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
             for sid in sorted(request.session_ids or ()):
@@ -5533,8 +5681,9 @@ class HubSessionManager:
                 scrollback = (await asyncio.to_thread(session.read_scrollback, 250)).text
             else:
                 scrollback = session.read_scrollback(250).text
+        record = self._record_from_session(session)
         await self.db.upsert_session(
-            session.to_dict(),
+            record,
             scrollback_text=scrollback,
             archive=self._archive_payload(session, force_scrollback=force_scrollback, final=final,
                                           snapshot=snapshot),
@@ -5677,6 +5826,10 @@ class HubSessionManager:
         rec = session.to_dict()
         rec["profile_snapshot"] = session.profile_snapshot
         rec["conversation_ref"] = session.conversation_ref
+        # to_dict is also a parent-facing status view and hides the engine's cursor position. The
+        # record the hub persists is the hub's own state: a pending omp approval must still know
+        # where the cursor was, or approve_session moves to the wrong option.
+        rec["pending_interaction"] = session.pending_interaction
         return rec
 
     @staticmethod
@@ -5737,6 +5890,9 @@ class HubSessionManager:
         """The final record, written when a session leaves the live list or at hub shutdown/start."""
         self._prepare_final_row(session, end_reason=end_reason, snapshot=snapshot)
         await self.persist_session(session, force_scrollback=True, final=True, snapshot=snapshot)
+        # A closed session (terminated, auto-cleaned or archived) no longer needs its brief file;
+        # a live one keeps it, including across a hub restart.
+        self._delete_session_brief(session.session_id)
         return session
 
     @staticmethod
@@ -6241,6 +6397,61 @@ class HubSessionManager:
     @staticmethod
     def _task_with_session_marker(session_id: str, task: str) -> str:
         return f"{task}\n\n[Hub Session: session_id={session_id}]"
+
+    def _brief_path(self, session_id: str) -> Optional[Path]:
+        """`<hub data dir>/briefs/<session_id>.md`, or None for an id that cannot name a file."""
+        sid = str(session_id or "")
+        if not re.match(r"^[A-Za-z0-9_.\-]+$", sid):
+            return None
+        return self.data_dir / "briefs" / f"{sid}.md"
+
+    def _write_session_brief(self, session_id: str, text: str) -> Path:
+        """Writes a spawn's brief outside the worktree; the task only carries the pointer line."""
+        path = self._brief_path(session_id)
+        if path is None:
+            raise ValueError("brief_markdown 的会话 id 无法用作文件名")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as error:
+            raise ValueError(f"无法写入 brief 文件 {path}：{error}") from error
+        return path
+
+    def _delete_session_brief(self, session_id: str) -> None:
+        """A closed or archived session's brief is deleted; a live one keeps it across a restart."""
+        path = self._brief_path(session_id)
+        if path is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("[%s] could not delete its brief file %s", session_id, path)
+
+    def _prune_stale_briefs(self, keep: Iterable[str] = ()) -> int:
+        """Delete brief files that neither a live session nor a session in `keep` owns.
+
+        A brief whose session is archived, ended while the hub was down, or unknown has no reader
+        any more. Returns how many were deleted.
+        """
+        directory = self.data_dir / "briefs"
+        if not directory.is_dir():
+            return 0
+        live = {str(session_id) for session_id in self.sessions} | {str(sid) for sid in keep}
+        removed = 0
+        for path in directory.glob("*.md"):
+            if path.stem in live:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning("could not delete stale brief file %s", path)
+                continue
+            removed += 1
+        return removed
 
     def _resume_task_text(self, session_id: str, text: str, engine: str) -> str:
         clean = str(text).replace("\r", " ").strip()
@@ -7619,7 +7830,7 @@ class HubSessionManager:
             "status": payload.get("status", "info"),
             "files_changed": payload.get("files_changed", []),
             "request_id": payload.get("request_id"),
-            "interaction": payload.get("interaction"),
+            "interaction": parent_interaction_view(payload.get("interaction")),
             "turn_id": getattr(sess, "turn_id", None),
         }
         data = dict(payload["data"]) if isinstance(payload.get("data"), dict) else {}
@@ -7741,7 +7952,10 @@ class HubSessionManager:
             "current_activity": meta.get("current_activity", ""),
             "last_task": meta.get("last_task", ""),
             "pending_question_id": meta.get("pending_question_id"),
-            "pending_interaction": sess.pending_interaction if sess else meta.get("pending_interaction"),
+            "pending_interaction": (
+                parent_interaction_view(sess.pending_interaction) if sess
+                else parent_interaction_view(meta.get("pending_interaction"))
+            ),
             "recent_tool_calls": tools,
             "intermediate_messages": inter_msgs,
             "final_response": final_resp,
@@ -7908,6 +8122,98 @@ class HubSessionManager:
             }
         return None
 
+    @staticmethod
+    def _auto_approve_once_prefix_matches(
+        session: AgentSession, interaction: Dict[str, Any]
+    ) -> Optional[str]:
+        """The spawn-time prefix an approval matches, or None.
+
+        Only a complete command from an engine's own transcript can match: omp records it with
+        `command_source=transcript` and `command_truncated=False`; agy fills the same fields from its
+        transcript. A cut-off copy read off the screen never matches. Shell composition is refused
+        even when the prefix fits (`;`, `|`, `&`, redirection, a backtick, `$(` or a newline).
+        """
+        snapshot = session.profile_snapshot if isinstance(session.profile_snapshot, dict) else {}
+        prefixes = snapshot.get("auto_approve_once_prefixes") or []
+        if not prefixes:
+            return None
+        engine = str(session.engine or snapshot.get("engine") or "").strip().lower()
+        if engine not in AUTO_APPROVE_ONCE_ENGINES:
+            return None
+        metadata = interaction.get("metadata") or {}
+        # Only an explicit False says the command is complete; a record without the flag is not
+        # trusted with an automatic approval.
+        if metadata.get("command_source") != "transcript" or metadata.get("command_truncated") is not False:
+            return None
+        command = str(metadata.get("command") or "").strip()
+        if not command:
+            return None
+        if any(ord(ch) < 32 or ord(ch) == 0x7F for ch in command):
+            return None
+        if any(token in command for token in AUTO_APPROVE_ONCE_BLOCKED_TOKENS):
+            return None
+        for prefix in prefixes:
+            if isinstance(prefix, str) and command_starts_with_prefix(command, prefix):
+                return prefix
+        return None
+
+    async def _auto_approve_once_prefix(
+        self, session: AgentSession, interaction: Dict[str, Any], request_id: str
+    ) -> bool:
+        """Answer one approval with `approve` (once) when a spawn prefix matches it.
+
+        The cap is per session and stored with the launch snapshot, so it counts across a resume.
+        The cap's refusal is left on the interaction for the approval event to carry: the parent
+        still gets the request, and it says why the automatic approval stopped.
+        """
+        prefix = self._auto_approve_once_prefix_matches(session, interaction)
+        if prefix is None:
+            return False
+        snapshot = session.profile_snapshot if isinstance(session.profile_snapshot, dict) else {}
+        used = int(snapshot.get("auto_approve_once_uses") or 0)
+        if used >= AUTO_APPROVE_ONCE_MAX_USES:
+            interaction.setdefault("metadata", {})["auto_approve_once_cap_reached"] = True
+            return False
+        command = str((interaction.get("metadata") or {}).get("command") or "")
+        try:
+            result = await self.respond_to_interaction(
+                session.session_id, decision="approve", request_id=request_id
+            )
+        except Exception:
+            logger.exception("[%s] automatic prefix approval failed for %s", session.session_id, request_id)
+            return False
+        count = used + 1
+        snapshot["auto_approve_once_uses"] = count
+        interaction["auto_approval"] = {
+            "rule": "auto_approve_once_prefix",
+            "decision": "approve_once",
+            "prefix": prefix,
+            "count": count,
+            "max_uses": AUTO_APPROVE_ONCE_MAX_USES,
+        }
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "approval_auto_resolved",
+                "category": "approval_auto_resolved",
+                "status": (result or {}).get("response_state") or "sent",
+                "decision": "approve_once",
+                "request_id": request_id,
+                "content": (
+                    f"Automatic approval {count}/{AUTO_APPROVE_ONCE_MAX_USES} matched prefix {prefix!r}"
+                ),
+                "data": {
+                    "rule": "auto_approve_once_prefix",
+                    "decision": "approve_once",
+                    "command": command,
+                    "prefix": prefix,
+                    "count": count,
+                    "max_uses": AUTO_APPROVE_ONCE_MAX_USES,
+                },
+            },
+        )
+        return True
+
     @logical_write
     async def set_auto_approval_rules(self, session_id: str, rules: Any) -> Dict[str, Any]:
         session = self.sessions.get(session_id)
@@ -8022,8 +8328,17 @@ class HubSessionManager:
                 )
                 return interaction
 
+        if kind == "approval_request" and await self._auto_approve_once_prefix(session, interaction, req_id):
+            return interaction
+
         opts_lines = "\n".join(f"  [{i + 1}] {opt}" for i, opt in enumerate(options)) if options else "  (free-text reply)"
         ev_type = "approval_request" if kind == "approval_request" else "question"
+        cap_note = ""
+        if (interaction.get("metadata") or {}).get("auto_approve_once_cap_reached"):
+            cap_note = (
+                f"\n- Automatic approval stopped: this session already used its cap of "
+                f"{AUTO_APPROVE_ONCE_MAX_USES} auto-approved commands, so this request goes to you."
+            )
         formatted_content = (
             f"{'Approval request' if kind == 'approval_request' else 'Interactive question'}\n"
             f"- Engine: `{interaction['engine']}` (`{source}`) | request_id=`{req_id}`\n"
@@ -8038,6 +8353,7 @@ class HubSessionManager:
             "unless the user agreed. Repeated approvals outside the worker's cwd mean a wrong layout: "
             "answer this one, then put the task's own outputs under cwd instead of approving each call; "
             "leave files it did not create in place and never widen cwd to cover them."
+            f"{cap_note}"
         )
         await self.record_worker_event(
             session.session_id,
@@ -8892,6 +9208,16 @@ class HubSessionManager:
         session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
         session._seen_tui_prompt_signatures.clear()
+        # Everything already in the transcript belongs to the turn that just ended; the turn-end
+        # sweep may only complete this new turn from a record appended after it (a resumed session
+        # attaches to a file that already holds the old answer).
+        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
+        native_path = session.transcript_path or ref.get("session_file")
+        if native_path:
+            try:
+                session._native_turn_end_offset = Path(str(native_path)).stat().st_size
+            except OSError:
+                pass
         if status is not None:
             session.status = status
 
@@ -9499,7 +9825,7 @@ class HubSessionManager:
             if sess is not None and sess.kind == "tui" and sess.status in LIVE_STATUSES:
                 await self.poll_tui_screen_interactions_once(sess)
             if sess is not None and sess.status == "waiting_parent" and sess.pending_interaction:
-                item = dict(sess.pending_interaction)
+                item = dict(parent_interaction_view(sess.pending_interaction) or {})
                 item.setdefault("session_id", sid)
                 pending.append(item)
         return pending
@@ -10021,10 +10347,13 @@ class HubSessionManager:
 
         turn_has_step = False
         pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        # (start, end) of the record being applied, so a failure costs that record only.
+        applying: Optional[Tuple[int, int]] = None
         while self._transcript_watch_alive(session):
+            applying = None
             try:
-                lines, offset = read_complete_lines(target_file, offset)
-                for line in lines:
+                records, offset = read_complete_records(target_file, offset)
+                for record_start, record_end, line in records:
                     line = line.strip()
                     if not line:
                         continue
@@ -10032,6 +10361,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    applying = (record_start, record_end)
                     self._observe_context_record(session, obj)
                     otype = obj.get("type")
                     ctype = obj.get("customType")
@@ -10238,13 +10568,130 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+                            if is_end_turn:
+                                # This row is the turn's durable end: the sweep must not complete
+                                # it again (begin_new_turn raises the floor for the next turn).
+                                session._native_turn_end_offset = record_end
+                    applying = None
             except PersistenceRecordTooLarge as exc:
+                # An unstorable record is skipped; the batch's remaining records are still read
+                # on the next pass instead of being thrown away with it.
                 self._skip_unstorable_record(session, "OMP session watcher", exc)
+                if applying is not None:
+                    offset = applying[1]
             except PersistenceUnavailable:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                # One record the watcher cannot apply must not cost the rest of the batch (the
+                # already-read rows would be lost with its offset): only that record is skipped,
+                # and the turn-end sweep completes the turn if it was the turn's last one.
+                logger.warning("OMP session watcher skipped a record (%s): %s", session.session_id, exc)
+                if applying is not None:
+                    offset = applying[1]
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    @classmethod
+    def _omp_turn_end_record(cls, path: Path, after_offset: int) -> Optional[Tuple[int, int, str]]:
+        """(start, end, final text) when omp's session file ends with a finished turn.
+
+        omp writes a turn's answer as an assistant message with no tool call and a terminal
+        stopReason; any row after it (a tool start, a user message) means the turn went on. Only
+        a row starting at or after `after_offset` counts, so a turn already accounted for — or an
+        answer a resumed session inherited — never completes the new turn.
+        """
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            return None
+        if size <= after_offset:
+            return None
+        read_from = max(int(after_offset), size - OMP_TURN_END_TAIL_SCAN_BYTES)
+        try:
+            with Path(path).open("rb") as stream:
+                stream.seek(read_from)
+                blob = stream.read(size - read_from)
+        except OSError:
+            return None
+        # The last COMPLETE row: a row still being written has no trailing newline yet.
+        line_end = blob.rfind(b"\n")
+        if line_end < 0:
+            return None
+        line_start = blob.rfind(b"\n", 0, line_end) + 1
+        start = read_from + line_start
+        if start < after_offset:
+            return None
+        try:
+            obj = json.loads(blob[line_start:line_end].decode("utf-8", "replace"))
+        except Exception:
+            return None
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            return None
+        if msg.get("stopReason") not in OMP_TURN_END_STOP_REASONS:
+            return None
+        texts: List[str] = []
+        for part in msg.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("toolCall", "tool_use"):
+                return None
+            if part.get("type") == "text" and part.get("text"):
+                texts.append(str(part["text"]).strip())
+        text = "\n".join(part for part in texts if part).strip()
+        if not text:
+            return None
+        return start, read_from + line_end + 1, text
+
+    async def _sweep_omp_turn_ends(self) -> int:
+        """Completes an omp turn whose last record the tail watcher never applied.
+
+        The watcher makes a turn end immediate, but it is a live tail: a record it could not
+        apply (one exception inside a record's processing), or a watcher that ended, used to
+        leave the session "running" for good — the group wait never settled and the final
+        response stayed empty although the session file already held it. The file is the
+        durable record, so the same turn-end rule is applied to its tail here.
+        """
+        completed = 0
+        for session in list(self.sessions.values()):
+            try:
+                if (session.engine or "").strip().lower() != "omp" or session.kind != "tui":
+                    continue
+                if session.status not in ("starting", "running") or session.pending_interaction is not None:
+                    continue
+                if not session.transcript_path or not session.is_process_alive():
+                    continue
+                found = await asyncio.to_thread(
+                    self._omp_turn_end_record,
+                    Path(str(session.transcript_path)),
+                    int(getattr(session, "_native_turn_end_offset", 0) or 0),
+                )
+                if not found or self.sessions.get(session.session_id) is not session:
+                    continue
+                if session.status not in ("starting", "running") or session.pending_interaction is not None:
+                    continue
+                _start, end, text = found
+                # Claim the row first: the watcher or a second sweep pass must not emit it again.
+                session._native_turn_end_offset = end
+                session._inflight_transcript_tool = None
+                await self.record_worker_event(
+                    session.session_id,
+                    {
+                        "type": "turn_completed",
+                        "category": "turn_completed",
+                        "status": "turn_idle",
+                        "content": text,
+                        "data": {"source": "omp_tail_sweep"},
+                    },
+                )
+                completed += 1
+            except Exception:
+                logger.exception("Turn-end sweep failed for %s", session.session_id)
+        return completed
+
+    async def _omp_turn_end_sweep_loop(self):
+        while not self._shutting_down:
+            await asyncio.sleep(OMP_TURN_END_SWEEP_INTERVAL_SEC)
+            await self._sweep_omp_turn_ends()
 
     @staticmethod
     def _kimi_resolved_interaction_ids(lines: List[str]) -> Set[str]:
@@ -10676,6 +11123,9 @@ class HubSessionManager:
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
+        # agy tasks this turn handed to its own background runner and whose result has not come
+        # back yet, by the id its start row and its callback both name.
+        bg_tasks: Set[str] = set()
         # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
         error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
@@ -10712,11 +11162,21 @@ class HubSessionManager:
                         )
                         continue
                     error_tail = None  # any later row means agy recovered or moved on
+                    if obj.get("type") == "SYSTEM_MESSAGE":
+                        # agy delivers a background task's result as a system message naming the
+                        # task as its sender. That task is no longer outstanding; the planner row
+                        # the callback triggers is the one that can end the turn.
+                        msg_text = str(obj.get("content") or "")
+                        if AGY_BG_TASK_DONE_RE.search(msg_text):
+                            for task_id in AGY_MESSAGE_SENDER_RE.findall(msg_text):
+                                bg_tasks.discard(task_id)
+                        continue
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
                             await self.note_native_user_prompt(session, user_txt)
                         session._inflight_transcript_tool = None
+                        session._agy_response_tools = []
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
                         turn_has_step = False
@@ -10725,9 +11185,13 @@ class HubSessionManager:
                         continue
                     if obj.get("type") == "GENERIC":
                         session._inflight_transcript_tool = None
+                        session._agy_response_tools = []
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
                         gen_content = str(obj.get("content") or "").strip()
+                        # A long command agy moved to its own background runner: the row that
+                        # starts it names the task its callback will carry.
+                        bg_tasks.update(AGY_BG_TASK_START_RE.findall(gen_content))
                         await self.record_telemetry(
                             session.session_id,
                             {
@@ -10761,6 +11225,7 @@ class HubSessionManager:
                                     "final_assistant_text": content or None,
                                 },
                             )
+                        response_calls: List[Dict[str, Any]] = []
                         for tc in tcalls:
                             if isinstance(tc, dict):
                                 turn_has_step = True
@@ -10793,6 +11258,7 @@ class HubSessionManager:
                                     "args": parsed_tc_args or targs,
                                     "call_id": str(tc.get("id") or obj.get("step_index") or ""),
                                 }
+                                response_calls.append(session._inflight_transcript_tool)
                                 await self.record_telemetry(
                                     session.session_id,
                                     {
@@ -10826,11 +11292,25 @@ class HubSessionManager:
                                             "multi_select": bool(q0.get("is_multi_select", False)),
                                         },
                                     )
+                        if response_calls:
+                            # Every call of this planner response, not only the last: an agy
+                            # approval prompt must fit exactly one of them.
+                            session._agy_response_tools = response_calls
                         if not tcalls:
                             # W6: a planner response with no pending tool calls is AGY's end of
                             # turn; the next transcript row is a new USER_INPUT (or the file ends).
                             # On a resume the watcher attaches at the old file size, so every event
                             # here belongs to a new turn and only one is emitted per turn.
+                            # A background task still outstanding means it is NOT the end: agy
+                            # ended this planner step only to wait for that task's callback, and
+                            # completing here handed the parent the "I have launched ..." line as
+                            # the answer before the callback started the very next step.
+                            if bg_tasks:
+                                session.current_activity = (
+                                    f"Waiting for background task {', '.join(sorted(bg_tasks)[:3])}"
+                                )
+                                await self.persist_session(session)
+                                continue
                             final_text = content or ""
                             if final_text:
                                 if not turn_has_step:
@@ -10876,6 +11356,7 @@ class HubSessionManager:
         if session.status not in ("starting", "running") or session.pending_interaction is not None:
             return
         session._inflight_transcript_tool = None
+        session._agy_response_tools = []
         await self.record_worker_event(
             session.session_id,
             {
@@ -13326,26 +13807,58 @@ class HubSessionManager:
         )
 
     async def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
-        """D7: agy's options are offered by label; the one that persists to settings.json never is."""
+        """D7: agy's options are offered by label; the one that persists to settings.json never is.
+
+        agy cuts a long command on its prompt. The full command comes from the last tool call in
+        agy's own transcript when the screen text is its cut copy (command_source=transcript);
+        otherwise the screen text is kept and marked cut, so the parent never approves it blind.
+        """
         opts = [dict(o) for o in parsed.get("options") or []]
         # Round 3: the conversation-wide deny rule (`No, and always deny … in this conversation`) is
         # not offered either; the parent's choices are approve once / for this conversation / deny.
         offered_opts = [o for o in opts if o.get("action") not in ("persist", "deny_session")]
         offered = [o["label"] for o in offered_opts]
-        inflight = getattr(session, "_inflight_transcript_tool", None) or {}
-        inflight_cmd = str(inflight.get("command") or "").strip()
+        header = str(parsed.get("header") or "")
         screen_cmd = str(parsed.get("command") or "").strip()
-        best_cmd = inflight_cmd if (inflight_cmd and len(inflight_cmd) >= len(screen_cmd)) else screen_cmd
-        truncated = best_cmd != inflight_cmd and screen_command_clipped(best_cmd)
+        is_command_prompt = header.startswith(("Requesting permission for", "Run this command?"))
+
+        def open_calls() -> List[Dict[str, Any]]:
+            calls = [c for c in (getattr(session, "_agy_response_tools", None) or [])
+                     if isinstance(c, dict)]
+            if not calls:
+                inflight = getattr(session, "_inflight_transcript_tool", None)
+                if isinstance(inflight, dict):
+                    calls = [inflight]
+            return calls
+
+        calls = open_calls()
+        full_cmd = agy_transcript_command(screen_cmd, calls) if is_command_prompt else None
+        if full_cmd is None and is_command_prompt and screen_command_clipped(screen_cmd):
+            # The watcher may not have read the call yet; the prompt shows a cut copy, so wait for
+            # the record rather than hand the parent a command that cannot be approved blind.
+            deadline = time.monotonic() + AGY_BOX_CALL_WAIT_SEC
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                calls = open_calls()
+                full_cmd = agy_transcript_command(screen_cmd, calls)
+                if full_cmd is not None:
+                    break
+        matched = next((c for c in calls if str(c.get("command") or "").strip() == full_cmd), None)
+        if full_cmd is not None:
+            command, command_source, truncated = full_cmd, "transcript", False
+        else:
+            command, command_source = screen_cmd, "screen"
+            # A command prompt shows a cut copy; a record that is missing, ambiguous or names
+            # another call leaves only that copy, which the parent has to treat as cut.
+            truncated = screen_command_clipped(screen_cmd) or bool(screen_cmd and is_command_prompt)
         lines: List[str] = []
         if parsed.get("reason"):
             lines.append(f"Reason: {parsed['reason']}")
-        if best_cmd:
-            what = "MCP tool" if str(parsed.get("header") or "").startswith("Allow calling this tool") \
-                else "Requesting permission for"
-            lines.append(f"{what}: {best_cmd}")
-        if parsed.get("header"):
-            lines.append(parsed["header"])
+        if command:
+            what = "MCP tool" if header.startswith("Allow calling this tool") else "Requesting permission for"
+            lines.append(f"{what}: {command}")
+        if header:
+            lines.append(header)
         if truncated:
             lines.append(CLIPPED_COMMAND_NOTE)
         return await self.register_pending_interaction(
@@ -13358,9 +13871,10 @@ class HubSessionManager:
             metadata={
                 "agy_options": opts,
                 "option_actions": [o.get("action") for o in offered_opts],
-                "command": best_cmd,
+                "command": command,
+                "command_source": command_source,
                 "command_truncated": truncated,
-                "transcript_tool": inflight.get("tool_name") if inflight else None,
+                "transcript_tool": (matched or {}).get("tool_name"),
             },
         )
 
@@ -14372,6 +14886,8 @@ class HubSessionManager:
         disabled_mcp_servers: Optional[List[str]] = None,
         strict_mcp_config: bool = False,
         auto_approval_rules: Any = None,
+        auto_approve_once_prefixes: Any = None,
+        brief_markdown: Any = None,
         approval_mode: Optional[str] = None,
         compaction_threshold: Any = None,
         leaf_worker: bool = False,
@@ -14388,10 +14904,14 @@ class HubSessionManager:
         extra_args = normalize_extra_args(extra_args)
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
         auto_approval_rules = normalize_auto_approval_rules(auto_approval_rules)
+        auto_approve_once_prefixes = normalize_auto_approve_once_prefixes(auto_approve_once_prefixes)
+        brief_text = normalize_brief_markdown(brief_markdown)
         if profile_id == "desktop-gui":
             validate_mcp_engine("desktop_gui", "desktop_gui", mcp_config)
         if extra_args and profile_id == "desktop-gui":
             raise ValueError("桌面 GUI 会话不支持 extra_args")
+        if brief_text is not None and profile_id == "desktop-gui":
+            raise ValueError("桌面 GUI 会话不支持 brief_markdown")
         if profile_id == "desktop-gui" and normalize_compaction_threshold(compaction_threshold):
             raise ValueError("桌面 GUI 会话不支持自动压缩阈值（compaction_threshold）")
         loop = asyncio.get_running_loop()
@@ -14422,6 +14942,8 @@ class HubSessionManager:
                 "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
                 "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
                 "auto_approval_rules": auto_approval_rules,
+                "auto_approve_once_prefixes": auto_approve_once_prefixes,
+                "auto_approve_once_uses": 0,
                 **resolve_session_approval("desktop_gui", {}, bypass_approvals, approval_mode),
             }
             if bypass_approvals is not None or approval_mode is not None:
@@ -14471,8 +14993,15 @@ class HubSessionManager:
         submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
         claude_session_uuid: Optional[str] = None
+        brief_path = self._brief_path(session_id) if brief_text is not None else None
         # What the worker receives; the title, last_task and activity keep the parent's own task.
-        delivered_task = with_leaf_worker_note(task) if leaf_worker else task
+        # A brief is written under the hub's data dir, so the worktree stays clean; the task carries
+        # one pointer line in front of it.
+        task_text = task
+        if brief_path is not None:
+            pointer = f"{BRIEF_POINTER_LINE}{brief_path.absolute()}"
+            task_text = f"{pointer}\n\n{task}" if task else pointer
+        delivered_task = with_leaf_worker_note(task_text) if leaf_worker else task_text
 
         if task_mode == "omp_positional":
             omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
@@ -14480,7 +15009,7 @@ class HubSessionManager:
             args.extend([
                 f"--session-dir={omp_sess_dir}",
             ])
-            if task:
+            if delivered_task:
                 args.append(self._task_with_session_marker(session_id, delivered_task))
         elif task_mode == "claude_positional":
             claude_session_uuid = str(uuid.uuid4())
@@ -14488,13 +15017,13 @@ class HubSessionManager:
                 "--session-id",
                 claude_session_uuid,
             ])
-            if task:
+            if delivered_task:
                 args.append(self._task_with_session_marker(session_id, delivered_task))
         elif task_mode == "agy_interactive_flag":
-            if task:
+            if delivered_task:
                 args.extend(["-i", self._task_with_session_marker(session_id, delivered_task)])
         elif task_mode == "codex_positional":
-            if task:
+            if delivered_task:
                 args.append(self._task_with_session_marker(session_id, delivered_task))
 
         prof_name = str(prof.get("name", profile_id))
@@ -14541,6 +15070,11 @@ class HubSessionManager:
             "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
             "compaction_threshold": compaction,
             "auto_approval_rules": auto_approval_rules,
+            # Spawn-time approve-once prefixes and their per-session use count (a resume keeps both).
+            "auto_approve_once_prefixes": auto_approve_once_prefixes,
+            "auto_approve_once_uses": 0,
+            # Where the brief file lives, so a close/archive deletes the right one.
+            "brief_path": str(brief_path) if brief_path is not None else None,
             # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
             "leaf_worker": leaf_worker,
             # Round 2: whether this launch had the profile's approval off switch on (a resume
@@ -14551,7 +15085,7 @@ class HubSessionManager:
         sess.launch_notes = list(launch.get("notes") or [])
 
         if kind == "web_gui":
-            if task:
+            if delivered_task:
                 sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(delivered_task)}; pwsh -NoLogo"]
             else:
                 sess.args = ["-NoLogo", "-NoProfile"]
@@ -14573,6 +15107,9 @@ class HubSessionManager:
                 }
 
         self._ensure_session_context_tracker(sess)
+        if brief_path is not None:
+            # Written only now: every validation above has passed, so a refused spawn leaves no file.
+            self._write_session_brief(session_id, brief_text)
         if task_mode == "dsh_hub_api":
             # B6 rule 4 / V-3: dsh injects no args. resolve_launch already built the dsh spec
             # (tier, provider/model split, effort), so the session and the preview use one value.
@@ -14596,7 +15133,13 @@ class HubSessionManager:
                     sess._claude_hook_offset = 0
         elif engine == "omp":
             self._prime_omp_approval_log(sess, env_overrides)
-        sess.start_pty(loop, env_overrides=env_overrides or None)
+        try:
+            sess.start_pty(loop, env_overrides=env_overrides or None)
+        except Exception:
+            # No session exists, so its brief must not outlive the refused spawn.
+            if brief_path is not None:
+                self._delete_session_brief(session_id)
+            raise
         self.sessions[session_id] = sess
         await self.persist_session(sess)
 
@@ -14614,7 +15157,7 @@ class HubSessionManager:
         if kind == "tui":
             self._schedule(self._watch_tui_interactive_prompts(sess))
             prompt_to_send: Optional[str] = None
-            if task and task_mode == "pty_input":
+            if delivered_task and task_mode == "pty_input":
                 prompt_to_send = self._task_with_session_marker(sess.session_id, delivered_task)
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
