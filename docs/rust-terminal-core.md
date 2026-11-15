@@ -775,18 +775,24 @@ a busy table is a retry, not a fault; 500 only for a genuine core fault; otherwi
   during that swap is kept exactly once: it lands either fully before the handover (its replay includes
   the old bytes and the banner) or fully after it.
 - W8 on resume: `spawn(strip_esc3j_on_output=true)` drops `ESC[3J` with the same 3-byte carry.
-- Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as before, and a
-  frame is an object only when it is exactly one JSON value and that value is an object, which is
-  `json.loads`'s rule: trailing junk, a non-JSON number (`+1`, `01`, `1.`, `NaN`, `Infinity`), a bad
-  escape or an unterminated string makes the whole frame bare text, and bare text is written as it
-  arrived. Duplicate keys keep the last value. `"data"` that is a string is written as is (after the
-  reply strip); absent or `null` writes nothing; any other type is ignored and logged once per socket —
-  Python wrote `str(data)`, the console never sends it, and reproducing Python's `repr` is not worth a
-  code path. A lone surrogate escape becomes U+FFFD, because a Rust `String` cannot hold one and
-  `json.loads` accepts it. `resize` takes `cols`/`rows` as JSON integers (truncating a fraction as
-  `int()` does) or as the ASCII form `int()` accepts, with whitespace and a sign; `propagate` is `bool()`
-  of the value and `true` when absent; a size `int()` would refuse, or one outside `1..=65535`, is no
-  resize at all. OSC terminal replies are stripped in the core with `OSC_TERMINAL_REPLY_RE`'s pattern
+- Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as before. Frames are
+  parsed by `serde_json` (decision `json-reader`, owner 2026-11-14); a frame is an object only when it is
+  exactly one JSON value and that value is an object, which is `json.loads`'s rule: trailing junk, a
+  non-JSON number (`+1`, `01`, `1.`), a bad escape or an unterminated string makes the
+  whole frame bare text, and bare text is written as it arrived. `NaN` and `Infinity`, which `json.loads`
+  accepts, are bare text too, as they were with the old reader. Duplicate keys keep the last value. A
+  frame nested past serde_json's 128-deep limit is bare text, as one past the old reader's 64 was; a
+  number past `f64::MAX` (`1e400`) is bare text where the old reader read `inf` and then refused the
+  resize, the one frame the console never sends whose meaning changed. `"data"` that is a string is
+  written as is (after the reply strip); absent or `null` writes nothing; any other type is ignored and
+  logged once per socket — Python wrote `str(data)`, the console never sends it, and reproducing
+  Python's `repr` is not worth a code path. A lone surrogate escape, which `json.loads` keeps and a Rust
+  `String` cannot hold, is still U+FFFD: such a frame is read a second time with that escape replaced and
+  paired escapes copied untouched; any other frame `serde_json` refuses stays bare text. `resize` takes
+  `cols`/`rows` as JSON integers (truncating a fraction as `int()` does) or as the ASCII form `int()`
+  accepts, with whitespace and a sign; `propagate` is `bool()` of the value and `true` when absent; a size
+  `int()` would refuse, or one outside `1..=65535`, is no resize at all. OSC terminal replies are
+  stripped in the core with `OSC_TERMINAL_REPLY_RE`'s pattern
   (`OSC_TERMINAL_REPLY_RE`, `session_manager.py:2000`) before any input reaches the PTY. A resize is
   **not** applied by the core: it raises a `resize` dirty flag with the requested cols/rows, and the hub
   applies the 20/5 clamp and the single-window propagation (`resize_session_from_client`,
@@ -1004,6 +1010,7 @@ the same version already sits in `desktop/src-tauri/Cargo.lock`, so a developer'
 |---|---|---|---|
 | `pyo3` | 0.30.1 (`abi3-py311`, `extension-module`) | the extension module, `#[pymethods]`, `py.detach` (was `allow_threads`), abi3 | no |
 | `tungstenite` | 0.28.0 (default features) | RFC 6455 handshake, frames, ping/pong, close handshake on the console socket; blocking, no async runtime | no |
+| `serde_json` | 1.0.154 (default features: no `derive`, no `arbitrary_precision`; builds `serde_core`, `itoa`, `memchr`, `zmij`) | parses the socket's input frames (§6.4 "Input", decision `json-reader`, owner 2026-11-14); the map keeps the last duplicate key and a nested frame is bounded by its recursion limit (128) | yes |
 | `hmac` | 0.12.1 | HMAC-SHA256 for the terminal ticket | no |
 | `sha2` | 0.10.9 | hash primitive under `hmac` | yes |
 | `base64` | 0.21.7 | ticket encoding (`URL_SAFE_NO_PAD`) | yes |
@@ -1012,12 +1019,11 @@ the same version already sits in `desktop/src-tauri/Cargo.lock`, so a developer'
 | `regex` | 1.13.1 | the two OSC patterns, only run when the buffer contains `\x1b]` | yes |
 | `unicode-normalization` | 0.1.26 | pyte NFC-composes every combined cell; this crate supplies the same tables (decision `nfc-compose`) | no |
 
-The socket's two input shapes are read by the small hand-written `ws/input.rs` reader. `serde_json` remains
-the owner's open call (`json-reader`); the current default keeps it out of the approved crate set.
-Other deliberately unused crates are `crossbeam-channel` (the writer queue is a std condvar and `VecDeque`),
-`parking_lot` (std mutexes are enough), `tokio` (no async runtime in the core), `unicode-width` (the
-parser's grid owns cell widths), `flate2` (permessage-deflate stays off until §11 shows a reason),
-`winpty-rs` and `portable-pty` (§7.1).
+The socket's input frames are parsed by `serde_json`; `ws/input.rs` keeps only the thin `json.loads` layer
+around a parsed value (decision `json-semantics`). Other deliberately unused crates are `crossbeam-channel`
+(the writer queue is a std condvar and `VecDeque`), `parking_lot` (std mutexes are enough), `tokio` (no
+async runtime in the core), `unicode-width` (the parser's grid owns cell widths), `flate2`
+(permessage-deflate stays off until §11 shows a reason), `winpty-rs` and `portable-pty` (§7.1).
 
 ## 8. Semantics that must survive migration
 

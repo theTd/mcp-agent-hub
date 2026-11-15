@@ -32,6 +32,9 @@ tungstenite = "=0.28.0"
 hmac = "=0.12.1"
 sha2 = "=0.10.9"
 base64 = "=0.21.7"
+# The socket's input frames (§6.4 "Input", decision `json-reader`, owner 2026-11-14): pinned to the version
+# already in desktop/src-tauri/Cargo.lock, default features only (no `derive`, no `arbitrary_precision`).
+serde_json = "=1.0.154"
 
 [features]
 # Test-only hooks (`test_hooks`): a controllable console close and a held resize slot, plus the
