@@ -6,16 +6,24 @@
 //! supported because the endpoint accepted one and a hand-driven client may still send it. A frame is
 //! an object only when it is **exactly one** JSON value and that value is an object, which is what
 //! `json.loads`-then-`isinstance(msg, dict)` decided: trailing junk, a non-JSON number such as `+1` or
-//! `01`, a bad escape, an unterminated string or a lone surrogate pair all make `json.loads` fail, so
-//! the raw frame is typed as bare text. Duplicate keys keep the last value, as `json.loads` does.
+//! `01`, a bad escape and an unterminated string all fail to parse, so the raw frame is typed as bare
+//! text. Duplicate keys keep the last value, as `json.loads` does.
 //!
-//! Two divergences from Python, both on frames the console never sends: `"data"` that is not a string
-//! (Python wrote `str(data)`; the frame is ignored and the socket logs it once) and a lone surrogate
-//! escape, which Python's `json.loads` keeps and a Rust `String` cannot, so each becomes U+FFFD.
+//! Frames are parsed by `serde_json` (decision `json-reader`, owner 2026-11-14). What stays here is the
+//! thin layer Python put on top of a parsed value, plus three divergences, all on frames the console
+//! never sends:
+//! - `NaN`, `Infinity` and `-Infinity`: `json.loads` accepts them, serde_json (like the reader before
+//!   it) refuses the frame, so it is bare text.
+//! - `"data"` that is not a string: Python wrote `str(data)`; the frame is ignored and the socket logs
+//!   it once.
+//! - a number outside what an f64 holds (`1e400`): `json.loads` made it `inf`, serde_json refuses the
+//!   frame, so it is bare text where it used to parse (and then be no resize at all).
 //!
-//! This is a small reader, not a JSON library: `serde_json` is deliberately not a dependency (§7.4,
-//! "there is no wire protocol"). It parses one complete value with a depth bound and a cursor, so a
-//! hostile frame costs one pass, no recursion beyond [`MAX_DEPTH`] and no allocation but the frames.
+//! A lone surrogate escape is the one value `json.loads` kept and serde_json refuses: a Rust `String`
+//! cannot hold it, so such a frame is read a second time with each unpaired `\uD800..\uDFFF` written as
+//! U+FFFD, the character the old reader gave it. A well-formed frame, pairs included, is parsed once.
+
+use serde_json::{Map, Value};
 
 /// One frame the console may have sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,16 +52,14 @@ pub enum Interpretation {
 /// The widths `ws_pty_endpoint` used when a resize frame omitted them (`int(msg.get("cols", 120))`).
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
-/// Deeper than any frame the console sends; a hostile one costs a constant, not the stack.
-const MAX_DEPTH: usize = 64;
 
 /// Reads one message from the socket.
 pub fn interpret(message: &str) -> Interpretation {
     // Only an object can carry a command, and `json.loads` accepts leading whitespace. Any other frame
     // is bare text: Python's dict test failed, or the value was not JSON at all.
     if message.trim_start().starts_with('{') {
-        if let Some(fields) = parse_frame(message) {
-            return interpret_object(&fields);
+        if let Some(object) = parse_object(message) {
+            return interpret_object(&object);
         }
     }
     if message.is_empty() {
@@ -63,14 +69,13 @@ pub fn interpret(message: &str) -> Interpretation {
     }
 }
 
-fn interpret_object(fields: &[(String, Json)]) -> Interpretation {
-    // `json.loads` keeps the last duplicate, so the lookup runs from the end.
-    let kind = field(fields, "type").and_then(Json::as_str);
-    match kind {
-        Some("input") => match field(fields, "data") {
-            None | Some(Json::Null) => Interpretation::Nothing,
-            Some(Json::Str(data)) if data.is_empty() => Interpretation::Nothing,
-            Some(Json::Str(data)) => {
+fn interpret_object(object: &Map<String, Value>) -> Interpretation {
+    // serde_json's map keeps the last duplicate, as `json.loads` does.
+    match object.get("type").and_then(Value::as_str) {
+        Some("input") => match object.get("data") {
+            None | Some(Value::Null) => Interpretation::Nothing,
+            Some(Value::String(data)) if data.is_empty() => Interpretation::Nothing,
+            Some(Value::String(data)) => {
                 Interpretation::Message(BrowserMessage::Input(data.clone()))
             }
             Some(_) => Interpretation::NonStringData,
@@ -79,13 +84,13 @@ fn interpret_object(fields: &[(String, Json)]) -> Interpretation {
             // `int(msg.get("cols", 120))`: absent takes the default, and a value `int()` would refuse
             // makes the whole resize fail, which the endpoint swallowed. `propagate` is Python's
             // truthiness of `msg.get("propagate", True)`.
-            let Some(cols) = size_field(fields, "cols", DEFAULT_COLS) else {
+            let Some(cols) = size_field(object, "cols", DEFAULT_COLS) else {
                 return Interpretation::Nothing;
             };
-            let Some(rows) = size_field(fields, "rows", DEFAULT_ROWS) else {
+            let Some(rows) = size_field(object, "rows", DEFAULT_ROWS) else {
                 return Interpretation::Nothing;
             };
-            let propagate = field(fields, "propagate").map(Json::truthy).unwrap_or(true);
+            let propagate = object.get("propagate").is_none_or(truthy);
             Interpretation::Message(BrowserMessage::Resize {
                 cols,
                 rows,
@@ -96,64 +101,40 @@ fn interpret_object(fields: &[(String, Json)]) -> Interpretation {
     }
 }
 
-/// The last value of `key`, or `None` when the object does not carry it.
-fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
-    fields
-        .iter()
-        .rev()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value)
-}
-
 /// `int(message.get(key, default))` narrowed to a size: absent keeps the default, a value `int()`
 /// would refuse (or one outside `1..=u16::MAX`) is no resize at all.
-fn size_field(fields: &[(String, Json)], key: &str, default: u16) -> Option<u16> {
-    match field(fields, key) {
+fn size_field(object: &Map<String, Value>, key: &str, default: u16) -> Option<u16> {
+    match object.get(key) {
         None => Some(default),
-        Some(value) => value.as_size(),
+        Some(value) => as_size(value),
     }
 }
 
-/// A JSON value as far as the console's frames need it. Containers keep only whether they are empty,
-/// which is all `bool()` needs.
-#[derive(Clone, Debug, PartialEq)]
-enum Json {
-    Str(String),
-    Num(f64),
-    Bool(bool),
-    Null,
-    Container { empty: bool },
+/// `bool(value)`: a string and a number by their truth, `null` false, a container by its emptiness.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => number.as_f64() != Some(0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+    }
 }
 
-impl Json {
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Json::Str(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    /// `bool(value)`: a string, a number, `null` and a container's emptiness.
-    fn truthy(&self) -> bool {
-        match self {
-            Json::Str(text) => !text.is_empty(),
-            Json::Num(number) => *number != 0.0,
-            Json::Bool(value) => *value,
-            Json::Null => false,
-            Json::Container { empty } => !empty,
-        }
-    }
-
-    /// `int()`'s truncation for a number, its integer parse for a string, and `None` for everything
-    /// `int()` would raise on — which the endpoint's own `try` swallowed.
-    fn as_size(&self) -> Option<u16> {
-        let value = match self {
-            Json::Num(number) if number.is_finite() => *number as i64,
-            Json::Str(text) => parse_int(text)?,
-            _ => return None,
-        };
-        u16::try_from(value).ok().filter(|size| *size >= 1)
-    }
+/// `int()`'s truncation for a number, its integer parse for a string, and `None` for everything
+/// `int()` would raise on — which the endpoint's own `try` swallowed. A `Value::Number` is always
+/// finite: serde_json refuses `NaN`, `Infinity` and a literal past `f64::MAX`.
+fn as_size(value: &Value) -> Option<u16> {
+    let size = match value {
+        // An integer stays exact; a float such as `140.7` or `1e3` truncates toward zero.
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value as i64))?,
+        Value::String(text) => parse_int(text)?,
+        _ => return None,
+    };
+    u16::try_from(size).ok().filter(|size| *size >= 1)
 }
 
 /// `int(text)` for the ASCII form: surrounding whitespace and an optional sign are accepted, nothing
@@ -167,244 +148,78 @@ fn parse_int(text: &str) -> Option<i64> {
     trimmed.parse::<i64>().ok()
 }
 
-/// One complete JSON object and nothing after it.
-fn parse_frame(text: &str) -> Option<Vec<(String, Json)>> {
-    let mut cursor = Cursor {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    cursor.skip_whitespace();
-    let fields = cursor.object(0)?;
-    cursor.skip_whitespace();
-    (cursor.pos == cursor.bytes.len()).then_some(fields)
+/// One complete JSON object and nothing after it, read by serde_json, which accepts the leading and
+/// trailing whitespace `json.loads` did and refuses trailing junk.
+fn parse_object(text: &str) -> Option<Map<String, Value>> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(object)) => Some(object),
+        Ok(_) => None,
+        // A lone surrogate escape is the only value `json.loads` kept and serde_json refuses on an
+        // otherwise valid frame, and it needs a `\u` in the text at all: every other refusal is final.
+        Err(_) if text.contains("\\u") => {
+            let repaired = without_lone_surrogates(text)?;
+            match serde_json::from_str::<Value>(&repaired) {
+                Ok(Value::Object(object)) => Some(object),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
 }
 
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl Cursor<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<u8> {
-        let byte = self.peek()?;
-        self.pos += 1;
-        Some(byte)
-    }
-
-    fn expect(&mut self, byte: u8) -> Option<()> {
-        (self.bump()? == byte).then_some(())
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Option<Vec<(String, Json)>> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        self.expect(b'{')?;
-        let mut fields = Vec::new();
-        self.skip_whitespace();
-        if self.peek() == Some(b'}') {
-            self.bump();
-            return Some(fields);
-        }
-        loop {
-            self.skip_whitespace();
-            let key = self.string()?;
-            self.skip_whitespace();
-            self.expect(b':')?;
-            self.skip_whitespace();
-            let value = self.value(depth + 1)?;
-            fields.push((key, value));
-            self.skip_whitespace();
-            match self.bump()? {
-                b',' => continue,
-                b'}' => return Some(fields),
-                _ => return None,
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Option<Json> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        self.expect(b'[')?;
-        self.skip_whitespace();
-        if self.peek() == Some(b']') {
-            self.bump();
-            return Some(Json::Container { empty: true });
-        }
-        loop {
-            self.skip_whitespace();
-            self.value(depth + 1)?;
-            self.skip_whitespace();
-            match self.bump()? {
-                b',' => continue,
-                b']' => return Some(Json::Container { empty: false }),
-                _ => return None,
-            }
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Option<Json> {
-        match self.peek()? {
-            b'"' => Some(Json::Str(self.string()?)),
-            b'{' => Some(Json::Container {
-                empty: self.object(depth)?.is_empty(),
-            }),
-            b'[' => self.array(depth),
-            b't' => self.literal("true").map(|_| Json::Bool(true)),
-            b'f' => self.literal("false").map(|_| Json::Bool(false)),
-            b'n' => self.literal("null").map(|_| Json::Null),
-            _ => self.number(),
-        }
-    }
-
-    fn literal(&mut self, word: &str) -> Option<()> {
-        if self.bytes[self.pos..].starts_with(word.as_bytes()) {
-            self.pos += word.len();
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    /// JSON's number grammar, so `+1`, `01`, `1.`, `.5`, `NaN` and `Infinity` are refused and the
-    /// frame falls back to bare text, the way `json.loads` refused them.
-    fn number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        match self.peek()? {
-            b'0' => {
-                self.pos += 1;
-                if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return None;
-                }
-            }
-            b'1'..=b'9' => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return None,
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return None;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
-                return None;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        std::str::from_utf8(&self.bytes[start..self.pos])
-            .ok()?
-            .parse::<f64>()
-            .ok()
-            .map(Json::Num)
-    }
-
-    fn string(&mut self) -> Option<String> {
-        self.expect(b'"')?;
-        let mut out = String::new();
-        loop {
-            let byte = self.bump()?;
-            match byte {
-                b'"' => return Some(out),
-                b'\\' => match self.bump()? {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{8}'),
-                    b'f' => out.push('\u{c}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => self.unicode_escape(&mut out)?,
-                    _ => return None,
-                },
-                // A raw control byte is not valid JSON text.
-                byte if byte < 0x20 => return None,
-                byte if byte < 0x80 => out.push(byte as char),
-                byte => {
-                    // The frame is a `&str`, so a multi-byte character is whole in `bytes`.
-                    let width = match byte {
-                        0xF0..=0xFF => 4,
-                        0xE0..=0xEF => 3,
-                        _ => 2,
-                    };
-                    let start = self.pos - 1;
-                    let end = start + width;
-                    let text = std::str::from_utf8(self.bytes.get(start..end)?).ok()?;
-                    out.push_str(text);
-                    self.pos = end;
-                }
-            }
-        }
-    }
-
-    /// `\uXXXX`: a high surrogate followed by a low one is one character; either one alone is a lone
-    /// surrogate, which `json.loads` accepts and a Rust `String` cannot, so it becomes U+FFFD.
-    fn unicode_escape(&mut self, out: &mut String) -> Option<()> {
-        let code = self.hex4()?;
-        if (0xDC00..0xE000).contains(&code) {
-            out.push(char::REPLACEMENT_CHARACTER);
-            return Some(());
-        }
-        if !(0xD800..0xDC00).contains(&code) {
-            out.push(char::from_u32(code)?);
-            return Some(());
-        }
-        let pair = self.pos;
-        if self.bytes.get(pair..pair + 2) == Some(b"\\u") {
-            self.pos += 2;
-            let low = self.hex4()?;
-            if !(0xDC00..0xE000).contains(&low) {
-                // A valid escape, but not the low half: the high one stays lone, and the escape that
-                // follows it is read on its own.
-                self.pos = pair;
-                out.push(char::REPLACEMENT_CHARACTER);
-                return Some(());
-            }
-            let combined = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-            out.push(char::from_u32(combined)?);
-            return Some(());
-        }
-        out.push(char::REPLACEMENT_CHARACTER);
-        Some(())
-    }
-
-    fn hex4(&mut self) -> Option<u32> {
+/// A copy of `text` in which every unpaired `\uD800..\uDFFF` escape is written as `\ufffd`, the
+/// character the reader always gave one; `None` when the frame has no such escape. Paired escapes are
+/// copied untouched, so only a frame serde_json refused reaches this and each run is one pass.
+fn without_lone_surrogates(text: &str) -> Option<String> {
+    fn hex4(bytes: &[u8], at: usize) -> Option<u32> {
         let mut value = 0u32;
-        for _ in 0..4 {
-            let digit = (self.bump()? as char).to_digit(16)?;
-            value = value * 16 + digit;
+        for digit in bytes.get(at..at + 4)? {
+            value = value * 16 + char::from(*digit).to_digit(16)?;
         }
         Some(value)
     }
+
+    let bytes = text.as_bytes();
+    let mut repaired = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    let mut changed = false;
+    while let Some(&byte) = bytes.get(pos) {
+        if byte != b'\\' {
+            repaired.push(byte);
+            pos += 1;
+            continue;
+        }
+        // Every escape but `\u` is copied two bytes at a time, so an escaped backslash in front of a
+        // `u` (`"\\ud800"`) never looks like a surrogate escape.
+        if bytes.get(pos + 1) != Some(&b'u') {
+            let end = (pos + 2).min(bytes.len());
+            repaired.extend_from_slice(&bytes[pos..end]);
+            pos = end;
+            continue;
+        }
+        // Not `\uXXXX`: another escape or a truncated one, which stays exactly as written because
+        // the frame is refused either way.
+        let Some(code) = hex4(bytes, pos + 2) else {
+            repaired.extend_from_slice(&bytes[pos..]);
+            break;
+        };
+        let low_follows = bytes.get(pos + 6) == Some(&b'\\')
+            && bytes.get(pos + 7) == Some(&b'u')
+            && matches!(hex4(bytes, pos + 8), Some(low) if (0xDC00..0xE000).contains(&low));
+        if (0xD800..0xDC00).contains(&code) && low_follows {
+            // A pair is one character and stays as written.
+            repaired.extend_from_slice(&bytes[pos..pos + 12]);
+            pos += 12;
+        } else if (0xD800..0xE000).contains(&code) {
+            repaired.extend_from_slice(b"\\ufffd");
+            pos += 6;
+            changed = true;
+        } else {
+            repaired.extend_from_slice(&bytes[pos..pos + 6]);
+            pos += 6;
+        }
+    }
+    changed.then(|| String::from_utf8(repaired).ok()).flatten()
 }
 
 #[cfg(test)]
@@ -542,6 +357,26 @@ mod tests {
             (
                 r#"{"type":"input","data":"\ud800\u0041"}"#,
                 Interpretation::Message(BrowserMessage::Input("\u{fffd}A".into())),
+            ),
+            // A well-paired escape in the same frame stays one character: only the lone one changes,
+            // so the second pass must not rewrite the pair.
+            (
+                r#"{"type":"input","data":"\ud83d\ude00\ud800"}"#,
+                Interpretation::Message(BrowserMessage::Input("😀\u{fffd}".into())),
+            ),
+            // `\\ud800` is a literal backslash and the text `ud800`: only the escape after it is lone,
+            // so the repair must not read an escaped backslash as the start of one.
+            (
+                r#"{"type":"input","data":"\\ud800\ud800"}"#,
+                Interpretation::Message(BrowserMessage::Input("\\ud800\u{fffd}".into())),
+            ),
+            // serde_json refuses a number past `f64::MAX` where `json.loads` made `inf`: the frame is
+            // bare text, and it was no resize either way.
+            (
+                r#"{"type":"resize","cols":1e400,"rows":30}"#,
+                Interpretation::Message(BrowserMessage::Input(
+                    r#"{"type":"resize","cols":1e400,"rows":30}"#.into(),
+                )),
             ),
             // Another type or no `type`: nothing, and either way not bare text.
             (
