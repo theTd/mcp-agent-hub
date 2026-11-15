@@ -126,6 +126,38 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await old)["state"], "superseded")
         self.assertEqual((await new)["state"], "waiting")
 
+    async def test_ask_coalescing_collects_only_requests_in_window(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        waiter = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.4, ask_coalesce_ms=60))
+        await asyncio.sleep(0.02)
+        await self.inbox.publish_event({"session_id": "a", "type": "approval_request", "request_id": "q2", "content": "second"})
+        result = await waiter
+        self.assertEqual([r["request_id"] for r in result["requests"]], ["q1", "q2"])
+        self.assertEqual(result["result_id"], "q1")
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q3", "content": "later"})
+        again = await self.inbox.wait(info["wait_handle"], 0.1, ask_coalesce_ms=0)
+        self.assertEqual(again["requests"][0]["request_id"], "q1")
+
+    async def test_ask_answered_during_coalescing_is_refreshed(self):
+        info = await self.inbox.create(["a"])
+        open_requests = {"q1"}
+        self.inbox.set_request_check(lambda _sid, request_id: request_id in open_requests)
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        waiter = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.2, ask_coalesce_ms=80))
+        await asyncio.sleep(0.02)
+        open_requests.clear()
+        await self.inbox._notify(info["wait_handle"])
+        result = await waiter
+        self.assertEqual(result["state"], "waiting")
+
+    async def test_open_ask_is_returned_when_the_window_outlasts_the_timeout(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        result = await self.inbox.wait(info["wait_handle"], 0.1, ask_coalesce_ms=800)
+        self.assertEqual(result["state"], "ask")
+        self.assertEqual([r["request_id"] for r in result["requests"]], ["q1"])
+
 
 if __name__ == "__main__":
     unittest.main()

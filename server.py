@@ -616,20 +616,35 @@ async def list_archived_sessions(query: Optional[str] = None, limit: int = 20) -
 
 
 @mcp.tool()
-async def respond_to_subagent(
+async def wait_for_hub(
+    wait_handle: str,
+    timeout_seconds: float = 50.0,
+    ask_coalesce_ms: int = 800,
+) -> Dict[str, Any]:
+    """Wait on a wait_handle or complete wait_url, returning waiting, ask, done or failed.
+
+    Hosts that cannot keep a background GET running (including shells capped at 10 seconds)
+    should use this tool. A timeout is a normal ``state=waiting`` result. When asking, ``requests``
+    contains every currently open request; answer all of them before waiting again.
+    """
+    handle = str(wait_handle or "").rstrip("/").rsplit("/", 1)[-1]
+    if not handle.startswith("wh_"):
+        raise ValueError("wait_handle must be a wh_... handle or wait_url")
+    if not 1 <= float(timeout_seconds) <= 300:
+        raise ValueError("timeout_seconds must be between 1 and 300")
+    if not 0 <= int(ask_coalesce_ms) <= 5000:
+        raise ValueError("ask_coalesce_ms must be between 0 and 5000")
+    return await hub.wait_inbox.wait(handle, timeout_seconds, ask_coalesce_ms=ask_coalesce_ms)
+
+
+async def _respond_to_subagent_impl(
     session_id: str,
     answer: Optional[str] = None,
     decision: Optional[str] = None,
     option_index: Optional[int] = None,
     custom_input: Optional[str] = None,
     request_id: Optional[str] = None,
-    wait_seconds: float = 8.0,  # deprecated compatibility field; never blocks
-    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Answer a question/approval once, or deliver ordinary feedback, by request_id.
-
-    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
-    """
     session = hub.sessions.get(session_id)
     if not session:
         raise ValueError(f"Session '{session_id}' not found in active sessions.")
@@ -650,6 +665,63 @@ async def respond_to_subagent(
         wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
     return {**_control_status(session, accepted=bool(action_result.get("ok", True))), **wait,
             "response": {key: action_result.get(key) for key in ("delivered", "response_state", "resolved_request_id", "idempotent") if key in action_result}}
+
+
+@mcp.tool()
+async def respond_to_subagent(
+    session_id: str,
+    answer: Optional[str] = None,
+    decision: Optional[str] = None,
+    option_index: Optional[int] = None,
+    custom_input: Optional[str] = None,
+    request_id: Optional[str] = None,
+    wait_seconds: float = 8.0,  # deprecated compatibility field; never blocks
+    ctx: Optional[Context] = None,
+) -> Dict[str, Any]:
+    """Answer a question/approval once, or deliver ordinary feedback, by request_id.
+
+    ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
+    """
+    return await _respond_to_subagent_impl(
+        session_id=session_id, answer=answer, decision=decision,
+        option_index=option_index, custom_input=custom_input, request_id=request_id,
+    )
+
+
+@mcp.tool()
+async def respond_to_subagents(
+    responses: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Answer up to 50 pending requests independently and report each outcome.
+
+    Each item has session_id, request_id and the same answer fields as respond_to_subagent:
+    decision, option_index, answer or custom_input. One invalid item does not stop the others.
+    """
+    if len(responses) > 50:
+        raise ValueError("responses may contain at most 50 entries")
+    outcomes = []
+    wait_handles = []
+    for item in responses:
+        try:
+            if not isinstance(item, dict):
+                raise ValueError("response entry must be an object")
+            session_id = item.get("session_id")
+            request_id = item.get("request_id")
+            if not session_id or not request_id:
+                raise ValueError("session_id and request_id are required")
+            result = await _respond_to_subagent_impl(
+                session_id=str(session_id), request_id=str(request_id),
+                answer=item.get("answer"), decision=item.get("decision"),
+                option_index=item.get("option_index"), custom_input=item.get("custom_input"),
+            )
+            if result.get("wait_handle"):
+                wait_handles.append(result["wait_handle"])
+            outcomes.append({"session_id": session_id, "request_id": request_id, "ok": True, "result": result})
+        except Exception as exc:
+            outcomes.append({"session_id": item.get("session_id") if isinstance(item, dict) else None,
+                             "request_id": item.get("request_id") if isinstance(item, dict) else None,
+                             "ok": False, "error": str(exc)})
+    return {"responses": outcomes, "wait_handles": list(dict.fromkeys(wait_handles))}
 
 
 @mcp.tool()
@@ -888,10 +960,10 @@ async def api_list_historical_sessions(limit: int = Query(30)):
 
 
 @app.get("/api/wait/{wait_handle}")
-async def api_wait(wait_handle: str, timeout: float = Query(25.0, ge=0.1, le=120.0)):
+async def api_wait(wait_handle: str, timeout: float = Query(25.0, ge=0.1, le=300.0), ask_coalesce_ms: int = Query(800, ge=0, le=5000)):
     """Long-poll one opaque handle.  Repeating this URL is the complete parent protocol."""
     try:
-        return await hub.wait_inbox.wait(wait_handle, timeout)
+        return await hub.wait_inbox.wait(wait_handle, timeout, ask_coalesce_ms=ask_coalesce_ms)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 

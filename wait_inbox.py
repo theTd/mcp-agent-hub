@@ -284,6 +284,19 @@ class WaitInbox:
                 return item
             return None
 
+    @staticmethod
+    def _ask_entry(event: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the stable parent-facing shape while retaining the raw event fields."""
+        entry = dict(event)
+        entry.setdefault("session_id", event.get("session_id"))
+        entry.setdefault("request_id", event.get("request_id"))
+        entry.setdefault("kind", event.get("type"))
+        entry.setdefault("prompt", event.get("prompt") or event.get("content") or event.get("question") or event.get("command"))
+        entry.setdefault("command", event.get("command"))
+        entry.setdefault("decisions", event.get("decisions") or event.get("options"))
+        entry.setdefault("options", event.get("options") or event.get("decisions"))
+        return entry
+
     async def _snapshot(self, handle: str) -> Dict[str, Any]:
         row = self._row(handle)
         if not row:
@@ -292,7 +305,12 @@ class WaitInbox:
         if event:
             kind = event.get("type")
             if kind in ("approval_request", "question"):
-                return {"state": "ask", "requests": [event], "result_id": event.get("result_id") or event.get("request_id")}
+                asks = await self._all_open_asks(handle)
+                if not asks:
+                    asks = [self._ask_entry(event)]
+                first = asks[0]
+                return {"state": "ask", "requests": asks,
+                        "result_id": first.get("result_id") or first.get("request_id")}
             if kind == "turn_completed":
                 # A group handle is all-settled by default.  A member completion is cached in the
                 # inbox, then the state provider decides whether every member has completed.
@@ -337,8 +355,24 @@ class WaitInbox:
                 return state
         return {"state": "waiting", "wait_handle": handle}
 
-    async def wait(self, handle: str, timeout: float = 25.0) -> Dict[str, Any]:
-        timeout = max(0.1, min(float(timeout), 120.0))
+    async def _all_open_asks(self, handle: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM wait_inbox_events WHERE handle=? AND consumed=0 AND event_type IN ('approval_request','question') ORDER BY id",
+                (handle,),
+            ).fetchall()
+        asks = []
+        for row in rows:
+            item = self._load(row["payload_json"], {})
+            item["request_id"] = row["request_id"] or item.get("request_id")
+            item["result_id"] = row["result_id"] or item.get("result_id")
+            if self._request_open(item, row["request_id"]):
+                asks.append(self._ask_entry(item))
+        return asks
+
+    async def wait(self, handle: str, timeout: float = 25.0, ask_coalesce_ms: int = 0) -> Dict[str, Any]:
+        timeout = max(0.1, min(float(timeout), 300.0))
+        ask_coalesce_ms = max(0, min(int(ask_coalesce_ms), 5000))
         async with self._lock:
             if not self._row(handle):
                 raise WaitHandleError("unknown wait handle")
@@ -349,10 +383,21 @@ class WaitInbox:
             future = asyncio.get_running_loop().create_future()
             self._waiters[handle] = (token, future)
         deadline = time.monotonic() + timeout
+        coalesced = False
         try:
             while True:
                 current = await self._snapshot(handle)
                 if current.get("state") != "waiting":
+                    if current.get("state") == "ask" and ask_coalesce_ms and not coalesced:
+                        coalesced = True
+                        remain = max(0.0, deadline - time.monotonic())
+                        if remain:
+                            await asyncio.sleep(min(ask_coalesce_ms / 1000.0, remain))
+                        if future.done() and future.result() is not True:
+                            return dict(future.result())
+                        # Read a fresh snapshot even when the window used up the timeout: an ask
+                        # still open must be returned, never hidden behind state=waiting.
+                        continue
                     return {"wait_handle": handle, **current}
                 remain = deadline - time.monotonic()
                 if remain <= 0:
