@@ -28,7 +28,7 @@ from PIL import Image
 # there is no Python PTY or parser behind it after step 3b.
 from terminal_core import Core
 
-from transcript_tail import TranscriptTail, read_complete_lines
+from transcript_tail import TranscriptTail, read_complete_lines, read_complete_records
 from transcript_feed import (
     FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, json_valued_arguments, tool_output_text,
     tool_title, interaction_view as transcript_interaction_view,
@@ -494,6 +494,19 @@ AGY_RESUME_VERIFY_WINDOW_SEC = 30.0
 # network issue" on screen) it writes nothing more and sits idle at its prompt. An error row followed by
 # this long a silence ends the turn, so the parent's wait does not stay "running" for good.
 AGY_ERROR_TURN_END_SEC = 60.0
+# agy hands a long `run_command` to its own background task and ends the turn with "I have
+# launched ... and will wait for it": that planner response is not the end of the turn, the
+# task's callback is. The start row names the task; the callback is a SYSTEM_MESSAGE whose
+# sender is that task and whose text says it finished.
+AGY_BG_TASK_START_RE = re.compile(r"Tool is running as a background task with task id:\s*(\S+)")
+AGY_MESSAGE_SENDER_RE = re.compile(r"sender=(\S+)")
+AGY_BG_TASK_DONE_RE = re.compile(r"\bfinished with result\b")
+# The omp session file is the durable answer to "did the turn end"; the tail watcher only makes
+# it immediate. A finished turn whose last record the watcher never applied is completed from
+# the file's own tail this often, so one unreadable/lost record cannot strand the session.
+OMP_TURN_END_SWEEP_INTERVAL_SEC = 5.0
+OMP_TURN_END_TAIL_SCAN_BYTES = 1024 * 1024
+OMP_TURN_END_STOP_REASONS = ("stop", "end_turn", "stop_sequence")
 # The hub's anchor (time.time()) and the filesystem's birth time are different clock sources and can
 # round against each other; a dir born in the same tick as the spawn is still the new conversation.
 AGY_CONVERSATION_ANCHOR_SLACK_SEC = 0.05
@@ -2312,6 +2325,9 @@ class AgentSession:
         self._inflight_transcript_tool: Optional[Dict[str, Any]] = None
         # omp runs tool calls side by side: every started call without a result yet, by call id.
         self._open_transcript_tools: Dict[str, Dict[str, Any]] = {}
+        # Byte offset past the last turn end this session accounted for (the watcher or the
+        # turn-end sweep). The sweep only completes a turn whose end row starts after it.
+        self._native_turn_end_offset: int = 0
         # omp's approval events: read offset; requests not resolved yet, by call id (in order); set
         # once the log shows the extension loaded; when a box no request covers was first seen.
         self._omp_approval_offset: int = 0
@@ -3445,6 +3461,7 @@ class HubSessionManager:
         self._schedule(asyncio.to_thread(dsh_tls_context))
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
+        self._schedule(self._omp_turn_end_sweep_loop())
         if request is not None:
             targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
             for sid in sorted(request.session_ids or ()):
@@ -8892,6 +8909,16 @@ class HubSessionManager:
         session.final_response_from_previous_turn = bool(session.final_response)
         session.completion_reported = False
         session._seen_tui_prompt_signatures.clear()
+        # Everything already in the transcript belongs to the turn that just ended; the turn-end
+        # sweep may only complete this new turn from a record appended after it (a resumed session
+        # attaches to a file that already holds the old answer).
+        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
+        native_path = session.transcript_path or ref.get("session_file")
+        if native_path:
+            try:
+                session._native_turn_end_offset = Path(str(native_path)).stat().st_size
+            except OSError:
+                pass
         if status is not None:
             session.status = status
 
@@ -10021,10 +10048,13 @@ class HubSessionManager:
 
         turn_has_step = False
         pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        # (start, end) of the record being applied, so a failure costs that record only.
+        applying: Optional[Tuple[int, int]] = None
         while self._transcript_watch_alive(session):
+            applying = None
             try:
-                lines, offset = read_complete_lines(target_file, offset)
-                for line in lines:
+                records, offset = read_complete_records(target_file, offset)
+                for record_start, record_end, line in records:
                     line = line.strip()
                     if not line:
                         continue
@@ -10032,6 +10062,7 @@ class HubSessionManager:
                         obj = json.loads(line)
                     except Exception:
                         continue
+                    applying = (record_start, record_end)
                     self._observe_context_record(session, obj)
                     otype = obj.get("type")
                     ctype = obj.get("customType")
@@ -10238,13 +10269,130 @@ class HubSessionManager:
                                     "final_assistant_text": final_txt,
                                 },
                             )
+                            if is_end_turn:
+                                # This row is the turn's durable end: the sweep must not complete
+                                # it again (begin_new_turn raises the floor for the next turn).
+                                session._native_turn_end_offset = record_end
+                    applying = None
             except PersistenceRecordTooLarge as exc:
+                # An unstorable record is skipped; the batch's remaining records are still read
+                # on the next pass instead of being thrown away with it.
                 self._skip_unstorable_record(session, "OMP session watcher", exc)
+                if applying is not None:
+                    offset = applying[1]
             except PersistenceUnavailable:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                # One record the watcher cannot apply must not cost the rest of the batch (the
+                # already-read rows would be lost with its offset): only that record is skipped,
+                # and the turn-end sweep completes the turn if it was the turn's last one.
+                logger.warning("OMP session watcher skipped a record (%s): %s", session.session_id, exc)
+                if applying is not None:
+                    offset = applying[1]
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    @classmethod
+    def _omp_turn_end_record(cls, path: Path, after_offset: int) -> Optional[Tuple[int, int, str]]:
+        """(start, end, final text) when omp's session file ends with a finished turn.
+
+        omp writes a turn's answer as an assistant message with no tool call and a terminal
+        stopReason; any row after it (a tool start, a user message) means the turn went on. Only
+        a row starting at or after `after_offset` counts, so a turn already accounted for — or an
+        answer a resumed session inherited — never completes the new turn.
+        """
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            return None
+        if size <= after_offset:
+            return None
+        read_from = max(int(after_offset), size - OMP_TURN_END_TAIL_SCAN_BYTES)
+        try:
+            with Path(path).open("rb") as stream:
+                stream.seek(read_from)
+                blob = stream.read(size - read_from)
+        except OSError:
+            return None
+        # The last COMPLETE row: a row still being written has no trailing newline yet.
+        line_end = blob.rfind(b"\n")
+        if line_end < 0:
+            return None
+        line_start = blob.rfind(b"\n", 0, line_end) + 1
+        start = read_from + line_start
+        if start < after_offset:
+            return None
+        try:
+            obj = json.loads(blob[line_start:line_end].decode("utf-8", "replace"))
+        except Exception:
+            return None
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            return None
+        if msg.get("stopReason") not in OMP_TURN_END_STOP_REASONS:
+            return None
+        texts: List[str] = []
+        for part in msg.get("content") or []:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("toolCall", "tool_use"):
+                return None
+            if part.get("type") == "text" and part.get("text"):
+                texts.append(str(part["text"]).strip())
+        text = "\n".join(part for part in texts if part).strip()
+        if not text:
+            return None
+        return start, read_from + line_end + 1, text
+
+    async def _sweep_omp_turn_ends(self) -> int:
+        """Completes an omp turn whose last record the tail watcher never applied.
+
+        The watcher makes a turn end immediate, but it is a live tail: a record it could not
+        apply (one exception inside a record's processing), or a watcher that ended, used to
+        leave the session "running" for good — the group wait never settled and the final
+        response stayed empty although the session file already held it. The file is the
+        durable record, so the same turn-end rule is applied to its tail here.
+        """
+        completed = 0
+        for session in list(self.sessions.values()):
+            try:
+                if (session.engine or "").strip().lower() != "omp" or session.kind != "tui":
+                    continue
+                if session.status not in ("starting", "running") or session.pending_interaction is not None:
+                    continue
+                if not session.transcript_path or not session.is_process_alive():
+                    continue
+                found = await asyncio.to_thread(
+                    self._omp_turn_end_record,
+                    Path(str(session.transcript_path)),
+                    int(getattr(session, "_native_turn_end_offset", 0) or 0),
+                )
+                if not found or self.sessions.get(session.session_id) is not session:
+                    continue
+                if session.status not in ("starting", "running") or session.pending_interaction is not None:
+                    continue
+                _start, end, text = found
+                # Claim the row first: the watcher or a second sweep pass must not emit it again.
+                session._native_turn_end_offset = end
+                session._inflight_transcript_tool = None
+                await self.record_worker_event(
+                    session.session_id,
+                    {
+                        "type": "turn_completed",
+                        "category": "turn_completed",
+                        "status": "turn_idle",
+                        "content": text,
+                        "data": {"source": "omp_tail_sweep"},
+                    },
+                )
+                completed += 1
+            except Exception:
+                logger.exception("Turn-end sweep failed for %s", session.session_id)
+        return completed
+
+    async def _omp_turn_end_sweep_loop(self):
+        while not self._shutting_down:
+            await asyncio.sleep(OMP_TURN_END_SWEEP_INTERVAL_SEC)
+            await self._sweep_omp_turn_ends()
 
     @staticmethod
     def _kimi_resolved_interaction_ids(lines: List[str]) -> Set[str]:
@@ -10676,6 +10824,9 @@ class HubSessionManager:
         verify_deadline = self._session_spawn_anchor(session) + AGY_RESUME_VERIFY_WINDOW_SEC
         stray_scan_at = 0.0  # the folder scan runs at most every TRANSCRIPT_RESCAN_INTERVAL_SEC
         turn_has_step = False
+        # agy tasks this turn handed to its own background runner and whose result has not come
+        # back yet, by the id its start row and its callback both name.
+        bg_tasks: Set[str] = set()
         # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
         error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
@@ -10712,6 +10863,15 @@ class HubSessionManager:
                         )
                         continue
                     error_tail = None  # any later row means agy recovered or moved on
+                    if obj.get("type") == "SYSTEM_MESSAGE":
+                        # agy delivers a background task's result as a system message naming the
+                        # task as its sender. That task is no longer outstanding; the planner row
+                        # the callback triggers is the one that can end the turn.
+                        msg_text = str(obj.get("content") or "")
+                        if AGY_BG_TASK_DONE_RE.search(msg_text):
+                            for task_id in AGY_MESSAGE_SENDER_RE.findall(msg_text):
+                                bg_tasks.discard(task_id)
+                        continue
                     if obj.get("type") == "USER_INPUT":
                         user_txt = str(obj.get("content") or "").strip()
                         if user_txt:
@@ -10728,6 +10888,9 @@ class HubSessionManager:
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
                         gen_content = str(obj.get("content") or "").strip()
+                        # A long command agy moved to its own background runner: the row that
+                        # starts it names the task its callback will carry.
+                        bg_tasks.update(AGY_BG_TASK_START_RE.findall(gen_content))
                         await self.record_telemetry(
                             session.session_id,
                             {
@@ -10831,6 +10994,16 @@ class HubSessionManager:
                             # turn; the next transcript row is a new USER_INPUT (or the file ends).
                             # On a resume the watcher attaches at the old file size, so every event
                             # here belongs to a new turn and only one is emitted per turn.
+                            # A background task still outstanding means it is NOT the end: agy
+                            # ended this planner step only to wait for that task's callback, and
+                            # completing here handed the parent the "I have launched ..." line as
+                            # the answer before the callback started the very next step.
+                            if bg_tasks:
+                                session.current_activity = (
+                                    f"Waiting for background task {', '.join(sorted(bg_tasks)[:3])}"
+                                )
+                                await self.persist_session(session)
+                                continue
                             final_text = content or ""
                             if final_text:
                                 if not turn_has_step:

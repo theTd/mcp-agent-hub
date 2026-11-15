@@ -19,6 +19,27 @@ def read_complete_lines(path, offset, *, batch_lines=256):
         return lines, offset
 
 
+def read_complete_records(path, offset, *, batch_lines=256):
+    """`read_complete_lines` with each row's (start, end) byte offsets.
+
+    A reader that fails on one row can then resume at the row after it instead of losing the
+    rest of the batch it had already read.
+    """
+    with Path(path).open("rb") as stream:
+        stream.seek(0, 2)
+        stream.seek(offset if stream.tell() >= offset else 0)
+        cursor = stream.tell()
+        records = []
+        for _ in range(batch_lines):
+            start = cursor
+            line = stream.readline()
+            if not line.endswith(b"\n"):
+                break
+            cursor = stream.tell()
+            records.append((start, cursor, line.decode("utf-8", "replace")))
+        return records, cursor
+
+
 class TranscriptTail:
     def __init__(self, path, *, batch_lines=64):
         self.path = Path(path)
