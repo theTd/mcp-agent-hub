@@ -274,7 +274,7 @@ mcp.add_middleware(LeafWorkerArgumentMiddleware())
 
 
 @mcp.tool()
-async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
+async def list_agent_profiles(refresh_discovery: bool = False, view: str = "compact") -> Dict[str, Any]:
     """
     List enabled profiles, engines, models and thinking levels.
     Read routing_guide_markdown and each profile's when_to_use before choosing an agent.
@@ -282,14 +282,24 @@ async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]
     Set refresh_discovery=true to refresh the installed engine catalog.
     """
     await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
+    if view not in {"compact", "full"}:
+        raise ValueError("view must be compact or full")
     base_url = hub_api_base_url()
-    return {
+    payload = {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
         "global_routing_instructions": hub.global_routing_instructions,
         "hub_console_url": f"{base_url}/",
         "engines_catalog": hub.get_mcp_engines_catalog(),
         "profiles": hub.get_mcp_enabled_profiles(),
     }
+    if view == "full":
+        return payload
+    profiles = {}
+    for pid, profile in payload["profiles"].items():
+        profiles[pid] = {key: profile.get(key) for key in ("id", "name", "engine", "default_model", "default_thinking_level", "when_to_use")}
+        if profile.get("env"):
+            profiles[pid]["env"] = profile["env"]
+    return {"routing_guide_markdown": payload["routing_guide_markdown"], "hub_console_url": payload["hub_console_url"], "profiles": profiles}
 
 
 @mcp.tool()
@@ -805,9 +815,49 @@ async def read_subagent_screen(
 
 
 @mcp.tool()
-async def list_active_sessions(include_historical: bool = True, limit: int = 25) -> Dict[str, Any]:
-    """List live console sessions and persisted historical sessions."""
-    active = [s.to_dict() for s in hub.sessions.values()]
+async def list_active_sessions(
+    include_historical: bool = False,
+    limit: int = 25,
+    view: str = "compact",
+    wait_handle: Optional[str] = None,
+    session_ids: Optional[List[str]] = None,
+    status_filter: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """List sessions; compact is the default and full preserves the legacy payload."""
+    if view not in {"compact", "full"}:
+        raise ValueError("view must be compact or full")
+    active = []
+    for session in hub.sessions.values():
+        item = session.to_dict()
+        item.setdefault("effective_model", getattr(session, "effective_model", None) or getattr(session, "model", None))
+        active.append(item)
+    wanted = set(str(x) for x in session_ids or [])
+    if wait_handle:
+        handle = str(wait_handle).rstrip("/").rsplit("/", 1)[-1]
+        group_ids = set(hub.wait_inbox.session_ids_for(handle))
+        wanted = (wanted & group_ids) if wanted else group_ids
+    if wanted:
+        active = [s for s in active if s.get("session_id") in wanted]
+    if status_filter:
+        allowed = set(status_filter)
+        active = [s for s in active if s.get("status") in allowed]
+    def compact(s):
+            pending = s.get("pending_interaction") or {}
+            prompt = pending.get("prompt") or pending.get("command_or_prompt") or pending.get("command") or ""
+            final = s.get("final_response")
+            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": bool(final), "final_response_length": len(final or ""), "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
+            if pending:
+                entry["open_request"] = {"request_id": pending.get("request_id"), "kind": pending.get("kind"), "prompt": str(prompt)[:120]}
+            return entry
+    if view == "compact":
+        historical = []
+        if include_historical:
+            historical = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
+            if wanted:
+                historical = [s for s in historical if s.get("session_id") in wanted]
+            if status_filter:
+                historical = [s for s in historical if s.get("status") in allowed]
+        return {"global_seq": hub.global_seq, "active_count": len(active), "active_sessions": [compact(s) for s in active], "historical_sessions": [compact(s) for s in historical]}
     result: Dict[str, Any] = {
         "global_seq": hub.global_seq,
         "active_count": len(active),
@@ -818,6 +868,55 @@ async def list_active_sessions(include_historical: bool = True, limit: int = 25)
         # by list_archived_sessions.
         result["persisted_sessions"] = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
     return result
+
+
+@mcp.tool()
+async def collect_and_terminate(
+    wait_handle: Optional[str] = None,
+    session_ids: Optional[List[str]] = None,
+    only_completed: bool = True,
+    max_chars: int = 3000,
+) -> Dict[str, Any]:
+    """Collect final answers and close sessions from a wait handle or ID list."""
+    if bool(wait_handle) == bool(session_ids):
+        raise ValueError("provide exactly one of wait_handle or session_ids")
+    if max_chars < 0:
+        raise ValueError("max_chars must be non-negative")
+    if wait_handle:
+        handle = str(wait_handle).rstrip("/").rsplit("/", 1)[-1]
+        ids = hub.wait_inbox.session_ids_for(handle)
+    else:
+        ids = list(dict.fromkeys(str(x) for x in session_ids or []))
+    collected, skipped, cwd_dirs = [], [], set()
+    done_states = {"completed", "failed", "ended", "exited", "crashed", "terminated", "interrupted"}
+    for sid in ids:
+        try:
+            sess = hub.sessions.get(sid)
+            rec = sess.to_dict() if sess else await hub.db.get_session_record(sid)
+            if not rec:
+                skipped.append({"session_id": sid, "status": "missing"})
+                continue
+            status = rec.get("status")
+            if only_completed and status not in done_states:
+                skipped.append({"session_id": sid, "status": status})
+                continue
+            already_closed = sess is None
+            if already_closed:
+                full = rec.get("final_response") or ""
+            else:
+                info = await hub.get_subagent_final_response(sid)
+                full = info.get("final_response") or ""
+                await hub.close_session(sid, source="mcp")
+            if rec.get("cwd"):
+                cwd_dirs.add(str(rec["cwd"]))
+            entry = {"session_id": sid, "status": status, "final_response": full[:max_chars], "full_length": len(full), "truncated": len(full) > max_chars, "already_closed": already_closed}
+            if entry["truncated"]:
+                entry["hint"] = "Call get_subagent_final_response for the rest."
+            collected.append(entry)
+        except Exception as exc:
+            collected.append({"session_id": sid, "error": str(exc)})
+    from cwd_git_status import collect_git_status
+    return {"collected": collected, "skipped": skipped, "git_status": await collect_git_status(sorted(cwd_dirs))}
 
 
 @mcp.tool()

@@ -126,6 +126,14 @@ class WaitInbox:
             item["result"] = self._load(item.pop("result_json"), None)
             return item
 
+    def session_ids_for(self, handle: str) -> List[str]:
+        """Return the sessions bound to a handle or wait URL."""
+        key = str(handle or "").rstrip("/").rsplit("/", 1)[-1]
+        row = self._row(key)
+        if not row:
+            raise WaitHandleError("unknown wait handle")
+        return [str(item) for item in row.get("session_ids") or []]
+
     @staticmethod
     def _new_handle() -> str:
         return "wh_" + secrets.token_urlsafe(24)

@@ -1,8 +1,9 @@
 """English instructions authored by the Hub for parent agents."""
 
 CLEANUP_HINT = (
-    "After collecting a result, terminate_subagent when no longer needed; completion leaves the "
-    "session open. Close started sessions before finishing unless handed off or cancelled. "
+    "After collecting a result, close the session: collect_and_terminate(wait_handle) collects and closes every "
+    "finished session in one call; terminate_subagent closes one. Completion leaves the session open. "
+    "Close started sessions before finishing unless handed off or cancelled. "
     "Results remain readable and resumable."
 )
 
@@ -24,6 +25,10 @@ WAIT_HANDLE_HINT = (
     "Wait on wait_url or wait_for_hub only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
     + CLEANUP_HINT
 )
+
+# list_active_sessions is intentionally compact for routine orchestration; request the legacy payload only
+# when a diagnostic caller needs it.
+SESSION_LIST_HINT = "list_active_sessions returns a compact view by default; use view=\"full\" for the legacy payload."
 
 # Prepended to a spawn's task when the parent passes leaf_worker=true. Advice only: nothing blocks the
 # worker's agent-hub tools (for that, Codex and Claude take disabled_mcp_servers).
@@ -53,6 +58,7 @@ ROUTING_RULES = (
     "bypass_approvals is the legacy switch (true = bypass, false = the default); never pass both.",
     "A blocked Windows DSH sandbox_preparation prevents dispatch; skipped is unverified. Permission readiness does not prove access; inspect the reason.",
     WAIT_HANDLE_HINT,
+    SESSION_LIST_HINT,
     "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "

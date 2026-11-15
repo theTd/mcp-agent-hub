@@ -1,4 +1,5 @@
 server.py
+cwd_git_status.py
 loopback_request_guard.py
 agent_guidance.py
 terminal_core.py
