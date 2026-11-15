@@ -776,7 +776,7 @@ a busy table is a retry, not a fault; 500 only for a genuine core fault; otherwi
   the old bytes and the banner) or fully after it.
 - W8 on resume: `spawn(strip_esc3j_on_output=true)` drops `ESC[3J` with the same 3-byte carry.
 - Input: `{"type":"input","data":…}`, `{"type":"resize",…}` and bare text are handled as before. Frames are
-  parsed by `serde_json` (decision `json-reader`, owner 2026-11-14); a frame is an object only when it is
+  parsed by `serde_json` (decision `json-reader`, owner 2026-11-15); a frame is an object only when it is
   exactly one JSON value and that value is an object, which is `json.loads`'s rule: trailing junk, a
   non-JSON number (`+1`, `01`, `1.`), a bad escape or an unterminated string makes the
   whole frame bare text, and bare text is written as it arrived. `NaN` and `Infinity`, which `json.loads`
@@ -1010,7 +1010,7 @@ the same version already sits in `desktop/src-tauri/Cargo.lock`, so a developer'
 |---|---|---|---|
 | `pyo3` | 0.30.1 (`abi3-py311`, `extension-module`) | the extension module, `#[pymethods]`, `py.detach` (was `allow_threads`), abi3 | no |
 | `tungstenite` | 0.28.0 (default features) | RFC 6455 handshake, frames, ping/pong, close handshake on the console socket; blocking, no async runtime | no |
-| `serde_json` | 1.0.154 (default features: no `derive`, no `arbitrary_precision`; builds `serde_core`, `itoa`, `memchr`, `zmij`) | parses the socket's input frames (§6.4 "Input", decision `json-reader`, owner 2026-11-14); the map keeps the last duplicate key and a nested frame is bounded by its recursion limit (128) | yes |
+| `serde_json` | 1.0.154 (default features: no `derive`, no `arbitrary_precision`; builds `serde_core`, `itoa`, `memchr`, `zmij`) | parses the socket's input frames (§6.4 "Input", decision `json-reader`, owner 2026-11-15); the map keeps the last duplicate key and a nested frame is bounded by its recursion limit (128) | yes |
 | `hmac` | 0.12.1 | HMAC-SHA256 for the terminal ticket | no |
 | `sha2` | 0.10.9 | hash primitive under `hmac` | yes |
 | `base64` | 0.21.7 | ticket encoding (`URL_SAFE_NO_PAD`) | yes |

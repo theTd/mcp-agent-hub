@@ -9,7 +9,7 @@
 //! `01`, a bad escape and an unterminated string all fail to parse, so the raw frame is typed as bare
 //! text. Duplicate keys keep the last value, as `json.loads` does.
 //!
-//! Frames are parsed by `serde_json` (decision `json-reader`, owner 2026-11-14). What stays here is the
+//! Frames are parsed by `serde_json` (decision `json-reader`, owner 2026-11-15). What stays here is the
 //! thin layer Python put on top of a parsed value, plus three divergences, all on frames the console
 //! never sends:
 //! - `NaN`, `Infinity` and `-Infinity`: `json.loads` accepts them, serde_json (like the reader before
