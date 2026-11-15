@@ -321,7 +321,7 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
         with patch.object(self.module.hub, "create_session", new_callable=AsyncMock,
                           return_value=self.session) as create:
-            await self.module.spawn_subagent("pwsh", wait_seconds=0)
+            await self.module.spawn_subagent("pwsh", leaf_worker=False, wait_seconds=0)
             self.assertEqual(create.call_args.kwargs["launch_source"], "agent")
             create.reset_mock()
             response = await self.client.post("/api/sessions", json={

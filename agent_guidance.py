@@ -22,8 +22,25 @@ WAIT_HANDLE_HINT = (
     + CLEANUP_HINT
 )
 
+# Prepended to a spawn's task when the parent passes leaf_worker=true. Advice only: nothing blocks the
+# worker's agent-hub tools (for that, Codex and Claude take disabled_mcp_servers).
+LEAF_WORKER_NOTE = (
+    "[agent-hub] You are a leaf worker: do this task yourself and never spawn subagents. Do not call "
+    "spawn_subagent or spawn_subagents, and do not hand any part of the task to another agent. If the task "
+    "is too big to finish alone, say so in your reply instead."
+)
+
+
+def with_leaf_worker_note(task: str) -> str:
+    return f"{LEAF_WORKER_NOTE}\n\n{task}"
+
+
 ROUTING_RULES = (
     "Use a short title and choose enabled profile/model/thinking_level from the catalog.",
+    "leaf_worker is required on every spawn: true (the usual choice for a self-contained job) puts a note before "
+    "the task telling the worker to do it itself and never spawn subagents; false, only for a worker meant to "
+    "dispatch others, sends the task unchanged. The note is advice, not a block: Codex/Claude also take "
+    'disabled_mcp_servers=["agent-hub"] to remove the tools.',
     'env={"KEY":"VALUE"} overrides profile env across resume; extra_args=["--flag","value"] '
     "are literal per-session TUI argv (DSH/GUI reject them).",
     'Codex/Claude mcp_servers use HTTP {"url","headers"} or stdio {"command","args","env"}; '

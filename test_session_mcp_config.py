@@ -200,7 +200,7 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
                     schema = next(t for t in await mcp_client.list_tools() if t.name == "spawn_subagent").input_schema
                     for key in config:
                         self.assertIn(key, schema["properties"])
-                    result = await mcp_client.call_tool("spawn_subagent", dict(agent_type="claude", wait_seconds=0, **config))
+                    result = await mcp_client.call_tool("spawn_subagent", dict(agent_type="claude", leaf_worker=False, wait_seconds=0, **config))
                     data = result.data if result.data is not None else json.loads(result.content[0].text)
                     self.assertIn(data["session_id"], self.hub.sessions)
         for sess in self.hub.sessions.values():

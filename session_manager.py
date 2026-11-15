@@ -47,7 +47,7 @@ from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
     build_mcp_args, merge_claude_settings, replace_claude_settings,
 )
-from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES
+from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES, with_leaf_worker_note
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
@@ -14374,11 +14374,16 @@ class HubSessionManager:
         auto_approval_rules: Any = None,
         approval_mode: Optional[str] = None,
         compaction_threshold: Any = None,
+        leaf_worker: bool = False,
     ) -> AgentSession:
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
         if bypass_approvals is not None and type(bypass_approvals) is not bool:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
+        if type(leaf_worker) is not bool:
+            raise ValueError("leaf_worker 只能是 true 或 false")
+        if leaf_worker and not (task or "").strip():
+            raise ValueError("leaf_worker=true 需要同时给出 task：叶子 Worker 的提示加在任务开头")
         approval_mode = normalize_approval_mode(approval_mode)
         extra_args = normalize_extra_args(extra_args)
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
@@ -14466,6 +14471,8 @@ class HubSessionManager:
         submit_key = str(prof.get("submit_key") or "\r")
         omp_sess_dir: Optional[Path] = None
         claude_session_uuid: Optional[str] = None
+        # What the worker receives; the title, last_task and activity keep the parent's own task.
+        delivered_task = with_leaf_worker_note(task) if leaf_worker else task
 
         if task_mode == "omp_positional":
             omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
@@ -14474,7 +14481,7 @@ class HubSessionManager:
                 f"--session-dir={omp_sess_dir}",
             ])
             if task:
-                args.append(self._task_with_session_marker(session_id, task))
+                args.append(self._task_with_session_marker(session_id, delivered_task))
         elif task_mode == "claude_positional":
             claude_session_uuid = str(uuid.uuid4())
             args.extend([
@@ -14482,13 +14489,13 @@ class HubSessionManager:
                 claude_session_uuid,
             ])
             if task:
-                args.append(self._task_with_session_marker(session_id, task))
+                args.append(self._task_with_session_marker(session_id, delivered_task))
         elif task_mode == "agy_interactive_flag":
             if task:
-                args.extend(["-i", self._task_with_session_marker(session_id, task)])
+                args.extend(["-i", self._task_with_session_marker(session_id, delivered_task)])
         elif task_mode == "codex_positional":
             if task:
-                args.append(self._task_with_session_marker(session_id, task))
+                args.append(self._task_with_session_marker(session_id, delivered_task))
 
         prof_name = str(prof.get("name", profile_id))
         sess = AgentSession(
@@ -14534,6 +14541,8 @@ class HubSessionManager:
             "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
             "compaction_threshold": compaction,
             "auto_approval_rules": auto_approval_rules,
+            # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
+            "leaf_worker": leaf_worker,
             # Round 2: whether this launch had the profile's approval off switch on (a resume
             # re-reads the profile's current value and overwrites this).
             "bypass_approvals": bool(launch.get("bypass_approvals")),
@@ -14543,7 +14552,7 @@ class HubSessionManager:
 
         if kind == "web_gui":
             if task:
-                sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(task)}; pwsh -NoLogo"]
+                sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(delivered_task)}; pwsh -NoLogo"]
             else:
                 sess.args = ["-NoLogo", "-NoProfile"]
             # "args (as launched)": web_gui really runs the dsh headless command, not the profile args.
@@ -14574,7 +14583,7 @@ class HubSessionManager:
             )
             self.sessions[session_id] = sess
             await self.persist_session(sess)
-            self._schedule(self._spawn_dsh_hub_job(sess, task))
+            self._schedule(self._spawn_dsh_hub_job(sess, delivered_task))
             return sess
 
         if engine == "claude":
@@ -14606,7 +14615,7 @@ class HubSessionManager:
             self._schedule(self._watch_tui_interactive_prompts(sess))
             prompt_to_send: Optional[str] = None
             if task and task_mode == "pty_input":
-                prompt_to_send = self._task_with_session_marker(sess.session_id, task)
+                prompt_to_send = self._task_with_session_marker(sess.session_id, delivered_task)
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,

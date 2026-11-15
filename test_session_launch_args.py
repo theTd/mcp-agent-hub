@@ -133,7 +133,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
                 async with Client(self.server.mcp) as mcp_client:
                     schema = next(t for t in await mcp_client.list_tools() if t.name == "spawn_subagent").input_schema
                     self.assertIn("extra_args", schema["properties"])
-                    result = await mcp_client.call_tool("spawn_subagent", {"agent_type": "codex", "extra_args": extra, "wait_seconds": 0})
+                    result = await mcp_client.call_tool("spawn_subagent", {"agent_type": "codex", "leaf_worker": False, "extra_args": extra, "wait_seconds": 0})
                     data = result.data if result.data is not None else json.loads(result.content[0].text)
                     self.assertIn(data["session_id"], self.hub.sessions)
         for sess in self.hub.sessions.values():

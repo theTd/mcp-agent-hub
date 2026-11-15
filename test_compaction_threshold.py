@@ -163,12 +163,12 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
                     schema = next(t for t in await mcp_client.list_tools() if t.name == "spawn_subagent").input_schema
                     self.assertIn("compaction_threshold", schema["properties"])
                     result = await mcp_client.call_tool(
-                        "spawn_subagent", {"agent_type": "omp", "compaction_threshold": 90000, "wait_seconds": 0})
+                        "spawn_subagent", {"agent_type": "omp", "leaf_worker": False, "compaction_threshold": 90000, "wait_seconds": 0})
                     data = result.data if result.data is not None else json.loads(result.content[0].text)
                     self.assertEqual(self.hub.sessions[data["session_id"]].profile_snapshot["compaction_threshold"],
                                      {"unit": "tokens", "value": 90000})
                     batch = await mcp_client.call_tool(
-                        "spawn_subagents", {"specs": [{"agent_type": "codex", "compaction_threshold": "120k"}]})
+                        "spawn_subagents", {"specs": [{"agent_type": "codex", "leaf_worker": False, "compaction_threshold": "120k"}]})
                     batch_data = batch.data if batch.data is not None else json.loads(batch.content[0].text)
                     codex_id = batch_data["sessions"][0]["session_id"]
                     self.assertIn("model_auto_compact_token_limit=120000", self.hub.sessions[codex_id].args)

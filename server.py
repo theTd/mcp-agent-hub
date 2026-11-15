@@ -256,6 +256,23 @@ class RetiredToolMiddleware(Middleware):
 mcp.add_middleware(RetiredToolMiddleware())
 
 
+class LeafWorkerArgumentMiddleware(Middleware):
+    """Explain a spawn_subagent call without leaf_worker: the parent's tool list may predate the field."""
+
+    async def on_call_tool(self, context, call_next):
+        if context.message.name == "spawn_subagent" and "leaf_worker" not in (context.message.arguments or {}):
+            raise ToolError(
+                "spawn_subagent requires leaf_worker (true or false): true tells the worker to do the task "
+                "itself and never spawn subagents; false sends the task unchanged. If your tool list has no "
+                "leaf_worker field, it predates a hub update: reconnect the agent-hub MCP server to refresh "
+                "it, or pass the field anyway."
+            )
+        return await call_next(context)
+
+
+mcp.add_middleware(LeafWorkerArgumentMiddleware())
+
+
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False) -> Dict[str, Any]:
     """
@@ -293,6 +310,7 @@ async def discover_agent_models_and_thinking_levels(refresh: bool = False) -> Di
 @mcp.tool()
 async def spawn_subagent(
     agent_type: str,
+    leaf_worker: bool,
     task: Optional[str] = None,
     model: Optional[str] = None,
     thinking_level: Optional[str] = None,
@@ -311,6 +329,13 @@ async def spawn_subagent(
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
+
+    ``leaf_worker`` is required, decide it on every spawn: true (the usual choice for a
+    self-contained job) puts a note before ``task`` telling the worker it is a leaf (do the task
+    itself, never spawn subagents or hand work to another agent); false, only for a worker meant
+    to dispatch others, sends the task unchanged. true needs a ``task``. The note is advice, not a
+    block: for Codex and Claude, add ``disabled_mcp_servers=["agent-hub"]`` to take the hub's tools
+    away too.
 
     ``approval_mode`` decides who approves the worker's risky actions:
     - omitted (the default): the engine's own auto-approval reviewer where it has one (Codex
@@ -341,6 +366,7 @@ async def spawn_subagent(
         bypass_approvals=bypass_approvals,
         approval_mode=approval_mode,
         compaction_threshold=compaction_threshold,
+        leaf_worker=leaf_worker,
         extra_args=extra_args,
         mcp_servers=mcp_servers,
         disabled_mcp_servers=disabled_mcp_servers,
@@ -366,9 +392,16 @@ async def spawn_subagent(
 async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True) -> Dict[str, Any]:
     """Start several subagents and return one group wait handle (all_settled by default).
 
-    Each spec takes spawn_subagent's fields; approval_mode follows the same default (auto)."""
+    Each spec takes spawn_subagent's fields, leaf_worker (true or false) required in every spec;
+    approval_mode follows the same default (auto)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
+    for spec in specs:
+        if type(spec.get("leaf_worker")) is not bool:
+            raise ValueError(
+                "each spec requires leaf_worker (true or false): true tells the worker to do the task "
+                "itself and never spawn subagents; false sends the task unchanged"
+            )
     sessions = []
     for spec in specs:
         item = dict(spec)
@@ -1187,6 +1220,7 @@ async def api_create_session(req: Request):
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
             auto_approval_rules=body.get("auto_approval_rules"),
+            leaf_worker=body.get("leaf_worker", False),
         )
     except ValueError as e:
         return bad_request(str(e))

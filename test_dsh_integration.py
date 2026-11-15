@@ -42,6 +42,7 @@ async def main():
                 "spawn_subagent",
                 {
                     "agent_type": "dsh-flash-high",
+                    "leaf_worker": False,
                     "title": "DSH-Native-Bridge-Test",
                     "task": task_prompt,
                     "cwd": str(HUB_DIR),

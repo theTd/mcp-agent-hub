@@ -432,7 +432,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
             async with Client(self.server.mcp) as client:
                 tools = {t.name: t for t in await client.list_tools()}
                 self.assertIn("approval_mode", tools["spawn_subagent"].inputSchema["properties"])
-                result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "approval_mode": "ask"})
+                result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "leaf_worker": False, "approval_mode": "ask"})
                 data = result.data if result.data is not None else json.loads(result.content[0].text)
                 self.assertEqual(data["approval"]["approval_mode"], "ask")
 
@@ -444,7 +444,7 @@ class SessionApprovalTests(unittest.IsolatedAsyncioTestCase):
             return self.sess
         with patch.object(self.hub, "create_session", create):
             async with Client(self.server.mcp) as client:
-                result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "bypass_approvals": False, "wait_seconds": 0})
+                result = await client.call_tool("spawn_subagent", {"agent_type": "codex", "leaf_worker": False, "bypass_approvals": False, "wait_seconds": 0})
                 data = result.data if result.data is not None else json.loads(result.content[0].text)
                 self.assertEqual(data["approval"]["approval_source"], "session")
 

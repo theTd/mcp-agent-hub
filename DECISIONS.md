@@ -90,6 +90,19 @@ Two owner answers on the same page that are not core decisions: `perf/session-ca
 lands (the branches stay). `docs/omp-approval-prompts-handoff.md` stays an untracked file in the main
 checkout.
 
+## Leaf-worker note (2026-11-15, owner: chat)
+
+The owner, after a Codex worker dispatched its task to another subagent: a spawn parameter that controls whether the
+worker may spawn subagents through the hub, "not a hard restriction", only a preset prompt put before the task ("you
+are a leaf worker, do works yourself, never spawn subagent"), and "the main agent must fill in this parameter".
+
+| id | decision | alternative not taken | how to reverse |
+|---|---|---|---|
+| leaf-worker-param (owner) | `leaf_worker: bool` is required on MCP `spawn_subagent` (schema `required`) and in every `spawn_subagents` spec (checked before any session starts). true puts `LEAF_WORKER_NOTE` (`agent_guidance.py`) and a blank line before the task the worker receives, ahead of the `[Hub Session: …]` marker; false sends the task unchanged. The title, `last_task` and the activity line keep the parent's own task; the snapshot records `leaf_worker`. A resume adds no note (the native record already holds the first one). This is an owner exception to `passive-marker`. | A hard block (removing the hub's MCP server from the worker): the owner asked for advice only; Codex/Claude callers can still add `disabled_mcp_servers`. | Make the parameter optional with default false in `server.py`; drop the note in `create_session`. |
+| leaf-worker-needs-task (medium) | `leaf_worker=true` without a `task` is refused: the note goes on the first task, and a spawn with no task delivers nothing it could go on. | Store the flag and put the note on the first `send_to_subagent` instead. | Persist a pending flag and prepend it in the send path. |
+| leaf-worker-old-clients (medium) | A `spawn_subagent` call without `leaf_worker` gets a `ToolError` that names the field and says the caller's tool list may predate the update (reconnect agent-hub, or pass the field anyway), from `LeafWorkerArgumentMiddleware`, instead of a bare validation error. Parents connected before the update keep their old tool list, so their spawns fail until they reconnect. | Accept a missing value as false for old clients: it keeps them working but drops "the main agent must fill in this parameter". | Default the parameter to false and remove the middleware. |
+| leaf-worker-console (small) | The console's `POST /api/sessions` takes an optional `leaf_worker` (default false, a non-boolean is a 400); the launcher has no control for it. | A launcher checkbox. | Add one. |
+
 ## Loopback Host/Origin guard (2026-11-14, decided by the orchestrator; the owner approved the master merge)
 
 | id | decision |
