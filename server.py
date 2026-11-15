@@ -277,7 +277,8 @@ mcp.add_middleware(LeafWorkerArgumentMiddleware())
 @mcp.tool()
 async def list_agent_profiles(refresh_discovery: bool = False, view: str = "compact") -> Dict[str, Any]:
     """
-    List enabled profiles, engines, models and thinking levels.
+    List enabled profiles and routing guidance. Models and thinking levels are in
+    routing_guide_markdown; view="full" adds the engine catalog.
     Read routing_guide_markdown and each profile's when_to_use before choosing an agent.
     Profiles include defaults; engines_catalog excludes disabled profiles and models.
     Set refresh_discovery=true to refresh the installed engine catalog.
@@ -860,7 +861,8 @@ async def list_active_sessions(
             pending = s.get("pending_interaction") or {}
             prompt = pending.get("prompt") or pending.get("command_or_prompt") or pending.get("command") or ""
             final = s.get("final_response")
-            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": bool(final), "final_response_length": len(final or ""), "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
+            has_final = bool(s.get("has_final_response")) if "has_final_response" in s else bool(final)
+            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": has_final, "final_response_length": len(final or "") if final is not None else 0, "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
             if pending:
                 entry["open_request"] = {"request_id": pending.get("request_id"), "kind": pending.get("kind"), "prompt": str(prompt)[:120]}
             return entry
@@ -892,7 +894,7 @@ async def collect_and_terminate(
     only_completed: bool = True,
     max_chars: int = 3000,
 ) -> Dict[str, Any]:
-    """Collect final answers and close sessions from a wait handle or ID list."""
+    """Collect final answers and close sessions; only_completed=False also closes running sessions."""
     if bool(wait_handle) == bool(session_ids):
         raise ValueError("provide exactly one of wait_handle or session_ids")
     if max_chars < 0:

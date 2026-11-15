@@ -46,3 +46,9 @@ class CwdGitStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
 
+    async def test_child_scan_is_threaded_and_bounded(self):
+        with patch.object(cwd_git_status, "_run_git", new=AsyncMock(return_value=(128, "fatal: not a git repository"))):
+            with patch.object(cwd_git_status.asyncio, "to_thread", new=AsyncMock(return_value=[])) as threaded:
+                await cwd_git_status._status("C:/cwd")
+        threaded.assert_awaited_once()
+

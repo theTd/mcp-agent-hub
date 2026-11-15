@@ -158,6 +158,40 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "ask")
         self.assertEqual([r["request_id"] for r in result["requests"]], ["q1"])
 
+    async def test_multiple_notifies_during_coalescing_are_safe(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        waiter = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.3, ask_coalesce_ms=80))
+        await asyncio.sleep(0.02)
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q2", "content": "second"})
+        result = await waiter
+        self.assertEqual(result["state"], "ask")
+        self.assertEqual([x["result_id"] for x in result["requests"]], ["q1", "q2"])
+
+    async def test_new_waiter_during_coalescing_supersedes_old(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        old = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.3, ask_coalesce_ms=100))
+        await asyncio.sleep(0.02)
+        new = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.2, ask_coalesce_ms=0))
+        self.assertEqual((await old)["state"], "superseded")
+        self.assertEqual((await new)["state"], "ask")
+
+    async def test_close_during_coalescing_supersedes_waiter(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        waiter = asyncio.create_task(self.inbox.wait(info["wait_handle"], 0.3, ask_coalesce_ms=100))
+        await asyncio.sleep(0.02)
+        await self.inbox.close()
+        self.assertEqual((await waiter)["state"], "superseded")
+
+    async def test_each_open_ask_has_its_request_result_id(self):
+        info = await self.inbox.create(["a"])
+        await self.inbox.publish_event({"session_id": "a", "type": "question", "request_id": "q1", "content": "first"})
+        await self.inbox.publish_event({"session_id": "a", "type": "approval_request", "request_id": "q2", "content": "second"})
+        result = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual([(x["request_id"], x["result_id"]) for x in result["requests"]], [("q1", "q1"), ("q2", "q2")])
+
 
 if __name__ == "__main__":
     unittest.main()

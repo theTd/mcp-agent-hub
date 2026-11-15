@@ -13,7 +13,7 @@ WAIT_HANDLE_HINT = (
     "If you can run background commands, loop the GET inside one background command while the reply is waiting "
     "and exit on anything else (ask, done, failed, an HTTP error), so a timeout never wakes you. "
     "Hosts that cannot keep that background GET running, or cap synchronous waits (AGY: 10 seconds), "
-    "call wait_for_hub(wait_handle) instead, again after each state=waiting. "
+    "call wait_for_hub(wait_handle, timeout_seconds=8) instead, again after each state=waiting. "
     "States are waiting, ask, done, failed. Every ask is an open approval or question: answer it at once "
     "with respond_to_subagent and its request_id (idempotent), or respond_to_subagents for several. "
     "An ask answer lists every open request in requests: answer every entry. "
