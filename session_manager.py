@@ -223,6 +223,10 @@ _AUTO_APPROVE_WINDOWS_ABSOLUTE_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[
 # A brief larger than this is a mistake, not a task description.
 BRIEF_MARKDOWN_MAX_CHARS = 200_000
 BRIEF_POINTER_LINE = "Read the full brief first: "
+# A graceful stop keeps the brief of every session it interrupts and records the ids here; the next
+# start keeps those briefs once more and deletes the file (a forced stop leaves no file: its rows
+# are still live in the store, which the start itself reports).
+BRIEFS_KEPT_AT_STOP_FILE = "kept-at-stop.json"
 AUTO_APPROVAL_SHELL_META_RE = re.compile(r"[;&|<>`]|\$\(|\b(?:bash|sh|cmd|powershell|pwsh)\s+-c\b", re.IGNORECASE)
 AUTO_APPROVAL_HARD_RISK_RE = re.compile(
     r"\b(?:rm|del|erase|rmdir|remove-item|format|diskpart|shutdown|restart-computer|"
@@ -601,6 +605,12 @@ AGY_ERROR_TURN_END_SEC = 60.0
 AGY_BG_TASK_START_RE = re.compile(r"Tool is running as a background task with task id:\s*(\S+)")
 AGY_MESSAGE_SENDER_RE = re.compile(r"sender=(\S+)")
 AGY_BG_TASK_DONE_RE = re.compile(r"\bfinished with result\b")
+# A task id whose finish message never matches must not hold a turn end forever: another sender
+# format, a cancelled task or a tool output that quotes the start text leaves the id in the ledger,
+# and every later planner response of that session would stay "waiting" (the parent waits forever,
+# idle cleanup skips a running session). After this long the held planner text is reported as the
+# turn's end, with a warning, and the ledger is cleared.
+AGY_BG_TASK_HOLD_MAX_SEC = 30 * 60.0
 # The omp session file is the durable answer to "did the turn end"; the tail watcher only makes
 # it immediate. A finished turn whose last record the watcher never applied is completed from
 # the file's own tail this often, so one unreadable/lost record cannot strand the session.
@@ -3585,10 +3595,12 @@ class HubSessionManager:
             live_at_stop = await self._normalize_archive_on_startup()
             await self.db.flush()
             # Briefs of sessions closed, ended or unknown have no reader. A session the stop cut off
-            # (live_at_stop) keeps its brief: resume-on-start, or the parent's resume_subagent right
-            # after, continues it and may read the brief again. It goes at the next start, or when
-            # the resumed session closes.
-            self._prune_stale_briefs(keep=set(live_at_stop))
+            # keeps its brief: resume-on-start, or the parent's resume_subagent right after,
+            # continues it and may read the brief again. A forced stop's sessions are still live in
+            # the store (`live_at_stop`); a graceful stop recorded the ids it kept before archiving
+            # them. Either way the brief goes at the next start, or when the resumed session closes.
+            keep_briefs = set(live_at_stop) | self._take_briefs_kept_at_stop()
+            self._prune_stale_briefs(keep=keep_briefs)
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
@@ -3666,7 +3678,18 @@ class HubSessionManager:
             if sess is not None:
                 inter = sess.pending_interaction
                 if inter and self._request_awaits_parent(sid, str(inter.get("request_id") or "")):
-                    pending.append(dict(inter))
+                    # No handle existed when the request was published, so there is no ask event to
+                    # return: build the entry the event path would have (parent_interaction_view
+                    # keeps the engine's cursor out of it, and WaitInbox._ask_entry gives it the
+                    # same fields an event has).
+                    view = parent_interaction_view(inter) or {}
+                    pending.append(WaitInbox._ask_entry({
+                        "type": str(view.get("kind") or ""),
+                        "session_id": sid,
+                        "request_id": view.get("request_id"),
+                        "content": view.get("prompt") or "",
+                        "interaction": view,
+                    }))
                 states.append({
                     "session_id": sid,
                     "status": sess.status,
@@ -5830,10 +5853,6 @@ class HubSessionManager:
         rec = session.to_dict()
         rec["profile_snapshot"] = session.profile_snapshot
         rec["conversation_ref"] = session.conversation_ref
-        # to_dict is also a parent-facing status view and hides the engine's cursor position. The
-        # record the hub persists is the hub's own state: a pending omp approval must still know
-        # where the cursor was, or approve_session moves to the wrong option.
-        rec["pending_interaction"] = session.pending_interaction
         return rec
 
     @staticmethod
@@ -5890,13 +5909,20 @@ class HubSessionManager:
 
     @logical_write
     async def _archive_session(self, session: AgentSession, end_reason: Optional[str] = None,
-                               snapshot: Optional[Dict[str, Any]] = None) -> AgentSession:
-        """The final record, written when a session leaves the live list or at hub shutdown/start."""
+                               snapshot: Optional[Dict[str, Any]] = None,
+                               keep_brief: bool = False) -> AgentSession:
+        """The final record, written when a session leaves the live list or at hub shutdown/start.
+
+        `keep_brief` is for a session the hub's own graceful stop interrupts: its brief stays so a
+        resume right after the restart can read it again (the start that follows keeps it once
+        more, then lets it go) and the stop records the id for that start.
+        """
         self._prepare_final_row(session, end_reason=end_reason, snapshot=snapshot)
         await self.persist_session(session, force_scrollback=True, final=True, snapshot=snapshot)
         # A closed session (terminated, auto-cleaned or archived) no longer needs its brief file;
         # a live one keeps it, including across a hub restart.
-        self._delete_session_brief(session.session_id)
+        if not keep_brief:
+            self._delete_session_brief(session.session_id)
         return session
 
     @staticmethod
@@ -6432,6 +6458,43 @@ class HubSessionManager:
             pass
         except OSError:
             logger.warning("[%s] could not delete its brief file %s", session_id, path)
+
+    def _kept_briefs_path(self) -> Path:
+        return self.data_dir / "briefs" / BRIEFS_KEPT_AT_STOP_FILE
+
+    def _remember_briefs_kept_at_stop(self, session_ids: Iterable[str]) -> None:
+        """Records the ids whose briefs the stop kept, for the next start's prune."""
+        ids = sorted({str(sid) for sid in session_ids if str(sid or "")})
+        if not ids:
+            return
+        path = self._kept_briefs_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"session_ids": ids}, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            logger.warning("could not record the briefs kept at stop (%s)", path)
+
+    def _take_briefs_kept_at_stop(self) -> Set[str]:
+        """The ids the last stop kept briefs for, then deletes the record (missing/unreadable = none)."""
+        path = self._kept_briefs_path()
+        ids: Set[str] = set()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ids
+        except (OSError, ValueError):
+            logger.warning("could not read the briefs kept at stop (%s); none are kept", path)
+        else:
+            values = raw.get("session_ids") if isinstance(raw, dict) else raw
+            if isinstance(values, list):
+                ids = {str(v) for v in values if isinstance(v, str) and v}
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("could not delete the briefs-kept-at-stop record (%s)", path)
+        return ids
 
     def _prune_stale_briefs(self, keep: Iterable[str] = ()) -> int:
         """Delete brief files that neither a live session nor a session in `keep` owns.
@@ -7308,6 +7371,11 @@ class HubSessionManager:
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
             else:
                 reasons[sess.session_id] = sess.end_reason or sess.classify_end_reason(sess.exit_code)
+        # A graceful stop cuts these sessions off: their briefs stay for a resume after the restart,
+        # and the record tells the next start's prune to keep them once more (the archive below
+        # would otherwise delete them with the session).
+        interrupted_ids = [sid for sid, reason in reasons.items() if reason == "interrupted"]
+        self._remember_briefs_kept_at_stop(interrupted_ids)
         snapshots: Dict[str, Dict[str, Any]] = {}
         core = self.core
         if core is not None:
@@ -7408,6 +7476,7 @@ class HubSessionManager:
                         sess,
                         end_reason=reasons[sess.session_id],
                         snapshot=snapshots.get(sess.session_id),
+                        keep_brief=reasons[sess.session_id] == "interrupted",
                     ))
                     remaining.remove(sess)
                     archived += 1
@@ -8134,7 +8203,9 @@ class HubSessionManager:
 
         Only a complete command from an engine's own transcript can match: omp records it with
         `command_source=transcript` and `command_truncated=False`; agy fills the same fields from its
-        transcript. A cut-off copy read off the screen never matches. Shell composition is refused
+        transcript. A cut-off copy never matches, whether it came off the screen or is omp's own
+        start row cut at 200 characters + `…` (the flag alone is not trusted: a caller that builds
+        the metadata by hand must not get past the cut text either). Shell composition is refused
         even when the prefix fits (`;`, `|`, `&`, redirection, a backtick, `$(` or a newline).
         """
         snapshot = session.profile_snapshot if isinstance(session.profile_snapshot, dict) else {}
@@ -8151,6 +8222,8 @@ class HubSessionManager:
             return None
         command = str(metadata.get("command") or "").strip()
         if not command:
+            return None
+        if screen_command_clipped(command):
             return None
         if any(ord(ch) < 32 or ord(ch) == 0x7F for ch in command):
             return None
@@ -10664,12 +10737,21 @@ class HubSessionManager:
                     continue
                 if not session.transcript_path or not session.is_process_alive():
                     continue
+                # The claim below must belong to the turn this read was started for: a new turn
+                # begins while the read runs in a worker (a follow-up message right after the
+                # answer), raises the offset and bumps the turn id, and writing the older offset
+                # over it would complete the new turn with the previous answer.
+                start_offset = int(getattr(session, "_native_turn_end_offset", 0) or 0)
+                turn_id = session.turn_id
                 found = await asyncio.to_thread(
                     self._omp_turn_end_record,
                     Path(str(session.transcript_path)),
-                    int(getattr(session, "_native_turn_end_offset", 0) or 0),
+                    start_offset,
                 )
                 if not found or self.sessions.get(session.session_id) is not session:
+                    continue
+                if int(getattr(session, "_native_turn_end_offset", 0) or 0) != start_offset \
+                        or session.turn_id != turn_id:
                     continue
                 if session.status not in ("starting", "running") or session.pending_interaction is not None:
                     continue
@@ -11130,6 +11212,9 @@ class HubSessionManager:
         # agy tasks this turn handed to its own background runner and whose result has not come
         # back yet, by the id its start row and its callback both name.
         bg_tasks: Set[str] = set()
+        # (monotonic time, planner text, task ids) of a turn end this ledger is holding back, so a
+        # finish message that never matches cannot suppress it for good (AGY_BG_TASK_HOLD_MAX_SEC).
+        bg_hold: Optional[Tuple[float, str, Tuple[str, ...]]] = None
         # The last ERROR_MESSAGE row while nothing has followed it: (error text, monotonic time seen).
         error_tail: Optional[Tuple[str, float]] = None
         while self._transcript_watch_alive(session):
@@ -11181,6 +11266,11 @@ class HubSessionManager:
                             await self.note_native_user_prompt(session, user_txt)
                         session._inflight_transcript_tool = None
                         session._agy_response_tools = []
+                        # A new turn supersedes a task the previous one still had in the ledger:
+                        # its finish message would name an id nothing waits for any more, and the
+                        # stale id must not suppress this turn's end.
+                        bg_tasks.clear()
+                        bg_hold = None
                         if session.pending_interaction is not None:
                             await self.clear_pending_interaction(session)
                         turn_has_step = False
@@ -11310,11 +11400,14 @@ class HubSessionManager:
                             # completing here handed the parent the "I have launched ..." line as
                             # the answer before the callback started the very next step.
                             if bg_tasks:
+                                if bg_hold is None:
+                                    bg_hold = (time.monotonic(), content or "", tuple(sorted(bg_tasks)))
                                 session.current_activity = (
                                     f"Waiting for background task {', '.join(sorted(bg_tasks)[:3])}"
                                 )
                                 await self.persist_session(session)
                                 continue
+                            bg_hold = None  # nothing is holding this turn end back
                             final_text = content or ""
                             if final_text:
                                 if not turn_has_step:
@@ -11338,6 +11431,36 @@ class HubSessionManager:
                                     "content": final_text,
                                 },
                             )
+                if (bg_hold is not None
+                        and time.monotonic() - bg_hold[0] >= AGY_BG_TASK_HOLD_MAX_SEC):
+                    # The task's finish never matched (another sender format, a cancelled task, a
+                    # tool output quoting the start text): report the text this turn ended with and
+                    # let the ledger and the session go, instead of waiting forever.
+                    held_for = max(0.0, time.monotonic() - bg_hold[0])
+                    held_text, held_tasks = bg_hold[1], bg_hold[2]
+                    bg_hold = None
+                    bg_tasks.clear()
+                    logger.warning(
+                        "[%s] agy background task %s reported no result in %.0f s; releasing the "
+                        "turn end it held", session.session_id, ", ".join(held_tasks) or "?",
+                        held_for,
+                    )
+                    if held_text:
+                        session.set_final_response(held_text, "native_transcript")
+                    await self.record_worker_event(
+                        session.session_id,
+                        {
+                            "type": "turn_completed",
+                            "category": "turn_completed",
+                            "status": "turn_idle",
+                            "content": held_text,
+                            "data": {
+                                "outcome": "background_task_unreported",
+                                "task_ids": list(held_tasks),
+                                "held_seconds": round(held_for, 1),
+                            },
+                        },
+                    )
                 if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
                     err_txt = error_tail[0]
                     error_tail = None
@@ -13849,7 +13972,10 @@ class HubSessionManager:
                     break
         matched = next((c for c in calls if str(c.get("command") or "").strip() == full_cmd), None)
         if full_cmd is not None:
-            command, command_source, truncated = full_cmd, "transcript", False
+            command, command_source = full_cmd, "transcript"
+            # The record is the full command; a record that itself carries the cut mark
+            # is still cut, and the matcher refuses it too.
+            truncated = screen_command_clipped(full_cmd)
         else:
             command, command_source = screen_cmd, "screen"
             # A command prompt shows a cut copy; a record that is missing, ambiguous or names
@@ -13910,7 +14036,10 @@ class HubSessionManager:
         `parsed` is the box read off the screen (None: not read), `call` the transcript tool call it
         asks about (None: not known). omp cuts long commands on the box, so the command comes from
         the call (command_source=transcript); otherwise from the box, marked command_truncated with a
-        note when the box cut it, so the parent never approves it blind. "Always Approve …" grants
+        note when the text was cut, so the parent never approves it blind. The transcript's own
+        `tool_execution_start` row is a display copy omp cuts at 200 characters + `…`; when the
+        assistant message's arguments were never merged into it, the call holds that cut copy, which
+        is cut whatever its source says. "Always Approve …" grants
         persist and are not offered. Without the box the options are Approve / Deny, which the
         answer keys (Ctrl+Q / Escape) reach on any box.
         """
@@ -13926,7 +14055,8 @@ class HubSessionManager:
             details = details[:cut_at]
         else:
             command, source = str(box.get("command") or "").strip(), ("screen" if parsed else "none")
-        truncated = source == "screen" and screen_command_clipped(command)
+        # A cut command is never complete, whatever the source says: omp's own start row is cut.
+        truncated = screen_command_clipped(command)
         tool_label = tool or str((call or {}).get("tool_name") or "")
         lines = [f"Allow tool: {tool_label or '?'}"] + details
         if command and command not in "\n".join(lines):

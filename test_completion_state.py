@@ -8,6 +8,7 @@ agy: a turn that ended only to wait for its own background task was reported "co
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -148,6 +149,28 @@ class CompletionStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.hub._sweep_omp_turn_ends(), 1)
         self.assertEqual(sess.final_response, "second answer")
 
+    async def test_a_turn_that_starts_during_the_read_is_not_completed_with_the_old_answer(self):
+        sess = self.session("omp")
+        path = self.root / "omp-tail.jsonl"
+        self.append(path, self.omp_final("first answer"))
+        sess.transcript_path = path
+        first_turn = sess.turn_id
+        original = HubSessionManager._omp_turn_end_record
+
+        def read_then_start_a_turn(file_path, after_offset):
+            found = original(file_path, after_offset)
+            # A follow-up message arrives while the sweep's read runs in its worker.
+            self.hub.begin_new_turn(sess, status="running")
+            return found
+
+        with patch.object(HubSessionManager, "_omp_turn_end_record",
+                          staticmethod(read_then_start_a_turn)):
+            self.assertEqual(await self.hub._sweep_omp_turn_ends(), 0)
+        self.assertNotEqual(sess.turn_id, first_turn)
+        self.assertEqual(sess.status, "running")
+        self.assertFalse(sess.final_response)
+        self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+
     # ---- agy ------------------------------------------------------------------------------
 
     @staticmethod
@@ -223,6 +246,66 @@ class CompletionStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sess.final_response, "All checks passed.")
         self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
+
+
+    async def test_agy_new_turn_drops_an_unmatched_background_task_id(self):
+        sess, path, watch = await self.agy_session("brain-unmatched")
+        try:
+            self.append(path, {"type": "USER_INPUT", "content": "run the demo"})
+            self.append(path, self.agy_planner([{"name": "run_command",
+                                                 "args": {"CommandLine": "python -m demo"}}]))
+            self.append(path, {"type": "GENERIC", "status": "RUNNING", "content": (
+                "Tool is running as a background task with task id: conversation-1/task-9")})
+            self.append(path, self.agy_planner(content="I have launched task-9."))
+            await asyncio.sleep(0.6)
+            self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+
+            # No finish message ever names that id; the next turn must not inherit it.
+            self.append(path, {"type": "USER_INPUT", "content": "never mind, just answer"})
+            self.append(path, self.agy_planner(content="Done anyway."))
+            await self.until(lambda: sess.status == "completed")
+        finally:
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+
+        self.assertEqual(sess.final_response, "Done anyway.")
+        self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
+
+    async def test_agy_held_turn_end_is_released_after_the_limit(self):
+        sess, path, watch = await self.agy_session("brain-held")
+        clock = {"offset": 0.0}
+        real_time = time
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            def monotonic(self):
+                return real_time.monotonic() + clock["offset"]
+
+        try:
+            with patch("session_manager.time", Clock()):
+                self.append(path, {"type": "USER_INPUT", "content": "run the demo"})
+                self.append(path, self.agy_planner([{"name": "run_command",
+                                                     "args": {"CommandLine": "python -m demo"}}]))
+                self.append(path, {"type": "GENERIC", "status": "RUNNING", "content": (
+                    "Tool is running as a background task with task id: conversation-1/task-7")})
+                self.append(path, self.agy_planner(content="I have launched task-7."))
+                await asyncio.sleep(0.6)
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+
+                # The finish never arrives; the hold limit passes on the watcher's own tick.
+                clock["offset"] = 31 * 60.0
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+
+        self.assertEqual(sess.final_response, "I have launched task-7.")
+        done = self.events(sess.session_id, "turn_completed")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["data"]["outcome"], "background_task_unreported")
+        self.assertEqual(done[0]["data"]["task_ids"], ["conversation-1/task-7"])
 
 
 if __name__ == "__main__":
