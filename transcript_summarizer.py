@@ -253,6 +253,10 @@ class OMPTranscriptSummarizer(BaseTranscriptSummarizer):
         assistant_texts: List[str] = []
         tool_actions: List[str] = []
         latest_conclusion: Optional[str] = None
+        # The text of the newest assistant message (empty when it held only thinking and tool
+        # calls), and how many assistant messages came after the newest one with any text.
+        last_message_text = ""
+        messages_after_last_text = 0
 
         if transcript_path and transcript_path.exists():
             try:
@@ -313,6 +317,8 @@ class OMPTranscriptSummarizer(BaseTranscriptSummarizer):
                                         turn_texts.append(t)
                                 elif ptype in ("toolCall", "tool_use"):
                                     has_tool_call = True
+                            last_message_text = "\n".join(turn_texts)
+                            messages_after_last_text = 0 if turn_texts else messages_after_last_text + 1
                             if turn_texts and not has_tool_call:
                                 latest_conclusion = "\n".join(turn_texts)
             except Exception:
@@ -323,8 +329,10 @@ class OMPTranscriptSummarizer(BaseTranscriptSummarizer):
         if not latest_conclusion:
             if session_meta.get("final_response") and session_meta.get("final_response_source") != "terminal_turn_snapshot":
                 latest_conclusion = session_meta["final_response"]
-            elif assistant_texts:
-                latest_conclusion = assistant_texts[-1]
+            elif last_message_text:
+                # Only the newest message can stand in for a conclusion: an old "I'll start by
+                # reading the brief" followed by a hundred tool calls is not how far the worker got.
+                latest_conclusion = last_message_text
 
         thoughts = _dedup_preserve_order(thoughts)
         step_count = max(
@@ -357,6 +365,8 @@ class OMPTranscriptSummarizer(BaseTranscriptSummarizer):
             "recent_actions": tool_actions[-10:],
             "key_thoughts": [_compact_str(t, 300) for t in thoughts[-5:]],
             "latest_conclusion": latest_conclusion,
+            "last_assistant_text": assistant_texts[-1] if assistant_texts else None,
+            "assistant_messages_after_last_text": messages_after_last_text if assistant_texts else None,
             "digest_markdown": digest,
         }
 

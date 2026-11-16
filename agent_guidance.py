@@ -1,4 +1,8 @@
 """English instructions authored by the Hub for parent agents."""
+from pathlib import Path
+
+# The waiter parents run as one background command (stdlib only, shipped in the portable payload).
+HUB_WAIT_CLI = Path(__file__).resolve().parent / "tools" / "hub_wait.py"
 
 CLEANUP_HINT = (
     "After collecting a result, close the session: collect_and_terminate(wait_handle) collects and closes every "
@@ -11,10 +15,17 @@ WAIT_HANDLE_HINT = (
     "Waiting: spawn, send, resume and respond return at once with wait_url, one URL per session or spawn group "
     "for all its turns, with no cursor or session parameters. GET it; a timeout returns state=waiting. "
     "If you can run background commands, loop the GET inside one background command while the reply is waiting "
-    "and exit on anything else (ask, done, failed, an HTTP error), so a timeout never wakes you. "
+    "and exit on anything else (ask, undelivered, done, failed, an HTTP error), so a timeout never wakes you. "
+    f'The hub ships that waiter: python "{HUB_WAIT_CLI}" <wait_url> [--max-seconds N] (any Python 3.8+) '
+    "exits 0 with the JSON on ask, undelivered, done or failed, 2 when N seconds (default 3000) pass still waiting, "
+    "so the cap doubles as a heartbeat, and 3 on an HTTP error or a hub unreachable for 2 minutes. "
     "Hosts that cannot keep that background GET running, or cap synchronous waits (AGY: 10 seconds), "
     "call wait_for_hub(wait_handle, timeout_seconds=8) instead, again after each state=waiting. "
-    "States are waiting, ask, done, failed. Every ask is an open approval or question: answer it at once "
+    "States are waiting, ask, undelivered, done, failed. "
+    "undelivered lists in messages your sent messages the worker never read (the hub could not submit them, "
+    "or could not prove it); the worker is still working: follow each entry's recovery_hint, then GET wait_url "
+    "again. A done result lists the turn's unread messages under undelivered_messages. "
+    "Every ask is an open approval or question: answer it at once "
     "with respond_to_subagent and its request_id (idempotent), or respond_to_subagents for several. "
     "An ask answer lists every open request in requests: answer every entry. "
     "Never make a waiter skip, filter or dedupe asks by request_id; that hides the next request. "
@@ -31,7 +42,11 @@ WAIT_HANDLE_HINT = (
 
 # list_active_sessions is intentionally compact for routine orchestration; request the legacy payload only
 # when a diagnostic caller needs it.
-SESSION_LIST_HINT = "list_active_sessions returns a compact view by default; use view=\"full\" for the legacy payload."
+SESSION_LIST_HINT = (
+    "list_active_sessions returns a compact view by default; use view=\"full\" for the legacy payload. "
+    "Each entry names spawned_by (the spawning hub session's id and title, or an outside parent's process); "
+    "mine=true lists only the sessions you spawned."
+)
 
 # Prepended to a spawn's task when the parent passes leaf_worker=true. Advice only: nothing blocks the
 # worker's agent-hub tools (for that, Codex and Claude take disabled_mcp_servers).
@@ -63,7 +78,10 @@ ROUTING_RULES = (
     WAIT_HANDLE_HINT,
     SESSION_LIST_HINT,
     "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
-    "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them.",
+    "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them. "
+    "When the task must use a folder outside cwd (a shared lock folder, say), pass extra_roots=[absolute folders] (claude, codex, omp, kimi, agy): "
+    "the worker may then read AND write there as in cwd, so list each folder the task needs, never a parent that holds them (it grants everything inside); "
+    "drive roots, home, credential, system and hub-data folders are refused. DSH takes no extra_roots: leave a folder the task did not create in place and answer its approvals.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
     "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet; to reduce approvals, spawn omp or agy with auto_approve_once_prefixes.",
     "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never approve for the session, for a high-risk command that starts with one of these prefixes. "
@@ -73,6 +91,9 @@ ROUTING_RULES = (
     "The arguments after the prefix are not checked, so name a specific program and subcommand, never a shell or interpreter alone (python.exe, cmd.exe /c, env). "
     "Each automatic approval leaves an approval_auto_resolved event.",
     "brief_markdown: for a task description longer than a few lines. The hub writes it to its data folder, starts the task with a one-line pointer to the file, and deletes it when the session closes. Limit: 200 000 characters.",
+    "A live measurement brief (numbers read from a running game, device or service under conditions the worker sets) must make the worker "
+    "read back every controlled variable it set (setting, mode, build, scene, load) on every recorded row, write the readback values into that row, "
+    "and mark a row whose readback differs from the intended value invalid instead of keeping it.",
     "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )

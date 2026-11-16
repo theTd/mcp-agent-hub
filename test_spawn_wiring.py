@@ -241,6 +241,10 @@ class ParentInteractionViewTests(SpawnWiringCase):
             }))
         self.assertNotIn("selected_index", json.dumps(data))
         self.assertEqual(data["response"]["resolved_request_id"], "int-omp-box")
+        # The reply names what was really selected (1-based index, label, action).
+        self.assertEqual(data["response"]["approval_action"], "deny")
+        self.assertTrue(data["response"]["chosen_label"])
+        self.assertIn("chosen_option_index", data["response"])
 
 
 class GuidanceTests(unittest.TestCase):

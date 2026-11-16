@@ -106,11 +106,39 @@ class LeafWorkerSpawnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess.args[-1], f"{TASK}\n\n[Hub Session: session_id={sess.session_id}]")
         self.assertIs(sess.profile_snapshot["leaf_worker"], False)
 
-    async def test_true_without_a_task_is_refused(self):
+    async def test_true_without_a_task_or_brief_is_refused_in_english(self):
         async with Client(self.server.mcp) as client:
-            with self.assertRaises(Exception):
+            with self.assertRaises(Exception) as caught:
                 await client.call_tool("spawn_subagent", {"agent_type": "codex", "leaf_worker": True})
+        self.assertIn("leaf_worker=true needs a task or a brief_markdown", str(caught.exception))
         self.assertEqual(self.hub.sessions, {})
+
+    async def test_a_blank_brief_counts_as_no_brief(self):
+        for blank in ("", "  \n\t"):
+            async with Client(self.server.mcp) as client:
+                with self.assertRaises(Exception) as caught:
+                    await client.call_tool("spawn_subagent", {"agent_type": "codex", "leaf_worker": True,
+                                                              "brief_markdown": blank})
+            self.assertIn("leaf_worker=true needs a task or a brief_markdown", str(caught.exception))
+            self.assertEqual(self.hub.sessions, {})
+
+    async def test_true_with_only_a_brief_puts_the_note_before_the_pointer(self):
+        brief = "# Port the parser\n\nLong description."
+        async with Client(self.server.mcp) as client:
+            data = _data(await client.call_tool("spawn_subagents", {"specs": [
+                {"agent_type": "codex", "leaf_worker": True, "brief_markdown": brief},
+            ]}))
+        (entry,) = data["sessions"]
+        sess = self.hub.sessions[entry["session_id"]]
+        brief_path = Path(sess.profile_snapshot["brief_path"]).absolute()
+        self.assertEqual(
+            sess.args[-1],
+            f"{LEAF_WORKER_NOTE}\n\nRead the full brief first: {brief_path}\n\n"
+            f"[Hub Session: session_id={sess.session_id}]",
+        )
+        self.assertEqual(brief_path.read_text(encoding="utf-8"), brief)
+        self.assertEqual(sess.last_task, "Port the parser")
+        self.assertEqual(sess.last_injection["reason"], "argv_positional")
 
     async def test_group_spawn_and_typed_task_carry_the_note(self):
         async with Client(self.server.mcp) as client:

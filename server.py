@@ -18,6 +18,7 @@ from starlette.background import BackgroundTask
 import fastmcp
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import Middleware
 from fastmcp.utilities.logging import configure_logging as configure_fastmcp_logging
 import uvicorn
@@ -35,6 +36,7 @@ from transcript_summarizer import sanitize_tui_screen_text
 from hub_persistence import PersistenceUnavailable
 from loopback_request_guard import LoopbackRequestGuard
 from agent_guidance import SERVER_INSTRUCTIONS
+from mcp_caller_identity import resolve_caller, same_caller
 import windows_accept_guard
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -196,6 +198,54 @@ async def _wait_contract(session_ids, *, turn_ids=None, existing_handle=None, mo
     }
 
 
+async def _mcp_caller() -> Optional[Dict[str, Any]]:
+    """The process, and the hub session, behind the current MCP request when the hub can tell.
+
+    {"pid", "process", "hub_session_id", "hub_session_title"}; None for an in-process client or
+    when the loopback connection's owner cannot be found.
+    """
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return None
+    client, server = request.client, request.scope.get("server")
+    if not client or not server:
+        return None
+    session_pids = {int(s.pid): sid for sid, s in hub.sessions.items() if getattr(s, "pid", None)}
+    caller = await asyncio.to_thread(resolve_caller, client.host, client.port, int(server[1]), session_pids)
+    if caller and caller.get("hub_session_id"):
+        owner = hub.sessions.get(str(caller["hub_session_id"]))
+        caller["hub_session_title"] = owner.title if owner else None
+    return caller
+
+
+def _recorded_caller(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The spawned_by a live session or a stored row keeps in its launch snapshot.
+
+    Summary rows (list_persisted_sessions) carry it as spawned_by_caller instead of the snapshot.
+    """
+    if isinstance(record.get("spawned_by_caller"), dict):
+        return record["spawned_by_caller"]
+    snapshot = record.get("profile_snapshot")
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot) if snapshot else {}
+        except ValueError:
+            snapshot = {}
+    caller = snapshot.get("spawned_by") if isinstance(snapshot, dict) else None
+    return caller if isinstance(caller, dict) else None
+
+
+def _spawned_by_view(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Who spawned a session, as list_active_sessions shows it."""
+    caller = _recorded_caller(record)
+    if caller is None:
+        return None
+    if caller.get("hub_session_id"):
+        return {"session_id": caller["hub_session_id"], "title": caller.get("hub_session_title")}
+    return {"process": caller.get("process"), "pid": caller.get("pid")}
+
+
 def _control_status(session, *, accepted=True):
     return {
         "accepted": bool(accepted),
@@ -284,11 +334,15 @@ async def list_agent_profiles(refresh_discovery: bool = False, view: str = "comp
     routing_guide_markdown; view="full" adds the engine catalog.
     Read routing_guide_markdown and each profile's when_to_use before choosing an agent.
     Profiles include defaults; engines_catalog excludes disabled profiles and models.
+    view="routing" returns only the routing rules, the fallbacks and the profile ids (about a
+    third of the compact size), for re-reading the routing after a compaction.
     Set refresh_discovery=true to refresh the installed engine catalog.
     """
     await ensure_profiles_loaded(refresh_discovery=refresh_discovery)
-    if view not in {"compact", "full"}:
-        raise ValueError("view must be compact or full")
+    if view not in {"compact", "full", "routing"}:
+        raise ValueError("view must be compact, full or routing")
+    if view == "routing":
+        return {"routing_guide_markdown": hub.build_routing_only_markdown()}
     base_url = hub_api_base_url()
     payload = {
         "routing_guide_markdown": hub.build_routing_guide_markdown(),
@@ -343,6 +397,7 @@ async def spawn_subagent(
     wait_seconds: float = 5.0,  # deprecated compatibility field; never blocks
     approval_mode: Optional[str] = None,
     compaction_threshold: Optional[Union[int, str]] = None,
+    extra_roots: Optional[List[str]] = None,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Start a subagent and return an opaque wait handle immediately.
@@ -350,7 +405,8 @@ async def spawn_subagent(
     ``leaf_worker`` is required, decide it on every spawn: true (the usual choice for a
     self-contained job) puts a note before ``task`` telling the worker it is a leaf (do the task
     itself, never spawn subagents or hand work to another agent); false, only for a worker meant
-    to dispatch others, sends the task unchanged. true needs a ``task``. The note is advice, not a
+    to dispatch others, sends the task unchanged. true needs a ``task`` or a ``brief_markdown``
+    (the note then goes before the brief's pointer line). The note is advice, not a
     block: for Codex and Claude, add ``disabled_mcp_servers=["agent-hub"]`` to take the hub's tools
     away too.
 
@@ -371,6 +427,12 @@ async def spawn_subagent(
     cannot add roots. Only what the task creates belongs there: leave files it did not create
     (sources, shared or others' data, credentials) in place, and never widen ``cwd`` to a parent,
     home or drive root to cover them.
+    ``extra_roots`` (claude, codex, omp, kimi, agy) names up to 8 absolute folders beyond ``cwd``
+    that the worker may read AND write, as it does ``cwd`` (each becomes ``--add-dir``; no engine
+    offers a read-only folder). List each folder the task must use there, such as a shared lock
+    folder, never a parent that holds them (it grants everything inside). Refused: a drive root,
+    the user's home or a folder holding it, credential and engine settings folders, system and
+    application folders, the hub's data; DSH takes none.
     ``compaction_threshold`` sets this session's auto-compaction point: ``"70%"`` of the context
     window or a token count (``200000``, ``"200k"``). omp takes both, claude only a percent (it can
     only compact earlier than its default), codex only tokens; other engines reject it.
@@ -387,6 +449,7 @@ async def spawn_subagent(
     session = await hub.create_session(
         profile_id=agent_type,
         launch_source="agent",
+        spawned_by=await _mcp_caller(),
         bypass_approvals=bypass_approvals,
         approval_mode=approval_mode,
         compaction_threshold=compaction_threshold,
@@ -398,6 +461,7 @@ async def spawn_subagent(
         auto_approval_rules=auto_approval_rules,
         auto_approve_once_prefixes=auto_approve_once_prefixes,
         brief_markdown=brief_markdown,
+        extra_roots=extra_roots,
         task=task,
         cwd=cwd,
         title=title,
@@ -421,8 +485,9 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
     Each spec takes spawn_subagent's fields, leaf_worker (true or false) required in every spec;
     approval_mode follows the same default (auto). A spec may also carry
     auto_approve_once_prefixes (omp and agy, approve once for a high-risk command starting with
-    one) and brief_markdown (a task description longer than a few lines, written to a file the hub
-    deletes when the session closes)."""
+    one), brief_markdown (a task description longer than a few lines, written to a file the hub
+    deletes when the session closes) and extra_roots (folders beyond cwd the worker may read and
+    write)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
     for spec in specs:
@@ -432,12 +497,15 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
                 "itself and never spawn subagents; false sends the task unchanged"
             )
     sessions = []
+    caller = await _mcp_caller()
     for spec in specs:
         item = dict(spec)
+        item.pop("spawned_by", None)  # the hub records the caller itself; a spec cannot name one
         agent_type = item.pop("agent_type", item.pop("profile_id", None))
         if not agent_type:
             raise ValueError("each spec requires agent_type")
-        sessions.append(await hub.create_session(profile_id=agent_type, launch_source="agent", **item))
+        sessions.append(await hub.create_session(profile_id=agent_type, launch_source="agent",
+                                                 spawned_by=caller, **item))
     wait = await _wait_contract([s.session_id for s in sessions],
                                 turn_ids={s.session_id: s.turn_id for s in sessions},
                                 mode="all_settled" if all_settled else "any_settled")
@@ -650,7 +718,7 @@ async def wait_for_hub(
     timeout_seconds: float = 50.0,
     ask_coalesce_ms: int = 800,
 ) -> Dict[str, Any]:
-    """Wait on a wait_handle or complete wait_url, returning waiting, ask, done or failed.
+    """Wait on a wait_handle or complete wait_url, returning waiting, ask, undelivered, done or failed.
 
     Hosts that cannot keep a background GET running (including shells capped at 10 seconds)
     should use this tool. A timeout is a normal ``state=waiting`` result. When asking, ``requests``
@@ -693,7 +761,16 @@ async def _respond_to_subagent_impl(
     else:
         wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
     return {**_control_status(session, accepted=bool(action_result.get("ok", True))), **wait,
-            "response": {key: action_result.get(key) for key in ("delivered", "response_state", "resolved_request_id", "idempotent") if key in action_result}}
+            "response": {key: action_result.get(key) for key in RESPOND_REPLY_KEYS if key in action_result}}
+
+
+# What a respond reply echoes from the interaction answer. The chosen option (1-based index, label,
+# the action it maps to, and the asked-for action when the hub downgraded it) lets the parent check
+# what was really selected; the wait-handle refactor (0168939) had dropped them.
+RESPOND_REPLY_KEYS = (
+    "delivered", "response_state", "resolved_request_id", "idempotent",
+    "chosen_option_index", "chosen_label", "approval_action", "requested_approval_action",
+)
 
 
 @mcp.tool()
@@ -841,14 +918,28 @@ async def list_active_sessions(
     wait_handle: Optional[str] = None,
     session_ids: Optional[List[str]] = None,
     status_filter: Optional[List[str]] = None,
+    mine: bool = False,
 ) -> Dict[str, Any]:
-    """List sessions; compact is the default and full preserves the legacy payload."""
+    """List sessions; compact is the default and full preserves the legacy payload.
+
+    Each compact entry names spawned_by: {"session_id", "title"} when a hub session spawned it,
+    {"process", "pid"} for a parent outside the hub, null when unknown (console launches, older
+    sessions). mine=true keeps only sessions the calling parent spawned: the same hub session, or
+    the same external process (a restarted parent is a new process).
+    """
     if view not in {"compact", "full"}:
         raise ValueError("view must be compact or full")
+    caller = await _mcp_caller() if mine else None
+    if mine and caller is None:
+        raise ValueError("mine=true needs a caller the hub can identify (a loopback MCP connection on Windows)")
     active = []
     for session in hub.sessions.values():
         item = session.to_dict()
         item.setdefault("effective_model", getattr(session, "effective_model", None) or getattr(session, "model", None))
+        snapshot_only = {"profile_snapshot": getattr(session, "profile_snapshot", None)}
+        item["spawned_by"] = _spawned_by_view(snapshot_only)
+        if mine and not same_caller(caller, _recorded_caller(snapshot_only)):
+            continue
         active.append(item)
     wanted = set(str(x) for x in session_ids or [])
     if wait_handle:
@@ -865,7 +956,7 @@ async def list_active_sessions(
             prompt = pending.get("prompt") or pending.get("command_or_prompt") or pending.get("command") or ""
             final = s.get("final_response")
             has_final = bool(s.get("has_final_response")) if "has_final_response" in s else bool(final)
-            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": has_final, "final_response_length": len(final or "") if final is not None else 0, "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
+            entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": has_final, "final_response_length": len(final or "") if final is not None else 0, "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at"), "spawned_by": s["spawned_by"] if "spawned_by" in s else _spawned_by_view(s)}
             if pending:
                 entry["open_request"] = {"request_id": pending.get("request_id"), "kind": pending.get("kind"), "prompt": str(prompt)[:120]}
             entry.update(parent_turn_outcome_fields(s))
@@ -878,6 +969,8 @@ async def list_active_sessions(
                 historical = [s for s in historical if s.get("session_id") in wanted]
             if status_filter:
                 historical = [s for s in historical if s.get("status") in allowed]
+            if mine:
+                historical = [s for s in historical if same_caller(caller, _recorded_caller(s))]
         return {"global_seq": hub.global_seq, "active_count": len(active), "active_sessions": [compact(s) for s in active], "historical_sessions": [compact(s) for s in historical]}
     result: Dict[str, Any] = {
         "global_seq": hub.global_seq,
@@ -887,7 +980,10 @@ async def list_active_sessions(
     if include_historical:
         # Spec §6: list_active_sessions stays "live + ended-in-memory"; archived records are listed
         # by list_archived_sessions.
-        result["persisted_sessions"] = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
+        persisted = await hub.db.list_persisted_sessions(limit=limit, include_archived=False, consistent=False)
+        if mine:
+            persisted = [s for s in persisted if same_caller(caller, _recorded_caller(s))]
+        result["persisted_sessions"] = persisted
     return result
 
 
@@ -898,7 +994,12 @@ async def collect_and_terminate(
     only_completed: bool = True,
     max_chars: int = 3000,
 ) -> Dict[str, Any]:
-    """Collect final answers and close sessions; only_completed=False also closes running sessions."""
+    """Collect final answers and close sessions; only_completed=False also closes running sessions.
+
+    A running session closed this way has no answer: its entry says interrupted=true,
+    final_response="" and carries a progress block (how far the worker got, as terminate_subagent
+    reports it).
+    """
     if bool(wait_handle) == bool(session_ids):
         raise ValueError("provide exactly one of wait_handle or session_ids")
     if max_chars < 0:
@@ -922,7 +1023,19 @@ async def collect_and_terminate(
                 skipped.append({"session_id": sid, "status": status})
                 continue
             already_closed = sess is None
-            if already_closed:
+            if sess is not None and status in MID_TURN_STATUSES:
+                stopped = await _terminate_mid_turn(sess)
+                if rec.get("cwd"):
+                    cwd_dirs.add(str(rec["cwd"]))
+                if stopped["interrupted"]:
+                    collected.append({"session_id": sid, "status": status, "interrupted": True,
+                                      "final_response": "", "full_length": 0, "truncated": False,
+                                      "already_closed": False, "progress": stopped["progress"]})
+                    continue
+                # The turn ended on its own while it was being stopped: its answer is collected.
+                rec, full = sess.to_dict(), stopped.get("final_response") or ""
+                status = rec.get("status")
+            elif already_closed:
                 full = rec.get("final_response") or ""
             else:
                 info = await hub.get_subagent_final_response(sid)
@@ -941,11 +1054,100 @@ async def collect_and_terminate(
     return {"collected": collected, "skipped": skipped, "git_status": await collect_git_status(sorted(cwd_dirs))}
 
 
+# A session in one of these is in the middle of a turn: its newest text is progress, not an answer.
+MID_TURN_STATUSES = ("starting", "running", "waiting_parent")
+
+
+def _this_turns_answer(session) -> Optional[str]:
+    """The answer the current turn produced, if it has one (an earlier turn's answer is not it)."""
+    if session.final_response and not session.final_response_from_previous_turn:
+        return session.final_response
+    return None
+
+
+async def _close_with_answer(session_id: str, closed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Close a session that is between turns (unless `closed` says it already is) and return its answer."""
+    result = closed if closed is not None else await hub.close_session(session_id, source="mcp")
+    final_info = await hub.get_subagent_final_response(session_id)
+    return {
+        "terminated": True,
+        "session_id": session_id,
+        "was_alive": result.get("was_alive"),
+        "status": result.get("status"),
+        "persisted_in_sqlite": hub.db.status()["pending_writes"] == 0,
+        "interrupted": False,
+        "final_response": final_info.get("final_response"),
+        "final_response_source": final_info.get("final_response_source"),
+        "step_count": final_info.get("step_count"),
+    }
+
+
+async def _terminate_mid_turn(session) -> Dict[str, Any]:
+    """Stop a session mid-turn and report how far it got, never as its answer.
+
+    The turn can still end on its own while this runs (the summary read and the close both wait):
+    then the reply is the normal one, interrupted=false with the answer.
+    """
+    session_id = session.session_id
+    status_before, activity = session.status, session.current_activity
+    previous_answer = session.final_response if session.final_response_from_previous_turn else None
+    answer_before = _this_turns_answer(session)
+    # Summarised before the close: a running session's summary never becomes its final response.
+    try:
+        summary = await hub.summarize_transcript(session_id)
+    except Exception as exc:
+        summary = {"summary_error": str(exc)}
+    if session.status not in MID_TURN_STATUSES or _this_turns_answer(session) != answer_before:
+        return await _close_with_answer(session_id)
+    if "last_assistant_text" in summary:
+        last_text = summary.get("last_assistant_text")
+    else:
+        # Engines without a separate field: their conclusion, unless it is a stored earlier answer.
+        last_text = summary.get("latest_conclusion")
+        if last_text and last_text == session.final_response:
+            last_text = None
+    result = await hub.close_session(session_id, source="mcp")
+    if _this_turns_answer(session) != answer_before:
+        return await _close_with_answer(session_id, closed=result)
+    from cwd_git_status import collect_git_status
+    progress = {
+        "note": "Stopped mid-turn: this is how far the worker got, not its answer.",
+        "status_before": status_before,
+        "current_activity": activity,
+        "step_count": max(int(session.step_count or 0), int(summary.get("step_count") or 0)),
+        "last_assistant_text": last_text,
+        "assistant_messages_after_last_text": summary.get("assistant_messages_after_last_text"),
+        "recent_actions": list(summary.get("recent_actions") or [])[-8:],
+        "last_thought": (list(summary.get("key_thoughts") or []) or [None])[-1],
+        "files_changed": list(session.files_changed or [])[-30:],
+    }
+    if previous_answer:
+        progress["previous_turn_answer"] = previous_answer
+    if summary.get("summary_error"):
+        progress["summary_error"] = summary["summary_error"]
+    return {
+        "terminated": True,
+        "session_id": session_id,
+        "was_alive": result.get("was_alive"),
+        "status": result.get("status"),
+        "persisted_in_sqlite": hub.db.status()["pending_writes"] == 0,
+        "interrupted": True,
+        "final_response": None,
+        "final_response_source": None,
+        "progress": progress,
+        "git_status": await collect_git_status([str(session.cwd)]) if session.cwd else {},
+    }
+
+
 @mcp.tool()
 async def terminate_subagent(session_id: str) -> Dict[str, Any]:
     """
     Stop a subagent process and queue its answer, terminal history and tool trace for persistence.
     Results remain readable with get_subagent_final_response or get_subagent_status_and_trace.
+    A session stopped mid-turn returns interrupted=true, final_response=null and a progress block
+    (last assistant text and how old it is, recent actions, activity, files changed, the cwd's git
+    status): how far the worker got, not its answer. If the turn ends on its own during the call,
+    the reply is the normal one: interrupted=false with the answer.
     """
     session = hub.sessions.get(session_id)
     if not session:
@@ -959,19 +1161,10 @@ async def terminate_subagent(session_id: str) -> Dict[str, Any]:
             }
         raise ValueError(f"Session '{session_id}' not found.")
 
+    if session.status in MID_TURN_STATUSES:
+        return await _terminate_mid_turn(session)
     # K5: the parent agent ended it, so the lifecycle event says 主 Agent, not 用户.
-    result = await hub.close_session(session_id, source="mcp")
-    final_info = await hub.get_subagent_final_response(session_id)
-    return {
-        "terminated": True,
-        "session_id": session_id,
-        "was_alive": result.get("was_alive"),
-        "status": result.get("status"),
-        "persisted_in_sqlite": hub.db.status()["pending_writes"] == 0,
-        "final_response": final_info.get("final_response"),
-        "final_response_source": final_info.get("final_response_source"),
-        "step_count": final_info.get("step_count"),
-    }
+    return await _close_with_answer(session_id)
 
 
 
@@ -1321,6 +1514,7 @@ async def api_launch_preview(req: Request):
             mcp_servers=body.get("mcp_servers"),
             disabled_mcp_servers=body.get("disabled_mcp_servers"),
             strict_mcp_config=body.get("strict_mcp_config", False),
+            extra_roots=body.get("extra_roots"),
         )
         if preview.get("engine") == "dsh":
             preview["sandbox_preparation"] = await hub._prepare_dsh_workspace(preview["cwd"], repair=False)
@@ -1384,6 +1578,7 @@ async def api_create_session(req: Request):
             auto_approve_once_prefixes=body.get("auto_approve_once_prefixes"),
             brief_markdown=body.get("brief_markdown"),
             leaf_worker=body.get("leaf_worker", False),
+            extra_roots=body.get("extra_roots"),
         )
     except ValueError as e:
         return bad_request(str(e))

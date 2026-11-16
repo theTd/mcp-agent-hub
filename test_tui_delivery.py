@@ -87,7 +87,25 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         response = await self.hub.deliver_parent_message(self.sess.session_id, "do not concatenate")
         self.assertFalse(response["delivered"])
         self.assertEqual(response["reason"], "input_recovery_required")
+        self.assertIn("clear_input=true", response["recovery_hint"])
         self.assertEqual(self.pty_inputs, before)
+        # Mid-turn clear_input is refused, so the hint must not send the parent there first
+        # (codex-624fde89: the parent was left with no way forward).
+        self.sess.status = "running"
+        response = await self.hub.deliver_parent_message(self.sess.session_id, "STOP")
+        self.assertEqual(response["reason"], "input_recovery_required")
+        self.assertIn("has not read it", response["recovery_hint"])
+        self.assertIn("only between turns", response["recovery_hint"])
+        self.assertIn("terminate_subagent", response["recovery_hint"])
+        self.assertEqual(self.pty_inputs, before)
+
+    async def test_a_queued_live_message_says_it_has_not_been_read(self):
+        with patch.object(self.hub, "_submit_queued_live_text", AsyncMock()):
+            response = await self.hub.deliver_parent_message(self.sess.session_id, "a steer")
+        self.assertIsNone(response["delivered"])
+        self.assertEqual(response["injection"], "pending")
+        self.assertEqual(response["state"], "queued")
+        self.assertIn("not read yet", response["note"])
 
     async def test_unconfirmed_has_no_retry_even_when_composer_clears(self):
         with patch.object(self.hub, "_await_typed_text_settled", AsyncMock(return_value=(self.screen, True, True, 1))), \
@@ -178,6 +196,26 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.hub._codex_composer_shows_whole(visible[:cut] + "↑ " + visible[cut + 1:], self.LONG))
         # An arrow inside a word is text, not the mark.
         self.assertFalse(self.hub._codex_composer_shows_whole(visible.replace("file", "fi↑le", 1), self.LONG))
+
+    STOP = ("STOP — do not start another run. Reply now with what you measured so far "
+            "and where the raw files are.")
+
+    def test_an_em_dash_the_composer_does_not_draw_still_counts_as_whole(self):
+        # codex-624fde89 (2026-11-16): the composer drew the typed em dash as nothing, the exact
+        # match never held, so Enter was never pressed and the steer sat in the composer.
+        shown = self.STOP.replace("—", "")
+        self.assertTrue(self.hub._codex_composer_shows_whole(shown, self.STOP))
+        self.assertTrue(self.hub._codex_composer_shows_whole(self.STOP, self.STOP))
+        # A draft still arriving is never whole, dash or no dash.
+        self.assertFalse(self.hub._codex_composer_shows_whole(shown[:-12], self.STOP))
+        self.assertFalse(self.hub._codex_composer_shows_whole(self.STOP[:-12], self.STOP))
+
+    async def test_an_em_dash_the_composer_does_not_draw_settles(self):
+        self.screen = "› " + self.STOP.replace("—", "") + "\n\n  ? for shortcuts"
+        with patch("session_manager.TUI_TYPE_SETTLE_SEC", .02), patch("session_manager.TUI_TYPE_SETTLE_POLL_SEC", .01):
+            result = await self.hub._await_typed_text_settled(self.sess, "codex", self.STOP[:30], self.STOP[-30:],
+                                                           typed_len=len(self.STOP), expected_text=self.STOP)
+        self.assertTrue(result[2])
 
     async def test_scrolled_composer_with_a_flush_mark_settles(self):
         visible = self.LONG[self.LONG.index("but no file"):]
@@ -308,6 +346,86 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual(result["delivery"]["reason"], "input_recovery_required")
         self.assertFalse(result["delivery"]["delivered"])
+
+
+class UndeliveredWakeTests(unittest.IsolatedAsyncioTestCase):
+    """Owner decision hub-friction-1116 (undelivered-wake): a live message the worker never read wakes
+    wait_url with state=undelivered, leaves it waiting, and is listed in the turn's done result."""
+
+    # The Codex fixture without re-running its tests.
+    asyncTearDown = CodexDeliveryTests.asyncTearDown
+    append_user = CodexDeliveryTests.append_user
+
+    async def asyncSetUp(self):
+        await CodexDeliveryTests.asyncSetUp(self)
+        self.sess.status = "running"  # a steer in the middle of a turn
+        self.handle = (await self.hub.wait_inbox.create([self.sess.session_id]))["wait_handle"]
+
+    async def test_a_steer_stuck_in_the_composer_wakes_the_wait_and_lands_in_the_result(self):
+        with patch.object(self.hub, "_await_typed_text_settled", AsyncMock(return_value=("› STOP", True, False, 10))):
+            reply = await self.hub.deliver_parent_message(self.sess.session_id, "STOP now")
+            woke = await self.hub.wait_inbox.wait(self.handle, 5)
+        self.assertEqual(woke["state"], "undelivered", woke)
+        [message] = woke["messages"]
+        self.assertEqual(message["message_id"], reply["submit_id"])
+        self.assertEqual(message["reason"], "typed_text_not_settled")
+        self.assertTrue(message["confirmed_failure"])
+        self.assertIn("still in the worker's composer", message["recovery_hint"])
+        self.assertIn("terminate_subagent, then resume_subagent", message["recovery_hint"])
+        self.assertEqual(self.hub.wait_inbox._row(self.handle)["state"], "waiting")
+        self.assertEqual((await self.hub.wait_inbox.wait(self.handle, 0.1))["state"], "waiting")
+        await self.hub.record_worker_event(self.sess.session_id, {"type": "turn_completed", "content": "Stopped."})
+        done = await self.hub.wait_inbox.wait(self.handle, 1)
+        self.assertEqual(done["state"], "done")
+        self.assertEqual([m["message_id"] for m in done["results"][0]["undelivered_messages"]], [reply["submit_id"]])
+        # The next turn starts clean.
+        self.hub.begin_new_turn(self.sess, status="running")
+        self.assertEqual(self.sess.undelivered_messages, [])
+
+    async def test_an_unconfirmed_submit_that_lands_later_is_dropped_from_the_result(self):
+        with patch.object(self.hub, "_await_typed_text_settled", AsyncMock(return_value=(self.screen, True, True, 1))), \
+             patch("session_manager.TUI_SUBMIT_EVIDENCE_SEC", .02):
+            result = await self.hub._submit_text_to_tui(self.sess, "queued steer", "\r")
+        self.assertIsNone(result["ok"])
+        await self.hub._record_tui_injection(self.sess, dict(result, mode="parent_message", submit_id="inj-late"))
+        woke = await self.hub.wait_inbox.wait(self.handle, 1)
+        self.assertEqual(woke["state"], "undelivered")
+        self.assertFalse(woke["messages"][0]["confirmed_failure"])
+        self.assertIn("Do not resend", woke["messages"][0]["recovery_hint"])
+        self.append_user("queued steer")  # Codex submitted it after its next tool call
+        await self.hub.record_worker_event(self.sess.session_id, {"type": "turn_completed", "content": "Done."})
+        done = await self.hub.wait_inbox.wait(self.handle, 1)
+        self.assertNotIn("undelivered_messages", done["results"][0])
+        self.assertIsNone(self.sess._tui_draft_pending)
+
+    async def test_unchecked_writes_and_startup_text_never_wake(self):
+        await self.hub._record_tui_injection(self.sess, dict(self.hub._unchecked_live_result(), submit_id="inj-u"))
+        await self.hub._record_tui_injection(self.sess, {"ok": False, "reason": "write_failed", "attempts": 0})
+        self.assertEqual((await self.hub.wait_inbox.wait(self.handle, 0.1))["state"], "waiting")
+        self.assertEqual(self.sess.undelivered_messages, [])
+
+    async def test_a_group_result_lists_it_from_the_live_session(self):
+        await self.hub._record_tui_injection(self.sess, {"ok": False, "reason": "write_failed", "attempts": 0,
+                                                         "mode": "parent_message", "submit_id": "inj-g"})
+        self.sess.status = "completed"
+        self.sess.completion_reported = True
+        state = await self.hub._wait_state_snapshot([self.sess.session_id])
+        self.assertEqual(state["state"], "done")
+        self.assertEqual(state["results"][0]["undelivered_messages"][0]["message_id"], "inj-g")
+        json.dumps(state)  # nothing but plain data reaches the parent
+
+
+class ScreenEchoKeyTests(unittest.TestCase):
+    def test_drops_what_terminals_draw_differently_and_keeps_letters(self):
+        from session_manager import screen_echo_key
+        self.assertEqual(screen_echo_key("a — b… “c” → d×e │"), "abcde")
+        self.assertEqual(screen_echo_key("x\u200dy\u0301z"), "xyz")  # zero-width joiner, combining acute
+        # Ambiguous-width letters are text, compared as typed; CJK and full-width punctuation too.
+        self.assertEqual(screen_echo_key("да αβ"), "даαβ")
+        self.assertEqual(screen_echo_key("停止，回复"), "停止，回复")
+        # Nothing but such characters: compared as typed, whitespace aside.
+        self.assertEqual(screen_echo_key(" → — "), "→—")
+        self.assertEqual(screen_echo_key(None), "")
 
 
 if __name__ == "__main__":
