@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -151,6 +152,11 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
             ("retry", {"message": "exceeded retry limit, last status: 429 Too Many Requests",
                        "codex_error_info": {"response_too_many_failed_attempts": {"http_status_code": 429}}},
              "rate_limit"),
+            # Finding 4: the real record's status sits in the nested variant object; without it
+            # this message carries no number and would classify as "other".
+            ("nested", {"message": "exceeded retry limit",
+                        "codex_error_info": {"response_too_many_failed_attempts": {"http_status_code": 429}}},
+             "rate_limit"),
             ("payload", {"message": "unexpected status 413 Payload Too Large: <html>\r\n<head>"
                                     "<title>413 Request Entity Too Large</title></head></html>, url: https://x"},
              "request"),
@@ -261,6 +267,192 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake.inputs_of(sess.session_id), [])
         self.assertEqual(sess.status, "running")
 
+    async def test_a_lost_esc_never_escalates_the_stall(self):
+        # Finding 3: the core refused the key ("input not delivered"). No escalation and no turn
+        # end may follow: the engine never got the interrupt.
+        sess = self.session("codex", "-lost-esc")
+        self.fake.sessions[sess.session_id].screen_text = (
+            "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
+            "  └ Connection failed: error sending request\n"
+        )
+        with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
+             patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15), \
+             patch.object(sess, "write_input", return_value=False):
+            await self.hub.poll_tui_screen_interactions_once(sess)
+            await asyncio.sleep(0.08)
+            await self.hub.poll_tui_screen_interactions_once(sess)
+            await asyncio.sleep(0.2)
+            await self.hub.poll_tui_screen_interactions_once(sess)
+        self.assertIsNotNone(sess._codex_reconnect)
+        self.assertFalse(sess._codex_reconnect["escalated_at"])
+        self.assertEqual(sess.status, "running")
+        self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+
+    async def test_the_stall_never_types_esc_over_a_parent_message(self):
+        # Nit 6: write_input bypasses the TUI writer queue, so an Esc while a parent message is
+        # being typed could land inside it.
+        sess = self.session("codex", "-writer-busy")
+        self.fake.sessions[sess.session_id].screen_text = (
+            "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
+            "  └ Connection failed: error sending request\n"
+        )
+        claim = sess.tui_writer.claim("live_message")
+        try:
+            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
+                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                await asyncio.sleep(0.08)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                await asyncio.sleep(0.2)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+            self.assertEqual(self.fake.inputs_of(sess.session_id), [])
+            self.assertFalse(sess._codex_reconnect["escalated_at"])
+            self.assertEqual(sess.status, "running")
+        finally:
+            claim.release()
+
+    async def test_codex_rollout_growth_after_the_esc_keeps_the_real_answer(self):
+        # Finding 3: growth proves Codex wrote something, not that the turn will end. The stall
+        # survives with a restarted window, and the turn's own answer still ends it as an answer
+        # (an engine_error end would outrank and discard that answer).
+        sess, path, task = await self.codex_rollout("-esc-recovered")
+        try:
+            self.fake.sessions[sess.session_id].screen_text = (
+                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
+                "  └ Connection failed: error sending request\n"
+            )
+            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
+                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                await asyncio.sleep(0.08)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertIn("\x1b", self.fake.inputs_of(sess.session_id))
+                # Writing again, but the turn has not ended yet.
+                self.append(path, {"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
+                await asyncio.sleep(0.2)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertIsNotNone(sess._codex_reconnect)
+                self.assertFalse(sess._codex_reconnect["escalated_at"])
+                self.assertEqual(sess.status, "running")
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                self.fake.sessions[sess.session_id].screen_text = "> "
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertIsNone(sess._codex_reconnect)
+                self.append(path, {"type": "event_msg", "payload": {
+                    "type": "task_complete", "last_agent_message": "the real answer"}})
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(sess.final_response, "the real answer")
+        self.assertIsNone(sess.last_turn_outcome)
+        self.assertEqual(sess.final_response_source, "codex_task_complete")
+
+    async def test_codex_rollout_growth_without_a_turn_end_ends_on_a_second_window(self):
+        # Finding 3, second half: growth with no turn end is a still-stuck turn. The restarted
+        # window must end it as the network error instead of leaving it running for good.
+        sess, path, task = await self.codex_rollout("-esc-still-stuck")
+        try:
+            self.fake.sessions[sess.session_id].screen_text = (
+                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
+                "  └ Connection failed: error sending request\n"
+            )
+            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
+                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                await asyncio.sleep(0.08)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertEqual(len(self.fake.inputs_of(sess.session_id)), 1)
+                # A retry record: bytes grew, the status line is still there, no turn end.
+                self.append(path, {"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
+                await asyncio.sleep(0.2)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertIsNotNone(sess._codex_reconnect)
+                self.assertFalse(sess._codex_reconnect["escalated_at"])
+                # A second full window: the hub interrupts again, and this timeout ends the turn.
+                await asyncio.sleep(0.08)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+                self.assertEqual(len(self.fake.inputs_of(sess.session_id)), 2)
+                await asyncio.sleep(0.2)
+                await self.hub.poll_tui_screen_interactions_once(sess)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(sess.status, "completed")
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
+        done = self.events(sess.session_id, "turn_completed")
+        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "error"))
+        self.assertTrue(done[0]["data"]["interrupted_by_hub"])
+
+    async def test_a_codex_error_while_an_interaction_is_pending_ends_after_the_answer(self):
+        # Finding 2: the one-shot task_complete error is consumed as it is read. A refused end
+        # must keep it on the session and the screen poll must end the turn once the parent has
+        # answered; before, the turn stayed running with nothing left that could end it.
+        sess, path, task = await self.codex_rollout("-error-pending")
+        try:
+            sess.pending_interaction = {"request_id": "req-codex", "kind": "question", "prompt": "?"}
+            sess.status = "waiting_parent"
+            self.append(path, {"type": "event_msg", "payload": {
+                "type": "task_complete", "last_agent_message": None,
+                "error": {"message": "Quota exceeded. Check your plan and billing details.",
+                          "codex_error_info": "usage_limit_exceeded"}}})
+            await self.until(lambda: sess._pending_engine_error is not None)
+            self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+            self.assertEqual(sess.status, "waiting_parent")
+            sess.pending_interaction = None
+            sess.status = "running"
+            await self.hub.poll_tui_screen_interactions_once(sess)
+            await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "quota"))
+        self.assertIsNone(sess._pending_engine_error)
+        done = self.events(sess.session_id, "turn_completed")
+        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "error"))
+
+    async def test_omp_error_hold_keeps_the_row_until_the_parent_answers(self):
+        # Finding 5: the error row may not be claimed (offset) while the turn cannot end.
+        sess, work, path = self.omp_wire("-hold-pending")
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+                self.append(path, self.omp_error())
+                await self.until(lambda: "Engine error (server)" in sess.current_activity)
+                sess.pending_interaction = {"request_id": "req-1", "kind": "question", "prompt": "?"}
+                await asyncio.sleep(0.35)
+                self.assertEqual(sess.status, "running")
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                self.assertFalse(getattr(sess, "_native_turn_end_offset", 0))
+                sess.pending_interaction = None
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "server"))
+
+    async def test_the_omp_hold_restarts_its_window_after_a_refused_end(self):
+        # Nit: re-arming with the old start time ended the turn on the first pass after the parent
+        # answered, before the engine's retry record could arrive. The window now restarts at each
+        # refusal, so the answer buys it a full window from that moment.
+        sess, work, path = self.omp_wire("-hold-window")
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 1.2):
+                self.append(path, self.omp_error())
+                await self.until(lambda: "Engine error (server)" in sess.current_activity)
+                sess.pending_interaction = {"request_id": "req-2", "kind": "question", "prompt": "?"}
+                await asyncio.sleep(1.5)  # several refusals: each restarts the window
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                sess.pending_interaction = None
+                answered = time.monotonic()
+                await self.until(lambda: sess.status == "completed")
+                self.assertGreaterEqual(time.monotonic() - answered, 0.8)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "server"))
+
     async def test_claude_api_error_message_ends_the_turn_as_an_error(self):
         sess = self.session("claude", "-api")
         work = self.root / "claude-api"
@@ -321,6 +513,65 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         # The engine's own retryable=false wins over the kind's default.
         self.assertFalse(sess.last_turn_error["retryable"])
         self.assertTrue(sess.final_response.startswith("kimi turn ended on an engine error (quota):"))
+
+    async def test_a_kimi_failed_turn_is_retried_after_the_interaction_is_answered(self):
+        # Finding 2 (kimi): the refused turn.ended is held, not dropped.
+        sess, path = self.kimi_wire("-failed-held")
+        task = self.hub._schedule(self.hub._watch_kimi_session(sess, self.root))
+        try:
+            sess.pending_interaction = {"request_id": "req-kimi", "kind": "question", "prompt": "?"}
+            sess.status = "waiting_parent"
+            self.append(path, {"type": "turn.ended", "agentId": "main", "turnId": 0,
+                               "reason": "failed",
+                               "error": {"code": "authentication_failed",
+                                         "message": "Not logged in · Please run /login"}})
+            await self.until(lambda: sess._pending_engine_error is not None)
+            self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+            sess.pending_interaction = None
+            sess.status = "running"
+            await self.hub.poll_tui_screen_interactions_once(sess)
+            await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "auth"))
+        self.assertIsNone(sess._pending_engine_error)
+        self.assertNotEqual(sess.final_response, "Not logged in · Please run /login")
+
+    def agy_wire(self, suffix=""):
+        sess = self.session("agy", suffix)
+        work = self.root / f"agy{suffix}"
+        path = work / ".system_generated/logs/transcript.jsonl"
+        path.parent.mkdir(parents=True)
+        path.touch()
+        sess.resume_attach = True
+        sess.conversation_ref = {"brain_dir": str(work)}
+        return sess, path, self.hub._schedule(self.hub._watch_agy_transcript(sess, self.root))
+
+    async def test_an_agy_error_tail_is_retried_after_the_interaction_is_answered(self):
+        # Coverage: the tail is kept on a refused end, so the retry after the answer still ends
+        # the turn as the engine's error (the row was already read and would otherwise be lost).
+        sess, path, task = self.agy_wire("-error-retry")
+        try:
+            with patch("session_manager.AGY_ERROR_TURN_END_SEC", 0.2):
+                sess.pending_interaction = {"request_id": "req-agy", "kind": "question", "prompt": "?"}
+                sess.status = "waiting_parent"
+                self.append(path, {"type": "ERROR_MESSAGE", "source": "SYSTEM", "status": "DONE",
+                                   "error": 'API error (attempt 8): request failed: Post "https://x/v1": EOF'})
+                await self.until(lambda: any(
+                    e["type"] == "error" for e in self.events(sess.session_id)))
+                await asyncio.sleep(0.5)  # past the window: the end was refused, the tail kept
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                self.assertEqual(sess.status, "waiting_parent")
+                sess.pending_interaction = None
+                sess.status = "running"
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
+        done = self.events(sess.session_id, "turn_completed")
+        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "error"))
 
     @staticmethod
     def omp_error(message="502 status code (no body)", status=502):
@@ -476,6 +727,9 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         reported = self.session("omp", "-closed")
         reported.status = "terminated"
         reported.final_response = "finished before the close"
+        # The per-turn evidence is persisted with the row; the answer alone is not evidence,
+        # because D2 keeps it across turns.
+        reported.completion_reported = True
         await self.hub.persist_session(reported)
         del self.hub.sessions[reported.session_id]
         still_running = self.session("kimi", "-running")
@@ -497,6 +751,115 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.hub._wait_state_snapshot([silent.session_id])
         self.assertEqual(snapshot["state"], "failed")
 
+    async def test_a_member_closed_mid_turn_after_a_previous_answer_is_failed(self):
+        # Finding 1: turn 1 reported "A"; the parent's follow-up kept that answer (D2) and the
+        # member died mid-turn. The stale answer must not read as this turn's completion.
+        sess = self.session("omp", "-mid-turn")
+        sess.status = "completed"
+        sess.completion_reported = True
+        sess.final_response = "A (turn 1)"
+        await self.hub.persist_session(sess)
+        self.hub.begin_new_turn(sess, status="running")
+        await self.hub.persist_session(sess)
+        sess.status = "crashed"
+        await self.hub.persist_session(sess)
+        record = await self.hub.db.get_session_record(sess.session_id)
+        self.assertEqual((record["status"], record["final_response"], record["completion_reported"]),
+                         ("crashed", "A (turn 1)", False))
+        del self.hub.sessions[sess.session_id]
+        snapshot = await self.hub._wait_state_snapshot([sess.session_id])
+        self.assertEqual(snapshot["state"], "failed")
+
+    async def test_a_row_without_stored_per_turn_state_keeps_master_behavior(self):
+        # Rows written before the per-turn columns existed: a clean exit with an answer was done,
+        # a crashed/terminated row with a stale answer failed — exactly what master returned.
+        done = self.session("omp", "-old-done")
+        done.status = "exited"
+        done.final_response = "old answer"
+        await self.hub.persist_session(done)
+        gone = self.session("omp", "-old-crashed")
+        gone.status = "crashed"
+        gone.final_response = "stale answer"
+        await self.hub.persist_session(gone)
+        for sess in (done, gone):
+            del self.hub.sessions[sess.session_id]
+        # The queued upserts must land before the simulated pre-change row is written back.
+        await self.hub.db.flush()
+        conn = sqlite3.connect(str(self.hub.db.db_path))
+        try:
+            for sess in (done, gone):
+                conn.execute(
+                    "UPDATE sessions SET completion_reported=NULL, last_turn_outcome=NULL, "
+                    "last_turn_error_json=NULL WHERE session_id=?", (sess.session_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual((await self.hub._wait_state_snapshot([done.session_id]))["state"], "done")
+        self.assertEqual((await self.hub._wait_state_snapshot([gone.session_id]))["state"], "failed")
+
+    async def test_a_running_follow_up_does_not_show_the_previous_error_turn(self):
+        # Finding 2: after an error turn the parent's follow-up keeps the answer and its source
+        # (D2); the whole new turn must not be reported as an error turn.
+        sess = self.session("omp", "-follow-up")
+        sess.status = "completed"
+        sess.completion_reported = True
+        sess.final_response = engine_error_summary("omp", {"kind": "quota", "message": "quota"})
+        sess.final_response_source = "engine_error"
+        sess.last_turn_outcome = "error"
+        sess.last_turn_error = {"kind": "quota", "retryable": False, "message": "quota"}
+        await self.hub.persist_session(sess)
+        self.hub.begin_new_turn(sess, status="running")
+        view = await self.hub.get_subagent_status_and_trace(sess.session_id)
+        self.assertNotIn("turn_outcome", view)
+        self.assertNotIn("turn_error", view)
+        self.assertEqual(view["final_response"], sess.final_response)
+        self.assertTrue(view["from_previous_turn"])
+        # The archived row of that running turn keeps the flag's effect too.
+        await self.hub.persist_session(sess)
+        record = await self.hub.db.get_session_record(sess.session_id)
+        self.assertEqual(parent_turn_outcome_fields(record), {})
+
+    async def test_an_archived_empty_follow_up_does_not_report_the_previous_error(self):
+        # Must-fix 1: turn N ended as quota; the follow-up (D2 keeps the answer and its source)
+        # ends with an empty turn_completed, as codex/kimi really do. The archived row reports
+        # completion of that empty turn, not the previous turn's engine error.
+        sess = self.session("codex", "-empty-follow-up")
+        info = classify_engine_error("Quota exceeded. Check your plan and billing details.",
+                                     code="usage_limit_exceeded")
+        self.assertTrue(await self.hub._end_engine_error_turn(sess, "codex", info))
+        self.hub.begin_new_turn(sess, status="running")
+        await self.hub.record_worker_event(sess.session_id, {
+            "type": "turn_completed", "category": "turn_completed", "status": "turn_idle", "content": "",
+        })
+        self.assertEqual(sess.status, "completed")
+        await self.hub.close_session(sess.session_id, source="mcp")
+        record = await self.hub.db.get_session_record(sess.session_id)
+        self.assertEqual((record["final_response_source"], record["completion_reported"]),
+                         ("engine_error", True))
+        self.assertEqual(parent_turn_outcome_fields(record), {})
+        snapshot = await self.hub._wait_state_snapshot([sess.session_id])
+        self.assertEqual(snapshot["state"], "done")
+        self.assertEqual(snapshot["results"][0]["outcome"], "answered")
+        self.assertNotIn("error", snapshot["results"][0])
+
+    async def test_an_archived_error_row_keeps_its_stored_kind_and_message(self):
+        # Round 1 item 7 / coverage: an ended error turn stores its classified kind, so the
+        # archived row names rate_limit, not a kind guessed from the summary text.
+        sess = self.session("claude", "-archived-kind")
+        info = classify_engine_error("API Error: 429 too many requests", http_status=429)
+        self.assertTrue(await self.hub._end_engine_error_turn(sess, "claude", info))
+        await self.hub.close_session(sess.session_id, source="mcp")
+        record = await self.hub.db.get_session_record(sess.session_id)
+        self.assertEqual(record["last_turn_error"],
+                         {"kind": "rate_limit", "retryable": True,
+                          "message": "API Error: 429 too many requests"})
+        self.assertEqual(parent_turn_outcome_fields(record)["turn_error"]["kind"], "rate_limit")
+        self.assertTrue(record["final_response"].startswith(
+            "claude turn ended on an engine error (rate_limit): API Error: 429 too many requests"))
+        rows = await self.hub.db.list_persisted_sessions(limit=5)
+        listed = next(row for row in rows if row["session_id"] == sess.session_id)
+        self.assertEqual(listed["last_turn_error"]["kind"], "rate_limit")
+
     def test_status_view_fields_exist_only_for_an_ended_error_or_abort(self):
         self.assertEqual(parent_turn_outcome_fields({}), {})
         error = parent_turn_outcome_fields({
@@ -511,6 +874,14 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
                                                "final_response": "codex turn ended..."})
         self.assertEqual(archived["turn_outcome"], "error")
         self.assertEqual(archived["turn_error"]["kind"], "other")
+        # Only a row written before completion_reported was stored reaches that fallback: a live
+        # follow-up (a bool, from_previous_turn set) is not the previous turn's error.
+        self.assertEqual(parent_turn_outcome_fields({
+            "final_response_source": "engine_error", "final_response": "codex turn ended...",
+            "from_previous_turn": True, "completion_reported": False}), {})
+        self.assertEqual(parent_turn_outcome_fields({
+            "final_response_source": "engine_error", "final_response": "codex turn ended...",
+            "completion_reported": True}), {})
 
 
 if __name__ == "__main__":

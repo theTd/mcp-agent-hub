@@ -210,6 +210,13 @@ class HubDatabase:
                 "ALTER TABLE sessions ADD COLUMN turn_id TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN wait_handle TEXT DEFAULT ''",
                 "ALTER TABLE sessions ADD COLUMN context_window_json TEXT",
+                # Engine-error turns: the current turn's completion evidence and its ended-turn
+                # outcome, so a closed member's wait state is read, never inferred from an answer
+                # D2 keeps across turns (finding: a member that answered turn 1 and died mid-turn
+                # read as done with the old answer).
+                "ALTER TABLE sessions ADD COLUMN completion_reported INTEGER",
+                "ALTER TABLE sessions ADD COLUMN last_turn_outcome TEXT",
+                "ALTER TABLE sessions ADD COLUMN last_turn_error_json TEXT",
                 # Transcript feed: structured tool fields (tool, call id, input, output, ok) of an event.
                 "ALTER TABLE worker_events ADD COLUMN data_json TEXT",
             ):
@@ -282,6 +289,17 @@ class HubDatabase:
             "resumable": arc.get("resumable"),
             "resume_block_reason": arc.get("resume_block_reason"),
             "context_window_json": arc.get("context_window_json"),
+            # Per-turn state is always known by the live record (`to_dict`), so a plain overwrite
+            # is right: begin_new_turn clearing the field must beat the previous turn's row.
+            "completion_reported": (
+                None if s_dict.get("completion_reported") is None
+                else (1 if s_dict.get("completion_reported") else 0)
+            ),
+            "last_turn_outcome": s_dict.get("last_turn_outcome") or "",
+            "last_turn_error_json": (
+                json.dumps(s_dict["last_turn_error"], ensure_ascii=False)
+                if isinstance(s_dict.get("last_turn_error"), dict) else ""
+            ),
         }
         columns = list(values.keys())
         placeholders = ", ".join(f":{c}" for c in columns)
@@ -437,6 +455,9 @@ class HubDatabase:
             d["conversation_ref"] = self._decode_json_column(d.pop("conversation_ref", None), None)
             d["parent_messages"] = self._decode_json_column(d.pop("parent_messages", None), [])
             d["context_window"] = self._decode_json_column(d.pop("context_window_json", None), None)
+            d["last_turn_error"] = self._decode_json_column(d.pop("last_turn_error_json", None), None)
+            raw_reported = d.pop("completion_reported", None)
+            d["completion_reported"] = None if raw_reported is None else bool(raw_reported)
             d.pop("scrollback", None)
             d["archived"] = bool(d.get("archived_at"))
             return d
@@ -521,7 +542,8 @@ class HubDatabase:
                        created_at, updated_at, ended_at, exit_code, step_count,
                        current_activity, last_task, engine, effective_model, effective_thinking_level,
                        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
-                       final_response_source
+                       final_response_source, completion_reported, last_turn_outcome,
+                       last_turn_error_json
                 FROM sessions
                 {where}
                 ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
@@ -529,7 +551,19 @@ class HubDatabase:
                 """,
                 (limit,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            result = []
+            for row in rows:
+                item = dict(row)
+                # Same decoding as get_session_record: compact rows name an ended turn's error
+                # with its stored kind, not a kind inferred from the answer text.
+                item["last_turn_error"] = self._decode_json_column(
+                    item.pop("last_turn_error_json", None), None)
+                item["completion_reported"] = (
+                    None if item.get("completion_reported") is None
+                    else bool(item["completion_reported"])
+                )
+                result.append(item)
+            return result
 
     # ---- Archive & resume storage (spec archive-spec.md §3, §6) ----------------------------
 

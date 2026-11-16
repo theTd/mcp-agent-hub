@@ -410,8 +410,10 @@ class WaitInbox:
                     state = {**state, "errors": [{"message": state.get("error") or "wait failed"}]}
                 if state.get("state") == "done":
                     results = [with_wait_outcome(item) for item in (state.get("results") or [])]
+                    # A group has no single answer (the provider's value is None); keep it as the
+                    # provider state had it instead of turning it into an empty string.
                     return {**state, **self._done_payload(
-                        state.get("result_id"), state.get("final_response") or "", results
+                        state.get("result_id"), state.get("final_response"), results
                     )}
                 return state
         return {"state": "waiting", "wait_handle": handle}

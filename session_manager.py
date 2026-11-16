@@ -400,12 +400,19 @@ def parent_interaction_view(interaction: Optional[Dict[str, Any]]) -> Optional[D
 def parent_turn_outcome_fields(record: Dict[str, Any]) -> Dict[str, Any]:
     """turn_outcome / turn_error for a status, collect or list reply (empty for a normal answer).
 
-    A live session keeps the ended turn's outcome (`last_turn_outcome`); a stored record only
-    keeps the final response and its source, and an engine error always wrote that source, so an
-    archived error turn is still named as one (its kind is not stored).
+    A live session keeps the ended turn's outcome (`last_turn_outcome`); a *row stored before that
+    state was persisted* (`completion_reported` NULL) only keeps the final response and its source,
+    and an engine error always wrote that source, so such an archived error turn is still named as
+    one (its kind is not stored). Every live `to_dict` and every row written now carries a bool:
+    a follow-up that ends with an empty turn_completed reports completion under the previous
+    turn's answer and its source (D2), and must not read as that answer's engine error.
     """
     outcome = str(record.get("last_turn_outcome") or "")
-    if outcome not in ("error", "aborted") and record.get("final_response_source") == "engine_error":
+    if (
+        outcome not in ("error", "aborted")
+        and record.get("final_response_source") == "engine_error"
+        and record.get("completion_reported") is None
+    ):
         outcome, record = "error", {**record, "last_turn_error": None}
     if outcome not in ("error", "aborted"):
         return {}
@@ -2511,6 +2518,12 @@ class AgentSession:
         # codex: a continuous "Reconnecting..." status line while the turn is running (see
         # _watch_codex_network_stall): {"since", "detail", "info", "escalated_at"}.
         self._codex_reconnect: Optional[Dict[str, Any]] = None
+        # A one-shot engine error whose turn end was refused (an interaction awaited the parent):
+        # (engine_label, info, extra_data). The record is already consumed, so the screen poll
+        # retries it; begin_new_turn and every turn end clear it (see _end_or_hold_engine_error).
+        self._pending_engine_error: Optional[
+            Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]
+        ] = None
         # A10: the real outcome of typing a startup/resume text into the TUI (never guessed).
         # K8 (fix 9d): every record set here is also kept in recent_injections (see the property).
         self._recent_injections: List[Dict[str, Any]] = []
@@ -3341,6 +3354,9 @@ class AgentSession:
             # None for an ordinary answer; "error" / "aborted" for a turn that ended without one.
             "last_turn_outcome": self.last_turn_outcome,
             "last_turn_error": self.last_turn_error,
+            # Stored with the row so a closed member's wait state reads this turn's evidence
+            # instead of inferring it from an answer that D2 keeps across turns.
+            "completion_reported": bool(self.completion_reported),
             # D2: true while the answer above still belongs to the turn before the current one.
             "from_previous_turn": self.final_response_from_previous_turn,
             "files_changed": self.files_changed,
@@ -3769,21 +3785,25 @@ class HubSessionManager:
                     **self._session_turn_outcome(sess),
                 })
             else:
-                rec = await self.db.get_session_record(sid)
-                final_response = (rec or {}).get("final_response")
-                outcome = (
-                    "error" if (rec or {}).get("final_response_source") == "engine_error" else "answered"
-                )
+                rec = await self.db.get_session_record(sid) or {}
+                status = rec.get("status", "unknown")
+                final_response = rec.get("final_response")
+                reported = rec.get("completion_reported")
+                if reported is None:
+                    # A row written before per-turn state was stored: master's rule, where only a
+                    # clean exit with an answer was settled; crashed/terminated/interrupted failed.
+                    reported = status in ("completed", "exited") and bool(final_response)
                 state = {
                     "session_id": sid,
-                    "status": (rec or {}).get("status", "unknown"),
-                    "turn_id": (rec or {}).get("turn_id"),
+                    "status": status,
+                    "turn_id": rec.get("turn_id"),
                     "final_response": final_response,
-                    "completion_reported": bool(final_response),
-                    "outcome": outcome,
+                    "completion_reported": bool(reported),
                 }
-                if outcome == "error":
-                    state["error"] = {"kind": "other", "retryable": False, "message": str(final_response or "")}
+                outcome_fields = parent_turn_outcome_fields(rec)
+                state["outcome"] = str(outcome_fields.get("turn_outcome") or "answered")
+                if isinstance(outcome_fields.get("turn_error"), dict):
+                    state["error"] = outcome_fields["turn_error"]
                 states.append(state)
         if pending:
             return {"state": "ask", "requests": pending, "result_id": pending[0].get("request_id")}
@@ -7980,6 +8000,10 @@ class HubSessionManager:
         ev_type = payload.get("type", "message")
         content = (payload.get("content") or "").strip()
         if sess:
+            if ev_type == "turn_completed":
+                # Any turn end closes a held one-shot error: it may never end a later turn, and a
+                # turn that already ended must not be ended a second time.
+                sess._pending_engine_error = None
             if ev_type == "turn_completed" and getattr(sess, "_turn_completion_emitted", False):
                 if content:
                     sess.set_final_response(content, "turn_completed")
@@ -9417,6 +9441,7 @@ class HubSessionManager:
         session.completion_reported = False
         session.last_turn_outcome = None
         session.last_turn_error = None
+        session._pending_engine_error = None
         session._codex_reconnect = None
         session._seen_tui_prompt_signatures.clear()
         # Everything already in the transcript belongs to the turn that just ended; the turn-end
@@ -9658,6 +9683,8 @@ class HubSessionManager:
             return
         sess.status = turn_before["status"]
         sess.completion_reported = bool(turn_before["completion_reported"])
+        sess.last_turn_outcome = turn_before.get("last_turn_outcome")
+        sess.last_turn_error = turn_before.get("last_turn_error")
         sess._turn_completion_emitted = bool(turn_before["turn_completion_emitted"])
         sess.final_response_from_previous_turn = bool(turn_before["from_previous_turn"])
 
@@ -9697,6 +9724,8 @@ class HubSessionManager:
             {
                 "status": sess.status,
                 "completion_reported": sess.completion_reported,
+                "last_turn_outcome": sess.last_turn_outcome,
+                "last_turn_error": sess.last_turn_error,
                 "turn_completion_emitted": getattr(sess, "_turn_completion_emitted", False),
                 "from_previous_turn": sess.final_response_from_previous_turn,
             }
@@ -10069,11 +10098,12 @@ class HubSessionManager:
 
     async def _end_aborted_codex_turn(
         self, session: AgentSession, reason: str, feedback_missing: bool = False
-    ) -> None:
+    ) -> bool:
         """An aborted codex turn is over: Codex is idle at its prompt with no answer for this turn.
 
         It ends the way task_complete does (turn_completed, so the parent's wait URL returns done),
-        with data.outcome "aborted" and a final response that says so, not an answer.
+        with data.outcome "aborted" and a final response that says so, not an answer. Returns
+        whether the turn is over; a declining error end keeps the stall state for a later pass.
         """
         missing = "the deny's feedback never reached Codex; " if feedback_missing else ""
         stall = getattr(session, "_codex_reconnect", None)
@@ -10081,12 +10111,13 @@ class HubSessionManager:
             # The hub's own Esc ended a network stall: the turn did not end on the user's abort,
             # it ended because the engine never got through. Data says who interrupted it.
             info = stall.get("info") if isinstance(stall.get("info"), dict) else None
-            session._codex_reconnect = None
-            await self._end_engine_error_turn(
+            if not await self._end_engine_error_turn(
                 session, "codex", info or classify_engine_error("connection failed while reconnecting"),
                 {"interrupted_by_hub": True},
-            )
-            return
+            ):
+                return False
+            session._codex_reconnect = None
+            return True
         if session.status == "waiting_parent" and session.pending_interaction is None:
             session.status = "running"  # so the turn end below can mark it completed
         await self.record_worker_event(
@@ -10104,6 +10135,7 @@ class HubSessionManager:
         )
         session.current_activity = f"Turn aborted ({reason}) — idle at prompt"
         await self.persist_session(session)
+        return True
 
     async def _watch_codex_rollout(self, session: AgentSession, root: Optional[Path] = None):
         """Live tails the Codex rollout jsonl files for a spawned Codex session.
@@ -10357,14 +10389,25 @@ class HubSessionManager:
                                 err_info = error.get("codex_error_info")
                             else:
                                 err_message, err_info = str(error), None
+                            # Real shape: {"response_too_many_failed_attempts": {"http_status_code": 429}}.
+                            # The status sits in the nested variant object, never on the outer dict, so
+                            # reading only the outer key left the retry-limit hint unused.
+                            err_status = None
+                            if isinstance(err_info, dict):
+                                err_status = err_info.get("http_status_code") or next(
+                                    (
+                                        value.get("http_status_code")
+                                        for value in err_info.values()
+                                        if isinstance(value, dict) and value.get("http_status_code")
+                                    ),
+                                    None,
+                                )
                             info = classify_engine_error(
                                 err_message,
                                 code=err_info if isinstance(err_info, str) else None,
-                                http_status=(
-                                    err_info.get("http_status_code") if isinstance(err_info, dict) else None
-                                ),
+                                http_status=err_status,
                             )
-                            await self._end_engine_error_turn(
+                            await self._end_or_hold_engine_error(
                                 session, "codex", info,
                                 {"partial_response": str(last_msg)} if last_msg else None,
                             )
@@ -10839,12 +10882,18 @@ class HubSessionManager:
                                 session._native_turn_end_offset = record_end
                     applying = None
                 if error_hold is not None and time.monotonic() - error_hold[1] >= OMP_ERROR_TURN_END_SEC:
-                    info, _since = error_hold
-                    error_hold = None
+                    info = error_hold[0]
                     # Claim every row read so far: the sweep and the next turn treat this error
-                    # as the end of the current turn, not as an answer to complete twice.
-                    session._native_turn_end_offset = offset
-                    await self._end_engine_error_turn(session, "omp", info)
+                    # as the end of the current turn, not as an answer to complete twice. Only
+                    # once the turn really ends: an interaction awaiting the parent declines the
+                    # end, and claiming past the row would lose it for the rest of the session.
+                    if await self._end_engine_error_turn(session, "omp", info):
+                        session._native_turn_end_offset = offset
+                        error_hold = None
+                    else:
+                        # Restart the window: the engine's retry record gets its full time from
+                        # the moment the parent answers the interaction, not from the first row.
+                        error_hold = (info, time.monotonic())
             except PersistenceRecordTooLarge as exc:
                 # An unstorable record is skipped; the batch's remaining records are still read
                 # on the next pass instead of being thrown away with it.
@@ -10968,13 +11017,17 @@ class HubSessionManager:
                         age = 0.0
                     if age < OMP_ERROR_TURN_END_SEC:
                         continue
+                if error_info is not None:
+                    # Only a turn that really ended is claimed: declining to end it (an
+                    # interaction is pending) keeps the row for the next pass instead of losing it.
+                    if await self._end_engine_error_turn(session, "omp", error_info):
+                        session._native_turn_end_offset = end
+                        session._inflight_transcript_tool = None
+                        completed += 1
+                    continue
                 # Claim the row first: the watcher or a second sweep pass must not emit it again.
                 session._native_turn_end_offset = end
                 session._inflight_transcript_tool = None
-                if error_info is not None:
-                    await self._end_engine_error_turn(session, "omp", error_info)
-                    completed += 1
-                    continue
                 await self.record_worker_event(
                     session.session_id,
                     {
@@ -11248,7 +11301,7 @@ class HubSessionManager:
                             if isinstance(error.get("retryable"), bool):
                                 # The engine's own judgement wins over the kind's default.
                                 info["retryable"] = error["retryable"]
-                            await self._end_engine_error_turn(session, "kimi", info)
+                            await self._end_or_hold_engine_error(session, "kimi", info)
                             continue
                         if latest_assistant_text:
                             if not turn_has_step:
@@ -11685,8 +11738,10 @@ class HubSessionManager:
                             )
                 if error_tail is not None and time.monotonic() - error_tail[1] >= AGY_ERROR_TURN_END_SEC:
                     err_txt = error_tail[0]
-                    error_tail = None
-                    await self._end_agy_error_turn(session, err_txt)
+                    # Keep the tail until the turn really ends: an interaction awaiting the parent
+                    # declines the end, and dropping the tail here would forget the error row.
+                    if await self._end_agy_error_turn(session, err_txt):
+                        error_tail = None
             except PersistenceRecordTooLarge as exc:
                 self._skip_unstorable_record(session, "AGY transcript watcher", exc)
             except PersistenceUnavailable:
@@ -11701,7 +11756,7 @@ class HubSessionManager:
         engine_label: str,
         info: Dict[str, Any],
         extra_data: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         """An engine's own failure ended the turn: mark it as an error, never as an answer.
 
         It ends the way a normal turn does (turn_completed, so the parent's wait URL returns done),
@@ -11709,9 +11764,13 @@ class HubSessionManager:
         final response's source is engine_error, the highest priority, so no screen, transcript
         summary or native row can replace it later — including on a terminate/archive write. A
         turn that is already over, or waits on the parent, is left alone.
+
+        Returns whether the turn really ended: a caller must not claim an offset past the error
+        row (or clear its own hold) when this returned False, or the row is lost and the turn
+        hangs once the parent answers the interaction.
         """
         if session.status not in ("starting", "running") or session.pending_interaction is not None:
-            return
+            return False
         kind = str(info.get("kind") or "other")
         message = str(info.get("message") or "")
         retryable = bool(info.get("retryable"))
@@ -11740,10 +11799,45 @@ class HubSessionManager:
         )
         session.current_activity = f"Turn ended on an engine error ({kind}) — idle at prompt: {message[:80]}"
         await self.persist_session(session)
+        return True
 
-    async def _end_agy_error_turn(self, session: AgentSession, error: str) -> None:
+    async def _end_agy_error_turn(self, session: AgentSession, error: str) -> bool:
         """agy gave up on a model call (its last row is an ERROR_MESSAGE) and is idle at its prompt."""
-        await self._end_engine_error_turn(session, "agy", classify_engine_error(error))
+        return await self._end_engine_error_turn(session, "agy", classify_engine_error(error))
+
+    async def _end_or_hold_engine_error(
+        self,
+        session: AgentSession,
+        engine_label: str,
+        info: Dict[str, Any],
+        extra_data: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """End the turn now, or hold the error for the screen poll when a prompt blocks the end.
+
+        A one-shot error record (codex `task_complete`, kimi `turn.ended failed`, claude
+        `isApiErrorMessage`) is consumed as it is read, so a refused end would otherwise leave the
+        turn running with nothing left to end it. The hold is cleared by begin_new_turn and by any
+        turn end (record_worker_event), so it can never end a later turn or end one twice.
+        """
+        if await self._end_engine_error_turn(session, engine_label, info, extra_data):
+            return True
+        session._pending_engine_error = (
+            engine_label,
+            dict(info),
+            dict(extra_data) if extra_data else None,
+        )
+        return False
+
+    async def _retry_pending_engine_error(self, session: AgentSession) -> bool:
+        """End a held one-shot engine error once the interaction that refused it is answered."""
+        held = session._pending_engine_error
+        if not held:
+            return False
+        engine_label, info, extra_data = held
+        if not await self._end_engine_error_turn(session, engine_label, info, extra_data):
+            return False
+        session._pending_engine_error = None
+        return True
 
     @staticmethod
     def _agy_conversation_is_durable(brain_dir: Path) -> bool:
@@ -12096,7 +12190,7 @@ class HubSessionManager:
                                 http_status=obj.get("apiErrorStatus"),
                             )
                             turn_completed_emitted = True
-                            await self._end_engine_error_turn(session, "claude", info)
+                            await self._end_or_hold_engine_error(session, "claude", info)
                             continue
                         stop_reason = msg.get("stop_reason")
                         think_dur_ms = obj.get("thinkingDurationMs")
@@ -14755,8 +14849,19 @@ class HubSessionManager:
             # After the Esc the status line usually disappears before turn_aborted is written, so
             # only the turn end (the watcher reads it) or this timeout may close the stall.
             if now - float(stall["escalated_at"]) >= CODEX_STALL_INTERRUPT_WAIT_SEC:
-                session._codex_reconnect = None
-                await self._end_engine_error_turn(
+                if self._codex_rollout_grew(session, stall):
+                    # Codex wrote again after the Esc, but growth is not a turn end (a retry or
+                    # token_count record proves nothing about the turn closing). Keep the stall
+                    # and restart its window so a later window can still end the turn; its own
+                    # answer or a turn_aborted clears it as before.
+                    stall["since"] = now
+                    stall["escalated_at"] = 0.0
+                    session.current_activity = (
+                        f"Reconnecting — {stall.get('detail') or 'waiting for the network'}"
+                    )
+                    await self.persist_session(session)
+                    return
+                if await self._end_engine_error_turn(
                     session,
                     "codex",
                     stall.get("info") or classify_engine_error("connection failed while reconnecting"),
@@ -14764,7 +14869,8 @@ class HubSessionManager:
                         "interrupted_by_hub": True,
                         "stall_seconds": round(now - float(stall.get("since") or now), 1),
                     },
-                )
+                ):
+                    session._codex_reconnect = None
             return
         detail = codex_reconnect_detail(screen_text)
         if detail is None:
@@ -14797,12 +14903,42 @@ class HubSessionManager:
         if session.pending_interaction is not None:
             # An approval or question is the parent's to answer; never type Esc over it.
             return
+        if session.tui_writer.busy():
+            # The writer is typing a parent message; `write_input` bypasses its queue, so an Esc
+            # now could land inside that message. Retry on the next poll.
+            return
+        if not session.write_input("\x1b"):
+            # The core refused the key (queue full, "input not delivered"): the engine never got
+            # the interrupt, so escalating would blame it for a timeout it cannot answer.
+            return
         stall["escalated_at"] = now
+        # What the rollout held when the Esc went in: bytes written since mean Codex recovered.
+        stall["rollout_size"] = self._codex_rollout_size(session)
         session.current_activity = (
             f"Reconnecting for {int(now - float(stall.get('since') or now))}s — interrupting the turn"
         )
-        session.write_input("\x1b")
         await self.persist_session(session)
+
+    @staticmethod
+    def _codex_rollout_size(session: AgentSession) -> Optional[int]:
+        """Byte size of the rollout this turn writes, or None when there is no file yet."""
+        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
+        path = str(ref.get("rollout_path") or "")
+        if not path:
+            return None
+        try:
+            return Path(path).stat().st_size
+        except OSError:
+            return None
+
+    @classmethod
+    def _codex_rollout_grew(cls, session: AgentSession, stall: Dict[str, Any]) -> bool:
+        """True when the rollout gained bytes since the Esc went in: Codex is writing again."""
+        now_size = cls._codex_rollout_size(session)
+        if now_size is None:
+            return False
+        before = stall.get("rollout_size")
+        return before is None or now_size > int(before)
 
     async def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Synchronously checks a live TUI session's hooks/transcript/screen once for approval or multi-choice prompts."""
@@ -14815,6 +14951,9 @@ class HubSessionManager:
             await self._drain_kimi_wire_interactions_once(session)
         elif eng == "omp":
             await self._drain_omp_approval_events(session)
+        if await self._retry_pending_engine_error(session):
+            # The held one-shot error was this turn's end; there is nothing left to report.
+            return None
         if session.pending_interaction is not None:
             return session.pending_interaction
         # D7: an answered prompt can stay on screen for a moment; it is not a new one.
