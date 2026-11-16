@@ -1,16 +1,19 @@
-// Session list in the sidebar plus the terminal / web GUI / desktop panes in the workspace.
+// Session list in the sidebar plus the terminal / web GUI panes in the workspace.
 import { hubApi } from './hub-api.js';
 import { state, on, emit, setActiveSession, removeSession, upsertSession } from './console-state.js';
 import {
   $, $$, escapeHtml, icon, formatDuration, shortPath, toast, confirmDialog, setBusy,
-  openModal, closeModal, registerModal, copyText, firstLine, formatWhen,
+  openModal, closeModal, registerModal, copyText, formatWhen,
 } from './ui-kit.js';
-import { statusLabel, statusTone, activityLabel, endReasonLabel } from './session-status-text.js';
+import { statusLabel, statusTone, endReasonLabel } from './session-status-text.js';
+import {
+  isLive, engineKey, profileLabel, sessionTitle, formatRuntimeHms, cwdBase, modelLine,
+  bypassBadgeHtml, activityText, idleText, pendingQuestionText,
+} from './session-card-fields.js';
 import { createTranscriptView, createTranscriptUiState } from './transcript-view.js';
 
 const HISTORY_MODAL = 'historyModal';
 const ARCHIVE_PAGE_SIZE = 50;
-const LIVE_STATUSES = new Set(['starting', 'running', 'waiting_parent']);
 const QUICK_KEYS = {
   enter: { text: '\r', label: '⏎', title: '发送 Enter' },
   yes: { text: 'y\r', label: 'y⏎', title: '发送 y + Enter（确认）' },
@@ -178,6 +181,14 @@ export function initSessionWorkspace() {
   on('layout:changed', renderWorkspace);
   on('layout:resized', scheduleFitAll);
   on('session:open', openSessionOrHistory);
+  // The session board (会话总览) asks through the bus; it never reaches into the panes itself.
+  on('session:close-request', (id) => closeSession(id));
+  on('session:focus-request', onFocusRequest);
+  on('board:changed', (open) => {
+    if (open) return;
+    scheduleFitAll(); // the panes were hidden under the board: their terminals need a fit
+    refreshVisibleTranscripts();
+  });
   on('history:open', openHistoryRecord);
   window.addEventListener('resize', scheduleFitAll);
   window.addEventListener('focus', scheduleFitAll);
@@ -218,85 +229,10 @@ function renderAll() {
 }
 
 // ---------------------------------------------------------- session shapes
-const isLive = (s) => (typeof s.process_alive === 'boolean' ? s.process_alive : LIVE_STATUSES.has(s.status));
-const engineKey = (s) => s.engine || s.kind || 'tui';
 // A DSH session started through the Harness job/message API has no terminal of its own: the Hub
 // reads its native session record, so the console shows the transcript only. (A legacy `web_gui`
 // DSH profile runs `dsh headless` in a real terminal and keeps the 记录 / TUI switch.)
 const isTranscriptOnly = (s) => String(s?.engine || '').toLowerCase() === 'dsh' && s?.kind !== 'web_gui';
-const profileLabel = (s) => s.profile_name || s.profile_id || '会话';
-
-const LEGACY_TITLE_ID_SUFFIX_RE = /\s*\([a-z0-9_-]+-[0-9a-f]{6,}\)\s*$/i;
-
-function summarizeTaskForTitle(taskText, maxLen = 24) {
-  if (!taskText) return '';
-  let text = String(taskText).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  text = text.replace(/\[Sub-Agent Bridge Info[\s\S]*$/i, '').trim();
-  text = text.replace(/\s*\[Hub Session: session_id=[^\]]+\]/g, '').trim();
-  const readExec = text.match(/^Read\s+(?:["'`]?[A-Za-z]:[\\/][^\s"'`]+["'`]?|["'`]?[^\s"'`:]+["'`]?)(?:\s+whole)?\s+and\s+(?:execute|run|implement|verify|fix|complete)\b\s*[:：]?\s*([\s\S]*)$/i);
-  if (readExec) {
-    const rest = (readExec[1] || '').trim();
-    const quoted = rest.match(/^["'“”‘’《》]([^"'“”‘’《》\n]{2,36})["'“”‘’《》]/);
-    if (quoted) {
-      const q = quoted[1].trim();
-      return q.length > maxLen ? `${q.slice(0, maxLen - 1).trimEnd()}…` : q;
-    }
-    if (rest) text = rest;
-    else {
-      const m = text.match(/([^\s\\/]+)\.(?:md|txt|json|py|js|ts)/i);
-      text = m ? `执行 ${m[1]}` : '执行任务文档';
-    }
-  }
-  const candidates = [];
-  for (const rawLine of text.split('\n')) {
-    let line = rawLine.trim().replace(/^[#*>\-\d.)\s`]+/, '').trim();
-    if (!line || line.startsWith('```')) continue;
-    line = line.replace(/["'`]?(?:[A-Za-z]:[\\/]|\/[A-Za-z0-9._-]+\/)[^\s"'`，,。；;)]+["'`]?/g, '').trim();
-    line = line.replace(/^(?:请你|请帮我|帮我|麻烦你|麻烦|请先|现在请|请|你需要|需要你|任务[:：]|目标[:：]|背景[:：])\s*/g, '').trim();
-    if (line) candidates.push(line);
-  }
-  if (!candidates.length) return '';
-  const first = candidates[0];
-  const clauses = first.split(/[。！？!?；;\n]|，|,\s+/).map((c) => c.trim()).filter(Boolean);
-  let chosen = clauses[0] || first;
-  if (chosen.length < 4 && clauses.length > 1) {
-    chosen = `${chosen} ${clauses[1]}`.trim();
-  }
-  chosen = chosen.replace(/\s+/g, ' ').replace(/^[:：,，.。;；\-—\s]+|[:：,，.。;；\-—\s]+$/g, '');
-  if (!chosen) return '';
-  return chosen.length > maxLen ? `${chosen.slice(0, maxLen - 1).trimEnd()}…` : chosen;
-}
-
-export function sessionTitle(s) {
-  const label = profileLabel(s);
-  const rawTitle = firstLine(s.title);
-  if (rawTitle && !LEGACY_TITLE_ID_SUFFIX_RE.test(rawTitle) && rawTitle !== s.session_id) {
-    if (rawTitle === label) {
-      const taskSummary = summarizeTaskForTitle(s.last_task);
-      return `${label} · ${taskSummary || '交互会话'}`;
-    }
-    if (rawTitle.startsWith(`${label} · `) || rawTitle.startsWith(`${label} - `) || rawTitle.startsWith(`${label}:`)) {
-      return rawTitle;
-    }
-    return `${label} · ${rawTitle}`;
-  }
-  const taskSummary = summarizeTaskForTitle(s.last_task);
-  return `${label} · ${taskSummary || '交互会话'}`;
-}
-
-function formatRuntimeHms(s) {
-  const created = Number(s?.created_at);
-  if (!Number.isFinite(created) || created <= 0) return '00:00:00';
-  const live = isLive(s);
-  const endTs = live
-    ? Date.now() / 1000
-    : Number(s?.ended_at || s?.last_output_at || s?.archived_at || Date.now() / 1000);
-  const elapsed = Math.max(0, Math.floor(endTs - created));
-  const hh = Math.floor(elapsed / 3600);
-  const mm = Math.floor((elapsed % 3600) / 60);
-  const ss = elapsed % 60;
-  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
-}
 
 function tickSessionDurations() {
   if (sessionsMode !== 'live' || document.hidden) return;
@@ -306,11 +242,6 @@ function tickSessionDurations() {
     const durEl = card.el.querySelector('[data-ref="duration"]');
     if (durEl) durEl.textContent = formatRuntimeHms(s);
   }
-}
-
-function cwdBase(cwd) {
-  const parts = String(cwd || '').split(/[\\/]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : '';
 }
 
 function orderedSessions() {
@@ -349,10 +280,6 @@ async function loadArchive(reset = true, { quiet = false } = {}) {
   } finally {
     if (seq === archiveReqSeq) archiveLoading = false;
   }
-}
-
-function modelLine(s) {
-  return [s.effective_model, s.effective_thinking_level].filter(Boolean).join(' · ');
 }
 
 // ------------------------------------------------------------- session list
@@ -430,13 +357,6 @@ function pathMetaHtml(s) {
   return bits.join('<span class="dot-sep"></span>');
 }
 
-/** Round 2: a session launched with the profile's bypass_approvals on (no high-risk approval). */
-function bypassBadgeHtml(s) {
-  return s.high_risk_approval === false
-    ? '<span class="approval-off-badge" title="该 Profile 打开了 bypass_approvals：高风险操作不会暂停等待审批">全自动</span>'
-    : '';
-}
-
 function sessionCardHtml(s) {
   const live = isLive(s);
   const path = pathMetaHtml(s);
@@ -456,15 +376,6 @@ function sessionCardHtml(s) {
       <span data-ref="idle"></span>
     </div>
     ${path ? `<div class="sc-meta sc-meta-sub">${path}</div>` : ''}`;
-}
-
-function activityText(s) {
-  return activityLabel(s.current_activity);
-}
-
-function idleText(s) {
-  if (isLive(s)) return `空闲 ${formatDuration(s.idle_seconds)}`;
-  return s.exit_code !== null && s.exit_code !== undefined ? `退出码 ${s.exit_code}` : '';
 }
 
 function archiveSignature(entries) {
@@ -801,19 +712,6 @@ function updatePane(pane, s) {
   updateWaitingBanner(pane, s);
 }
 
-function pendingQuestionText(s) {
-  const interaction = s.pending_interaction;
-  let text = '';
-  if (typeof interaction === 'string') text = interaction;
-  else if (interaction && typeof interaction === 'object') {
-    text = interaction.question || interaction.text || interaction.prompt || interaction.title || '';
-    const options = Array.isArray(interaction.options) ? interaction.options.filter(Boolean) : [];
-    if (options.length) text += `\n选项：${options.map((opt, i) => `${i + 1}) ${opt}`).join('  ')}`;
-  }
-  text = String(text || '').trim();
-  return text || activityText(s);
-}
-
 function updateWaitingBanner(pane, s) {
   // In the transcript view the question sits in the transcript's own reply dock.
   const transcriptShown = (transcriptViews.get(s.session_id)?.mode || 'transcript') === 'transcript';
@@ -874,7 +772,8 @@ function applyPaneView(pane, sessionId) {
 }
 
 function refreshVisibleTranscripts() {
-  if (document.hidden) return;
+  // Nothing in the workspace is visible under the session board; its transcripts wait.
+  if (document.hidden || state.sessionListView === 'board') return;
   for (const session of visibleSessions()) {
     if ((transcriptViews.get(session.session_id)?.mode || 'transcript') === 'transcript') {
       refreshTranscript(session.session_id);
@@ -1230,6 +1129,30 @@ function flushFits() {
       for (const id of retryIds) scheduleFit(id);
     }, 60);
   }
+}
+
+/** The board opened a session: focus it, or its reply box when the tile's 去回复 was used. */
+function onFocusRequest({ id, reply } = {}) {
+  if (!id || id !== state.activeSessionId) return;
+  if (reply) focusReplyBox(id);
+  else focusActiveSession();
+}
+
+// A pane mounts and loads its transcript asynchronously, so the reply box may not exist yet.
+function focusReplyBox(id, triesLeft = 20) {
+  if (id !== state.activeSessionId) return;
+  const pane = panes.get(id);
+  const visible = (el) => el && !el.disabled && el.offsetParent !== null;
+  const reply = pane?.el.querySelector('[data-ref="reply"]');
+  const compose = pane?.el.querySelector('[data-ref="compose-input"]');
+  const input = visible(reply) ? reply : visible(compose) ? compose : null;
+  if (input) {
+    if (state.layoutMode === 'matrix') pane.el.scrollIntoView({ block: 'nearest' });
+    input.focus();
+    return;
+  }
+  if (triesLeft > 0) setTimeout(() => focusReplyBox(id, triesLeft - 1), 100);
+  else focusActiveSession(); // TUI view: there is no reply box, the terminal takes the answer
 }
 
 function focusActiveSession() {

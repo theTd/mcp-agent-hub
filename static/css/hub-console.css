@@ -1367,6 +1367,114 @@ body.is-resizing-sidebar * {
 .tool-row code { flex: 0 0 auto; max-width: 50%; font-size: 11px; white-space: normal; }
 .tool-row span { color: var(--text-2); font-size: 12px; line-height: 1.5; }
 
+/* ----------------------------------------------------------- session board */
+/* 会话总览 sits over the workspace; the pane grid stays mounted underneath, only hidden. */
+body.board-open #gridContainer { display: none; }
+.session-board { flex: 1; min-height: 0; display: flex; flex-direction: column; outline: none; }
+.session-board[hidden] { display: none; }
+.board-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1);
+}
+.board-title { display: inline-flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 600; }
+.board-chips {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-0);
+}
+.board-chips button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font: 500 12px var(--font-ui);
+  cursor: pointer;
+}
+.board-chips button:hover { color: var(--text-1); }
+.board-chips button[aria-pressed="true"] { background: var(--bg-4); color: var(--text-1); }
+.board-chips .count-badge { height: 16px; min-width: 16px; padding: 0 4px; font-size: 10.5px; line-height: 16px; }
+.board-search { flex: 0 1 320px; margin-left: auto; }
+.board-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 12px 14px 18px;
+}
+.board-group-title { margin: 0 0 8px; color: var(--text-3); font-size: 12px; font-weight: 600; }
+.board-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 8px; }
+.board-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.board-tile:hover { border-color: var(--line-3); background: var(--bg-2); }
+.board-tile:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+.board-tile.active { border-color: var(--accent-line); box-shadow: 0 0 0 1px var(--accent-line); }
+.board-tile[data-group="waiting"] { border-color: var(--warning); }
+.board-tile[data-group="ended"] { opacity: 0.85; }
+.bt-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.bt-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.bt-close { visibility: hidden; margin: -3px -4px -3px 0; }
+.board-tile:hover .bt-close, .board-tile:focus-within .bt-close { visibility: visible; }
+.board-tile p { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--text-2); overflow-wrap: anywhere; }
+.bt-task, .bt-answer, .bt-question p { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
+.bt-task { -webkit-line-clamp: 2; line-clamp: 2; }
+.bt-answer { -webkit-line-clamp: 3; line-clamp: 3; }
+.bt-activity { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bt-label { margin-right: 6px; color: var(--text-3); font-size: 11.5px; }
+.bt-question {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 9px;
+  border-radius: var(--r-sm);
+  background: var(--warning-soft);
+}
+.bt-question p { -webkit-line-clamp: 4; line-clamp: 4; color: var(--text-1); white-space: pre-line; }
+.bt-question .btn { align-self: flex-end; }
+.bt-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: auto;
+  padding-top: 2px;
+  overflow: hidden;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+/* Every field carries a 14px gutter with its "·" in it, and the row is pulled 14px left under
+   .bt-foot's clip: a field that starts a line (first, or wrapped) shows no dangling separator. */
+.bt-meta { display: flex; flex-wrap: wrap; align-items: center; row-gap: 2px; min-width: 0; margin-left: -14px; }
+.bt-meta > * { position: relative; padding-left: 14px; }
+.bt-meta > .bt-sep::before { content: "·"; position: absolute; left: 5px; color: var(--line-3); }
+.bt-meta > .sc-meta-duration { flex-basis: auto; width: auto; min-width: calc(8ch + 14px); }
+.bt-model, .bt-folder { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bt-folder { display: inline-flex; align-items: center; gap: 3px; max-width: calc(16ch + 14px); }
+.board-empty { padding: 48px 12px; color: var(--text-3); font-size: 13px; text-align: center; }
+
 /* ------------------------------------------------------------- responsive */
 @media (max-width: 1360px) {
   .brand-sub { display: none; }

@@ -39,6 +39,8 @@ static/js/hub-console.js
 static/js/markdown-lite.js
 static/js/profile-manager.js
 static/js/routing-guide.js
+static/js/session-board.js
+static/js/session-card-fields.js
 static/js/session-launcher.js
 static/js/session-status-text.js
 static/js/session-workspace.js

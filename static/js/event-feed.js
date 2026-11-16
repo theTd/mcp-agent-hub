@@ -2,7 +2,7 @@
 import { state, prefs, savePrefs, on, emit, setActiveSession } from './console-state.js';
 import { $, escapeHtml, formatClock } from './ui-kit.js';
 import { activityLabel, eventTypeLabel, eventTypeTone, isLifecycleSentence } from './session-status-text.js';
-import { sessionTitle } from './session-workspace.js';
+import { sessionTitle } from './session-card-fields.js';
 
 const MAX_EVENTS = 30;
 

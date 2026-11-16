@@ -166,6 +166,10 @@
         <div class="section-head">
           <h2 class="section-title" id="sessionsTitle">会话</h2>
           <span class="section-meta grow" id="sessionSummary" style="text-align:right"></span>
+          <button type="button" class="icon-btn sm" data-cmd="toggle-session-board" aria-pressed="false"
+            title="会话总览：在工作区里用卡片平铺全部会话（Esc 关闭）" aria-label="会话总览">
+            <svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg>
+          </button>
           <button class="icon-btn sm" data-cmd="refresh-sessions" title="立即刷新会话列表" aria-label="刷新会话列表">
             <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
           </button>
@@ -194,6 +198,23 @@
     <main class="workspace">
       <div class="conn-banner" id="connBanner" role="status" aria-live="polite" hidden></div>
       <div id="gridContainer" class="grid grid-single"></div>
+      <section class="session-board" id="sessionBoard" tabindex="-1" aria-labelledby="sessionBoardTitle" hidden>
+        <header class="board-head">
+          <h2 class="board-title" id="sessionBoardTitle">
+            <svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg>会话总览
+          </h2>
+          <div class="board-chips" id="sessionBoardChips" role="group" aria-label="按状态筛选"></div>
+          <label class="search-input board-search">
+            <svg class="icon icon-sm" aria-hidden="true"><use href="#i-search"></use></svg>
+            <input id="sessionBoardFilter" type="search" placeholder="按标题、引擎、模型、目录或任务筛选"
+              aria-label="筛选会话" spellcheck="false" autocomplete="off" />
+          </label>
+          <button type="button" class="icon-btn" data-cmd="close-session-board" title="关闭会话总览 (Esc)" aria-label="关闭会话总览">
+            <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+          </button>
+        </header>
+        <div class="board-body" id="sessionBoardBody"></div>
+      </section>
     </main>
   </div>
 
