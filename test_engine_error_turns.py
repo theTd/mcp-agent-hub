@@ -198,191 +198,68 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
                          "half an answer")
         self.assertNotEqual(sess.final_response, "half an answer")
 
-    async def test_codex_reconnect_stall_escalates_and_turn_aborted_names_the_error(self):
-        sess, path, task = await self.codex_rollout("-stall")
-        try:
-            stalled_screen = (
-                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
-                "  └ Connection failed: error sending request\n"
-                "  └ Tip: Use /keymap to configure keyboard shortcuts.\n"
-                "› "
-            )
-            self.fake.sessions[sess.session_id].screen_text = stalled_screen
-            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.3):
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertEqual(sess.current_activity, "Reconnecting — Connection failed: error sending request")
-                self.assertEqual(len(self.events(sess.session_id, "error")), 1)
-                await asyncio.sleep(0.08)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertIn("\x1b", self.fake.inputs_of(sess.session_id))
-                # The interruption made the status line disappear; only turn_aborted (or the
-                # timeout) may end the stall now.
-                self.fake.sessions[sess.session_id].screen_text = "> "
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.append(path, {"type": "event_msg", "payload": {
-                    "type": "turn_aborted", "reason": "interrupted"}})
-                await self.until(lambda: sess.status == "completed")
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(sess.last_turn_outcome, "error")
-        self.assertEqual(sess.last_turn_error["kind"], "network")
-        done = self.events(sess.session_id, "turn_completed")
-        self.assertEqual((len(done), done[0]["data"]["interrupted_by_hub"]), (1, True))
-        self.assertTrue(sess.final_response.startswith(
-            "codex turn ended on an engine error (network): Connection failed"))
-
-    async def test_codex_stall_without_turn_aborted_ends_after_the_wait(self):
-        sess = self.session("codex", "-stall-timeout")
-        self.fake.sessions[sess.session_id].screen_text = (
-            "• Reconnecting... 2/5\n  └ Connection failed: error sending request\n"
-        )
-        with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-             patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
-            await self.hub.poll_tui_screen_interactions_once(sess)
-            await asyncio.sleep(0.08)
-            await self.hub.poll_tui_screen_interactions_once(sess)
-            self.assertIn("\x1b", self.fake.inputs_of(sess.session_id))
-            await asyncio.sleep(0.2)
-            await self.hub.poll_tui_screen_interactions_once(sess)
-        self.assertEqual(sess.status, "completed")
-        self.assertEqual(sess.last_turn_outcome, "error")
-        self.assertEqual(self.events(sess.session_id, "turn_completed")[0]["data"]["interrupted_by_hub"], True)
-
-    async def test_codex_stall_that_clears_before_the_threshold_sends_nothing(self):
-        sess = self.session("codex", "-stall-cleared")
-        self.fake.sessions[sess.session_id].screen_text = (
-            "• Reconnecting... waiting for network (4s • esc to interrupt)\n"
-            "  └ Connection failed: error sending request\n"
-        )
-        with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05):
-            await self.hub.poll_tui_screen_interactions_once(sess)
-            self.assertIsNotNone(sess._codex_reconnect)
-            self.fake.sessions[sess.session_id].screen_text = "› Ask Codex to do anything\n"
-            await self.hub.poll_tui_screen_interactions_once(sess)
-            await asyncio.sleep(0.08)
-            await self.hub.poll_tui_screen_interactions_once(sess)
-        self.assertIsNone(sess._codex_reconnect)
-        self.assertEqual(self.fake.inputs_of(sess.session_id), [])
-        self.assertEqual(sess.status, "running")
-
-    async def test_a_lost_esc_never_escalates_the_stall(self):
-        # Finding 3: the core refused the key ("input not delivered"). No escalation and no turn
-        # end may follow: the engine never got the interrupt.
-        sess = self.session("codex", "-lost-esc")
+    async def test_codex_reconnecting_is_shown_once_and_never_interrupted(self):
+        # Owner decision 2026-11-16 (item codex_network_stall): the status line is evidence for
+        # the parent, never a reason for the hub to type Esc into the turn.
+        sess = self.session("codex", "-stall-show")
         self.fake.sessions[sess.session_id].screen_text = (
             "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
             "  └ Connection failed: error sending request\n"
+            "  └ Tip: Use /keymap to configure keyboard shortcuts.\n"
+            "› "
         )
-        with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-             patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15), \
-             patch.object(sess, "write_input", return_value=False):
+        for _ in range(6):
             await self.hub.poll_tui_screen_interactions_once(sess)
-            await asyncio.sleep(0.08)
-            await self.hub.poll_tui_screen_interactions_once(sess)
-            await asyncio.sleep(0.2)
-            await self.hub.poll_tui_screen_interactions_once(sess)
-        self.assertIsNotNone(sess._codex_reconnect)
-        self.assertFalse(sess._codex_reconnect["escalated_at"])
+            await asyncio.sleep(0.05)
+        self.assertEqual(sess.current_activity, "Reconnecting — Connection failed: error sending request")
+        errors = self.events(sess.session_id, "error")
+        self.assertEqual([(e["category"], e["content"]) for e in errors],
+                         [("progress", "Connection failed: error sending request")])
+        self.assertEqual(self.fake.inputs_of(sess.session_id), [])
         self.assertEqual(sess.status, "running")
         self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
 
-    async def test_the_stall_never_types_esc_over_a_parent_message(self):
-        # Nit 6: write_input bypasses the TUI writer queue, so an Esc while a parent message is
-        # being typed could land inside it.
-        sess = self.session("codex", "-writer-busy")
-        self.fake.sessions[sess.session_id].screen_text = (
-            "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
-            "  └ Connection failed: error sending request\n"
-        )
-        claim = sess.tui_writer.claim("live_message")
+    async def test_codex_reconnecting_line_clears_and_a_new_appearance_is_a_new_episode(self):
+        sess = self.session("codex", "-stall-episodes")
+        numbered = "• Reconnecting... 2/5\n  └ Connection failed: error sending request\n"
+        self.fake.sessions[sess.session_id].screen_text = numbered
+        await self.hub.poll_tui_screen_interactions_once(sess)
+        await self.hub.poll_tui_screen_interactions_once(sess)
+        self.assertEqual(len(self.events(sess.session_id, "error")), 1)
+        self.fake.sessions[sess.session_id].screen_text = "› Ask Codex to do anything\n"
+        await self.hub.poll_tui_screen_interactions_once(sess)
+        self.assertIsNone(sess._codex_reconnect)
+        self.fake.sessions[sess.session_id].screen_text = numbered
+        await self.hub.poll_tui_screen_interactions_once(sess)
+        await self.hub.poll_tui_screen_interactions_once(sess)
+        self.assertEqual(len(self.events(sess.session_id, "error")), 2)
+        self.assertEqual(self.fake.inputs_of(sess.session_id), [])
+        self.assertEqual(sess.status, "running")
+
+    async def test_codex_turn_aborted_after_a_reconnect_episode_is_the_ordinary_abort(self):
+        sess, path, task = await self.codex_rollout("-stall-aborted")
         try:
-            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                await asyncio.sleep(0.08)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                await asyncio.sleep(0.2)
-                await self.hub.poll_tui_screen_interactions_once(sess)
+            self.fake.sessions[sess.session_id].screen_text = (
+                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
+                "  └ Connection failed: error sending request\n"
+            )
+            await self.hub.poll_tui_screen_interactions_once(sess)
+            await asyncio.sleep(0.1)
+            await self.hub.poll_tui_screen_interactions_once(sess)
             self.assertEqual(self.fake.inputs_of(sess.session_id), [])
-            self.assertFalse(sess._codex_reconnect["escalated_at"])
-            self.assertEqual(sess.status, "running")
-        finally:
-            claim.release()
-
-    async def test_codex_rollout_growth_after_the_esc_keeps_the_real_answer(self):
-        # Finding 3: growth proves Codex wrote something, not that the turn will end. The stall
-        # survives with a restarted window, and the turn's own answer still ends it as an answer
-        # (an engine_error end would outrank and discard that answer).
-        sess, path, task = await self.codex_rollout("-esc-recovered")
-        try:
-            self.fake.sessions[sess.session_id].screen_text = (
-                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
-                "  └ Connection failed: error sending request\n"
-            )
-            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                await asyncio.sleep(0.08)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertIn("\x1b", self.fake.inputs_of(sess.session_id))
-                # Writing again, but the turn has not ended yet.
-                self.append(path, {"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
-                await asyncio.sleep(0.2)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertIsNotNone(sess._codex_reconnect)
-                self.assertFalse(sess._codex_reconnect["escalated_at"])
-                self.assertEqual(sess.status, "running")
-                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
-                self.fake.sessions[sess.session_id].screen_text = "> "
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertIsNone(sess._codex_reconnect)
-                self.append(path, {"type": "event_msg", "payload": {
-                    "type": "task_complete", "last_agent_message": "the real answer"}})
-                await self.until(lambda: sess.status == "completed")
+            self.assertEqual(len(self.events(sess.session_id, "error")), 1)
+            self.append(path, {"type": "event_msg", "payload": {
+                "type": "turn_aborted", "reason": "interrupted"}})
+            await self.until(lambda: sess.status == "completed")
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(sess.final_response, "the real answer")
-        self.assertIsNone(sess.last_turn_outcome)
-        self.assertEqual(sess.final_response_source, "codex_task_complete")
-
-    async def test_codex_rollout_growth_without_a_turn_end_ends_on_a_second_window(self):
-        # Finding 3, second half: growth with no turn end is a still-stuck turn. The restarted
-        # window must end it as the network error instead of leaving it running for good.
-        sess, path, task = await self.codex_rollout("-esc-still-stuck")
-        try:
-            self.fake.sessions[sess.session_id].screen_text = (
-                "• Reconnecting... waiting for network (9m 05s • esc to interrupt)\n"
-                "  └ Connection failed: error sending request\n"
-            )
-            with patch("session_manager.CODEX_NETWORK_STALL_SEC", 0.05), \
-                 patch("session_manager.CODEX_STALL_INTERRUPT_WAIT_SEC", 0.15):
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                await asyncio.sleep(0.08)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertEqual(len(self.fake.inputs_of(sess.session_id)), 1)
-                # A retry record: bytes grew, the status line is still there, no turn end.
-                self.append(path, {"type": "event_msg", "payload": {"type": "token_count", "info": {}}})
-                await asyncio.sleep(0.2)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertIsNotNone(sess._codex_reconnect)
-                self.assertFalse(sess._codex_reconnect["escalated_at"])
-                # A second full window: the hub interrupts again, and this timeout ends the turn.
-                await asyncio.sleep(0.08)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-                self.assertEqual(len(self.fake.inputs_of(sess.session_id)), 2)
-                await asyncio.sleep(0.2)
-                await self.hub.poll_tui_screen_interactions_once(sess)
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(sess.status, "completed")
-        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
+        self.assertEqual(sess.last_turn_outcome, "aborted")
+        self.assertIsNone(sess.last_turn_error)
         done = self.events(sess.session_id, "turn_completed")
-        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "error"))
-        self.assertTrue(done[0]["data"]["interrupted_by_hub"])
+        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "aborted"))
+        self.assertNotIn("interrupted_by_hub", done[0]["data"])
+        self.assertTrue(sess.final_response.startswith("Codex turn aborted (interrupted)"))
 
     async def test_a_codex_error_while_an_interaction_is_pending_ends_after_the_answer(self):
         # Finding 2: the one-shot task_complete error is consumed as it is read. A refused end

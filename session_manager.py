@@ -1627,13 +1627,8 @@ AGY_DENY_FEEDBACK_DELAY_SEC = 1.2
 # codex: the abort of a deny with feedback is held this long for that message (its checked submit
 # included); if none arrives, the abort ends the turn as a plain deny does.
 CODEX_DENY_FEEDBACK_HOLD_SEC = 30.0
-# codex shows "Reconnecting... waiting for network" and, with no rollout record at all, waits
-# forever inside a turn (observed 9+ minutes with its retry limits at 1). A continuous status line
-# this long is a dead turn: Esc interrupts it, and the turn ends as an engine error.
-CODEX_NETWORK_STALL_SEC = 300.0
-# After that Esc the rollout normally writes turn_aborted at once; without it this long the turn is
-# ended from the stall itself, so the parent's wait never stays "waiting" for good.
-CODEX_STALL_INTERRUPT_WAIT_SEC = 15.0
+# codex's "Reconnecting..." status line is shown as progress; the hub never interrupts that turn
+# (owner decision 2026-11-16, item codex_network_stall).
 # A machine record (kimi wire) of a prompt the screen detector already registered and the parent
 # already answered is the same prompt if it arrives this soon after the screen registration.
 SCREEN_ADOPT_WINDOW_SEC = 20.0
@@ -2516,7 +2511,7 @@ class AgentSession:
         self.last_turn_outcome: Optional[str] = None
         self.last_turn_error: Optional[Dict[str, Any]] = None
         # codex: a continuous "Reconnecting..." status line while the turn is running (see
-        # _watch_codex_network_stall): {"since", "detail", "info", "escalated_at"}.
+        # _watch_codex_network_stall): {"detail"}. Shown as progress; never interrupted.
         self._codex_reconnect: Optional[Dict[str, Any]] = None
         # A one-shot engine error whose turn end was refused (an interaction awaited the parent):
         # (engine_label, info, extra_data). The record is already consumed, so the screen poll
@@ -10102,22 +10097,10 @@ class HubSessionManager:
         """An aborted codex turn is over: Codex is idle at its prompt with no answer for this turn.
 
         It ends the way task_complete does (turn_completed, so the parent's wait URL returns done),
-        with data.outcome "aborted" and a final response that says so, not an answer. Returns
-        whether the turn is over; a declining error end keeps the stall state for a later pass.
+        with data.outcome "aborted" and a final response that says so, not an answer. Returns True;
+        the bool is the callers' turn-end guard.
         """
         missing = "the deny's feedback never reached Codex; " if feedback_missing else ""
-        stall = getattr(session, "_codex_reconnect", None)
-        if isinstance(stall, dict) and stall.get("escalated_at"):
-            # The hub's own Esc ended a network stall: the turn did not end on the user's abort,
-            # it ended because the engine never got through. Data says who interrupted it.
-            info = stall.get("info") if isinstance(stall.get("info"), dict) else None
-            if not await self._end_engine_error_turn(
-                session, "codex", info or classify_engine_error("connection failed while reconnecting"),
-                {"interrupted_by_hub": True},
-            ):
-                return False
-            session._codex_reconnect = None
-            return True
         if session.status == "waiting_parent" and session.pending_interaction is None:
             session.status = "running"  # so the turn end below can mark it completed
         await self.record_worker_event(
@@ -14830,115 +14813,34 @@ class HubSessionManager:
             meta.pop("absent_since", None)
 
     async def _watch_codex_network_stall(self, session: AgentSession, screen_text: str) -> None:
-        """A codex turn stuck in "Reconnecting..." ends as an engine error instead of never ending.
+        """Codex's "Reconnecting..." status line is shown as progress, never interrupted.
 
-        With no network there is no rollout record at all, so the watcher has nothing to read; the
-        TUI keeps the status line and the turn forever. One status line lasting
-        CODEX_NETWORK_STALL_SEC is a dead turn: Esc interrupts it (the same key path the hub sends
-        for a deny), the rollout's turn_aborted marks it as this hub's interruption, and a
-        turn_aborted that never arrives is ended here after CODEX_STALL_INTERRUPT_WAIT_SEC. A line
-        that goes away before the threshold was a retry that recovered and is cleared.
+        With no network no rollout record arrives, so the TUI keeps the status line; the poll that
+        already read the screen reports the line (activity plus one progress event) and clears the
+        state when the line goes away. A line that comes back is a new episode and a new event.
+        The turn itself is the engine's to end (owner decision 2026-11-16).
         """
         if (session.engine or "").strip().lower() != "codex" or session.status not in ("starting", "running"):
-            if getattr(session, "_codex_reconnect", None) is not None:
-                session._codex_reconnect = None
-            return
-        now = time.monotonic()
-        stall = getattr(session, "_codex_reconnect", None)
-        if isinstance(stall, dict) and stall.get("escalated_at"):
-            # After the Esc the status line usually disappears before turn_aborted is written, so
-            # only the turn end (the watcher reads it) or this timeout may close the stall.
-            if now - float(stall["escalated_at"]) >= CODEX_STALL_INTERRUPT_WAIT_SEC:
-                if self._codex_rollout_grew(session, stall):
-                    # Codex wrote again after the Esc, but growth is not a turn end (a retry or
-                    # token_count record proves nothing about the turn closing). Keep the stall
-                    # and restart its window so a later window can still end the turn; its own
-                    # answer or a turn_aborted clears it as before.
-                    stall["since"] = now
-                    stall["escalated_at"] = 0.0
-                    session.current_activity = (
-                        f"Reconnecting — {stall.get('detail') or 'waiting for the network'}"
-                    )
-                    await self.persist_session(session)
-                    return
-                if await self._end_engine_error_turn(
-                    session,
-                    "codex",
-                    stall.get("info") or classify_engine_error("connection failed while reconnecting"),
-                    {
-                        "interrupted_by_hub": True,
-                        "stall_seconds": round(now - float(stall.get("since") or now), 1),
-                    },
-                ):
-                    session._codex_reconnect = None
+            session._codex_reconnect = None
             return
         detail = codex_reconnect_detail(screen_text)
         if detail is None:
             session._codex_reconnect = None
             return
-        if not isinstance(stall, dict):
-            info = classify_engine_error(detail or "connection failed while reconnecting")
-            if info.get("kind") != "network":
-                info = {
-                    "kind": "network",
-                    "retryable": True,
-                    "message": detail or "connection failed while reconnecting",
-                }
-            stall = {"since": now, "detail": detail, "info": info, "escalated_at": 0.0}
-            session._codex_reconnect = stall
-            session.current_activity = f"Reconnecting — {detail or 'waiting for the network'}"
-            await self.record_worker_event(
-                session.session_id,
-                {
-                    "type": "error",
-                    "category": "progress",
-                    "status": "running",
-                    "content": detail or "Codex is reconnecting: connection failed",
-                },
-            )
-            await self.persist_session(session)
+        if isinstance(session._codex_reconnect, dict):
             return
-        if now - float(stall.get("since") or now) < CODEX_NETWORK_STALL_SEC:
-            return
-        if session.pending_interaction is not None:
-            # An approval or question is the parent's to answer; never type Esc over it.
-            return
-        if session.tui_writer.busy():
-            # The writer is typing a parent message; `write_input` bypasses its queue, so an Esc
-            # now could land inside that message. Retry on the next poll.
-            return
-        if not session.write_input("\x1b"):
-            # The core refused the key (queue full, "input not delivered"): the engine never got
-            # the interrupt, so escalating would blame it for a timeout it cannot answer.
-            return
-        stall["escalated_at"] = now
-        # What the rollout held when the Esc went in: bytes written since mean Codex recovered.
-        stall["rollout_size"] = self._codex_rollout_size(session)
-        session.current_activity = (
-            f"Reconnecting for {int(now - float(stall.get('since') or now))}s — interrupting the turn"
+        session._codex_reconnect = {"detail": detail}
+        session.current_activity = f"Reconnecting — {detail or 'waiting for the network'}"
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "error",
+                "category": "progress",
+                "status": "running",
+                "content": detail or "Codex is reconnecting: connection failed",
+            },
         )
         await self.persist_session(session)
-
-    @staticmethod
-    def _codex_rollout_size(session: AgentSession) -> Optional[int]:
-        """Byte size of the rollout this turn writes, or None when there is no file yet."""
-        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
-        path = str(ref.get("rollout_path") or "")
-        if not path:
-            return None
-        try:
-            return Path(path).stat().st_size
-        except OSError:
-            return None
-
-    @classmethod
-    def _codex_rollout_grew(cls, session: AgentSession, stall: Dict[str, Any]) -> bool:
-        """True when the rollout gained bytes since the Esc went in: Codex is writing again."""
-        now_size = cls._codex_rollout_size(session)
-        if now_size is None:
-            return False
-        before = stall.get("rollout_size")
-        return before is None or now_size > int(before)
 
     async def poll_tui_screen_interactions_once(self, session: AgentSession) -> Optional[Dict[str, Any]]:
         """Synchronously checks a live TUI session's hooks/transcript/screen once for approval or multi-choice prompts."""
