@@ -22,6 +22,9 @@ WAIT_HANDLE_HINT = (
     "wait again; it returns the next ask or the result. "
     "After a response with response_state=unconfirmed, GET wait_url; never inspect or resend. "
     "An answered request never comes back: if wait_url repeats one, call get_subagent_status_and_trace and report a hub fault. "
+    "A done result whose outcome is error (also listed in engine_errors) means the engine stopped on an error, not an answer: "
+    "error.kind is quota, rate_limit, network, server, auth, request or other; quota and auth need the user, "
+    "rate_limit, network and server can be retried by sending a message, request needs a smaller or changed request. "
     "Wait on wait_url or wait_for_hub only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
     + CLEANUP_HINT
 )

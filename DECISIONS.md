@@ -251,3 +251,25 @@ Native DSH acceptance limitation: the isolated Modify-only fixture reproduces Wi
 | passive-marker | Initial/resumed tasks carry only `[Hub Session: session_id=…]` for transcript ownership, with no reporting instructions. Strip identifiable old Hub launch additions on spawn/resume; preserve user configuration and historical transcripts/results. |
 | observation | Prefer structured native transcript records; retain native permission hooks and TUI detection where transcripts lack records. DSH continues through its native host messages/results. Do not infer pending questions from prose punctuation. |
 | native-completion | Intermediate assistant text is telemetry. A native end-of-turn signal captures the final answer and emits one completion per turn, including empty answers. Keep the previous final answer until the new turn produces an answer; summaries/screens remain low-priority fallbacks for inactive sessions. Drain native records for up to three seconds after process exit. |
+
+## Engine errors reach the parent as errors (2026-11-16, owner: decision page `hub-engine-errors-1116`)
+
+Branch `fix/engine-error-turns`. An engine's own failure (quota, rate limit, network, server, auth, a rejected
+request) ends the turn as a marked error, never as a hang or an ordinary answer. The owner kept the defaults of
+`error_turn_state`, `retry_hold`, `persist_turn_state` and `error_kinds` and changed `codex_network_stall`.
+
+| id | decision | default |
+|---|---|---|
+| error_turn_state | A turn that ended on an engine error is wait state `done`. Each result entry carries `outcome` (`answered` / `error` / `aborted`), an error entry also `error: {kind, retryable, message}`, and a done result with an error entry adds top-level `engine_errors`. The final response says it is not an answer (source `engine_error`, the highest priority). `failed` keeps its meaning: the session crashed, was closed or was interrupted. | yes |
+| codex_network_stall | A Codex `Reconnecting...` stall is only shown: current_activity `Reconnecting — <detail>` and one progress event per episode. The hub never sends Esc and never ends the turn for it; the parent sees it through the session status. | no (was: Esc after 300 s, end the turn as a network error) |
+| retry_hold | OMP and AGY hold an error record for 60 s (`OMP_ERROR_TURN_END_SEC`, `AGY_ERROR_TURN_END_SEC`); a later record is a retry and the turn goes on. Claude, Kimi and Codex error records end the turn at once: they are written after the engine's own retries. | yes |
+| persist_turn_state | The sessions row stores `completion_reported`, `last_turn_outcome` and `last_turn_error_json`, added in place through the `_init_db` ALTER list. A closed member's wait state is read from them, never inferred from an earlier answer; a row without them keeps master's rule. | yes |
+| error_kinds | Seven kinds, first match in this order: `auth`, `quota`, `rate_limit`, `server`, `network`, `request`, else `other` (`engine_errors.classify_engine_error`). `retryable` only for `rate_limit`, `network` and `server`; an engine's own retryable flag wins. | yes |
+
+Decided by the orchestrator (small, reversible):
+
+| id | decision | how to reverse |
+|---|---|---|
+| eof-is-network | A dropped stream (`EOF`, a bare `terminated`) is a `network` error. | Drop those patterns from the network rule. |
+| held-one-shot-errors | A one-shot error record (codex `task_complete` error, kimi `turn.ended failed`, claude `isApiErrorMessage`) that arrives while an interaction is pending is held on the session and ended by the screen poll once it is answered; any turn end and `begin_new_turn` clear it. DSH keeps degrading to `failed`. | Remove `_pending_engine_error` and its retry in `poll_tui_screen_interactions_once`. |
+| legacy-error-rows | An error turn archived before this change reads as kind `other` with the summary as its message. | None needed; new rows store the real kind. |
