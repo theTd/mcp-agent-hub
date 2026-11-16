@@ -4,6 +4,7 @@ import { state, prefs, savePrefs, on, emit, setHubConnected, reloadProfiles } fr
 import { $, $$, toast, copyText, openModal, initModalSystem, icon } from './ui-kit.js';
 import { initSessionLauncher, expandLauncher } from './session-launcher.js';
 import { initSessionWorkspace } from './session-workspace.js';
+import { initSessionBoard, setBoardOpen, isBoardOpen } from './session-board.js';
 import { initEventFeed } from './event-feed.js';
 import { initProfileManager, openProfileManager } from './profile-manager.js';
 
@@ -121,6 +122,8 @@ window.openHubSession = openHubSession;
 
 // -------------------------------------------------------------------- layout
 function setLayout(mode) {
+  // A layout change is meant to be seen: it closes the board, but the board never changes the layout.
+  if (isBoardOpen()) setBoardOpen(false);
   state.layoutMode = mode === 'matrix' ? 'matrix' : 'single';
   savePrefs({ layoutMode: state.layoutMode });
   $$('[data-layout]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.layout === state.layoutMode)));
@@ -233,6 +236,8 @@ const COMMANDS = {
     $('#taskInput').focus();
   },
   'refresh-sessions': () => requestRefresh(),
+  'toggle-session-board': () => setBoardOpen(!isBoardOpen()),
+  'close-session-board': () => setBoardOpen(false),
   'copy-endpoint': () => copyText(hubApi.mcpEndpointUrl(), '已复制 MCP 接入地址'),
   'copy-target': (el) => copyText($(el.dataset.target)?.textContent || ''),
 };
@@ -266,6 +271,7 @@ async function init() {
 
   initSessionLauncher();
   initSessionWorkspace();
+  initSessionBoard();
   initEventFeed();
   initProfileManager();
 

@@ -26,6 +26,8 @@ export const state = {
   hubConnected: null,
 
   layoutMode: 'single', // 'single' | 'matrix'
+  // 会话总览: the session list as tiles over the workspace. Independent of layoutMode.
+  sessionListView: 'list', // 'list' | 'board'
 };
 
 // ------------------------------------------------------------------ event bus
@@ -47,6 +49,7 @@ export function emit(event, payload) {
 const PREFS_KEY = 'subAgentHub.console.prefs.v1';
 const PREF_DEFAULTS = {
   layoutMode: 'single',
+  sessionListView: 'list',
   sidebarCollapsed: false,
   sidebarWidth: 320,
   launcherCollapsed: true,
