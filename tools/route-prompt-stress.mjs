@@ -188,6 +188,37 @@ async function main() {
   console.log(JSON.stringify(stats, null, 2));
 }
 
-// Run only when started directly; importing the module (e.g. to convert the scenarios) sends nothing.
+// The same scenarios as a spec for the prompt-stress-test skill (stress.mjs / compare.mjs), printed by --spec.
+function skillSpec() {
+  const alias = (pairs) => pairs.map(([pattern, token]) => ({ pattern, token }));
+  return {
+    name: 'hub-routing',
+    about: 'mcp-agent-hub routing guide, printed by tools/route-prompt-stress.mjs --spec. Pass the prompt file with --prompt.',
+    repeats: 3,
+    batch: 5,
+    preamble,
+    instruction,
+    fields: [
+      {
+        name: 'primary',
+        tokens: primaryTokens,
+        aliases: alias([
+          ['gpt-6-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
+          ['terra.*medium', 'terra-medium'], ['terra.*(^|[^a-z])low', 'terra-low'], ['terra.*high', 'terra-high'],
+          ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.1-sol.*xhigh', 'sol-xhigh'],
+          ['gpt-6.1-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.1-sol.*high', 'sol-high'], ['primary codex', 'root'],
+        ]),
+      },
+      { name: 'companion', tokens: companionTokens, aliases: alias([['^(none|-|)$', 'null'], ['kimi.*max', 'kimi-max'], ['kimi', 'kimi-high']]) },
+      { name: 'notice', tokens: noticeTokens, aliases: alias([['^(null|-|)$', 'none']]) },
+    ],
+    scenarios: scenarios.map(([id, input, primary, companion, notice]) => ({ id, input, expect: { primary, companion, notice } })),
+  };
+}
+
+// Run only when started directly; importing the module sends nothing.
 const self = fileURLToPath(import.meta.url).toLowerCase();
-if (process.argv[1] && resolve(process.argv[1]).toLowerCase() === self) await main();
+if (process.argv[1] && resolve(process.argv[1]).toLowerCase() === self) {
+  if (process.argv.includes('--spec')) process.stdout.write(JSON.stringify(skillSpec(), null, 2) + nl);
+  else await main();
+}

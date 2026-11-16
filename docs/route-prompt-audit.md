@@ -185,7 +185,7 @@ Owner 要求：主代理按路由派出的 agent 没做好（只做一半、做�
 改动：
 - “Failure and unavailable fallbacks” 末尾加一条：派出的 agent 因模型能力不足而没做好（只做一部分、做错、漏掉写明的要求，且 brief 完整、环境正常）时照常走 fallback，汇报里还必须提醒用户调整该类任务的路由规则，写明任务类型、所用路由和差在哪里；起因是 brief、权限、基础设施、其他会话或他人的状态、取消时不提醒。
 - 压缩：路由表之外以 “OMP” 代替重复的 `omp / clay/deepseek-flash`，各行去掉冗余措辞；MCP 只读调研一行的 `bypass_approvals=true` 改为 `approval_mode="bypass"`（同义，Dispatch 一节称前者为旧开关）。
-- `tools/route-prompt-stress.mjs`：输出加第三列 `notice`（`tune` = 提醒调整路由，`none` = 不提醒）；token `dsh-high`/`dsh-max` 改为 `omp-high`/`omp-max`，三个 DSH 场景改写为 OMP；期望值可以是列表（多个答案都对）；`ROUTE_PROMPT_FILE` 可指定提示词快照；场景、token 和指令改为 export，导入模块时不发请求，便于转换成压测 skill 的 spec。
+- `tools/route-prompt-stress.mjs`：输出加第三列 `notice`（`tune` = 提醒调整路由，`none` = 不提醒）；token `dsh-high`/`dsh-max` 改为 `omp-high`/`omp-max`，三个 DSH 场景改写为 OMP；期望值可以是列表（多个答案都对）；`ROUTE_PROMPT_FILE` 可指定提示词快照；场景、token 和指令改为 export，导入模块时不发请求；`--spec` 把同一批场景输出为压测 skill 的 spec。
 - 新增 13 个场景（共 46 个）：
   - 能力不足、期望 tune：`halfimpl`（OMP 只实现一半）、`wrongdiag`（terra medium 根因与日志证据相反）、`missreview`（审查漏掉明显 bug）、`agyfail`（AGY fallback 一半没改完）、`opusui`（Opus UI 精修违背需求）、`lowfail`（terra low 谎报装好）；
   - 其他起因、期望 none（防过度执行）：`briefgap`（brief 漏写规格路径）、`blocked`（被他人世界锁挡住并按规定停下）、`hubdrop`（Hub 重启断开）、`noaccess`（无写权限）、`cancelled`（用户取消）、`success`（结果正确）；
@@ -209,7 +209,7 @@ Owner 要求：主代理按路由派出的 agent 没做好（只做一半、做�
 
 ```bash
 SK=<prompt-stress-test skill 目录>
-node convert.mjs tools/route-prompt-stress.mjs > spec.json   # 一次性转换脚本，读取本工具 export 的场景
+node tools/route-prompt-stress.mjs --spec > spec.json   # 同一批场景输出为 skill 的 spec，不发请求
 node "$SK/scripts/stress.mjs" spec.json --prompt baseline.txt --label baseline > base1.json
 node "$SK/scripts/stress.mjs" spec.json --prompt candidate.txt --label candidate > cand1.json
 node "$SK/scripts/compare.mjs" base*.json cand*.json
