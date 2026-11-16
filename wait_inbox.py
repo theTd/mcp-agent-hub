@@ -22,7 +22,25 @@ WAKE_EVENT_TYPES = frozenset({
     "session_exited", "exited", "crashed", "hub_shutdown",
 })
 ASK_EVENT_TYPES = frozenset({"approval_request", "question"})
-TERMINAL_FAILURE_TYPES = frozenset({"delivery_failed", "crashed", "session_exited", "exited"})
+TERMINAL_FAILURE_TYPES = frozenset({"crashed", "session_exited", "exited"})
+# A parent's live message the hub could not submit, or could not prove submitted: the worker has not
+# read it. Owner decision `hub-friction-1116` (undelivered-wake, 2026-11-16): it wakes the handle with
+# state=undelivered and leaves it waiting (the worker is still alive), never failed.
+UNDELIVERED_EVENT_TYPE = "delivery_failed"
+
+
+def undelivered_entry(event: Dict[str, Any]) -> Dict[str, Any]:
+    """The parent-facing view of one undelivered message (a delivery_failed event)."""
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    return {
+        "session_id": event.get("session_id"),
+        "message_id": data.get("message_id") or event.get("request_id"),
+        "reason": data.get("reason") or event.get("content") or "undelivered",
+        "confirmed_failure": bool(data.get("confirmed_failure")),
+        "session_status": data.get("session_status"),
+        "recovery_hint": data.get("recovery_hint") or "",
+        "at": data.get("at") or event.get("timestamp"),
+    }
 
 
 def with_wait_outcome(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -384,6 +402,12 @@ class WaitInbox:
                             result_id, state.get("final_response") or result.get("final_response", ""), results
                         )
                 return {"state": "waiting", "wait_handle": handle}
+            if kind == UNDELIVERED_EVENT_TYPE:
+                # Every undelivered message waiting in the inbox comes back at once; the handle
+                # stays waiting, so the next GET waits for the turn's result again.
+                events = [event] + await self._take_events(handle, UNDELIVERED_EVENT_TYPE)
+                return {"state": "undelivered", "result_id": event.get("result_id"),
+                        "messages": [undelivered_entry(item) for item in events]}
             if kind in TERMINAL_FAILURE_TYPES or kind == "hub_shutdown":
                 message = event.get("content") or kind
                 return {
@@ -426,6 +450,21 @@ class WaitInbox:
         if errors:
             payload["engine_errors"] = errors
         return payload
+
+    async def _take_events(self, handle: str, event_type: str) -> List[Dict[str, Any]]:
+        """Consume and return every unconsumed event of `event_type` in the handle's inbox, in order."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM wait_inbox_events WHERE handle=? AND consumed=0 AND event_type=? ORDER BY id",
+                (handle, event_type),
+            ).fetchall()
+            items = []
+            for row in rows:
+                conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (row["id"],))
+                item = self._load(row["payload_json"], {})
+                item["result_id"] = row["result_id"] or item.get("result_id")
+                items.append(item)
+        return items
 
     async def _all_open_asks(self, handle: str) -> List[Dict[str, Any]]:
         with self._connect() as conn:

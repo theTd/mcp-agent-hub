@@ -543,7 +543,7 @@ class HubDatabase:
                        current_activity, last_task, engine, effective_model, effective_thinking_level,
                        CASE WHEN final_response IS NOT NULL AND length(final_response) > 0 THEN 1 ELSE 0 END AS has_final_response,
                        final_response_source, completion_reported, last_turn_outcome,
-                       last_turn_error_json
+                       last_turn_error_json, profile_snapshot
                 FROM sessions
                 {where}
                 ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
@@ -562,6 +562,11 @@ class HubDatabase:
                     None if item.get("completion_reported") is None
                     else bool(item["completion_reported"])
                 )
+                # Only the spawner leaves the launch snapshot: list_active_sessions shows it and
+                # filters mine=true on it; the rest of the snapshot stays out of summary rows.
+                snapshot = self._decode_json_column(item.pop("profile_snapshot", None), None)
+                spawned_by = snapshot.get("spawned_by") if isinstance(snapshot, dict) else None
+                item["spawned_by_caller"] = spawned_by if isinstance(spawned_by, dict) else None
                 result.append(item)
             return result
 

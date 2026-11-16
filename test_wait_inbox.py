@@ -99,6 +99,22 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "done")
         self.assertEqual(result["final_response"], "A")
 
+    async def test_undelivered_messages_wake_together_and_leave_the_handle_waiting(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        for mid in ("inj-1", "inj-2"):
+            await self.inbox.publish_event({"session_id": "a", "type": "delivery_failed", "seq": mid,
+                                            "result_id": f"undelivered:a:{mid}",
+                                            "data": {"message_id": mid, "reason": "write_failed",
+                                                     "confirmed_failure": True, "recovery_hint": "send it again."}})
+        woke = await self.inbox.wait(handle, 0.1)
+        self.assertEqual(woke["state"], "undelivered")
+        self.assertEqual([m["message_id"] for m in woke["messages"]], ["inj-1", "inj-2"])
+        self.assertEqual(woke["messages"][0]["recovery_hint"], "send it again.")
+        self.assertEqual(self.inbox._row(handle)["state"], "waiting")
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["state"], "waiting")
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "A"})
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["state"], "done")
+
     async def test_rearming_handle_hides_previous_turn_result(self):
         info = await self.inbox.create(["a"])
         await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "old"})

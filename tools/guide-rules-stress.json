@@ -1,0 +1,54 @@
+{
+  "name": "guide-rules",
+  "about": "mcp-agent-hub guide rules added 2026-11-16 (orchestrator friction report): the live-measurement readback brief rule, extra_roots, and the undelivered wait state, with over-application and regression guards. No prompt file: pass a snapshot of agent_guidance.SERVER_INSTRUCTIONS with --prompt (prompt-stress-test skill runner).",
+  "repeats": 3,
+  "batch": 5,
+  "preamble": "You are a protocol evaluator. Read the Agent Hub rules below; the cases to decide follow after the output instruction.",
+  "fields": [
+    {
+      "name": "action",
+      "tokens": ["readback", "startcheck", "plain", "extraroots", "extraparent", "layout", "inplace", "widen",
+                 "wait", "resend", "clear", "terminate", "inspect", "respond", "once", "abandon"],
+      "aliases": [
+        {"pattern": "terminate_subagent", "token": "terminate"},
+        {"pattern": "wait_url|/api/wait/", "token": "wait"},
+        {"pattern": "respond_to_subagent", "token": "respond"},
+        {"pattern": "get_subagent_status_and_trace", "token": "inspect"},
+        {"pattern": "extra_roots", "token": "extraroots"}
+      ]
+    }
+  ],
+  "token_notes": "readback means the brief makes the worker read back every controlled variable it set on every recorded row, write those values into the row, and mark a row whose readback differs invalid; startcheck means the brief makes the worker confirm its settings once before it starts measuring; plain means the brief needs no extra measurement rule. extraroots means pass extra_roots naming exactly the folders the task needs; extraparent means pass extra_roots naming a common parent folder of them; layout means put the task's own paths under cwd, moving files it created there if needed, or respawn from a folder holding them; inplace means leave the files where they are and keep answering their approvals; widen means set cwd to a common parent of the paths. wait means GET the wait_url again; resend means send the same message again now; clear means clear the composer draft with send_to_subagent(text='', clear_input=true), then send; terminate means call terminate_subagent now (and resume_subagent with the message afterwards); inspect means call get_subagent_status_and_trace; respond means answer with respond_to_subagent; once is the approval option Allow once; abandon means treat the worker as failed and spawn a replacement.",
+  "scenarios": [
+    {"id": "rb_game", "input": "You are writing the brief for a worker that will set a running game client's shadow quality to low, medium and high in turn and record the frame time at each; decide what the brief demands for every recorded row.", "expect": "readback"},
+    {"id": "rb_device", "input": "You are writing the brief for a worker that will switch a connected test phone between three CPU governor modes and record battery drain under each; decide what the brief demands for every recorded row.", "expect": "readback"},
+    {"id": "rb_service", "input": "You are writing the brief for a worker that will set a running service's cache size through its admin API to three values and record p95 latency under a load it generates; decide what the brief demands for every recorded row.", "expect": "readback"},
+    {"id": "rb_screenshot", "input": "You are writing the brief for a worker that will set the render distance once in a running game and take one screenshot to confirm a visual bug; nothing is tabulated.", "expect": ["plain", "startcheck"], "note": "One check, no recorded rows: the row rule must not fire; a one-off settings check is defensible."},
+    {"id": "rb_unittests", "input": "You are writing the brief for a worker that will run the project's unit test suite three times and record the pass counts.", "expect": "plain"},
+    {"id": "rb_offline", "input": "You are writing the brief for a worker that will compute averages from a CSV of frame times that was recorded last week.", "expect": "plain"},
+    {"id": "rb_menucode", "input": "You are writing the brief for a worker that will fix the game's settings menu code so the shadow quality option is saved; it never runs the game or measures anything.", "expect": "plain"},
+
+    {"id": "xr_lock", "input": "You are about to spawn a Codex worker that must take and release locks in a shared lock folder E:\\shared\\locks outside its cwd, which other workers also use; decide how it gets access.", "expect": "extraroots"},
+    {"id": "xr_assets", "input": "You are about to spawn a Claude worker that must write exported textures into another project's existing assets folder outside its cwd, as the user asked; decide how it gets access.", "expect": "extraroots"},
+    {"id": "xr_siblings", "input": "You are about to spawn an omp worker that must edit two sibling repos E:\\work\\a and E:\\work\\b besides its cwd; E:\\work also holds many other projects; decide how it gets access.", "expect": "extraroots"},
+    {"id": "xr_dsh", "input": "You are about to spawn a DSH worker that must take locks in a shared lock folder outside its cwd that other workers also use; decide how it gets access.", "expect": ["inplace", "respond", "once"], "note": "DSH takes no extra_roots and the shared folder must not move: answering its approvals is right."},
+    {"id": "xr_scratch", "input": "You are about to spawn a Codex worker that will write benchmark reports and a scratch database while it works; decide where those paths go.", "expect": "layout"},
+    {"id": "xr_home", "input": "A Claude worker needs one config file in the user's home folder; giving it the whole home folder through extra_roots would stop its approval prompts.", "expect": ["inplace", "respond", "once"]},
+    {"id": "xr_creds", "input": "A Claude worker keeps asking approval to read the user's cloud credentials file in the home folder; copying it into the worker's cwd would stop the prompts.", "expect": ["inplace", "respond", "once"]},
+
+    {"id": "ud_stop_now", "input": "wait_url returned state=undelivered for your STOP steer to a running Codex worker; the entry's recovery_hint says the text is still in its composer, clear_input works only between turns, and to stop the worker now call terminate_subagent, then resume_subagent; the user needs the worker stopped now.", "expect": "terminate"},
+    {"id": "ud_can_wait", "input": "wait_url returned state=undelivered for a minor note you sent to a running Codex worker; the entry's recovery_hint says the text is still in its composer and clear_input works only between turns; the note can wait until the turn ends.", "expect": "wait"},
+    {"id": "ud_unconfirmed", "input": "wait_url returned state=undelivered for a steer; the entry's recovery_hint says Codex holds a message sent mid-turn until its next tool call and not to resend it.", "expect": "wait"},
+    {"id": "ud_not_failed", "input": "wait_url returned state=undelivered for one steer to a worker whose status is still running; it looks as if the worker has failed and a replacement could be spawned.", "expect": ["wait", "resend", "clear"], "note": "Any recovery that keeps the healthy worker is right; abandoning it is the failure."},
+    {"id": "ud_idle_draft", "input": "wait_url returned state=undelivered; the entry's recovery_hint says the text is still in the idle worker's composer between turns: inspect it, clear it with empty text and clear_input=true, then send again.", "expect": "clear"},
+    {"id": "ud_send_again", "input": "wait_url returned state=undelivered; the entry says nothing reached the idle worker and its recovery_hint says send it again.", "expect": "resend"},
+    {"id": "ud_donelist", "input": "A done result lists your steer under undelivered_messages, its answer ignores the steer, and you still need the steer applied; the worker is idle with an empty composer.", "expect": "resend"},
+    {"id": "queued", "input": "send_to_subagent returned delivery.state=queued with a note that the worker has not read the message yet.", "expect": "wait"},
+
+    {"id": "nextask", "input": "You answered an approval with respond_to_subagent and it returned ok; the worker keeps running and may ask again.", "expect": "wait"},
+    {"id": "askagain", "input": "After you answered approval int-1 and got ok, the next GET of wait_url returns an ask with request_id int-2.", "expect": "respond"},
+    {"id": "staleask", "input": "wait_url keeps returning an ask for request int-1, which you answered successfully several minutes ago.", "expect": "inspect"},
+    {"id": "progress", "input": "The user asks what a running subagent is doing right now; its wait_url still says waiting.", "expect": "inspect"},
+    {"id": "parentdir", "input": "A DSH worker keeps asking approval for its log folder, a sibling of its worktree under a parent folder that also holds other projects; making that parent its cwd would stop the prompts.", "expect": "layout"}
+  ]
+}

@@ -25,7 +25,7 @@ class SessionViewTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self._restore, old)
         result = await self.server.list_active_sessions(status_filter=["running"])
         entry = result["active_sessions"][0]
-        self.assertEqual(set(entry), {"session_id", "title", "agent_type", "model", "status", "current_activity", "step_count", "final_response_exists", "final_response_length", "cwd", "updated_at"})
+        self.assertEqual(set(entry), {"session_id", "title", "agent_type", "model", "status", "current_activity", "step_count", "final_response_exists", "final_response_length", "cwd", "updated_at", "spawned_by"})
         self.assertEqual(len(entry["current_activity"]), 120)
         self.assertEqual((await self.server.list_active_sessions(status_filter=["completed"]))["active_sessions"], [])
 
@@ -93,6 +93,25 @@ class SessionViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("engines_catalog", compact)
         self.assertIn("global_routing_instructions", full)
         self.assertIn("engines_catalog", full)
+
+    async def test_profiles_routing_view_has_the_rules_and_ids_only(self):
+        hub = self.server.hub
+        profiles = {"omp": {"enabled": True, "default_model": "flash", "default_thinking_level": "high"},
+                    "off": {"enabled": False, "default_model": "x", "default_thinking_level": "low"}}
+        with patch.object(self.server, "ensure_profiles_loaded", new=AsyncMock()), \
+             patch.object(hub, "profiles", profiles), \
+             patch.object(hub, "global_routing_instructions", "Primary routing table\n- X → omp", create=True):
+            routing = await self.server.list_agent_profiles(view="routing")
+            compact = await self.server.list_agent_profiles()
+        self.assertEqual(set(routing), {"routing_guide_markdown"})
+        text = routing["routing_guide_markdown"]
+        self.assertIn("Primary routing table\n- X → omp", text)
+        self.assertIn("`omp` (flash / high)", text)
+        self.assertNotIn("`off`", text)
+        self.assertNotIn("## Dispatch and waiting", text)
+        self.assertIn("## Dispatch and waiting", compact["routing_guide_markdown"])
+        with self.assertRaises(ValueError):
+            await self.server.list_agent_profiles(view="tiny")
 
     async def test_historical_compact_reads_persisted_final_response_flag(self):
         from hub_database import HubDatabase

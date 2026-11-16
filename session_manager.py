@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import unicodedata
 import shutil
 import sys
 import tempfile
@@ -34,6 +35,7 @@ from dsh_session_record import (
 from dsh_mailbox_replay import DshMailboxReplay
 from restart_resume_request import RestartResumeGate, RestartResumeRequest, wait_for_port
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
+from spawn_extra_roots import extra_root_args, normalize_extra_roots
 from compaction_threshold import (
     CLAUDE_PCT_ENV, CODEX_TOKEN_LIMIT_KEY, check_compaction_conflicts, check_compaction_support,
     format_compaction_threshold, normalize_compaction_threshold, write_omp_compaction_overlay,
@@ -46,7 +48,7 @@ from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES, with_leaf_worker
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
-from wait_inbox import WaitInbox, WAKE_EVENT_TYPES, engine_errors_of
+from wait_inbox import WaitInbox, WAKE_EVENT_TYPES, UNDELIVERED_EVENT_TYPE, engine_errors_of
 from engine_errors import classify_engine_error, engine_error_summary
 
 from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
@@ -320,7 +322,10 @@ def command_starts_with_prefix(command: str, prefix: str) -> bool:
 
 
 def normalize_brief_markdown(raw_brief: Any) -> Optional[str]:
-    """The spawn-time long task description, bounded to a size a session file can carry."""
+    """The spawn-time long task description, bounded to a size a session file can carry.
+
+    A blank brief is no brief: it would write an empty file and point the worker at it.
+    """
     if raw_brief is None:
         return None
     if not isinstance(raw_brief, str):
@@ -329,7 +334,37 @@ def normalize_brief_markdown(raw_brief: Any) -> Optional[str]:
         raise ValueError(
             f"brief_markdown is {len(raw_brief)} characters; the limit is {BRIEF_MARKDOWN_MAX_CHARS}"
         )
-    return raw_brief
+    return raw_brief if raw_brief.strip() else None
+
+
+def screen_echo_key(text: Optional[str]) -> str:
+    """Text as the hub compares it with a terminal's echo of it.
+
+    Whitespace is dropped (an engine wraps a composer wherever it likes), and so are the characters
+    terminals draw differently: zero-width marks, and East Asian ambiguous-width punctuation and
+    symbols (— … “ ” → × │, one cell or two depending on the renderer). Ambiguous-width letters
+    (Greek, Cyrillic) stay, so a message in those scripts is still compared letter by letter.
+    A Codex composer once showed a typed em dash as nothing, so an exact match never held and
+    the message was never submitted (codex-624fde89, 2026-11-16). Text made of nothing but such
+    characters is compared as typed, whitespace aside.
+    """
+    raw = str(text or "")
+    kept = "".join(
+        ch for ch in raw
+        if not ch.isspace()
+        and unicodedata.category(ch) not in ("Mn", "Me", "Cf")
+        and not (unicodedata.east_asian_width(ch) == "A" and not unicodedata.category(ch).startswith("L"))
+    )
+    return kept or "".join(ch for ch in raw if not ch.isspace())
+
+
+def brief_first_line(brief_text: Optional[str]) -> str:
+    """The brief's first nonblank line without Markdown heading marks, for task lists."""
+    for line in (brief_text or "").splitlines():
+        shown = line.strip().lstrip("#").strip()
+        if shown:
+            return shown
+    return ""
 
 
 def parent_interaction_view(interaction: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -702,6 +737,13 @@ TUI_TYPE_SETTLE_HARD_CAP_SEC = 120.0
 # the space _tui_wrapped_glyph_composer joins rows with.
 TUI_CODEX_SCROLL_MARK_RE = re.compile(r"↑(?=\s)")
 TUI_CODEX_SCROLLED_MIN_CHARS = 40
+# A live message handed to the background submit (state "queued" in the send reply).
+LIVE_QUEUED_NOTE = (
+    "Queued, not read yet: the hub types it into the worker's composer when its turn comes and "
+    "submits it once the composer shows all of it. If that fails, or the hub cannot prove the worker got it, "
+    "wait_url wakes with state=undelivered naming this message's id (delivery.submit_id); its outcome also "
+    "replaces last_injection (get_subagent_status_and_trace)."
+)
 # D3: when the evidence window ends with ok:null/"unconfirmed" the hub presses Enter once more and
 # watches this short window. The press counts toward TUI_SUBMIT_MAX_TRIES.
 TUI_SUBMIT_EXTRA_PRESS_SEC = 5.0
@@ -2456,6 +2498,10 @@ class AgentSession:
         # begin_new_turn clears it). `last_turn_error` is {kind, retryable, message}.
         self.last_turn_outcome: Optional[str] = None
         self.last_turn_error: Optional[Dict[str, Any]] = None
+        # This turn's live messages the worker never read (the wait_inbox undelivered_entry shape),
+        # listed in the turn's done result; begin_new_turn clears it. Kept in memory only: the
+        # undelivered wake itself is durable in the wait inbox.
+        self.undelivered_messages: List[Dict[str, Any]] = []
         # codex: a continuous "Reconnecting..." status line while the turn is running (see
         # _watch_codex_network_stall): {"detail"}. Shown as progress; never interrupted.
         self._codex_reconnect: Optional[Dict[str, Any]] = None
@@ -3611,6 +3657,11 @@ class HubSessionManager:
                 }
                 for s in states
             ]
+            for result in results:
+                live = self.sessions.get(result["session_id"])
+                undelivered = self._undelivered_view(live) if live is not None else []
+                if undelivered:
+                    result["undelivered_messages"] = undelivered
             rid = "group:" + ":".join(f"{r['session_id']}:{r.get('turn_id') or 'current'}" for r in results)
             payload = {
                 "state": "done",
@@ -5232,6 +5283,28 @@ class HubSessionManager:
                     model_line += f" — {note}"
                 model_line += f" | thinking levels: {levels}"
                 lines.append(model_line)
+        return "\n".join(lines)
+
+    def build_routing_only_markdown(self) -> str:
+        """The routing rules and fallbacks alone, for a parent re-reading them after a compaction.
+
+        The dispatch and waiting rules also reach every parent in the MCP server instructions, and
+        the model catalog is only needed to check a model name, so both stay in the compact view.
+        """
+        lines: List[str] = ["# Subagent routing guide (routing only)"]
+        instructions = (self.global_routing_instructions or "").strip()
+        if instructions:
+            lines.append(instructions)
+        profiles = [
+            f"`{pid}` ({p.get('default_model') or 'none'} / {p.get('default_thinking_level') or 'none'})"
+            for pid, p in self.profiles.items() if p.get("enabled", True)
+        ]
+        lines.append("")
+        lines.append("Profiles (agent_type, defaults): " + ", ".join(profiles))
+        lines.append(
+            'Dispatch, waiting and approval rules, profile notes and the model list: '
+            'list_agent_profiles(view="compact").'
+        )
         return "\n".join(lines)
 
     # ---- B13: model enable/disable + per-model notes -------------------------------------
@@ -7858,6 +7931,11 @@ class HubSessionManager:
         record["seq"] = seq
         if ev_type == "turn_completed":
             record["result_id"] = f"result:{session_id}:{record.get('turn_id') or seq}"
+            undelivered = self._undelivered_view(sess) if sess else []
+            if undelivered:
+                record["undelivered_messages"] = undelivered
+        elif ev_type == UNDELIVERED_EVENT_TYPE:
+            record["result_id"] = f"undelivered:{session_id}:{data.get('message_id') or seq}"
         # The parent inbox has its own durable cursor and only receives wake-worthy events.  Tool,
         # progress and ordinary delivery telemetry remains in worker_events for the console/audit.
         if ev_type in WAKE_EVENT_TYPES:
@@ -9230,6 +9308,7 @@ class HubSessionManager:
         session.completion_reported = False
         session.last_turn_outcome = None
         session.last_turn_error = None
+        session.undelivered_messages = []
         session._pending_engine_error = None
         session._codex_reconnect = None
         session._seen_tui_prompt_signatures.clear()
@@ -9499,9 +9578,20 @@ class HubSessionManager:
                     "pty_written": False, "injection": "none"}
         if sess and sess.engine == "codex" and getattr(sess, "_tui_draft_pending", None):
             if not self._reconcile_codex_submit(sess):
+                # codex-624fde89 (2026-11-16): mid-turn the old hint pointed at clear_input, which
+                # _clear_tui_draft refuses during a turn, so the parent was left with no way forward.
+                mid_turn = sess.status not in ("completed", "idle")
                 return {"delivered": False, "reason": "input_recovery_required", "session_id": session_id,
                         "pty_written": False, "injection": "none",
-                        "recovery_hint": "Inspect the draft, then send empty text with clear_input=true; do not resend blindly."}
+                        "recovery_hint": (
+                            "The composer still holds text the hub typed but never submitted (an earlier "
+                            "message or a draft): the worker has not read it, and this message was not sent. "
+                            + ("clear_input works only between turns: wait for this turn to end, inspect the "
+                               "draft, clear it with empty text and clear_input=true, then send; to stop the "
+                               "worker now, call terminate_subagent."
+                               if mid_turn else
+                               "Inspect the draft, then send empty text with clear_input=true; do not resend blindly.")
+                        )}
         # T1: this message may start a new turn on a session that already reported completion. The
         # status is captured before the delivery branches change it, and the reset itself runs at
         # the end, only when the text really reached the session — a failed delivery must not leave
@@ -9753,6 +9843,9 @@ class HubSessionManager:
             "injection": live_injection or ("live_write" if pty_written else "none"),
             "mailbox_message_id": msg_rec["id"],
             **({"submit_id": live_submit_id} if live_submit_id else {}),
+            # codex-624fde89 (2026-11-16): delivered=null alone read as "sent"; say plainly that a
+            # queued message has not reached the worker yet.
+            **({"state": "queued", "note": LIVE_QUEUED_NOTE} if live_queued else {}),
         }
 
     def get_worker_events(self, session_id: str = "all", after_seq: int = 0) -> List[Dict[str, Any]]:
@@ -12436,13 +12529,14 @@ class HubSessionManager:
         A long task wraps: its START sits on the composer's first row, while a horizontally
         scrolled composer (codex) may instead show its END. Either proves the text is still there.
         K2 (fix 9): whitespace is ignored on both sides, because a wrapped composer's rows are joined
-        with one space wherever the engine broke the line, which may not be where the text had one.
+        with one space wherever the engine broke the line, which may not be where the text had one;
+        so are the characters terminals draw differently (screen_echo_key).
         """
         if line is None:
             return False
-        flat = re.sub(r"\s+", "", line)
+        flat = screen_echo_key(line)
         for part in (probe, tail):
-            key = re.sub(r"\s+", "", part or "")
+            key = screen_echo_key(part)
             if key and (key in flat or (len(key) >= 12 and key[:-2] in flat)):
                 return True
         return False
@@ -12657,7 +12751,7 @@ class HubSessionManager:
 
     @staticmethod
     def _codex_composer_shows_whole(line: Optional[str], expected: str) -> bool:
-        """The Codex composer shows the whole expected text (whitespace ignored).
+        """The Codex composer shows the whole expected text (compared by screen_echo_key).
 
         Either all of it is visible, or the composer scrolled (TUI_CODEX_SCROLL_MARK_RE marks the
         hidden rows) and what is visible is exactly the text's end, at least
@@ -12666,14 +12760,14 @@ class HubSessionManager:
         """
         if line is None:
             return False
-        want = re.sub(r"\s+", "", expected or "")
+        want = screen_echo_key(expected)
         if not want:
             return False
-        if re.sub(r"\s+", "", line) == want:
+        if screen_echo_key(line) == want:
             return True
         padded = f" {line} "
         for mark in TUI_CODEX_SCROLL_MARK_RE.finditer(padded):
-            seen = re.sub(r"\s+", "", padded[:mark.start()] + padded[mark.end():])
+            seen = screen_echo_key(padded[:mark.start()] + padded[mark.end():])
             if TUI_CODEX_SCROLLED_MIN_CHARS <= len(seen) < len(want) and want.endswith(seen):
                 return True
         return False
@@ -12906,13 +13000,14 @@ class HubSessionManager:
         out of kimi's box ("↑ 2 more" on its top border). K7 (fix 9d): a glyph composer's span holds
         its wrapped rows when its frame is closed; otherwise it is only its first row, so the rows
         below it are read too. Rows above the
-        composer (submitted history) never count. Whitespace is ignored, as in _composer_holds.
+        composer (submitted history) never count. Both sides are compared by screen_echo_key, as in
+        _composer_holds.
         """
-        key = re.sub(r"\s+", "", tail or "")
+        key = screen_echo_key(tail)
         if span is None or not key:
             return False
         below = "".join(lines[span[2] + 1:])
-        haystack = re.sub(r"\s+", "", span[0] + below)
+        haystack = screen_echo_key(span[0] + below)
         return key in haystack or (len(key) >= 12 and key[:-2] in haystack)
 
     async def _await_typed_text_settled(
@@ -13148,12 +13243,89 @@ class HubSessionManager:
             session.emit_virtual_ansi(
                 f"\r\n\x1b[90m… {what}未确认（unconfirmed）\x1b[0m\r\n"
             )
+        # While Codex holds a deny's abort for its feedback, a lost message is reported by the turn
+        # end itself (done with feedback_missing), so it does not wake the wait a second time.
+        feedback_hold = time.monotonic() < getattr(session, "_codex_abort_hold_until", 0.0)
+        if (result.get("mode") == "parent_message" and not feedback_hold
+                and self._live_message_undelivered(result)):
+            await self._publish_undelivered(session, result)
         try:
             await self.persist_session(session)
         except PersistenceUnavailable:
             raise
         except Exception:
             pass
+
+    @staticmethod
+    def _live_message_undelivered(result: Dict[str, Any]) -> bool:
+        """A live message the worker has not read: a failed submit, or a checked one left unproven.
+
+        An unchecked write (live_write_unchecked: the hub cannot see that engine's composer) and a
+        submit still in progress are not reported; nothing was checked yet.
+        """
+        if result.get("ok") is False:
+            return True
+        return result.get("ok") is None and result.get("reason") not in ("live_write_unchecked", "submitting")
+
+    @staticmethod
+    def _undelivered_recovery_hint(session: AgentSession, result: Dict[str, Any]) -> str:
+        """What the parent can do about one undelivered live message (owner decision
+        `hub-friction-1116`, interrupt-send: no interrupt-then-send; stopping means terminate, then resume)."""
+        mid_turn = session.status not in ("completed", "idle")
+        if result.get("reason") in ("process_gone", "write_failed") or not session.is_process_alive():
+            return ("The worker's terminal took nothing (its process is gone or refused the text): "
+                    "GET wait_url again for the session's end, then resume_subagent with this message.")
+        if result.get("ok") is None:
+            return ("The hub pressed Enter, but the worker's transcript does not show the message yet; Codex "
+                    "holds a message sent mid-turn until its next tool call. Do not resend it: GET wait_url "
+                    "again, and the turn's done result lists it under undelivered_messages only if it never arrived.")
+        if result.get("recovery_required"):
+            return ("The text is still in the worker's composer, never submitted. " + (
+                "clear_input works only between turns: wait for this turn to end (GET wait_url again), "
+                "clear the draft with empty text and clear_input=true, then send again; to stop the worker "
+                "now, call terminate_subagent, then resume_subagent with this message."
+                if mid_turn else
+                "Inspect it (read_subagent_screen), clear it with empty text and clear_input=true, then send again."
+            ))
+        return "Nothing reached the worker: " + (
+            "GET wait_url again for this turn's result, and send the message again if it is still needed."
+            if mid_turn else "send it again."
+        )
+
+    async def _publish_undelivered(self, session: AgentSession, result: Dict[str, Any]) -> None:
+        """Wake the parent's wait_url with state=undelivered and list the message in the turn's result."""
+        data = {
+            "message_id": result.get("submit_id"),
+            "reason": str(result.get("reason") or "undelivered"),
+            "confirmed_failure": result.get("ok") is False,
+            "session_status": session.status,
+            "recovery_hint": self._undelivered_recovery_hint(session, result),
+            "at": result.get("at") or round(time.time(), 3),
+        }
+        session.undelivered_messages = [
+            item for item in (getattr(session, "undelivered_messages", None) or [])
+            if item.get("message_id") != data["message_id"]
+        ] + [{"session_id": session.session_id, **data}]
+        await self.record_worker_event(session.session_id, {
+            "type": UNDELIVERED_EVENT_TYPE,
+            "category": "delivery_failed",
+            "status": "error" if data["confirmed_failure"] else "warning",
+            "content": f"Live message not delivered: {data['reason']}",
+            "data": data,
+        })
+
+    def _undelivered_view(self, session: AgentSession, reconcile: bool = True) -> List[Dict[str, Any]]:
+        """The turn's undelivered messages for a done result. With `reconcile`, a Codex message left
+        unconfirmed that the transcript now shows (Codex submitted it after a tool call) is dropped;
+        that reads the transcript, so only a settled result asks for it."""
+        items = list(getattr(session, "undelivered_messages", None) or [])
+        if reconcile and items and session.engine == "codex" and getattr(session, "_tui_draft_pending", None):
+            if self._reconcile_codex_submit(session):
+                pending = [item for item in items if not item.get("confirmed_failure")]
+                items = [item for item in items if item.get("confirmed_failure")]
+                session.undelivered_messages = items
+                logger.info("[%s] %d unconfirmed message(s) reached the transcript later", session.session_id, len(pending))
+        return [dict(item) for item in items]
 
     async def _auto_handle_tui_startup_and_trust(
         self,
@@ -14833,10 +15005,13 @@ class HubSessionManager:
         strict_mcp_config: bool = False,
         approval_mode: Optional[str] = None,
         compaction_threshold: Any = None,
+        extra_roots: Any = None,
     ) -> Dict[str, Any]:
         """B6: the one place that turns (profile, model, thinking, cwd, env) into a real command line.
 
         Returns exactly what will run; raises a Chinese ValueError for invalid input. Spawns nothing.
+        `extra_roots` (spawn_extra_roots) become one --add-dir=<folder> each, after the caller's argv;
+        the snapshot keeps them in `args`, so a resume launches with them again.
         """
         pid = (profile_id or '').strip()
         prof = self.profiles.get(pid)
@@ -14857,6 +15032,8 @@ class HubSessionManager:
         if caller_args and (eng == 'dsh' or kind != 'tui'):
             raise ValueError(f"{name} 不通过 TUI 命令行启动，不支持 extra_args")
         base_args.extend(caller_args)
+        roots = normalize_extra_roots(extra_roots, forbidden=(str(self.data_dir), str(self.runtime_configs_dir)))
+        base_args.extend(extra_root_args(eng, kind, roots))
         notes = []  # Chinese notes, e.g. substitutions
         ignored_model = injected_flags_in_args(eng, caller_args)
         if ignored_model:
@@ -15194,6 +15371,7 @@ class HubSessionManager:
             'extra_args': caller_args,
             **mcp_config,
             **mcp_settings,
+            'extra_roots': roots,
             'env': resolved_env,
             'cwd': work_dir,
             'model': resolved_model,
@@ -15230,27 +15408,38 @@ class HubSessionManager:
         approval_mode: Optional[str] = None,
         compaction_threshold: Any = None,
         leaf_worker: bool = False,
+        spawned_by: Optional[Dict[str, Any]] = None,
+        extra_roots: Any = None,
     ) -> AgentSession:
+        """`spawned_by` is the MCP caller the server found (mcp_caller_identity), kept in the snapshot.
+
+        `extra_roots` are folders beyond cwd the worker may read and write (spawn_extra_roots).
+        """
         if launch_source not in ("user", "agent"):
             raise ValueError("launch_source must be user or agent")
         if bypass_approvals is not None and type(bypass_approvals) is not bool:
             raise ValueError("bypass_approvals 只能是 true、false 或 null")
         if type(leaf_worker) is not bool:
-            raise ValueError("leaf_worker 只能是 true 或 false")
-        if leaf_worker and not (task or "").strip():
-            raise ValueError("leaf_worker=true 需要同时给出 task：叶子 Worker 的提示加在任务开头")
+            raise ValueError("leaf_worker must be true or false")
         approval_mode = normalize_approval_mode(approval_mode)
         extra_args = normalize_extra_args(extra_args)
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)
         auto_approval_rules = normalize_auto_approval_rules(auto_approval_rules)
         auto_approve_once_prefixes = normalize_auto_approve_once_prefixes(auto_approve_once_prefixes)
         brief_text = normalize_brief_markdown(brief_markdown)
+        # The leaf note goes in front of the first text the worker reads: the task, or the brief's
+        # pointer line when only a brief is given. With neither, nothing is delivered to carry it.
+        if leaf_worker and not (task or "").strip() and brief_text is None:
+            raise ValueError(
+                "leaf_worker=true needs a task or a brief_markdown: the leaf note is put in front of "
+                "the first text the worker reads"
+            )
         loop = asyncio.get_running_loop()
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
                                      bypass_approvals=bypass_approvals, approval_mode=approval_mode,
                                      extra_args=extra_args, compaction_threshold=compaction_threshold,
-                                     **mcp_config)
+                                     extra_roots=extra_roots, **mcp_config)
 
         prof = self.profiles[profile_id]
         engine = launch['engine']
@@ -15356,6 +15545,8 @@ class HubSessionManager:
             "config_dir": launch.get("config_dir"),
             "args": launch_args,
             "extra_args": list(launch.get("extra_args") or []),
+            # Folders beyond cwd the worker may read and write (their --add-dir flags are in args).
+            "extra_roots": list(launch.get("extra_roots") or []),
             **{key: launch[key] for key in ("mcp_servers", "disabled_mcp_servers", "strict_mcp_config")},
             **({"mcp_settings_base": launch["mcp_settings_base"]} if "mcp_settings_base" in launch else {}),
             "env": dict(launch.get("env") or {}),
@@ -15376,6 +15567,8 @@ class HubSessionManager:
             "brief_path": str(brief_path) if brief_path is not None else None,
             # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
             "leaf_worker": leaf_worker,
+            # Who spawned it: {"pid", "process", "hub_session_id", "hub_session_title"} or None.
+            "spawned_by": dict(spawned_by) if isinstance(spawned_by, dict) else None,
             # Round 2: whether this launch had the profile's approval off switch on (a resume
             # re-reads the profile's current value and overwrites this).
             "bypass_approvals": bool(launch.get("bypass_approvals")),
@@ -15391,10 +15584,12 @@ class HubSessionManager:
             # "args (as launched)": web_gui really runs the dsh headless command, not the profile args.
             sess.profile_snapshot["args"] = list(sess.args)
 
-        if task:
-            # B9: last_task is the initial task and is never overwritten afterwards.
-            sess.last_task = task
-            sess.current_activity = f"Running initial task: {task[:80]}"
+        if delivered_task:
+            # B9: last_task is the initial task and is never overwritten afterwards. A brief-only
+            # spawn shows the brief's first line, not the hub's pointer to it.
+            shown_task = task or brief_first_line(brief_text) or delivered_task
+            sess.last_task = shown_task
+            sess.current_activity = f"Running initial task: {shown_task[:80]}"
             if task_mode in ("claude_positional", "omp_positional", "agy_interactive_flag", "codex_positional"):
                 sess.last_injection = {
                     "at": round(time.time(), 3),
