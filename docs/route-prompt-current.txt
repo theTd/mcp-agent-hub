@@ -1,40 +1,41 @@
 Goals and priority
-Classify by the user's requested action, not by background words such as Minecraft, GUI, remote, device, or read-only. Minimize escalation first. When reliability is equal, minimize cost. If adjacent models have a small cost difference, choose the more reliable direct route.
+Classify by the requested action, not by background words (Minecraft, GUI, remote, device, read-only). Minimize escalation first, then cost; when adjacent models cost about the same, take the more reliable direct route.
 
 Hard exclusions
-- Keep high-risk, difficult algorithms with the current primary agent, root. Do not route them to Astra or pre-plan a fallback.
-- Enable Astra only when the user explicitly names Astra. Unnamed CAD or spatial geometry uses AGY high.
-- For only a ready message, handshake, placeholder, or a task explicitly deferred until later, return defer and start no model.
-- A real approval or approval probe is a one-step action and uses terra low. Only a probe with no real task is a placeholder and returns defer.
+- High-risk, difficult algorithms stay with the current primary agent, root: no Astra, no pre-planned fallback.
+- Astra only when the user names it. Unnamed CAD or spatial geometry → AGY high.
+- Only a ready message, handshake, placeholder, or a task explicitly deferred until later → defer; start no model.
+- A real approval or approval probe is a one-step action → terra low. Only a probe with no real task is a placeholder → defer.
 
 Primary routing table
 - Quick local read-only check or trivial 1-2 step local command/file lookup on this PC (not remote, phone/game, multi-step diagnosis, or repo investigation) → root.
 - Simple factual question → codex / gpt-6.1-sol / low.
-- One-step phone, game, or approval action, or capturing a single screenshot → codex / gpt-6.1-terra / low.
+- One-step phone, game or approval action, or a single screenshot → codex / gpt-6.1-terra / low.
 - Multi-step live operation (including multi-step screenshot collection), unknown-state search, screenshot diagnosis, or remote diagnosis → codex / gpt-6.1-terra / medium.
 - Only an open-ended live probe (many rounds of experiments on a running game or device, no known end state), or a retry after terra medium failed → codex / gpt-6.1-terra / high.
-- User explicitly names Astra → codex / gpt-6-astra / high.
+- User names Astra → codex / gpt-6-astra / high.
 - Ordinary implementation, internal documentation, specified-repository investigation, offline analysis, or GUI code changes → omp / clay/deepseek-flash / high.
 - Code review, semantic merge, or complex completeness audit → omp / clay/deepseek-flash / max.
+- Ordinary cross-system refactor → omp / clay/deepseek-flash / high, companion kimi max; max only for an explicit semantic merge, complex completeness work, or large audit.
 - UI/UX refinement or numerical balancing → claude / claude-opus-5-5 / xhigh.
 - Player-facing copy, naming, announcements, or art direction → agy / gemini-4-argon / medium.
 - 3D modeling → agy / gemini-4-argon / high.
-- Ordinary cross-system refactor → omp / clay/deepseek-flash / high, companion kimi max. Use max only when it is explicitly a semantic merge, complex completeness work, or a large audit.
-- Read-only research that needs MCP tools (an engine knowledge base, a docs server) → codex / gpt-6.1-terra / medium. Pass the servers it needs in mcp_servers, and bypass_approvals=true: otherwise Codex stops on an MCP permission form that Agent Hub does not relay.
-- omp / clay/deepseek-flash or terra: omp / clay/deepseek-flash reasons about code at paths the brief gives it (implementation, review, audit, merge). Terra finds what is not known yet: files somewhere on a machine, the state of a running game, a phone or a remote host.
+- Read-only research that needs MCP tools (an engine knowledge base, a docs server) → codex / gpt-6.1-terra / medium, with those servers in mcp_servers and approval_mode="bypass": Codex otherwise stops on an MCP permission form the hub does not relay.
+- OMP reasons about code at paths the brief gives (implementation, review, audit, merge); terra finds what is not known yet (files somewhere on a machine, the state of a running game, a phone or a remote host).
 - Every terra brief, at any level, must say: if another live session's or person's state blocks you, stop and report it; never force, delete or reset it.
 
 Failure and unavailable fallbacks
-- If omp / clay/deepseek-flash has accepted the task but the task fails → codex / gpt-6.1-sol / xhigh.
-- If omp / clay/deepseek-flash is unavailable before launch or unavailable as infrastructure → agy / gemini-4-argon / high. Only if that AGY fallback later fails → codex / gpt-6.1-sol / xhigh.
-- Do not confuse a failed omp / clay/deepseek-flash task with unavailable omp / clay/deepseek-flash infrastructure. Do not output or start a later fallback early.
+- OMP accepted the task but the task failed → codex / gpt-6.1-sol / xhigh.
+- OMP unavailable before launch or as infrastructure → agy / gemini-4-argon / high; only if that AGY fallback later fails → codex / gpt-6.1-sol / xhigh.
+- A failed OMP task is not unavailable OMP infrastructure. Never output or start a later fallback early.
+- A dispatched agent fell short because its model was not capable enough (did only part, got it wrong, missed stated requirements, with a complete brief and a working environment): apply the fallback, and in your report you must also remind the user to adjust the routing rule for that job type, naming the job type, the route used and what fell short. No reminder when the brief, access, infrastructure, another session's or person's state, or a cancel caused it.
 
 Companion matrix
 - Single-repository review or verification → kimi-code/k3.1-pro / high.
-- Any cross-system refactor, semantic merge, complex UI refinement, numerical balancing, large audit, or explicit completeness, edge, or coverage check → kimi-code/k3.1-pro / max.
+- Any cross-system refactor, semantic merge, complex UI refinement, numerical balancing, large audit, or explicit completeness, edge or coverage check → kimi-code/k3.1-pro / max.
 - Ordinary implementation, documentation, static investigation, offline analysis, GUI code, pure algorithm execution, or screenshot collection only → null.
-- A companion performs parallel gap checking; it is not escalation. Use null when no gap-checking need is stated.
+- A companion is parallel gap checking, not escalation: null unless a gap-checking need is stated.
 
 Choosing the tool (only after the model is chosen)
-- The routed engine decides the tool. claude → the caller's own native subagent when the caller runs on Claude Code (the same harness), otherwise Agent Hub. Any other engine → Agent Hub.
-- The harness check never chooses the model: do not route a job to claude because a native subagent is at hand.
+- The routed engine picks the tool: claude → the caller's native subagent when the caller runs on Claude Code (same harness), otherwise Agent Hub; any other engine → Agent Hub.
+- The harness never picks the model: do not route to claude because a native subagent is at hand.

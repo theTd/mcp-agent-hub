@@ -175,3 +175,44 @@ Owner 要求：引擎有原生自动审批时默认使用，主 Agent 只有刻�
 v1 压缩时漏掉了旧规则里的“任务未完成时 GET wait_url”，`unfinished` 因此出现 defer。“GET again for the next ask” 又让 `askagain` 判成 wait。v2 把两件事拆开，并恢复 unfinished 子句。`skipid` 在各版本都停在 4/10，正向表述（v4）反而降到 0/10。所以这个场景主要靠 Hub 修复兜底：已回答的请求不再重复出现，就没有需要过滤的东西。定稿比基线多 168 字节（+4.3%），每次请求的输入约 1,756 tokens（基线 1,711）。
 
 另有一项改动：调用已改名的工具（`respond_to_subagent_approval_or_choice`、`reply_to_subagent`、`wait_subagent_events`）时，Hub 返回替代工具名、“重连 agent-hub MCP 刷新工具列表”的提示和一个当下可用的替代做法，不再只返回 Unknown tool。起因：上报会话从 11-10 起一直连着，客户端工具列表没有随 Hub 更新刷新。
+
+## 能力不足时提醒调整路由（2026-11-15）
+
+Owner 要求：主代理按路由派出的 agent 没做好（只做一半、做错，总之可归因于模型能力不足）时，必须提醒用户调整路由规则。
+
+基线：线上 Hub 全局路由已与本仓库副本不同（owner 在控制台加了本机简单只读检查 → root 一行，DSH 换成 omp / clay/deepseek-flash，去掉了评测输出格式一节），先把线上原文写回 `docs/route-prompt-current.txt` 作为基线（052e890），再在其上修改。
+
+改动：
+- “Failure and unavailable fallbacks” 末尾加一条：派出的 agent 因模型能力不足而没做好（只做一部分、做错、漏掉写明的要求，且 brief 完整、环境正常）时照常走 fallback，汇报里还必须提醒用户调整该类任务的路由规则，写明任务类型、所用路由和差在哪里；起因是 brief、权限、基础设施、其他会话或他人的状态、取消时不提醒。
+- 压缩：路由表之外以 “OMP” 代替重复的 `omp / clay/deepseek-flash`，各行去掉冗余措辞；MCP 只读调研一行的 `bypass_approvals=true` 改为 `approval_mode="bypass"`（同义，Dispatch 一节称前者为旧开关）。
+- `tools/route-prompt-stress.mjs`：输出加第三列 `notice`（`tune` = 提醒调整路由，`none` = 不提醒）；token `dsh-high`/`dsh-max` 改为 `omp-high`/`omp-max`，三个 DSH 场景改写为 OMP；期望值可以是列表（多个答案都对）；`ROUTE_PROMPT_FILE` 可指定提示词快照；场景、token 和指令改为 export，导入模块时不发请求，便于转换成压测 skill 的 spec。
+- 新增 13 个场景（共 46 个）：
+  - 能力不足、期望 tune：`halfimpl`（OMP 只实现一半）、`wrongdiag`（terra medium 根因与日志证据相反）、`missreview`（审查漏掉明显 bug）、`agyfail`（AGY fallback 一半没改完）、`opusui`（Opus UI 精修违背需求）、`lowfail`（terra low 谎报装好）；
+  - 其他起因、期望 none（防过度执行）：`briefgap`（brief 漏写规格路径）、`blocked`（被他人世界锁挡住并按规定停下）、`hubdrop`（Hub 重启断开）、`noaccess`（无写权限）、`cancelled`（用户取消）、`success`（结果正确）；
+  - `localcheck`：线上新增 root 行的回归保护。
+  - 原 33 个派发前场景的 notice 均期望 none；`retry`、`taskfail` 未说明失败原因，tune/none 都算对。没有 fallback 规则的路由（`opusui`、`lowfail`）和非能力原因的场景，primary 接受多个答案，主要考 notice。
+
+压测（本机 8789 评测器，skill 的 `stress.mjs` 加由本工具转换的 spec，46 个场景、每批 5 个、3 次重复，每版 2–3 轮）：
+
+| 版本 | 轮数 | 结果 | notice 错误 | 缺行 | 字节 | 输入 tokens/请求 |
+|---|---|---|---|---|---|---|
+| 基线（线上原文） | 3 | `348/414`（84.1%） | 46 | 7 | 4,358 | 1,433 |
+| A：基线 + 新规则 | 2 | `267/276`（96.7%） | 0 | 1 | 4,915 | 1,546 |
+| B：A 压缩（定稿） | 3 | `399/414`（96.4%） | 0 | 1 | 4,429 | 1,443 |
+| C：再压缩 | 3 | `390/414`（94.2%） | 1 | 9 | 4,076 | 1,375 |
+
+- 基线没有这条规则时，评测器对能力不足场景多半答 none（`halfimpl` 1/9，`missreview`、`agyfail` 3/9），又对派发前场景乱答 tune（`hardalgo` 4/9）。A、B 的 notice 列全部正确。
+- B 比 A 少 486 字节（−9.9%），只比基线多 71 字节（+1.6%），可靠性与 A 持平，因此定稿为 B。C 再少 353 字节，但 `wrongdiag` 漏提醒 1 次，`opusui` 的下一跳 6/9 判为 omp-high（B 3/9），不采用。
+- 残留偏差：`taskfail`、`halfimpl` 偶尔在同一批里一起判为 sol-high（应为 sol-xhigh）。用 `--only` 单独重问这一批（localcheck、taskfail、infraoff、infraref、halfimpl），B 在全部 20 次中出现 2 次（3 轮全量、6 次重复 `30/30`、10 次重复 `49/50`、本工具自跑 1 次），基线 15 次中 0 次（6 次重复 `23/30`，`halfimpl` 5 次 none）。把两条 fallback 行恢复成线上原句（B2，4,497 字节）10 次中仍有 2 次，说明不是压缩措辞造成的；暂按小幅残留记录，后续轮次继续观察。
+- 各版共有的 primary 偏差（基线同样出现，不计入本次改动）：`noaccess` 常判 sol-xhigh、`blocked` 判 terra-high，即现有 fallback 规则会把权限问题或被他人状态挡住当作任务失败而升级；`success` 偶判 root。
+- C 的第 1、2 轮因误操作与另一份相同的压测进程并发运行（同时写同一批结果文件），可解析的结果文件均为完整的单次运行；损坏的基线第 3 轮和 B 第 3 轮已单独重跑。
+
+```bash
+SK=<prompt-stress-test skill 目录>
+node convert.mjs tools/route-prompt-stress.mjs > spec.json   # 一次性转换脚本，读取本工具 export 的场景
+node "$SK/scripts/stress.mjs" spec.json --prompt baseline.txt --label baseline > base1.json
+node "$SK/scripts/stress.mjs" spec.json --prompt candidate.txt --label candidate > cand1.json
+node "$SK/scripts/compare.mjs" base*.json cand*.json
+# 本工具自带的运行方式（不依赖 skill）：
+ROUTE_PROMPT_FILE=docs/route-prompt-current.txt ROUTE_TEST_REPEATS=3 ROUTE_TEST_BATCH=5 node tools/route-prompt-stress.mjs
+```
