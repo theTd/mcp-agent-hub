@@ -23,6 +23,7 @@ windows_accept_guard.py
 restart_resume_request.py
 transcript_summarizer.py
 wait_inbox.py
+engine_errors.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/claude-auto-approval.json
