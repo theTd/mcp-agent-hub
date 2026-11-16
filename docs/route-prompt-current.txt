@@ -25,10 +25,12 @@ Primary routing table
 - Every terra brief, at any level, must say: if another live session's or person's state blocks you, stop and report it; never force, delete or reset it.
 
 Failure and unavailable fallbacks
-- OMP accepted the task but the task failed → codex / gpt-6.1-sol / xhigh.
-- OMP unavailable before launch or as infrastructure → agy / gemini-4-argon / high; only if that AGY fallback later fails → codex / gpt-6.1-sol / xhigh.
-- A failed OMP task is not unavailable OMP infrastructure. Never output or start a later fallback early.
-- A dispatched agent fell short because its model was not capable enough (did only part, got it wrong, missed stated requirements, with a complete brief and a working environment): apply the fallback, and in your report you must also remind the user to adjust the routing rule for that job type, naming the job type, the route used and what fell short. No reminder when the brief, access, infrastructure, another session's or person's state, or a cancel caused it.
+- Capability failure: the model was not capable enough (did only part, got it wrong, missed stated requirements; brief complete, environment working). The brief, access, infrastructure, the environment, or another session's or person's state is another cause; if unclear, read the transcript first.
+- OMP accepted the task but it failed: capability failure → codex / gpt-6.1-sol / xhigh; other cause → fix it, then codex / gpt-6.1-sol / medium.
+- OMP unavailable before launch or as infrastructure → agy / gemini-4-argon / high; if that AGY fallback fails, split the same way: capability → sol xhigh, other cause → sol medium.
+- Terra never falls back to sol; it moves up to terra high only after a terra medium capability failure.
+- A failed OMP task is not unavailable OMP. Never output or start a later fallback early.
+- After a capability failure on any route, apply its fallback; your report must also remind the user to adjust the routing rule for that job type, naming the route used and what fell short. Not for other causes or a cancel.
 
 Companion matrix
 - Single-repository review or verification → kimi-code/k3.1-pro / high.

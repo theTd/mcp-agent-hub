@@ -38,8 +38,8 @@ export const scenarios = [
   ['noise', '提到 Minecraft/GUI 但只改纯代码函数', 'omp-high', 'null', 'none'],
   ['cad', 'CAD 空间几何但未点名 Astra', 'agy-high', 'null', 'none'],
   ['localcheck', '在本机用一两条命令查看某个配置文件里的端口号', 'root', 'null', 'none'],
-  // Cause not stated: either notice answer is defensible.
-  ['taskfail', 'OMP 已接手但任务执行失败，请选择任务失败 fallback', 'sol-xhigh', 'null', ['tune', 'none']],
+  // Cause not stated: either fallback level and either notice answer is defensible.
+  ['taskfail', 'OMP 已接手但任务执行失败，请选择任务失败 fallback', ['sol-xhigh', 'sol-medium'], 'null', ['tune', 'none']],
   ['infraoff', 'OMP 启动前不可用，请选择基础设施不可用 fallback', 'agy-high', 'null', 'none'],
   ['infraref', 'OMP 不可用的跨系统重构并查遗漏，请给第一跳 fallback', 'agy-high', 'kimi-max', 'none'],
   // Capability shortfalls: the brief and the environment were fine, the model fell short.
@@ -51,16 +51,19 @@ export const scenarios = [
   // Routes with no fallback rule: the next route is open, the reminder is not.
   ['opusui', 'Opus xhigh 做 UI 精修，交回的版本有一半改动违背 brief 里写明的需求；brief 完整、环境正常。给出下一步', ['opus-xhigh', 'root', 'sol-xhigh', 'defer'], ['kimi-max', 'null'], 'tune'],
   ['lowfail', 'terra low 单步手机安装，回报已装好，实际没装上；brief 清楚、手机正常。给出重试路由', ['terra-low', 'terra-medium', 'terra-high'], 'null', 'tune'],
-  // Shortfalls with another cause: no routing reminder. Their next route is secondary here.
-  ['briefgap', 'OMP high 交回的实现不对，原因是 brief 漏写了接口规格文件路径，worker 按 brief 做的部分都正确。给出补全 brief 后的派发', ['omp-high', 'sol-xhigh'], 'null', 'none'],
+  // Failures with another cause: sol medium, never sol xhigh, and no routing reminder.
+  ['briefgap', 'OMP high 交回的实现不对，原因是 brief 漏写了接口规格文件路径，worker 按 brief 做的部分都正确。给出补全 brief 后的派发', 'sol-medium', 'null', 'none'],
+  ['envfail', 'OMP high 已接手实现，测试依赖的本地数据库没启动，测试跑不起来而失败；代码按规格写对了。环境修好后给出下一跳', 'sol-medium', 'null', 'none'],
+  ['agyinfra', 'OMP 启动前不可用，转 AGY high 做的实现因网络中断中途失败，它此前的改动都正确。给出下一跳', 'sol-medium', 'null', 'none'],
+  ['noaccess', 'OMP high 实现任务卡住：仓库目录没有写权限，worker 报告后停下。权限补上后给出下一跳', 'sol-medium', 'null', 'none'],
+  // Other stops: nothing to escalate. Their next route is secondary here.
   ['blocked', 'terra medium 按 brief 停下报告：另一位测试者的在线世界锁挡住了操作，它没有强制解锁。给出下一步', ['defer', 'terra-medium'], 'null', 'none'],
   ['hubdrop', 'terra medium 会话因 Hub 进程重启中途断开，任务未完成，它此前的操作都正确。给出重新派发', ['terra-medium', 'terra-high'], 'null', 'none'],
-  ['noaccess', 'OMP high 实现任务卡住：仓库目录没有写权限，worker 报告后停下。给出下一步', ['omp-high', 'defer', 'agy-high'], 'null', 'none'],
   ['cancelled', '用户中途取消了 OMP 正在做的实现任务，说以后再做', 'defer', 'null', 'none'],
   ['success', 'OMP high 按规格完成实现并补了测试，主代理复核全部正确。给出后续路由', ['defer', 'omp-high'], 'null', 'none'],
 ];
 
-export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'root', 'astra-high', 'sol-high', 'sol-xhigh', 'defer'];
+export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'root', 'astra-high', 'sol-medium', 'sol-high', 'sol-xhigh', 'defer'];
 export const companionTokens = ['kimi-high', 'kimi-max', 'null'];
 export const noticeTokens = ['tune', 'none'];
 export const preamble = '你是路由评测器。';
@@ -85,6 +88,7 @@ function normalizePrimary(value, id) {
   if (v.includes('gemini-4-argon') && v.includes('high')) return 'agy-high';
   if (v.includes('gpt-6.1-sol') && v.includes('xhigh')) return id === 'hardalgo' ? 'root' : 'sol-xhigh';
   if (v.includes('gpt-6.1-sol') && v.includes('low')) return 'sol-low';
+  if (v.includes('gpt-6.1-sol') && v.includes('medium')) return 'sol-medium';
   if (v.includes('gpt-6.1-sol') && v.includes('high')) return 'sol-high';
   if (v === 'root' || v.includes('primary codex')) return 'root';
   return v;
@@ -206,7 +210,7 @@ function skillSpec() {
           ['gpt-6-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
           ['terra.*medium', 'terra-medium'], ['terra.*(^|[^a-z])low', 'terra-low'], ['terra.*high', 'terra-high'],
           ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.1-sol.*xhigh', 'sol-xhigh'],
-          ['gpt-6.1-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.1-sol.*high', 'sol-high'], ['primary codex', 'root'],
+          ['gpt-6.1-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.1-sol.*medium', 'sol-medium'], ['gpt-6.1-sol.*high', 'sol-high'], ['primary codex', 'root'],
         ]),
       },
       { name: 'companion', tokens: companionTokens, aliases: alias([['^(none|-|)$', 'null'], ['kimi.*max', 'kimi-max'], ['kimi', 'kimi-high']]) },

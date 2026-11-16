@@ -216,3 +216,33 @@ node "$SK/scripts/compare.mjs" base*.json cand*.json
 # 本工具自带的运行方式（不依赖 skill）：
 ROUTE_PROMPT_FILE=docs/route-prompt-current.txt ROUTE_TEST_REPEATS=3 ROUTE_TEST_BATCH=5 node tools/route-prompt-stress.mjs
 ```
+
+## 只有能力不足才升级到 sol xhigh（2026-11-15）
+
+Owner 要求：只有能力不足导致的失败才能升级到 sol xhigh，其他原因升级到 sol medium。
+
+改动（“Failure and unavailable fallbacks” 重写，与上一节的提醒规则共用同一个“能力不足”定义）：
+- 先定义能力不足：模型能力不够（只做一部分、做错、漏掉写明的要求；brief 完整、环境正常）；brief、权限、基础设施、环境、其他会话或他人的状态属于其他原因；原因不明时先读 transcript。
+- OMP 已接手但失败：能力不足 → sol xhigh；其他原因 → 先修好，再 sol medium。
+- OMP 启动前或基础设施不可用 → AGY high 不变；该 AGY fallback 再失败时按同样的原因划分到 sol xhigh 或 sol medium。
+- terra 不 fallback 到 sol，只有 terra medium 能力不足后才升到 terra high。
+- 提醒规则改为引用同一定义：任何路由能力不足后照常 fallback 并提醒用户调整路由；其他原因或取消不提醒。
+- 范围：owner 的规则只说 sol xhigh，所以只改原本升级到 sol xhigh 的两处（OMP 任务失败、AGY fallback 失败）；取消、被他人状态挡住不派 sol medium；OMP 基础设施不可用仍走 AGY high。
+
+`tools/route-prompt-stress.mjs`：新增 `sol-medium` token；新增 `envfail`（测试依赖的数据库没启动）、`agyinfra`（AGY fallback 因网络中断失败），期望 sol-medium；`briefgap`、`noaccess` 改为期望 sol-medium（`noaccess` 场景改写为“权限补上后给出下一跳”）；`taskfail` 未说明原因，sol-xhigh/sol-medium 都算对。共 48 个场景。
+
+压测（本机 8789 评测器，`--spec` 输出的 spec，每批 5 个、3 次重复）：
+
+| 版本 | 轮数 | 结果 | 字节 | 输入 tokens/请求 | 主要偏差 |
+|---|---|---|---|---|---|
+| 基线（上一节定稿） | 3 | `375/432`（86.8%） | 4,430 | 1,453 | 4 个新 sol-medium 场景全部 0/9（判 sol-xhigh 或 omp-high） |
+| D：泛化句 “Only a capability failure escalates to sol xhigh” | 2 | `262/288`（91.0%） | 4,756 | 1,522 | 外溢到 terra：`lowfail` 0/6、`wrongdiag` 1/6 判 sol-xhigh，`hubdrop`、`blocked` 判 sol-medium |
+| D2：原因划分写进 OMP/AGY 两行，加 “a terra failure follows the terra rows” | 2 | `269/288`（93.4%） | 4,826 | 1,548 | `blocked` 2/6（判 terra-high） |
+| D3：D2 去掉 terra 一行 | 2 | `280/288`（97.2%） | 4,729 | 1,527 | `blocked` 3/6 |
+| D4：terra 一行改为“只有 terra medium 能力不足后才升 terra high” | 3 | `417/432`（96.5%） | 4,834 | 1,549 | `blocked` 9/9 |
+| D5：D4 压缩（定稿） | 3 | `420/432`（97.2%） | 4,682 | 1,506 | 见下 |
+
+- D5 的新场景：`briefgap` 8/9（1 次 omp-high）、`envfail`、`agyinfra`、`noaccess` 均 9/9；能力不足场景 `halfimpl`、`agyfail` 9/9，`missreview` 8/9（companion 1 次 kimi-max）；terra 场景 `wrongdiag`、`lowfail`、`hubdrop` 9/9，`blocked` 8/9（与基线相同）；notice 列无错误。
+- 教训：泛化的 “only X escalates to sol xhigh” 被读成 “X 就升到 sol xhigh”，吞掉了 terra 的重试规则；把划分写进做选择的那两行、并给 terra 一句明确的升级条件后消除。
+- 各版共有、与本次改动无关的偏差：`opusui` 的下一跳常判 omp-high（基线 3/9），`success` 偶判 root，`shotcapture` 偶判 root。
+- 定稿比基线多 252 字节（+5.7%），每次请求输入多约 53 tokens（+3.6%）。
