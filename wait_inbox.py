@@ -25,6 +25,46 @@ ASK_EVENT_TYPES = frozenset({"approval_request", "question"})
 TERMINAL_FAILURE_TYPES = frozenset({"delivery_failed", "crashed", "session_exited", "exited"})
 
 
+def with_wait_outcome(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """One result entry carrying the ended turn's outcome: answered, error or aborted.
+
+    The turn_completed event's ``data`` (record_worker_event copies it) names the outcome; an
+    entry without one is an ordinary answer.  An error entry also carries its classified error.
+    """
+    entry = dict(entry)
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    outcome = str(data.get("outcome") or entry.get("outcome") or "answered")
+    if outcome not in ("error", "aborted"):
+        outcome = "answered"
+    entry["outcome"] = outcome
+    if outcome == "error":
+        error = entry.get("error") if isinstance(entry.get("error"), dict) else {}
+        entry["error"] = {
+            "kind": str(error.get("kind") or data.get("error_kind") or "other"),
+            "retryable": bool(error.get("retryable", data.get("retryable"))),
+            "message": str(error.get("message") or data.get("error") or ""),
+        }
+    else:
+        entry.pop("error", None)
+    return entry
+
+
+def engine_errors_of(results: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The done result's engine errors, one flat entry per session (top-level ``engine_errors``)."""
+    errors = []
+    for result in results:
+        if not isinstance(result, dict) or result.get("outcome") != "error":
+            continue
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        errors.append({
+            "session_id": result.get("session_id"),
+            "kind": str(error.get("kind") or "other"),
+            "retryable": bool(error.get("retryable")),
+            "message": str(error.get("message") or ""),
+        })
+    return errors
+
+
 class _ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -324,21 +364,25 @@ class WaitInbox:
                 # A group handle is all-settled by default.  A member completion is cached in the
                 # inbox, then the state provider decides whether every member has completed.
                 if len(row["session_ids"]) == 1 or row.get("mode") != "all_settled":
-                    result = dict(event)
+                    result = with_wait_outcome(dict(event))
                     result.setdefault("final_response", event.get("content", ""))
                     result_id = event.get("result_id") or f"result:{event.get('session_id')}:{event.get('turn_id') or event.get('seq')}"
                     with self._connect() as conn:
                         conn.execute("UPDATE wait_handles SET result_json=?,result_id=?,state='done',updated_at=? WHERE handle=?", (self._json(result), result_id, time.time(), handle))
-                    return {"state": "done", "result_id": result_id, "final_response": result.get("final_response", ""), "results": [result]}
+                    return self._done_payload(result_id, result.get("final_response", ""), [result])
                 if self._state_provider:
                     state = await self._state_provider(list(row["session_ids"]))
                     if state.get("state") == "done":
-                        result = dict(event)
+                        result = with_wait_outcome(dict(event))
                         result.setdefault("final_response", event.get("content", ""))
                         result_id = state.get("result_id") or event.get("result_id") or f"result:{event.get('session_id')}:{event.get('turn_id') or event.get('seq')}"
+                        results = [with_wait_outcome(item) for item in (state.get("results") or [result])]
+                        saved = {**state, "results": results}
                         with self._connect() as conn:
-                            conn.execute("UPDATE wait_handles SET result_json=?,result_id=?,state='done',updated_at=? WHERE handle=?", (self._json(state), result_id, time.time(), handle))
-                        return {"state": "done", "result_id": result_id, "final_response": state.get("final_response") or result.get("final_response", ""), "results": state.get("results") or [result]}
+                            conn.execute("UPDATE wait_handles SET result_json=?,result_id=?,state='done',updated_at=? WHERE handle=?", (self._json(saved), result_id, time.time(), handle))
+                        return self._done_payload(
+                            result_id, state.get("final_response") or result.get("final_response", ""), results
+                        )
                 return {"state": "waiting", "wait_handle": handle}
             if kind in TERMINAL_FAILURE_TYPES or kind == "hub_shutdown":
                 message = event.get("content") or kind
@@ -349,7 +393,10 @@ class WaitInbox:
                 }
         if row["state"] == "done" and row.get("result") is not None:
             saved = row["result"] or {}
-            return {"state": "done", "result_id": row.get("result_id"), "final_response": saved.get("final_response") or saved.get("content", ""), "results": saved.get("results") or [saved]}
+            results = [with_wait_outcome(item) for item in (saved.get("results") or [saved])]
+            return self._done_payload(
+                row.get("result_id"), saved.get("final_response") or saved.get("content", ""), results
+            )
         if row["state"] == "failed":
             return {
                 "state": "failed",
@@ -361,8 +408,22 @@ class WaitInbox:
             if state.get("state") in ("done", "failed", "ask"):
                 if state.get("state") == "failed" and not state.get("errors"):
                     state = {**state, "errors": [{"message": state.get("error") or "wait failed"}]}
+                if state.get("state") == "done":
+                    results = [with_wait_outcome(item) for item in (state.get("results") or [])]
+                    return {**state, **self._done_payload(
+                        state.get("result_id"), state.get("final_response") or "", results
+                    )}
                 return state
         return {"state": "waiting", "wait_handle": handle}
+
+    @staticmethod
+    def _done_payload(result_id: Any, final_response: Any, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """A done result keeps its state; every entry names its outcome, errors are listed once."""
+        payload = {"state": "done", "result_id": result_id, "final_response": final_response, "results": results}
+        errors = engine_errors_of(results)
+        if errors:
+            payload["engine_errors"] = errors
+        return payload
 
     async def _all_open_asks(self, handle: str) -> List[Dict[str, Any]]:
         with self._connect() as conn:

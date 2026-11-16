@@ -29,6 +29,7 @@ from session_manager import (
     hub_api_base_url,
     hub_port,
     parent_interaction_view,
+    parent_turn_outcome_fields,
     resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
@@ -865,6 +866,7 @@ async def list_active_sessions(
             entry = {"session_id": s.get("session_id"), "title": s.get("title"), "agent_type": s.get("profile_id") or s.get("engine"), "model": s.get("effective_model") or s.get("model") or "", "status": s.get("status"), "current_activity": str(s.get("current_activity") or "")[:120], "step_count": s.get("step_count", 0), "final_response_exists": has_final, "final_response_length": len(final or "") if final is not None else 0, "cwd": s.get("cwd"), "updated_at": s.get("last_output_at") or s.get("ended_at") or s.get("created_at")}
             if pending:
                 entry["open_request"] = {"request_id": pending.get("request_id"), "kind": pending.get("kind"), "prompt": str(prompt)[:120]}
+            entry.update(parent_turn_outcome_fields(s))
             return entry
     if view == "compact":
         historical = []
@@ -927,6 +929,7 @@ async def collect_and_terminate(
             if rec.get("cwd"):
                 cwd_dirs.add(str(rec["cwd"]))
             entry = {"session_id": sid, "status": status, "final_response": full[:max_chars], "full_length": len(full), "truncated": len(full) > max_chars, "already_closed": already_closed}
+            entry.update(parent_turn_outcome_fields(rec))
             if entry["truncated"]:
                 entry["hint"] = "Call get_subagent_final_response for the rest."
             collected.append(entry)

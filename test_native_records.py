@@ -413,7 +413,9 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
                 self.append(path, *(self.agy_error(n) for n in range(1, 9)))
                 done = await self.hub.wait_inbox.wait(handle, 3)
             self.assertEqual(done["state"], "done")
-            self.assertTrue(done["final_response"].startswith("agy turn ended on an engine error: API error (attempt 8)"))
+            self.assertTrue(done["final_response"].startswith(
+                "agy turn ended on an engine error (network): API error (attempt 8)"
+            ))
             self.assertEqual(done["results"][0]["data"]["outcome"], "error")
             self.assertEqual(sess.status, "completed")
             events = [e["type"] for e in self.hub.worker_events if e["session_id"] == sess.session_id]
