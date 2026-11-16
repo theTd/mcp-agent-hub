@@ -109,7 +109,7 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hub.resolve_launch("kimi", cwd=str(self.root), compaction_threshold=None)["compaction_threshold"])
 
     async def test_rejections_leave_no_session(self):
-        for engine, kwargs in (("kimi", {}), ("dsh", {}), ("desktop-gui", {"hwnd": 123})):
+        for engine, kwargs in (("kimi", {}), ("dsh", {})):
             with self.subTest(engine=engine), self.assertRaises(ValueError):
                 await self.hub.create_session(engine, compaction_threshold="70%", **kwargs)
         self.assertEqual(self.hub.sessions, {})

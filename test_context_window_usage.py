@@ -69,7 +69,7 @@ class EngineFormulaTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_unsupported_engines_return_none(self):
-        for eng in ("dsh", "pwsh", "desktop_gui", "generic"):
+        for eng in ("dsh", "pwsh", "generic"):
             tracker = ContextWindowTracker(eng, catalog=ContextWindowCatalog(home=self.home))
             self.assertFalse(tracker.supported)
             self.assertFalse(tracker.observe_record({"type": "token_count", "tokens": 1234}))

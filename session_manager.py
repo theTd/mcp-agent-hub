@@ -1,11 +1,7 @@
 import asyncio
-import base64
-import ctypes
-from ctypes import wintypes
 import datetime
 import fnmatch
 import hashlib
-import io
 import json
 import logging
 import math
@@ -22,7 +18,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 import httpx
-from PIL import Image
 
 # §5.1: the hub's one terminal core. The wrapper turns a missing build into the build command, and
 # there is no Python PTY or parser behind it after step 3b.
@@ -72,50 +67,6 @@ from transcript_summarizer import (
 )
 
 logger = logging.getLogger("mcp-agent-hub.session_manager")
-
-# Win32 API constants for Desktop GUI window capture & off-screen tucking
-user32 = ctypes.windll.user32
-gdi32 = ctypes.windll.gdi32
-kernel32 = ctypes.windll.kernel32
-
-# S4: a window's process name is read through a limited-information handle; a failure is not an error.
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-try:
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.QueryFullProcessImageNameW.argtypes = [
-        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
-    ]
-    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-except Exception:  # pragma: no cover - only on a non-Windows host
-    pass
-
-PW_RENDERFULLCONTENT = 0x00000002
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_CHAR = 0x0102
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-
-
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize", wintypes.DWORD),
-        ("biWidth", wintypes.LONG),
-        ("biHeight", wintypes.LONG),
-        ("biPlanes", wintypes.WORD),
-        ("biBitCount", wintypes.WORD),
-        ("biCompression", wintypes.DWORD),
-        ("biSizeImage", wintypes.DWORD),
-        ("biXPelsPerMeter", wintypes.LONG),
-        ("biYPelsPerMeter", wintypes.LONG),
-        ("biClrUsed", wintypes.DWORD),
-        ("biClrImportant", wintypes.DWORD),
-    ]
-
-
-
 
 # Native answers outrank derived summaries and screen snapshots.
 FINAL_SOURCE_PRIORITY = {
@@ -501,7 +452,6 @@ def normalize_subagent_idle_timeout(value: Any) -> int:
 RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh")
 ENGINE_RESUME_BLOCK_REASONS = {
     "pwsh": "PowerShell 会话结束后无法找回上下文",
-    "desktop_gui": "桌面窗口会话结束后无法找回上下文",
 }
 DEFAULT_RESUME_BLOCK_REASON = "该引擎的会话结束后无法恢复上下文"
 RESUME_SCROLLBACK_MAX_BYTES = 512 * 1024
@@ -1508,7 +1458,7 @@ def approval_mode_notes(engine: str, policy: Dict[str, Any]) -> List[str]:
 
 def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bool]:
     """What the session runs with: True = high-risk approval on, False = bypassed, None = the engine
-    has no hub-injected approval (dsh, pwsh, desktop GUI)."""
+    has no hub-injected approval (dsh, pwsh)."""
     eng = (engine or "").strip().lower()
     if eng not in APPROVAL_ENGINES:
         return None
@@ -2353,7 +2303,6 @@ class AgentSession:
         command: str,
         args: List[str],
         gui_url: Optional[str] = None,
-        hwnd: Optional[int] = None,
         cols: int = 120,
         rows: int = 36,
         # The hub's one Core (§5.1); tests pass a fake of its calls instead.
@@ -2370,15 +2319,12 @@ class AgentSession:
         self.wait_handle: Optional[str] = None
         self.profile_id = profile_id
         self.profile_name = profile_name
-        self.kind = kind  # "tui" | "web_gui" | "desktop_gui"
+        self.kind = kind  # "tui" | "web_gui"
         self.title = title
         self.cwd = cwd
         self.command = command
         self.args = args
         self.gui_url = gui_url
-        self.hwnd = hwnd
-        self.tucked_offscreen = False
-        self.original_rect: Optional[tuple] = None
         self.on_exit_cb = on_exit_cb
         self.on_tui_tool_cb = on_tui_tool_cb
 
@@ -3125,7 +3071,7 @@ class AgentSession:
             return "crashed"
         if self.completion_reported:
             return "exited"
-        if (self.engine or "").strip().lower() in ("pwsh", "generic") or self.kind == "desktop_gui":
+        if (self.engine or "").strip().lower() in ("pwsh", "generic"):
             return "exited"
         return "crashed"
 
@@ -3255,8 +3201,6 @@ class AgentSession:
             "title": self.title,
             "cwd": self.cwd,
             "gui_url": self.gui_url,
-            "hwnd": self.hwnd,
-            "tucked_offscreen": self.tucked_offscreen,
             "status": self.status,
             "process_alive": alive,
             "step_count": self.step_count,
@@ -3299,156 +3243,6 @@ class AgentSession:
             # K8 (fix 9d): the recent submit records, newest last (last_injection is one of them).
             "recent_injections": self.recent_injections,
         }
-
-
-class Win32WindowHelper:
-    """Manages native Windows GUI Agent windows so they can be viewed & controlled inside the Web Console without cluttering the desktop."""
-
-    @staticmethod
-    def _process_exe_name(pid: int) -> str:
-        """S4: the window owner's executable file name, or "" when Windows refuses the query."""
-        if not pid:
-            return ""
-        handle = None
-        try:
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-            if not handle:
-                return ""
-            buf = ctypes.create_unicode_buffer(1024)
-            size = wintypes.DWORD(len(buf))
-            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                return ""
-            return os.path.basename(buf.value)
-        except Exception:
-            return ""
-        finally:
-            if handle:
-                try:
-                    kernel32.CloseHandle(handle)
-                except Exception:
-                    pass
-
-    @staticmethod
-    def list_top_windows() -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def callback(hwnd, _):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value.strip()
-            if not title or title in ("Program Manager", "Settings", "Windows Input Experience"):
-                return True
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            if w < 100 or h < 80:
-                return True
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            results.append({
-                "hwnd": int(hwnd),
-                "title": title,
-                "pid": int(pid.value),
-                "process_name": Win32WindowHelper._process_exe_name(int(pid.value)),
-                "x": rect.left,
-                "y": rect.top,
-                "width": w,
-                "height": h,
-            })
-            return True
-
-        user32.EnumWindows(WNDENUMPROC(callback), 0)
-        return results
-
-    @staticmethod
-    def capture_window_jpeg_b64(hwnd: int) -> Optional[Dict[str, Any]]:
-        if not user32.IsWindow(hwnd):
-            return None
-        rect = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        width = rect.right - rect.left
-        height = rect.bottom - rect.top
-        if width <= 10 or height <= 10:
-            return None
-
-        hwnd_dc = user32.GetWindowDC(hwnd)
-        if not hwnd_dc:
-            return None
-        mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
-        bmp = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
-        old_bmp = gdi32.SelectObject(mem_dc, bmp)
-
-        user32.PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT)
-
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = width
-        bmi.biHeight = -height
-        bmi.biPlanes = 1
-        bmi.biBitCount = 32
-        bmi.biCompression = 0
-
-        buf_len = width * height * 4
-        buf = ctypes.create_string_buffer(buf_len)
-        gdi32.GetDIBits(mem_dc, bmp, 0, height, buf, ctypes.byref(bmi), 0)
-
-        gdi32.SelectObject(mem_dc, old_bmp)
-        gdi32.DeleteObject(bmp)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(hwnd, hwnd_dc)
-
-        img = Image.frombuffer("RGBA", (width, height), buf, "raw", "BGRA", 0, 1).convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=78)
-        b64 = base64.b64encode(out.getvalue()).decode("ascii")
-        return {"width": width, "height": height, "jpeg_b64": b64}
-
-    @staticmethod
-    def tuck_window_offscreen(session: AgentSession, tuck: bool) -> bool:
-        hwnd = session.hwnd
-        if not hwnd or not user32.IsWindow(hwnd):
-            return False
-        rect = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if tuck and not session.tucked_offscreen:
-            session.original_rect = (rect.left, rect.top, w, h)
-            user32.MoveWindow(hwnd, -3200, 100, w, h, True)
-            session.tucked_offscreen = True
-        elif not tuck and session.tucked_offscreen:
-            orig_x, orig_y = (session.original_rect[0], session.original_rect[1]) if session.original_rect else (120, 120)
-            user32.MoveWindow(hwnd, orig_x, orig_y, w, h, True)
-            session.tucked_offscreen = False
-        return True
-
-    @staticmethod
-    def send_click(hwnd: int, x: int, y: int):
-        if not user32.IsWindow(hwnd):
-            return False
-        lparam = (int(y) << 16) | (int(x) & 0xFFFF)
-        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 1, lparam)
-        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
-        return True
-
-    @staticmethod
-    def send_text(hwnd: int, text: str):
-        if not user32.IsWindow(hwnd):
-            return False
-        for ch in text:
-            if ch in ("\n", "\r"):
-                user32.PostMessageW(hwnd, WM_KEYDOWN, 0x0D, 0)
-                user32.PostMessageW(hwnd, WM_KEYUP, 0x0D, 0)
-            else:
-                user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
-        return True
 
 
 class HubSessionManager:
@@ -9710,10 +9504,7 @@ class HubSessionManager:
                     dsh_error = f"DSH 消息发送失败：{e}"
                     sess.emit_virtual_ansi(f"\r\n\x1b[31m✖ DSH message delivery error: {e}\x1b[0m\r\n")
         elif sess and also_write_pty and not resolved_question_id:
-            if sess.kind == "desktop_gui" and sess.hwnd:
-                payload = text + ("\r" if press_enter and not text.endswith("\r") else "")
-                pty_written = Win32WindowHelper.send_text(sess.hwnd, payload)
-            elif (press_enter and sess.kind == "tui" and text.rstrip("\r\n").strip()
+            if (press_enter and sess.kind == "tui" and text.rstrip("\r\n").strip()
                   and sess.is_process_alive()):
                 # K6 (fix 9c): a live message with Enter goes through the same checked submit as
                 # the startup text when the composer can be located, one writer at a time.
@@ -14967,7 +14758,6 @@ class HubSessionManager:
         task: Optional[str] = None,
         cwd: Optional[str] = None,
         title: Optional[str] = None,
-        hwnd: Optional[int] = None,
         model: Optional[str] = None,
         thinking_level: Optional[str] = None,
         env: Optional[Any] = None,
@@ -14998,53 +14788,7 @@ class HubSessionManager:
         auto_approval_rules = normalize_auto_approval_rules(auto_approval_rules)
         auto_approve_once_prefixes = normalize_auto_approve_once_prefixes(auto_approve_once_prefixes)
         brief_text = normalize_brief_markdown(brief_markdown)
-        if profile_id == "desktop-gui":
-            validate_mcp_engine("desktop_gui", "desktop_gui", mcp_config)
-        if extra_args and profile_id == "desktop-gui":
-            raise ValueError("桌面 GUI 会话不支持 extra_args")
-        if brief_text is not None and profile_id == "desktop-gui":
-            raise ValueError("桌面 GUI 会话不支持 brief_markdown")
-        if auto_approve_once_prefixes and profile_id == "desktop-gui":
-            raise ValueError(AUTO_APPROVE_ONCE_ENGINE_ERROR.format(engine="desktop_gui"))
-        if profile_id == "desktop-gui" and normalize_compaction_threshold(compaction_threshold):
-            raise ValueError("桌面 GUI 会话不支持自动压缩阈值（compaction_threshold）")
         loop = asyncio.get_running_loop()
-
-        if profile_id == "desktop-gui" and hwnd:
-            session_id = f"gui-{uuid.uuid4().hex[:8]}"
-            sess = AgentSession(
-                session_id=session_id,
-                profile_id="desktop-gui",
-                profile_name="Desktop GUI Window",
-                kind="desktop_gui",
-                title=title or f"HWND-{hwnd}",
-                cwd=cwd or os.getcwd(),
-                command="",
-                args=[],
-                hwnd=int(hwnd),
-                on_exit_cb=self._exit_callback,
-                on_tui_tool_cb=self._tool_callback,
-            )
-            sess.status = "running"
-            sess.engine = "desktop_gui"
-            # Spec §3: even a non-resumable session keeps the launch it ran with, so the archive can
-            # say why it cannot be revived instead of "no launch recorded".
-            sess.profile_snapshot = {
-                "launch_source": launch_source,
-                "profile_id": "desktop-gui", "engine": "desktop_gui", "kind": "desktop_gui",
-                "command": "", "args": [], "env": {}, "model": None, "thinking_level": None,
-                "cli_model": None, "cwd": sess.cwd, "task_mode": "desktop_gui",
-                "startup_delay_sec": 0, "submit_key": "\r", "dsh_spec": None,
-                "auto_approval_rules": auto_approval_rules,
-                "auto_approve_once_prefixes": auto_approve_once_prefixes,
-                "auto_approve_once_uses": 0,
-                **resolve_session_approval("desktop_gui", {}, bypass_approvals, approval_mode),
-            }
-            if bypass_approvals is not None or approval_mode is not None:
-                sess.launch_notes = [BYPASS_NO_EFFECT_NOTE.format(engine="desktop_gui")]
-            self.sessions[session_id] = sess
-            await self.persist_session(sess)
-            return sess
 
         launch = self.resolve_launch(profile_id, model=model, thinking_level=thinking_level, cwd=cwd, env=env,
                                      bypass_approvals=bypass_approvals, approval_mode=approval_mode,

@@ -317,7 +317,6 @@ textarea { resize: vertical; min-height: 64px; line-height: 1.55; }
 [data-engine="claude"] { --engine-color: #d97757; }
 [data-engine="dsh"] { --engine-color: #f2b347; }
 [data-engine="pwsh"] { --engine-color: #8e9ab0; }
-[data-engine="desktop"] { --engine-color: #f28fb5; }
 
 .engine-badge {
   display: inline-flex;
@@ -792,28 +791,6 @@ body.is-resizing-sidebar * {
 .pane[data-status="waiting_parent"] .pane-foot { background: var(--warning-soft); }
 
 
-.desktop-stream {
-  position: relative;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: auto;
-  background: #050608;
-}
-.desktop-stream img { max-width: 100%; max-height: 100%; border-radius: 4px; box-shadow: 0 0 0 1px var(--line); cursor: crosshair; user-select: none; }
-.stream-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  background: rgba(5, 6, 8, 0.82);
-  color: var(--text-2);
-  font-size: 12.5px;
-}
-
 .empty-state {
   align-self: center;
   justify-self: center;
@@ -1104,18 +1081,6 @@ body.is-resizing-sidebar * {
 .tool-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .tool-chips code { padding: 3px 8px; font-size: 11.5px; }
 
-/* --------------------------------------------------------- desktop windows */
-.win-tools { display: flex; align-items: center; gap: 8px; }
-.win-count { font-size: 12px; color: var(--text-3); white-space: nowrap; }
-.win-list { display: flex; flex-direction: column; gap: 6px; min-height: 200px; }
-.win-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-2); transition: border-color 0.12s; }
-.win-row:hover { border-color: var(--line-3); }
-.win-icon { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border-radius: var(--r-sm); background: var(--bg-3); color: var(--text-2); }
-.win-info { flex: 1; min-width: 0; }
-.win-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.win-meta { font: 11.5px var(--font-mono); color: var(--text-3); }
-.list-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 36px 12px; color: var(--text-3); font-size: 12.5px; text-align: center; }
-.list-state.error { color: var(--danger-text); }
 
 /* ----------------------------------------------------------------- toasts */
 .toast-host { position: fixed; right: 16px; bottom: 16px; z-index: 300; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; pointer-events: none; }

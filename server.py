@@ -24,7 +24,6 @@ import uvicorn
 
 from session_manager import (
     HubSessionManager,
-    Win32WindowHelper,
     default_profiles_path,
     hub_api_base_url,
     hub_port,
@@ -237,6 +236,8 @@ RETIRED_TOOL_HINTS = {
         "the wait_url that every spawn/send/respond result returns",
         "Until then, GET that wait_url; it needs no other tool.",
     ),
+    # Removed with the desktop GUI window sessions; nothing replaces it.
+    "attach_desktop_gui_window": (None, "The hub no longer attaches desktop windows."),
 }
 
 
@@ -248,8 +249,9 @@ class RetiredToolMiddleware(Middleware):
         if hint is None:
             return await call_next(context)
         replacement, fallback = hint
+        instead = f"use {replacement} instead" if replacement else "it has no replacement"
         raise ToolError(
-            f"{context.message.name} is retired; use {replacement} instead. Your client's tool list predates "
+            f"{context.message.name} is retired; {instead}. Your client's tool list predates "
             f"a hub update, so reconnect the agent-hub MCP server to refresh it. {fallback}"
         )
 
@@ -969,36 +971,6 @@ async def terminate_subagent(session_id: str) -> Dict[str, Any]:
     }
 
 
-@mcp.tool()
-async def attach_desktop_gui_window(
-    window_title_keyword: str,
-    tuck_offscreen: bool = True,
-) -> Dict[str, Any]:
-    """Attach a desktop window matching the title keyword to the console; optionally tuck it offscreen."""
-    windows = Win32WindowHelper.list_top_windows()
-    matched = [w for w in windows if window_title_keyword.lower() in w["title"].lower()]
-    if not matched:
-        return {
-            "attached": False,
-            "message": f"No desktop window title contains '{window_title_keyword}'",
-            "available_windows": windows[:15],
-        }
-    target = matched[0]
-    sess = await hub.create_session(
-        profile_id="desktop-gui",
-        launch_source="agent",
-        title=target["title"],
-        hwnd=target["hwnd"],
-    )
-    if tuck_offscreen:
-        Win32WindowHelper.tuck_window_offscreen(sess, True)
-    return {
-        "attached": True,
-        "session_id": sess.session_id,
-        "window": target,
-        "tucked_offscreen": sess.tucked_offscreen,
-        "console_url": f"{hub_api_base_url()}/?session={sess.session_id}",
-    }
 
 
 # Parent MCP app and Hub lifespan
@@ -1124,7 +1096,7 @@ async def api_parent_respond(session_id: str, req: Request):
 
 
 # ============================================================================
-# 4. Web 总控台与 ConPTY / Win32 路由
+# 4. Web 总控台与 ConPTY 路由
 # ============================================================================
 class RevalidatingStaticFiles(StaticFiles):
     """Console assets: always revalidate (cheap 304) so an edited module never mixes with a cached one."""
@@ -1385,7 +1357,6 @@ async def api_create_session(req: Request):
     task = body.get("task")
     cwd = body.get("cwd")
     title = body.get("title")
-    hwnd = body.get("hwnd")
     model = body.get("model")
     thinking_level = body.get("thinking_level")
     env = body.get("env")
@@ -1396,7 +1367,6 @@ async def api_create_session(req: Request):
             task=task,
             cwd=cwd,
             title=title,
-            hwnd=hwnd,
             model=model,
             thinking_level=thinking_level,
             env=env,
@@ -1492,48 +1462,6 @@ async def api_delete_session(session_id: str):
         "was_alive": result.get("was_alive"),
         "status": result.get("status"),
     }
-
-
-@app.get("/api/win32/windows")
-async def api_list_win32_windows():
-    return {"windows": Win32WindowHelper.list_top_windows()}
-
-
-@app.get("/api/sessions/{session_id}/frame")
-async def api_get_window_frame(session_id: str):
-    sess = hub.sessions.get(session_id)
-    if not sess or not sess.hwnd:
-        return not_found(f"找不到会话 {session_id}")
-    frame = Win32WindowHelper.capture_window_jpeg_b64(sess.hwnd)
-    if not frame:
-        raise HTTPException(status_code=410, detail="窗口已关闭或不可用")
-    return frame
-
-
-@app.post("/api/sessions/{session_id}/tuck")
-async def api_tuck_window(session_id: str, req: Request):
-    sess = hub.sessions.get(session_id)
-    # S2: an unknown session is a 404 with the same wording every other session route uses.
-    if not sess:
-        return not_found(f"找不到会话 {session_id}")
-    if not sess.hwnd:
-        return bad_request(f"会话 {session_id} 不是桌面窗口会话。")
-    body = await req.json()
-    tuck = bool(body.get("tuck", True))
-    Win32WindowHelper.tuck_window_offscreen(sess, tuck)
-    return {"ok": True, "tucked_offscreen": sess.tucked_offscreen}
-
-
-@app.post("/api/sessions/{session_id}/click")
-async def api_click_window(session_id: str, req: Request):
-    sess = hub.sessions.get(session_id)
-    if not sess:
-        return not_found(f"找不到会话 {session_id}")
-    if not sess.hwnd:
-        return bad_request(f"会话 {session_id} 不是桌面窗口会话。")
-    body = await req.json()
-    Win32WindowHelper.send_click(sess.hwnd, int(body.get("x", 0)), int(body.get("y", 0)))
-    return {"ok": True}
 
 
 @app.get("/api/sessions/{session_id}/terminal-ticket")

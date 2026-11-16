@@ -79,7 +79,7 @@ function Source-Stamp([string]$exe) {
 }
 function Check-Imports([string]$python) {
     # -I implies -P, so explicitly put the extracted resources beside server.py on sys.path.
-    $code = 'import sys; sys.path.insert(0, sys.argv[1]); import fastapi,fastmcp,httpx,uvicorn,ssl,sqlite3; from PIL import Image; import hub_terminal_core'
+    $code = 'import sys; sys.path.insert(0, sys.argv[1]); import fastapi,fastmcp,httpx,uvicorn,ssl,sqlite3; import hub_terminal_core'
     $r = Run-Tool $python @('-I','-c',$code,$ResourceDir) 60
     if ($r.code -ne 0) { Write-Host $r.errors }
     return ($r.code -eq 0)

@@ -1,7 +1,7 @@
 """Accurate per-engine context window and auto-compaction usage tracking.
 
 Supported CLI engines: codex, kimi, omp, claude, agy.
-Excluded / non-LLM engines (dsh, pwsh, desktop_gui, generic) return None.
+Excluded / non-LLM engines (dsh, pwsh, generic) return None.
 """
 from __future__ import annotations
 
