@@ -6,7 +6,6 @@ import { initSessionLauncher, expandLauncher } from './session-launcher.js';
 import { initSessionWorkspace } from './session-workspace.js';
 import { initEventFeed } from './event-feed.js';
 import { initProfileManager, openProfileManager } from './profile-manager.js';
-import { initDesktopWindows, openDesktopWindows } from './desktop-windows.js';
 
 const POLL_MS = 2500;
 const POLL_HIDDEN_MS = 10000;
@@ -226,7 +225,6 @@ function initSidebarResizer() {
 // ------------------------------------------------------------ global commands
 const COMMANDS = {
   'open-profiles': () => openProfileManager(),
-  'open-win32': () => openDesktopWindows(),
   'open-mcp-guide': () => openModal('mcpModal'),
   'toggle-sidebar': () => setSidebarCollapsed(!document.body.classList.contains('sidebar-collapsed')),
   'focus-launcher': () => {
@@ -270,7 +268,6 @@ async function init() {
   initSessionWorkspace();
   initEventFeed();
   initProfileManager();
-  initDesktopWindows();
 
   on('sessions:refresh-request', requestRefresh);
   on('layout:set', setLayout);

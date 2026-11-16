@@ -101,7 +101,6 @@ const cards = new Map(); // session_id -> { el, sig }
 const archiveRows = new Map(); // session_id -> { el, sig } for the 归档 list (R7 keeps scroll + focus)
 const panes = new Map(); // session_id -> { el, head, body, refs, headSig, mounted }
 const terminals = new Map(); // session_id -> { term, fit, ws, host, ro, opened, disposed, wsOpen }
-const streams = new Map(); // session_id -> { stopped, timer }
 const transcriptViews = new Map(); // session_id -> { mode, data, version, fullAt, loading, limit, ui, controller }
 const TRANSCRIPT_PAGE = 80;
 const TRANSCRIPT_PAGE_STEP = 120;
@@ -220,7 +219,7 @@ function renderAll() {
 
 // ---------------------------------------------------------- session shapes
 const isLive = (s) => (typeof s.process_alive === 'boolean' ? s.process_alive : LIVE_STATUSES.has(s.status));
-const engineKey = (s) => (s.kind === 'desktop_gui' ? 'desktop' : s.engine || s.kind || 'tui');
+const engineKey = (s) => s.engine || s.kind || 'tui';
 // A DSH session started through the Harness job/message API has no terminal of its own: the Hub
 // reads its native session record, so the console shows the transcript only. (A legacy `web_gui`
 // DSH profile runs `dsh headless` in a real terminal and keeps the 记录 / TUI switch.)
@@ -654,7 +653,6 @@ function renderWorkspace() {
   for (const [id, pane] of panes) {
     if (!visibleIds.has(id)) {
       pane.el.hidden = true;
-      stopStream(id);
     }
   }
 
@@ -689,7 +687,6 @@ function renderWorkspace() {
       mountPaneBody(pane, s);
       pane.mounted = true;
     }
-    if (isVisible && s.kind === 'desktop_gui') ensureStream(s.session_id);
   }
   scheduleFitAll();
 }
@@ -706,7 +703,6 @@ function emptyStateHtml() {
       <p class="empty-desc">展开左侧「启动 Sub-Agent」选择 Profile 后启动，或让任意 MCP 客户端调用 <code>spawn_subagent</code>。</p>
       <div class="empty-actions">
         <button type="button" class="btn btn-primary" data-cmd="focus-launcher">${icon('play')}启动 Sub-Agent</button>
-        <button type="button" class="btn" data-cmd="open-win32">${icon('monitor')}纳管桌面窗口</button>
         <button type="button" class="btn" data-cmd="open-mcp-guide">${icon('plug')}MCP 接入指南</button>
       </div>
     </div>`;
@@ -743,7 +739,6 @@ function createPane(s) {
 function paneHeadHtml(s) {
   const live = isLive(s);
   const wsOpen = !!terminals.get(s.session_id)?.wsOpen;
-  const isDesktop = s.kind === 'desktop_gui';
   const transcriptOnly = isTranscriptOnly(s);
   const view = transcriptViews.get(s.session_id)?.mode || 'transcript';
   const keys = Object.entries(QUICK_KEYS).map(([key, k]) => {
@@ -751,9 +746,6 @@ function paneHeadHtml(s) {
     const title = enabled ? k.title : '终端未连接';
     return `<button type="button" data-action="key" data-key="${key}" title="${escapeHtml(title)}" ${enabled ? '' : 'disabled'}>${k.label}</button>`;
   }).join('');
-  const tuckButton = s.tucked_offscreen
-    ? `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="false" title="把原窗口移回屏幕">${icon('eye', 'icon-sm')}<span class="btn-label">移回屏幕</span></button>`
-    : `<button type="button" class="btn btn-sm" data-action="tuck" data-tuck="true" title="把原窗口移出屏幕，画面继续显示在总控台">${icon('archive', 'icon-sm')}<span class="btn-label">移出屏幕</span></button>`;
   return `
     <div class="pane-title">
       <span class="engine-badge" data-engine="${escapeHtml(engineKey(s))}">${escapeHtml(engineKey(s))}</span>
@@ -762,7 +754,7 @@ function paneHeadHtml(s) {
       ${pillsHtml(s)}
     </div>
     <div class="pane-actions">
-      ${isDesktop ? tuckButton : transcriptOnly ? '' : `
+      ${transcriptOnly ? '' : `
         <div class="view-switch" role="group" aria-label="会话视图">
           <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化记录：消息、工具调用与审批（默认）">记录</button>
           <button type="button" data-action="view" data-view="tui" aria-pressed="${view === 'tui'}" title="原始 TUI 终端画面">TUI</button>
@@ -787,7 +779,7 @@ function pillsHtml(s) {
 function updatePane(pane, s) {
   const sig = [
     state.layoutMode, sessionTitle(s), s.status, s.process_alive, s.kind, s.engine,
-    s.effective_model, s.effective_thinking_level, s.tucked_offscreen, s.high_risk_approval,
+    s.effective_model, s.effective_thinking_level, s.high_risk_approval,
     terminals.get(s.session_id)?.wsOpen ? '1' : '0', transcriptViews.get(s.session_id)?.mode || 'transcript',
   ].join('|');
   if (sig !== pane.headSig) {
@@ -824,7 +816,7 @@ function pendingQuestionText(s) {
 
 function updateWaitingBanner(pane, s) {
   // In the transcript view the question sits in the transcript's own reply dock.
-  const transcriptShown = s.kind !== 'desktop_gui' && (transcriptViews.get(s.session_id)?.mode || 'transcript') === 'transcript';
+  const transcriptShown = (transcriptViews.get(s.session_id)?.mode || 'transcript') === 'transcript';
   const waiting = s.status === 'waiting_parent' && !transcriptShown;
   let banner = pane.el.querySelector('.pane-banner');
   if (!waiting) {
@@ -884,7 +876,6 @@ function applyPaneView(pane, sessionId) {
 function refreshVisibleTranscripts() {
   if (document.hidden) return;
   for (const session of visibleSessions()) {
-    if (session.kind === 'desktop_gui') continue;
     if ((transcriptViews.get(session.session_id)?.mode || 'transcript') === 'transcript') {
       refreshTranscript(session.session_id);
     }
@@ -989,15 +980,6 @@ async function respondFromTranscript(id, body, trigger) {
 }
 
 function mountPaneBody(pane, s) {
-  if (s.kind === 'desktop_gui') {
-    pane.body.innerHTML = `
-      <div class="desktop-stream">
-        <img alt="${escapeHtml(sessionTitle(s))} 窗口画面" draggable="false" hidden />
-        <div class="stream-overlay"><span class="spinner"></span>正在获取窗口画面…</div>
-      </div>`;
-    pane.body.querySelector('img').addEventListener('click', (ev) => onDesktopClick(ev, s.session_id));
-    return;
-  }
   if (isTranscriptOnly(s)) {
     pane.body.innerHTML = '<div class="transcript-slot" data-ref="transcript"></div>';
   } else {
@@ -1027,7 +1009,6 @@ function disposeGoneSessions() {
     pane.el.remove();
     panes.delete(id);
   }
-  for (const id of [...streams.keys()]) if (!alive.has(id)) stopStream(id);
   for (const [id, view] of [...transcriptViews]) {
     if (alive.has(id)) continue;
     view.controller?.dispose();
@@ -1273,58 +1254,6 @@ function onGlobalKeydown(ev) {
   if (nextIndex !== index) setActiveSession(ordered[nextIndex].session_id);
 }
 
-// ----------------------------------------------------------- desktop streams
-function ensureStream(sessionId) {
-  if (streams.has(sessionId)) return;
-  const stream = { stopped: false, timer: 0 };
-  streams.set(sessionId, stream);
-  const tick = async () => {
-    if (stream.stopped) return;
-    const body = panes.get(sessionId)?.body;
-    const img = body?.querySelector('img');
-    const overlay = body?.querySelector('.stream-overlay');
-    try {
-      const frame = await hubApi.windowFrame(sessionId);
-      if (frame.jpeg_b64 && img) {
-        img.src = `data:image/jpeg;base64,${frame.jpeg_b64}`;
-        img.dataset.winWidth = frame.width;
-        img.dataset.winHeight = frame.height;
-        img.hidden = false;
-        if (overlay) overlay.hidden = true;
-      }
-    } catch (err) {
-      if (overlay) {
-        overlay.hidden = false;
-        overlay.innerHTML = `${icon('alert')}${err.status === 410 ? '窗口已关闭或不可用' : '暂时无法获取窗口画面，正在重试…'}`;
-      }
-    }
-    if (!stream.stopped) stream.timer = setTimeout(tick, 600);
-  };
-  tick();
-}
-
-function stopStream(sessionId) {
-  const stream = streams.get(sessionId);
-  if (!stream) return;
-  stream.stopped = true;
-  clearTimeout(stream.timer);
-  streams.delete(sessionId);
-}
-
-async function onDesktopClick(ev, sessionId) {
-  const img = ev.currentTarget;
-  const rect = img.getBoundingClientRect();
-  const winW = parseFloat(img.dataset.winWidth || img.naturalWidth || rect.width);
-  const winH = parseFloat(img.dataset.winHeight || img.naturalHeight || rect.height);
-  const x = Math.round(((ev.clientX - rect.left) / rect.width) * winW);
-  const y = Math.round(((ev.clientY - rect.top) / rect.height) * winH);
-  try {
-    await hubApi.clickWindow(sessionId, x, y);
-  } catch (err) {
-    toast(`点击转发失败：${err.message}`, 'error');
-  }
-}
-
 // ------------------------------------------------------------- pane actions
 async function onWorkspaceClick(ev) {
   const paneEl = ev.target.closest('.pane');
@@ -1349,9 +1278,6 @@ async function onWorkspaceClick(ev) {
       break;
     case 'close':
       await closeSession(id);
-      break;
-    case 'tuck':
-      await toggleTuck(id, action.dataset.tuck === 'true', action);
       break;
     case 'focus-single':
       openInSingleView(id);
@@ -1389,19 +1315,6 @@ function sendKey(id, key) {
   }
   t.ws.send(JSON.stringify({ type: 'input', data: k.text }));
   t.term.focus();
-}
-
-async function toggleTuck(id, tuck, button) {
-  setBusy(button, true);
-  try {
-    const res = await hubApi.tuckWindow(id, tuck);
-    if (res.tucked_offscreen !== tuck) toast('窗口状态没有改变，原窗口可能已关闭', 'error');
-    emit('sessions:refresh-request');
-  } catch (err) {
-    toast(`操作失败：${err.message}`, 'error');
-  } finally {
-    setBusy(button, false);
-  }
 }
 
 async function closeSession(id) {

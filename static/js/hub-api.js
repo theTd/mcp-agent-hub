@@ -71,10 +71,6 @@ export const hubApi = {
   // `since` (the last full answer's version) turns an unchanged transcript into { unchanged: true }.
   transcript: (id, limit = 80, since = '') => request('GET', `/api/sessions/${enc(id)}/transcript?limit=${encodeURIComponent(limit)}${since ? `&since=${encodeURIComponent(since)}` : ''}`, undefined, { timeoutMs: 10000 }),
 
-  listWin32Windows: () => request('GET', '/api/win32/windows'),
-  windowFrame: (id) => request('GET', `/api/sessions/${enc(id)}/frame`),
-  tuckWindow: (id, tuck) => request('POST', `/api/sessions/${enc(id)}/tuck`, { tuck }),
-  clickWindow: (id, x, y) => request('POST', `/api/sessions/${enc(id)}/click`, { x, y }),
 
   // The console's terminal socket is served by the terminal core, not by the hub, so the hub only
   // hands out a one-use ticket (§6.4). Bounded like listSessions: a hung ticket must reach the

@@ -32,7 +32,6 @@ static/index.html
 static/css/hub-console.css
 static/css/transcript-view.css
 static/js/console-state.js
-static/js/desktop-windows.js
 static/js/engine-catalog.js
 static/js/event-feed.js
 static/js/hub-api.js

@@ -81,9 +81,7 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_launch_source_survives_persistence_resume_and_mailbox_delivery(self):
         for source in ("agent", "user"):
-            sess = await self.hub.create_session(
-                "desktop-gui", hwnd=123, launch_source=source,
-            )
+            sess = await self.create_without_process(launch_source=source)
             self.assertEqual(sess.to_dict()["launch_source"], source)
             await self.hub.db.flush()
             record = await self.hub.db.get_session_record(sess.session_id)
@@ -106,8 +104,15 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_and_default_launches_keep_user_notifications(self):
         legacy = self.session("codex", "-legacy")
         self.assertEqual(legacy.launch_source, "user")
-        sess = await self.hub.create_session("desktop-gui", hwnd=123)
+        sess = await self.create_without_process()
         self.assertEqual(sess.launch_source, "user")
+
+    async def create_without_process(self, **kwargs):
+        """A session made by create_session itself, with the process start patched out."""
+        self.hub.profiles.setdefault("pwsh", {"name": "pwsh", "engine": "pwsh", "enabled": True, "kind": "tui",
+                                              "command": "unused", "args": []})
+        with patch.object(AgentSession, "start_pty"), patch.object(self.hub, "_schedule", lambda coro: coro.close()):
+            return await self.hub.create_session("pwsh", cwd=str(self.root), **kwargs)
 
     def session(self, engine, suffix="", virtual=False):
         sid = f"{engine}-native{suffix}"

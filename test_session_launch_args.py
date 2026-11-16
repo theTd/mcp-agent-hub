@@ -105,7 +105,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(a.startswith("--extension=") for a in resumed["args"]), 1)
 
     async def test_non_cli_and_invalid_input_rejected_before_spawn(self):
-        for profile, kwargs in (("dsh", {}), ("desktop-gui", {"hwnd": 123})):
+        for profile, kwargs in (("dsh", {}),):
             with self.subTest(profile=profile), self.assertRaises(ValueError):
                 await self.hub.create_session(profile, extra_args=["--flag"], **kwargs)
         with self.assertRaises(ValueError):
