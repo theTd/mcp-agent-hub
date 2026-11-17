@@ -994,6 +994,11 @@ body.is-resizing-sidebar * {
 .note .icon { margin-top: 2px; color: var(--accent); }
 .engine-card { display: flex; flex-direction: column; gap: 14px; padding: 16px 18px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--bg-1); transition: opacity 0.15s; }
 .engine-card[aria-busy="true"] { opacity: 0.6; pointer-events: none; }
+.engine-card.is-off { border-style: dashed; }
+.engine-card.is-off .model-rows, .engine-card.is-off .chip-wrap, .engine-card.is-off .ec-meta { opacity: 0.55; }
+.ec-engine-switch { flex: none; }
+.ec-engine-state { font-size: 11.5px; color: var(--success-text); }
+.ec-engine-state.is-off { color: var(--text-3); }
 .ec-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .ec-name { font-size: 14.5px; font-weight: 600; }
 .ec-bin { flex: 1; min-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11.5px var(--font-mono); color: var(--text-3); }

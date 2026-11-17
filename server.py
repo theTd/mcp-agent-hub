@@ -1385,6 +1385,25 @@ async def api_toggle_engine_model(engine: str, req: Request):
         "hub_port": hub_port(),
     }
 
+@app.post("/api/engines/{engine}/toggle")
+async def api_toggle_engine(engine: str, req: Request):
+    """Enable or disable one engine; only model policy stays untouched, live sessions keep running."""
+    try:
+        body = await req.json()
+    except Exception:
+        return bad_request("请求体必须是 JSON 对象。")
+    if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
+        return bad_request("enabled 必须是布尔值 true 或 false。")
+    try:
+        eng_info = await asyncio.to_thread(hub.set_engine_enabled, engine, body["enabled"])
+    except ValueError as e:
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload.update({"ok": True, "engine": eng_info.get("engine") or engine.strip().lower(),
+                    "engine_info": eng_info})
+    return payload
+
+
 @app.get("/api/sessions")
 async def api_list_sessions():
     # B11: never block the first poll on discovery; answer from whatever is already loaded.

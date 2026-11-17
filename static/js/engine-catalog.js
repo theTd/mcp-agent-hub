@@ -16,7 +16,7 @@ export function renderEngineCatalog() {
   }
   const engines = sortEngines(Object.keys(state.enginesCatalog));
   wrap.innerHTML = `
-    <div class="note">${icon('info')}<span>用开关启用或停用模型。停用的模型会从启动面板与 MCP 可用模型列表中移除；备注是写给主 Agent 看的模型说明。</span></div>
+    <div class="note">${icon('info')}<span>用开关启用或停用引擎与模型。停用引擎后不能再新建或恢复该引擎的会话，正在运行的会话不受影响；停用的模型会从启动面板与 MCP 可用模型列表中移除；备注是写给主 Agent 看的模型说明。</span></div>
     ${engines.length ? engines.map(engineCardHtml).join('') : '<div class="list-empty">没有发现任何引擎，试试右上角的「重新扫描模型」。</div>'}`;
 }
 
@@ -28,12 +28,18 @@ function engineCardHtml(engine) {
 
 function cardHeadHtml(engine, info, enabledCount, total, bulkLabel, bulkDisabled) {
   const e = escapeHtml(engine);
+  const engineOff = info.enabled === false;
   return `
     <header class="ec-head">
       <span class="engine-badge" data-engine="${e}">${e}</span>
       <h4 class="ec-name">${escapeHtml(info.name || engine)}</h4>
       <span class="state-badge ${info.installed ? 'ok' : 'off'}">${info.installed ? `${icon('check', 'icon-xs')}已安装` : '未检测到本地程序'}</span>
       <span class="ec-bin" title="${escapeHtml(info.binary || '')}">${escapeHtml(info.binary || '')}</span>
+      <label class="switch ec-engine-switch" title="${engineOff ? '启用' : '停用'}引擎 ${e}">
+        <input type="checkbox" data-action="toggle-engine" ${engineOff ? '' : 'checked'} />
+        <span class="switch-track"></span>
+      </label>
+      <span class="ec-engine-state${engineOff ? ' is-off' : ''}">${engineOff ? '引擎已停用' : '引擎已启用'}</span>
       <div class="ec-actions">
         <button type="button" class="btn btn-sm" data-action="enable-all" ${total ? '' : 'disabled'}>全部启用</button>
         <button type="button" class="btn btn-sm" data-action="only-default" ${bulkDisabled ? 'disabled' : ''}
@@ -50,7 +56,7 @@ function modelsCardHtml(engine, info) {
     ? models.map((m) => modelRowHtml(engine, m)).join('')
     : '<div class="list-empty">未检测到模型</div>';
   return `
-    <section class="engine-card" data-engine-card="${escapeHtml(engine)}">
+    <section class="engine-card${info.enabled === false ? ' is-off' : ''}" data-engine-card="${escapeHtml(engine)}">
       ${cardHeadHtml(engine, info, enabledCount, models.length, '只保留各 Profile 的默认模型', !models.length)}
       <div class="ec-meta">
         <span>模型参数 <code>${escapeHtml(flags.model || 'N/A')}</code></span>
@@ -102,7 +108,7 @@ function legacyCardHtml(engine, info) {
   const levelPills = levels.map((l) =>
     `<span class="pill pill-effort${l === info.default_thinking_level ? ' is-default' : ''}">${escapeHtml(l)}</span>`).join('');
   return `
-    <section class="engine-card" data-engine-card="${escapeHtml(engine)}">
+    <section class="engine-card${info.enabled === false ? ' is-off' : ''}" data-engine-card="${escapeHtml(engine)}">
       ${cardHeadHtml(engine, info, enabledCount, all.length, '仅保留默认', !info.default_model)}
       <div class="ec-meta">
         <span>模型参数 <code>${escapeHtml(flags.model || 'N/A')}</code></span>
@@ -153,6 +159,11 @@ function keptModels(engine) {
 
 // ---------------------------------------------------------------- handlers
 async function onCatalogChange(ev) {
+  const engineInput = ev.target.closest('[data-action="toggle-engine"]');
+  if (engineInput) {
+    await toggleEngine(engineInput);
+    return;
+  }
   const input = ev.target.closest('[data-action="toggle-model"]');
   if (!input) return;
   const card = input.closest('[data-engine-card]');
@@ -186,6 +197,32 @@ async function onCatalogChange(ev) {
     toast(`切换失败：${err.message}`, 'error');
   } finally {
     row.classList.remove('is-busy');
+  }
+}
+
+async function toggleEngine(input) {
+  const card = input.closest('[data-engine-card]');
+  const engine = card?.dataset.engineCard;
+  if (!engine) return;
+  const enable = input.checked;
+  if (card) card.setAttribute('aria-busy', 'true');
+  try {
+    try {
+      await hubApi.toggleEngine(engine, enable);
+    } catch (err) {
+      input.checked = !enable;
+      toast(`${enable ? '启用' : '停用'}引擎失败：${err.message}`, 'error');
+      return;
+    }
+    try {
+      await reloadProfiles(false);
+    } catch (err) {
+      toast(`引擎状态已切换，但刷新失败：${err.message}`, 'error');
+    }
+    if (enable) toast(`已启用引擎 ${engine}`, 'success');
+    else toast(`已停用引擎 ${engine}；正在运行的会话不受影响`, 'success');
+  } finally {
+    if (card) card.removeAttribute('aria-busy');
   }
 }
 

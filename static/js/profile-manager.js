@@ -153,16 +153,18 @@ function renderProfileList() {
 function profileItemHtml(id, p) {
   const enabled = p.enabled !== false;
   const engine = p.engine || 'other';
+  const engineOff = state.enginesCatalog?.[engine]?.enabled === false;
   const model = p.default_model || engineDefaultModel(engine) || '未设置模型';
   const level = p.default_thinking_level || '未设置思考等级';
+  const suffix = `${enabled ? '' : ' · 已停用'}${engineOff ? ' · 引擎已停用' : ''}`;
   return `
-    <button type="button" class="pm-item${enabled ? '' : ' is-disabled'}" role="option" data-id="${escapeHtml(id)}" aria-selected="${id === selectedId}">
+    <button type="button" class="pm-item${enabled && !engineOff ? '' : ' is-disabled'}" role="option" data-id="${escapeHtml(id)}" aria-selected="${id === selectedId}">
       <span class="pm-item-row">
         <span class="pm-item-name">${escapeHtml(p.name || id)}</span>
         <span class="engine-badge" data-engine="${escapeHtml(engine)}">${escapeHtml(engine)}</span>
       </span>
       <span class="pm-item-id">${escapeHtml(id)}</span>
-      <span class="pm-item-defaults">${escapeHtml(model)} · ${escapeHtml(level)}${enabled ? '' : ' · 已停用'}</span>
+      <span class="pm-item-defaults">${escapeHtml(model)} · ${escapeHtml(level)}${suffix}</span>
     </button>`;
 }
 

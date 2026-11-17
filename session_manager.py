@@ -5011,11 +5011,13 @@ class HubSessionManager:
         for eng, eng_info in raw_engines.items():
             e_copy = dict(eng_info)
             all_mods = list(e_copy.get("all_discovered_models") or e_copy.get("available_models", []))
-            pol = self.engine_policies.get(eng) or {}
+            pol_raw = self.engine_policies.get(eng) if isinstance(self.engine_policies, dict) else None
+            pol = pol_raw if isinstance(pol_raw, dict) else {}
             disabled_mods = list(pol.get("disabled_models") or [])
             mod_notes = dict(pol.get("model_notes") or {})
             enabled_mods = [m for m in all_mods if m not in disabled_mods]
 
+            e_copy["enabled"] = pol.get("enabled", True) is not False
             e_copy["all_discovered_models"] = all_mods
             e_copy["disabled_models"] = disabled_mods
             e_copy["model_notes"] = mod_notes
@@ -5158,11 +5160,18 @@ class HubSessionManager:
         """
         self._apply_profile_data(data, self._cached_discovery)
 
+    def engine_enabled(self, engine: Any) -> bool:
+        """`engine_policies.<engine>.enabled`, default true; a hand-edited non-bool means on."""
+        eng = str(engine or "").strip().lower()
+        policies = self.engine_policies if isinstance(self.engine_policies, dict) else {}
+        policy = policies.get(eng) if isinstance(policies.get(eng), dict) else {}
+        return policy.get("enabled", True) is not False
+
     def get_enabled_profiles(self) -> Dict[str, Dict[str, Any]]:
-        """Returns only enabled profiles where the default model is not disabled (or dynamic base profiles)."""
+        """Enabled profiles on enabled engines; a disabled engine accepts no new or resumed spawn."""
         result: Dict[str, Dict[str, Any]] = {}
         for pid, p in self.profiles.items():
-            if not p.get("enabled", True):
+            if not p.get("enabled", True) or not self.engine_enabled(p.get("engine")):
                 continue
             result[pid] = p
         return result
@@ -5254,7 +5263,7 @@ class HubSessionManager:
         lines.append("")
         lines.append("## Profiles (agent_type)")
         for pid, p in self.profiles.items():
-            if not p.get("enabled", True):
+            if not p.get("enabled", True) or not self.engine_enabled(p.get("engine")):
                 continue
             name = p.get("name") or pid
             def_mod = p.get("default_model") or "none"
@@ -5297,7 +5306,8 @@ class HubSessionManager:
             lines.append(instructions)
         profiles = [
             f"`{pid}` ({p.get('default_model') or 'none'} / {p.get('default_thinking_level') or 'none'})"
-            for pid, p in self.profiles.items() if p.get("enabled", True)
+            for pid, p in self.profiles.items()
+            if p.get("enabled", True) and self.engine_enabled(p.get("engine"))
         ]
         lines.append("")
         lines.append("Profiles (agent_type, defaults): " + ", ".join(profiles))
@@ -5420,6 +5430,34 @@ class HubSessionManager:
         order = [str(x) for x in (info.get("available_thinking_levels") or [])]
         seen = [l for l in order if l in levels]
         return seen + [l for l in levels if l not in seen]
+
+    def set_engine_enabled(self, engine: str, enabled: bool) -> Dict[str, Any]:
+        """Persists `engine_policies.<engine>.enabled`; model policy (disabled_models, notes) is untouched.
+
+        Disabling an engine only refuses new launches and resumes: live sessions keep running.
+        """
+        eng = (engine or "").strip().lower()
+        if not eng:
+            raise ValueError("缺少引擎标识。")
+        if eng not in KNOWN_ENGINES and eng not in (self.engines_catalog or {}):
+            raise ValueError(f"未知引擎「{eng}」。可用：{', '.join(KNOWN_ENGINES)}")
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值 true 或 false。")
+
+        raw_data = self._read_profiles_file()
+        policies = raw_data.get("engine_policies")
+        if not isinstance(policies, dict):
+            policies = raw_data["engine_policies"] = {}
+        eng_pol = policies.get(eng)
+        if not isinstance(eng_pol, dict):
+            eng_pol = policies[eng] = {}
+        eng_pol["enabled"] = enabled
+
+        self._write_profiles_file(raw_data)
+        self._reload_after_write(raw_data)
+        info = dict(self.engines_catalog.get(eng) or {"engine": eng})
+        info["enabled"] = self.engine_enabled(eng)
+        return info
 
     def toggle_engine_model(
         self,
@@ -5968,6 +6006,8 @@ class HubSessionManager:
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
         if not cwd or not os.path.isdir(cwd):
             return False, f"工作目录已不存在：{cwd}"
+        if not self.engine_enabled(engine):
+            return False, f"引擎「{engine}」已停用，无法恢复会话"
         profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
         prof = (self.profiles if context is None else context["profiles"]).get(profile_id)
         if not prof or not prof.get("enabled", True):
@@ -6051,6 +6091,8 @@ class HubSessionManager:
         already checked. The message is appended later by resume_subagent, per the engine's task mode.
         """
         engine = str(record.get("engine") or "").strip().lower()
+        if not self.engine_enabled(engine):
+            raise ValueError(f"引擎「{engine}」已停用，无法恢复会话")
         snapshot = record.get("profile_snapshot") or {}
         ref = record.get("conversation_ref") or {}
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
@@ -15022,6 +15064,8 @@ class HubSessionManager:
             )
 
         eng = str(prof.get('engine') or 'generic').strip().lower()
+        if not self.engine_enabled(eng):
+            raise ValueError(f"引擎「{eng}」已停用，无法启动；请先在「引擎与模型」里启用它。")
         name = str(prof.get('name') or pid)
         kind = str(prof.get('kind') or 'tui')
         mcp_config = normalize_mcp_config(mcp_servers, disabled_mcp_servers, strict_mcp_config)

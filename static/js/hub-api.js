@@ -29,6 +29,8 @@ export const hubApi = {
   listProfiles: (refresh = false) => request('GET', refresh ? '/api/profiles?refresh=true' : '/api/profiles'),
   saveProfile: (profile) => request('POST', '/api/profiles', profile),
   deleteProfile: (id) => request('DELETE', `/api/profiles/${enc(id)}`),
+  toggleEngine: (engine, enabled) =>
+    request('POST', `/api/engines/${enc(engine)}/toggle`, { enabled }),
   toggleEngineModel: (engine, model, enabled) =>
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled }),
   setModelNote: (engine, model, enabled, note) =>

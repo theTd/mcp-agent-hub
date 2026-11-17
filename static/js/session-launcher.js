@@ -83,10 +83,14 @@ function applyCollapsed(collapsed) {
 }
 
 // ------------------------------------------------------------------ profiles
+function launchableProfile(p) {
+  return p.enabled !== false && state.enginesCatalog[p.engine]?.enabled !== false;
+}
+
 function renderProfileOptions({ reset = true } = {}) {
   const sel = $('#profileSelect');
   const previous = sel.value || prefs.lastProfileId;
-  const entries = Object.entries(state.profiles).filter(([, p]) => p.enabled !== false);
+  const entries = Object.entries(state.profiles).filter(([, p]) => launchableProfile(p));
   sel.innerHTML = '';
   for (const [id, p] of entries) {
     const opt = new Option(p.name || id, id);
@@ -95,7 +99,7 @@ function renderProfileOptions({ reset = true } = {}) {
   }
   if (!entries.length) sel.appendChild(new Option('没有已启用的 Profile', ''));
   sel.disabled = entries.length === 0;
-  const keep = previous && state.profiles[previous]?.enabled !== false ? previous : entries[0]?.[0] || '';
+  const keep = previous && launchableProfile(state.profiles[previous] || {}) ? previous : entries[0]?.[0] || '';
   sel.value = keep;
   renderProfileDetails({ reset });
   syncLaunchButton();
