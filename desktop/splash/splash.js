@@ -20,6 +20,10 @@
         $('error-log').scrollTop = $('error-log').scrollHeight;
       }
       $('retry').disabled = retrying;
+      $('recover').hidden = !view.can_recover;
+      $('recover').disabled = retrying;
+      $('recovery-detail').hidden = !view.recovery_detail;
+      $('recovery-detail').textContent = view.recovery_detail || '';
     } else {
       retrying = false;
       $('starting-message').textContent = view.message || '正在启动 Hub…';
@@ -40,6 +44,17 @@
     $('retry').disabled = true;
     try {
       await invoke('retry_hub');
+    } finally {
+      setTimeout(() => { retrying = false; refresh(); }, 300);
+    }
+  });
+
+  $('recover').addEventListener('click', async () => {
+    retrying = true;
+    $('recover').disabled = true;
+    $('retry').disabled = true;
+    try {
+      await invoke('recover_hub');
     } finally {
       setTimeout(() => { retrying = false; refresh(); }, 300);
     }

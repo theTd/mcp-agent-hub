@@ -22,7 +22,11 @@
       <pre id="error-log"></pre>
     </section>
     <p class="detail">日志：<span id="log-path"></span></p>
-    <button id="retry" type="button">重试</button>
+    <p id="recovery-detail" class="detail" hidden></p>
+    <div class="actions">
+      <button id="recover" type="button" hidden>结束残留 Hub 并重试</button>
+      <button id="retry" type="button">重试</button>
+    </div>
   </main>
   <script src="splash.js"></script>
 </body>

@@ -49,6 +49,7 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: 0.5; cursor: default; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
 .spinner {
   width: 28px;
   height: 28px;

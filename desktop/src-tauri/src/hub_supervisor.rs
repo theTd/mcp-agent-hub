@@ -44,6 +44,8 @@ pub struct SplashView {
     pub detail: String,
     pub log_tail: String,
     pub log_path: String,
+    pub can_recover: bool,
+    pub recovery_detail: String,
 }
 
 struct ShellState {
@@ -132,6 +134,8 @@ impl HubShell {
                     detail: String::new(),
                     log_tail: String::new(),
                     log_path,
+                    can_recover: false,
+                    recovery_detail: String::new(),
                 },
                 counts: SessionCounts::default(),
                 pending_session: None,
@@ -275,6 +279,8 @@ impl HubShell {
             st.splash.message = message.into();
             st.splash.detail = detail.into();
             st.splash.log_tail.clear();
+            st.splash.can_recover = false;
+            st.splash.recovery_detail.clear();
         }
         self.navigate_splash(app);
         tray_menu::refresh(app);
@@ -298,6 +304,15 @@ impl HubShell {
             st.splash.message = message.into();
             st.splash.detail.clear();
             st.splash.log_tail = tail;
+            #[cfg(feature = "portable")]
+            {
+                st.splash.can_recover = message.contains("占用") || message.contains("残留 Hub");
+                st.splash.recovery_detail = if st.splash.can_recover {
+                    "仅会结束已验证属于本便携版的残留 Hub；无法验证归属的进程不会被结束".into()
+                } else {
+                    String::new()
+                };
+            }
         }
         self.bump_generation();
         self.navigate_splash(app);
@@ -325,6 +340,38 @@ impl HubShell {
         tauri::async_runtime::spawn(async move { shell.start(&app).await });
     }
 
+    #[cfg(feature = "portable")]
+    pub fn recover_stale(self: &Arc<Self>, app: &AppHandle) {
+        if self.mode() != HubMode::Failed {
+            return;
+        }
+        let shell = self.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _guard = shell.ops.lock().await;
+            shell.set_starting(&app, "正在清理已验证的残留 Hub…", "不会结束无法验证归属的进程");
+            match crate::portable_runtime::recover_stale().await {
+                Ok(report) => {
+                    shell.log(&format!("stale hub recovery: live_peer={:?}, stopped={:?}", report.live_peer, report.stopped));
+                    if report.live_peer.is_some() {
+                        shell.fail(&app, "另一个便携版实例仍在运行，请先关闭它", false);
+                        return;
+                    }
+                    let payload = crate::hub_config::portable_root().join("resources").join(crate::portable_runtime::PAYLOAD_ID);
+                    let holders = crate::portable_runtime::payload_holders(&payload);
+                    match crate::portable_runtime::stop_holders(&holders).await {
+                        Ok(_) => shell.start_locked(&app).await,
+                        Err(error) => shell.fail(&app, &error.to_string(), false),
+                    }
+                }
+                Err(error) => shell.fail(&app, &error.to_string(), false),
+            }
+        });
+    }
+
+    #[cfg(not(feature = "portable"))]
+    pub fn recover_stale(self: &Arc<Self>, _app: &AppHandle) {}
+
     async fn start_locked(self: &Arc<Self>, app: &AppHandle) {
         self.cancel_start.store(false, Ordering::SeqCst);
         // An owned hub can still be running here (the error view for a hub that stopped listening
@@ -337,14 +384,14 @@ impl HubShell {
         #[cfg(not(feature = "portable"))]
         let config_result = hub_config::load();
         #[cfg(feature = "portable")]
-        let config_result = crate::portable_runtime::prepare(
+        let config_result = crate::portable_runtime::prepare_detailed(
             |message, detail| self.set_starting(app, message, detail),
             &self.cancel_start,
         )
         .await;
         let cfg = match config_result {
             Ok(cfg) => cfg,
-            Err(e) => return self.fail(app, &e, false),
+            Err(e) => return self.fail(app, &e.to_string(), false),
         };
         self.st().config = Some(cfg.clone());
         if let Err(e) = hub_config::validate(&cfg) {

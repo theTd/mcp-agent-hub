@@ -2,7 +2,11 @@
 //! job, wait for `/api/hub/info`, stop gracefully. hub_supervisor drives these for the app; the
 //! ignored tests below drive the same code headless against a real hub.
 
+#[cfg(feature = "portable")]
+use std::fs::{File, OpenOptions};
 use std::path::Path;
+#[cfg(feature = "portable")]
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -119,6 +123,10 @@ pub struct OwnedHub {
     job: HubJob,
     token: String,
     port: u16,
+    #[cfg(feature = "portable")]
+    _data_lock: File,
+    #[cfg(feature = "portable")]
+    launch_path: PathBuf,
 }
 
 impl OwnedHub {
@@ -149,9 +157,25 @@ impl OwnedHub {
             .stdout(out)
             .stderr(err);
         #[cfg(feature = "portable")]
-        {
-            let data = crate::hub_config::portable_root().join("data");
+        let (data_lock, launch_path) = {
+            let portable_root = crate::hub_config::portable_root();
+            let data = portable_root.join("data");
             std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+            let data_lock_path = portable_root.join("data.lock");
+            let data_lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&data_lock_path)
+                .map_err(|e| format!("无法打开便携版数据锁：{e}"))?;
+            match data_lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err("便携版数据目录已被另一个 Hub 实例占用，请先关闭它或使用恢复按钮".into())
+                }
+                Err(e) => return Err(format!("无法取得便携版数据锁：{e}")),
+            }
             cmd.env("HUB_DATA_DIR", &data)
                 .env("HUB_PROFILES_PATH", &data.join("agent_profiles.json"))
                 .env("HUB_API_URL", format!("http://127.0.0.1:{}", cfg.port))
@@ -160,7 +184,8 @@ impl OwnedHub {
                 .env_remove("AGENT_HUB_PORT")
                 .env_remove("PYTHONHOME")
                 .env_remove("PYTHONPATH");
-        }
+            (data_lock, portable_root.join("launch.json"))
+        };
         let child = windows_process::spawn_in_job(&mut cmd, &job).map_err(|e| {
             format!(
                 "{} {}：{e}",
@@ -168,8 +193,33 @@ impl OwnedHub {
                 cfg.server_py().display()
             )
         })?;
+        #[cfg(feature = "portable")]
+        {
+            let record = crate::hub_config::LaunchRecord::prepared(
+                cfg.python.clone(),
+                cfg.repo_dir.clone(),
+                cfg.port,
+            )
+            .with_owner(child.id(), Some(token.clone()))
+            .and_then(|record| {
+                record.with_runtime_metadata(
+                    std::process::id(),
+                    crate::hub_config::portable_root().join("data"),
+                    "OwnedHub::launch",
+                )
+            })
+            .map_err(|error| {
+                job.terminate();
+                format!("无法记录 Hub 所有权：{error}")
+            })?;
+            if let Err(error) = crate::hub_config::write_launch_record(&launch_path, &record) {
+                job.terminate();
+                return Err(format!("无法写入 Hub 所有权记录：{error}"));
+            }
+        }
         log(&format!(
-            "hub launched: pid {} = {} {} (cwd {}, port {})",
+            "hub launched: parent pid {} spawn path OwnedHub::launch, pid {} = {} {} (cwd {}, port {})",
+            std::process::id(),
             child.id(),
             cfg.python.display(),
             cfg.server_py().display(),
@@ -181,6 +231,10 @@ impl OwnedHub {
             job,
             token,
             port: cfg.port,
+            #[cfg(feature = "portable")]
+            _data_lock: data_lock,
+            #[cfg(feature = "portable")]
+            launch_path,
         })
     }
 
@@ -200,6 +254,8 @@ impl OwnedHub {
 
     /// Kill everything in the job now (no graceful stop).
     pub fn terminate(self) {
+        // Keep the launch record until the next startup can verify that the process tree is gone.
+        // Removing it before termination would hide exactly the orphan this record is meant to recover.
         self.job.terminate();
     }
 
@@ -233,8 +289,12 @@ impl OwnedHub {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let port = self.port;
+        #[cfg(feature = "portable")]
+        let launch_path = self.launch_path.clone();
         drop(self);
         wait_port_free(port, PORT_RELEASE_WAIT).await;
+        #[cfg(feature = "portable")]
+        let _ = std::fs::remove_file(launch_path);
         log("hub stopped");
         StopReport { graceful, exit }
     }

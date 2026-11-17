@@ -1,12 +1,15 @@
 //! Win32 process plumbing for the owned hub: a kill-on-close Job Object, a suspended start so the
 //! hub (and the venv launcher's real python child) is inside the job before it runs a single
-//! instruction, a process-tree kill for taking over an external hub, the PID that listens on a
-//! port, and a random per-launch token.
+//! instruction, a process-tree kill for taking over an external hub, process identity and
+//! command-line queries for telling an orphan from a reused PID or an unrelated program, the PID
+//! that listens on a port, and a random per-launch token.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+#[cfg(any(feature = "portable", test))]
+use std::path::PathBuf;
 use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
@@ -30,6 +33,8 @@ use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, OpenThread, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
     CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
+#[cfg(any(feature = "portable", test))]
+use windows_sys::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
 
 /// A Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the last handle closes (this app
 /// exits, crashes or is killed), Windows kills every process in it.
@@ -218,7 +223,10 @@ pub fn process_name(pid: u32) -> Option<String> {
         .map(|p| p.exe)
 }
 
-fn creation_time(pid: u32) -> Option<u64> {
+/// The creation time of `pid`, in Windows FILETIME ticks (100 ns since 1601), or `None` when the
+/// process is gone or cannot be queried. Two queries that return the same value describe the same
+/// process instance: Windows does reuse PIDs, but never with the same creation time.
+pub fn creation_time(pid: u32) -> Option<u64> {
     // SAFETY: query-only handle, closed before returning.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -236,6 +244,135 @@ fn creation_time(pid: u32) -> Option<u64> {
             return None;
         }
         Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+}
+
+/// A process instance: the PID plus the creation time that distinguishes it from a later process
+/// that happens to get the same PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub creation_time: u64,
+}
+
+/// `None` when `pid` is not running now.
+pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    creation_time(pid).map(|creation_time| ProcessIdentity { pid, creation_time })
+}
+
+/// Whether the exact process instance `identity` still exists.
+pub fn process_is_alive(identity: ProcessIdentity) -> bool {
+    creation_time(identity.pid) == Some(identity.creation_time)
+}
+
+#[cfg(any(feature = "portable", test))]
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+// `PROCESSINFOCLASS` 60 (`ProcessCommandLineInformation`) has no kernel32 wrapper. With
+// `PROCESS_QUERY_LIMITED_INFORMATION` it returns a UNICODE_STRING followed by the UTF-16 command
+// line inside the caller's buffer.
+#[cfg(any(feature = "portable", test))]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        process_handle: HANDLE,
+        process_information_class: u32,
+        process_information: *mut core::ffi::c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(any(feature = "portable", test))]
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+
+/// The full command line of `pid` (UTF-16 decoded lossily), or `None` for a protected, exited or
+/// inaccessible process. Used only to tell our own hub processes from unrelated ones.
+#[cfg(any(feature = "portable", test))]
+pub fn process_command_line(pid: u32) -> Option<String> {
+    // SAFETY: every pointer describes a live local buffer; the process handle is closed here.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut needed = 0u32;
+        // Any failure that reports the required size is usable; the second call is authoritative.
+        NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        if needed == 0 {
+            CloseHandle(handle);
+            return None;
+        }
+        // Two trailing bytes keep a NUL terminator available even if the API omits one.
+        let mut buffer = vec![0u8; needed as usize + 2];
+        let mut written = 0u32;
+        let status = NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            needed,
+            &mut written,
+        );
+        CloseHandle(handle);
+        if status != 0 {
+            return None;
+        }
+        let header = std::ptr::read_unaligned(buffer.as_ptr() as *const UnicodeString);
+        let chars = header.length as usize / 2;
+        if header.buffer.is_null() || chars == 0 {
+            return None;
+        }
+        let start = buffer.as_ptr() as usize;
+        let text = header.buffer as usize;
+        if text < start || text + chars * 2 > start + buffer.len() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+            header.buffer,
+            chars,
+        )))
+    }
+}
+
+/// The full image path of `pid`, or `None` when the process is gone or inaccessible.
+#[cfg(any(feature = "portable", test))]
+pub fn process_image_path(pid: u32) -> Option<PathBuf> {
+    // SAFETY: query-only handle; the wide buffer is sized by the API's required-length protocol.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut size = 512u32;
+        loop {
+            let mut buffer = vec![0u16; size as usize];
+            let mut len = size;
+            if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+                != 0
+            {
+                CloseHandle(handle);
+                return Some(PathBuf::from(String::from_utf16_lossy(
+                    &buffer[..len as usize],
+                )));
+            }
+            // ERROR_INSUFFICIENT_BUFFER: double the buffer within a sane bound.
+            if io::Error::last_os_error().raw_os_error() != Some(122) || size >= 32_768 {
+                CloseHandle(handle);
+                return None;
+            }
+            size *= 2;
+        }
     }
 }
 
@@ -276,7 +413,9 @@ pub fn process_tree(
     out
 }
 
-/// `root` and its live descendants right now (root first).
+/// `root` and its live descendants right now (root first). Test/lived evidence only; runtime kills
+/// use identities so a reused PID between the snapshot and the kill is skipped.
+#[cfg(test)]
 pub fn live_process_tree(root: u32) -> io::Result<Vec<ProcessEntry>> {
     let procs = list_processes()?;
     let tree = process_tree(root, &procs, &creation_time);
@@ -286,14 +425,26 @@ pub fn live_process_tree(root: u32) -> io::Result<Vec<ProcessEntry>> {
         .collect())
 }
 
-/// Kill `root` and its process tree. Returns how many processes were terminated.
-pub fn kill_process_tree(root: u32) -> io::Result<usize> {
-    let tree = live_process_tree(root)?;
+/// Identities of `root` and its live descendants. Capture this before a graceful stop: a child the
+/// hub spawned can outlive (and be reparented after) its parent, so PID ancestry is no longer
+/// enough once the root has exited.
+pub fn live_process_identities(root: u32) -> io::Result<Vec<ProcessIdentity>> {
+    let procs = list_processes()?;
+    let tree = process_tree(root, &procs, &creation_time);
+    Ok(tree.into_iter().filter_map(process_identity).collect())
+}
+
+/// Terminate exactly the process instances in `identities` that still exist. A PID that was
+/// reused by an unrelated process is skipped, not killed.
+pub fn kill_identities(identities: &[ProcessIdentity]) -> usize {
     let mut killed = 0;
-    for pid in tree.into_iter().map(|p| p.pid) {
+    for identity in identities {
+        if !process_is_alive(*identity) {
+            continue;
+        }
         // SAFETY: terminate-only handle, closed right after use.
         unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            let h = OpenProcess(PROCESS_TERMINATE, 0, identity.pid);
             if !h.is_null() {
                 if TerminateProcess(h, 1) != 0 {
                     killed += 1;
@@ -302,7 +453,12 @@ pub fn kill_process_tree(root: u32) -> io::Result<usize> {
             }
         }
     }
-    Ok(killed)
+    killed
+}
+
+/// Kill `root` and its process tree. Returns how many processes were terminated.
+pub fn kill_process_tree(root: u32) -> io::Result<usize> {
+    Ok(kill_identities(&live_process_identities(root)?))
 }
 
 fn port_from_table(dw_local_port: u32) -> u16 {
@@ -463,5 +619,36 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn identity_is_stable_for_this_process_and_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let identity = process_identity(pid).expect("our own process is queryable");
+        assert_eq!(identity.pid, pid);
+        assert_eq!(Some(identity.creation_time), creation_time(pid));
+        assert!(process_is_alive(identity));
+        let reused = ProcessIdentity {
+            pid,
+            creation_time: identity.creation_time + 1,
+        };
+        assert!(!process_is_alive(reused), "a different creation time is another process");
+    }
+
+    #[test]
+    fn command_line_and_image_path_describe_this_process() {
+        let pid = std::process::id();
+        let command_line = process_command_line(pid).expect("our command line is readable");
+        let image = process_image_path(pid).expect("our image path is readable");
+        let current = std::env::current_exe().unwrap();
+        let normalize = |value: &str| value.to_lowercase().replace("\\\\?\\", "");
+        assert_eq!(normalize(&image.to_string_lossy()), normalize(&current.to_string_lossy()));
+        let command_line = command_line.to_lowercase().replace('/', "\\");
+        let image_name = image
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        assert!(command_line.contains(&image_name), "{command_line}");
     }
 }

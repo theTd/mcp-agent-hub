@@ -57,15 +57,19 @@ def main():
         busy.close()  # An existing desktop already occupies the default port.
     try:
         ready = subprocess.run([str(exe), "--portable-prepare-only"], env=env, cwd=root, timeout=60)
-        launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
-        check(4445 <= launch["port"] <= 4544, "occupied default port selects an independent Hub port")
+        check(ready.returncode != 0, "occupied default port fails closed instead of selecting a second Hub port")
         config.write_text(json.dumps({"port": 4444}), encoding="utf-8")
         conflict = subprocess.run([str(exe), "--portable-prepare-only"], env=env, cwd=root, timeout=60)
         check(conflict.returncode != 0, "explicit occupied port fails instead of attaching to another Hub")
         config.write_text("{}", encoding="utf-8")
     finally:
         busy.close()
+    # The first probe intentionally failed while 4444 was held; prepare succeeds after the holder
+    # is released and keeps the configured endpoint.
+    ready = subprocess.run([str(exe), "--portable-prepare-only"], env=env, cwd=root, timeout=60)
+    launch = json.loads((runtime / "launch.json").read_text(encoding="utf-8"))
     check(ready.returncode == 0, "single EXE unpacks and prepares with network unavailable")
+    check(launch["port"] == 4444, "portable startup keeps the configured default port")
     check(old_config.read_bytes() == old_bytes, "installed configuration and legacy environment are isolated")
     python = Path(json.loads((runtime / "prepared.json").read_text(encoding="utf-8"))["python"])
     moved = root / "moved.exe"

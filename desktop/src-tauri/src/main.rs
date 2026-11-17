@@ -36,6 +36,12 @@ fn retry_hub(app: AppHandle, shell: State<'_, Arc<HubShell>>) {
     shell.retry(&app);
 }
 
+/// The error view's verified stale-process recovery action.
+#[tauri::command]
+fn recover_hub(app: AppHandle, shell: State<'_, Arc<HubShell>>) {
+    shell.recover_stale(&app);
+}
+
 fn main() {
     #[cfg(feature = "portable")]
     if std::env::args().any(|arg| arg == "--portable-prepare-only") {
@@ -107,7 +113,7 @@ fn main() {
         )
         .plugin(tauri_plugin_dialog::init())
         .manage(shell.clone())
-        .invoke_handler(tauri::generate_handler![splash_state, retry_hub])
+        .invoke_handler(tauri::generate_handler![splash_state, retry_hub, recover_hub])
         .setup(move |app| {
             #[cfg(feature = "portable")]
             assert_eq!(app.config().identifier, desktop_toast::APP_USER_MODEL_ID, "portable build requires tauri.portable.conf.json");
