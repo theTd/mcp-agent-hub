@@ -18,9 +18,13 @@ export const scenarios = [
   ['liveprobe', '在运行中的游戏里反复试验多轮，摸清一个未知的渲染卡顿现象，没有明确终点', 'terra-high', 'null', 'none'],
   // Cause not stated: either notice answer is defensible.
   ['retry', 'terra medium 做多步真机操作失败了，重试这项任务', 'terra-high', 'null', ['tune', 'none']],
-  ['mcpres', '只读调研，需要引擎知识库 MCP 工具查一个引擎接口的行为', 'terra-medium', 'null', 'none'],
+  ['mcpres', '只读调研，需要引擎知识库 MCP 工具查一个引擎接口的行为', 'omp-max', 'null', 'none'],
   ['offline', '离线分析手机录像指标', 'omp-high', 'null', 'none'],
-  ['survey', '指定仓库事实调查，不审 commit', 'omp-high', 'null', 'none'],
+  ['survey', '指定仓库事实调查，不审 commit', 'omp-max', 'null', 'none'],
+  // Research over-application guards: static research never stays on omp-high.
+  ['researcharch', '调研几种消息队列的架构取舍，给出技术方案对比，不写代码', 'omp-max', 'null', 'none'],
+  ['researchlib', '离线调研两个开源库的实现差异并做来源对比，不启动任何服务', 'omp-max', 'null', 'none'],
+  ['researchplain', '研究某个技术方案在几个项目里的落地方式，先查资料再汇报', 'omp-max', 'null', 'none'],
   ['impl', '按规格实现代码并补测试', 'omp-high', 'null', 'none'],
   ['gui', '只改 GUI 代码不运行', 'omp-high', 'null', 'none'],
   ['review', '单仓 commit 代码/设计审查', 'omp-max', 'kimi-high', 'none'],
@@ -29,14 +33,16 @@ export const scenarios = [
   ['balance', '设计数值平衡并查边界', 'opus-xhigh', 'kimi-max', 'none'],
   ['copy', '玩家公告和商店文案', 'agy-medium', 'null', 'none'],
   ['art', '玩家可见艺术方向', 'agy-medium', 'null', 'none'],
-  ['model', '3D 模型与实体比例', 'agy-high', 'null', 'none'],
+  ['model', '3D 模型与实体比例', 'carbon-medium', 'null', 'none'],
+  ['modelinfra', 'AGY 在启动前不可用，需要继续完成 3D 建模', 'sol-xhigh', 'null', 'none'],
+  ['modelfail', 'AGY 做 3D 建模交回的模型比例全错、漏做一半部件；brief 完整、环境正常。给出下一跳', 'sol-xhigh', 'null', 'tune'],
   ['refactor', '普通跨系统重构', 'omp-high', 'kimi-max', 'none'],
   ['hardalgo', '高风险复杂算法，主代理处理', 'root', 'null', 'none'],
   ['astra', '用户明确要求 Astra 做 CAD', 'astra-high', 'null', 'none'],
   ['gap', '大型跨系统设计完整性审计', 'omp-max', 'kimi-max', 'none'],
   ['ready', '只回复 ready，真实任务稍后', 'defer', 'null', 'none'],
   ['noise', '提到 Minecraft/GUI 但只改纯代码函数', 'omp-high', 'null', 'none'],
-  ['cad', 'CAD 空间几何但未点名 Astra', 'agy-high', 'null', 'none'],
+  ['cad', 'CAD 空间几何但未点名 Astra', 'carbon-medium', 'null', 'none'],
   ['localcheck', '在本机用一两条命令查看某个配置文件里的端口号', 'root', 'null', 'none'],
   // Cause not stated: either fallback level and either notice answer is defensible.
   ['taskfail', 'OMP 已接手但任务执行失败，请选择任务失败 fallback', ['sol-xhigh', 'sol-medium'], 'null', ['tune', 'none']],
@@ -63,7 +69,7 @@ export const scenarios = [
   ['success', 'OMP high 按规格完成实现并补了测试，主代理复核全部正确。给出后续路由', ['defer', 'omp-high'], 'null', 'none'],
 ];
 
-export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'root', 'astra-high', 'sol-medium', 'sol-high', 'sol-xhigh', 'defer'];
+export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'carbon-medium', 'root', 'astra-high', 'sol-medium', 'sol-high', 'sol-xhigh', 'defer'];
 export const companionTokens = ['kimi-high', 'kimi-max', 'null'];
 export const noticeTokens = ['tune', 'none'];
 export const preamble = '你是路由评测器。';
@@ -84,6 +90,7 @@ function normalizePrimary(value, id) {
   if (v.includes('terra') && v.includes('medium')) return 'terra-medium';
   if (v.includes('terra') && /(^|[^a-z])low/.test(v)) return 'terra-low';
   if (v.includes('terra') && v.includes('high')) return 'terra-high';
+  if (v.includes('gemini-4-carbon') && v.includes('medium')) return 'carbon-medium';
   if (v.includes('gemini-4-argon') && v.includes('medium')) return 'agy-medium';
   if (v.includes('gemini-4-argon') && v.includes('high')) return 'agy-high';
   if (v.includes('gpt-6.2-sol') && v.includes('xhigh')) return id === 'hardalgo' ? 'root' : 'sol-xhigh';
@@ -209,6 +216,7 @@ function skillSpec() {
         aliases: alias([
           ['gpt-6.2-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
           ['terra.*medium', 'terra-medium'], ['terra.*(^|[^a-z])low', 'terra-low'], ['terra.*high', 'terra-high'],
+          ['gemini-4-carbon.*medium', 'carbon-medium'],
           ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.2-sol.*xhigh', 'sol-xhigh'],
           ['gpt-6.2-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.2-sol.*medium', 'sol-medium'], ['gpt-6.2-sol.*high', 'sol-high'], ['primary codex', 'root'],
         ]),

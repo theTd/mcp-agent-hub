@@ -2,7 +2,38 @@
 
 日期：2026-11-11
 
-本轮目标是让路由按“先可靠性、后成本”的词典序决策，并明确区分 DSH 任务失败和 DSH 基础设施不可用。提示词按以下顺序维护：目标与优先级、硬性排除规则、主路由表、失败/不可用 fallback、companion 矩阵、输出格式与协议约束。
+## 2026-11-18 路由规则复核、压缩与压测
+
+本轮同时收紧三处规则，并压缩提示词：
+
+- 调研/研究类一律 `omp / clay/deepseek-flash / max`：规则句改用英文 `research`、`study`、`survey`、`source or data comparison`、`offline research`、`research of a technical approach`、knowledge base、architecture or technical-scheme survey、named-repository research，需求即使以中文提出（如“离线调研……”“研究某个技术方案”）也照此路由；未知 worktree/状态检索与实时、远程未知状态仍归 `codex / gpt-6.1-terra`。`离线分析手机录像指标` 这类离线数据/录像指标分析仍留在 `omp / clay/deepseek-flash / high`。
+- 3D 建模首选 `agy / gemini-4-carbon / medium`；AGY 启动前不可用或 3D 尝试失败 → `codex / gpt-6.2-sol / xhigh`，失败按能力不足处理、汇报时提醒调整规则。未点名 Astra 的 CAD 或空间几何同样走 carbon medium；Astra 仍需用户点名。
+- 面向玩家的文案、命名、公告、艺术方向仍为 `agy / gemini-4-argon / medium`；OMP 启动前不可用或作为基础设施不可用仍为 `agy / gemini-4-argon / high`。
+
+提示词由 4,835 bytes（不含结尾换行 4,831）降至 4,455 bytes；承载同一套新规则的未压缩草稿为 5,067 bytes。全文改为纯英文（无中日韩字符），6 个章节与全部规则语义保留。调研句原先用 `调研 / 研究 / 查资料对比` 等中文词作触发，现改为 `research / study / survey / source or data comparison / offline research / research of a technical approach` 等英文表述。
+
+压测使用 53 个场景、3 轮、每批 5 个（每轮 11 个请求），评测器为本机 `127.0.0.1:8789`：
+
+| 变体 | bytes | R1 | R2 | R3 | 合计 | input tokens |
+|---|---|---|---|---|---|---|
+| 基线（未压缩草稿） | 5,067 | 47/53 | 50/53 | 52/53 | 149/159（93.7%） | 52,661 |
+| 候选（压缩英文版） | 4,455 | 51/53 | 52/53 | 49/53 | 152/159（95.6%） | 48,568 |
+
+关键回归检查：
+
+- 调研误判到 `omp-high`：0 次；`mcpres`、`survey`、`researcharch`、`researchlib`、`researchplain` 三轮全中（场景文本仍为中文，英文规则照样命中），`offline`、`impl` 仍为 `omp-high`。
+- 3D：`model`、`modelinfra`、`modelfail`、`cad` 三轮全中；基线 `model` 有两轮被判成 `sol xhigh` 并误带 tune。
+- 残余偏差都在既有噪声场景：`shotcapture` 2 次、`blocked` 2 次；R3 一轮把 `wrongdiag`、`missreview`、`lowfail` 的 notice 判成 none（能力失败提醒）。都不属于本轮调研/3D 规则；三轮无缺行、无协议错误。
+
+迭代记录：3D fallback 若写在主路由同一行，`model` 会被读成“AGY 已失败”而落到 `sol xhigh`（基线 2/3 轮、首版候选 1/3 轮）。把 fallback 移入 Failure 章节、并在主路由行写明“a plain request with no failure stated”后，最终三轮 0 次。压缩到此为止：再删只会动到本轮要保住的规则句。
+
+## 当前修订（2026-11-18）
+
+本轮将静态调研、事实调查、来源比较、知识库检索和仓库调研统一路由到 `OMP / clay/deepseek-flash / max`；实时或远程未知状态仍由 Terra 处理。3D 建模现已改为 `AGY / gemini-4-carbon / medium`，AGY 启动前不可用或 3D 尝试失败时才 fallback 到 `Codex / gpt-6.2-sol / xhigh`（见上一节）。DSH 已退役，不再作为当前路由目标。
+
+压测使用 49 个场景、3 轮、每批 5 个：候选 `146/147`（99.3%，1 protocol noise），基线 `136/147`（92.5%，1 missing）。新场景 `mcpres`、`survey`、`modelinfra` 均为 `3/3`；最终候选提示词 4,831 bytes，评测器输入共 46,131 tokens。评测器为本机 `127.0.0.1:8789`，唯一异常是输出 id 拼写为 `inrafref`，不属于路由错误。
+
+本轮目标是让路由按“先可靠性、后成本”的词典序决策，并明确区分 OMP 任务失败和 OMP 基础设施不可用。提示词按以下顺序维护：目标与优先级、硬性排除规则、主路由表、失败/不可用 fallback、companion 矩阵、输出格式与协议约束。
 
 ## 已确认规则
 
@@ -11,13 +42,13 @@
 - Astra 只有用户明确点名时可用。
 - ready、握手和“真实任务稍后提供”返回 defer。
 - 分类只看实际动作；Minecraft、GUI、远程等词不能单独触发高档模型。
-- DSH 任务失败 → `gpt-6.2-sol xhigh`。
-- DSH 不可用 → `gemini-4-argon high`；该 AGY fallback 失败后才 → `gpt-6.2-sol xhigh`。
+- OMP 任务失败：能力不足 → `gpt-6.2-sol xhigh`，其他原因 → 修好后 `gpt-6.2-sol medium`。
+- OMP 不可用 → `gemini-4-argon high`；该 AGY fallback 失败后才 → `gpt-6.2-sol xhigh`。
 - Companion 只做并行查缺补漏，不是升级链；普通实现、文档、静态调查、离线分析、GUI 代码和纯截图采集均为 null。
 
 ## 边界场景覆盖
 
-压力脚本覆盖以下边界：`terra medium`/`terra high` 的单步与多步、纯截图采集与截图诊断、GUI/Minecraft 背景词、DSH 任务失败与 DSH 不可用、跨系统重构 companion、高风险算法、未点名 Astra、ready 占位，以及 Opus/AGY/Kimi 触发范围。
+压力脚本覆盖以下边界：`terra medium`/`terra high` 的单步与多步、纯截图采集与截图诊断、GUI/Minecraft 背景词、OMP 任务失败与 OMP 不可用、跨系统重构 companion、高风险算法、未点名 Astra、ready 占位，以及 Opus/AGY/Kimi 触发范围。
 
 ## 评测协议
 
