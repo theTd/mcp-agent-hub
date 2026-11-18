@@ -77,7 +77,7 @@ const accepts = (want) => [want].flat();
 function normalizePrimary(value, id) {
   const v = value.toLowerCase().replace(/\s+/g, ' ').trim();
   if (v === 'defer' || (id === 'ready' && v === '')) return 'defer';
-  if (v.includes('gpt-6-astra')) return 'astra-high';
+  if (v.includes('gpt-6.2-astra')) return 'astra-high';
   if (v.includes('opus-5-5') || v.includes('claude-opus-5-5')) return 'opus-xhigh';
   if (v.includes('deepseek') && v.includes('max')) return 'omp-max';
   if (v.includes('deepseek') && v.includes('high')) return 'omp-high';
@@ -86,10 +86,10 @@ function normalizePrimary(value, id) {
   if (v.includes('terra') && v.includes('high')) return 'terra-high';
   if (v.includes('gemini-4-argon') && v.includes('medium')) return 'agy-medium';
   if (v.includes('gemini-4-argon') && v.includes('high')) return 'agy-high';
-  if (v.includes('gpt-6.1-sol') && v.includes('xhigh')) return id === 'hardalgo' ? 'root' : 'sol-xhigh';
-  if (v.includes('gpt-6.1-sol') && v.includes('low')) return 'sol-low';
-  if (v.includes('gpt-6.1-sol') && v.includes('medium')) return 'sol-medium';
-  if (v.includes('gpt-6.1-sol') && v.includes('high')) return 'sol-high';
+  if (v.includes('gpt-6.2-sol') && v.includes('xhigh')) return id === 'hardalgo' ? 'root' : 'sol-xhigh';
+  if (v.includes('gpt-6.2-sol') && v.includes('low')) return 'sol-low';
+  if (v.includes('gpt-6.2-sol') && v.includes('medium')) return 'sol-medium';
+  if (v.includes('gpt-6.2-sol') && v.includes('high')) return 'sol-high';
   if (v === 'root' || v.includes('primary codex')) return 'root';
   return v;
 }
@@ -207,10 +207,10 @@ function skillSpec() {
         name: 'primary',
         tokens: primaryTokens,
         aliases: alias([
-          ['gpt-6-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
+          ['gpt-6.2-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
           ['terra.*medium', 'terra-medium'], ['terra.*(^|[^a-z])low', 'terra-low'], ['terra.*high', 'terra-high'],
-          ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.1-sol.*xhigh', 'sol-xhigh'],
-          ['gpt-6.1-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.1-sol.*medium', 'sol-medium'], ['gpt-6.1-sol.*high', 'sol-high'], ['primary codex', 'root'],
+          ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.2-sol.*xhigh', 'sol-xhigh'],
+          ['gpt-6.2-sol.*(^|[^a-z])low', 'sol-low'], ['gpt-6.2-sol.*medium', 'sol-medium'], ['gpt-6.2-sol.*high', 'sol-high'], ['primary codex', 'root'],
         ]),
       },
       { name: 'companion', tokens: companionTokens, aliases: alias([['^(none|-|)$', 'null'], ['kimi.*max', 'kimi-max'], ['kimi', 'kimi-high']]) },

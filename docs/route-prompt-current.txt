@@ -9,11 +9,11 @@ Hard exclusions
 
 Primary routing table
 - Quick local read-only check or trivial 1-2 step local command/file lookup on this PC (not remote, phone/game, multi-step diagnosis, or repo investigation) → root.
-- Simple factual question → codex / gpt-6.1-sol / low.
+- Simple factual question → codex / gpt-6.2-sol / low.
 - One-step phone, game or approval action, or a single screenshot → codex / gpt-6.1-terra / low.
 - Multi-step live operation (including multi-step screenshot collection), unknown-state search, screenshot diagnosis, or remote diagnosis → codex / gpt-6.1-terra / medium.
 - Only an open-ended live probe (many rounds of experiments on a running game or device, no known end state), or a retry after terra medium failed → codex / gpt-6.1-terra / high.
-- User names Astra → codex / gpt-6-astra / high.
+- User names Astra → codex / gpt-6.2-astra / high.
 - Ordinary implementation, internal documentation, specified-repository investigation, offline analysis, or GUI code changes → omp / clay/deepseek-flash / high.
 - Code review, semantic merge, or complex completeness audit → omp / clay/deepseek-flash / max.
 - Ordinary cross-system refactor → omp / clay/deepseek-flash / high, companion kimi max; max only for an explicit semantic merge, complex completeness work, or large audit.
@@ -26,7 +26,7 @@ Primary routing table
 
 Failure and unavailable fallbacks
 - Capability failure: the model was not capable enough (did only part, got it wrong, missed stated requirements; brief complete, environment working). The brief, access, infrastructure, the environment, or another session's or person's state is another cause; if unclear, read the transcript first.
-- OMP accepted the task but it failed: capability failure → codex / gpt-6.1-sol / xhigh; other cause → fix it, then codex / gpt-6.1-sol / medium.
+- OMP accepted the task but it failed: capability failure → codex / gpt-6.2-sol / xhigh; other cause → fix it, then codex / gpt-6.2-sol / medium.
 - OMP unavailable before launch or as infrastructure → agy / gemini-4-argon / high; if that AGY fallback fails, split the same way: capability → sol xhigh, other cause → sol medium.
 - Terra never falls back to sol; it moves up to terra high only after a terra medium capability failure.
 - A failed OMP task is not unavailable OMP. Never output or start a later fallback early.

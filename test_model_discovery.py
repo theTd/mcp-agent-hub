@@ -395,5 +395,105 @@ class ClaudeDiscoverySessionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无", str(ctx.exception))
 
 
+class CodexModelCatalogJsonTests(unittest.TestCase):
+    """`model_catalog_json` replaces Codex's bundled catalog, so discovery must mirror it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="hub-codex-catalog-")
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        (self.home / ".codex").mkdir(parents=True)
+        self.catalog_path = self.home / ".codex" / "catalog.json"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_config(self, catalog_path: str) -> None:
+        (self.home / ".codex" / "config.toml").write_text(
+            'model = "gpt-6.2-sol"\n'
+            'model_provider = "clay"\n'
+            f"model_catalog_json = '{catalog_path}'\n",
+            encoding="utf-8",
+        )
+
+    def _write_catalog(self, models) -> None:
+        self.catalog_path.write_text(json.dumps({"models": models}), encoding="utf-8")
+
+    def _discover(self):
+        disc = AgentModelDiscovery()
+        disc.home = self.home
+        with patch("model_discovery.shutil.which", return_value=None):
+            return disc._discover_codex()
+
+    def test_custom_catalog_models_are_listed(self):
+        self._write_catalog([
+            {
+                "slug": "gpt-6.2-sol",
+                "display_name": "GPT-6.2-Sol",
+                "visibility": "list",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "context_window": 300000,
+            },
+            {
+                "slug": "gpt-6.2-astra",
+                "display_name": "GPT-6.2-Astra",
+                "visibility": "list",
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "context_window": "272K",
+            },
+        ])
+        self._write_config("catalog.json")
+
+        info = self._discover()
+
+        self.assertIn("gpt-6.2-sol", info["available_models"])
+        detail = next(d for d in info["model_details"] if d["id"] == "gpt-6.2-sol")
+        self.assertEqual(detail["display_name"], "GPT-6.2-Sol")
+        self.assertEqual(detail["supported_thinking_levels"], ["low", "high"])
+        self.assertEqual(detail["default_thinking_level"], "medium")
+        self.assertEqual(detail["context_window_tokens"], 300000)
+        self.assertIn("gpt-6.2-astra", info["available_models"])
+        self.assertTrue(info["custom_catalog_loaded"])
+        self.assertEqual(info["custom_catalog_path"], str(self.catalog_path))
+
+    def test_custom_catalog_replaces_bundled_catalog(self):
+        embedded_path = self.home / "AppData" / "Local" / "OpenAI" / "Codex" / "bin" / "codex.exe"
+        embedded_path.parent.mkdir(parents=True)
+        embedded_path.write_bytes(
+            b'prefix {"models": [{"slug": "embedded-only", "display_name": "Embedded", '
+            b'"supported_reasoning_levels": [{"effort": "low"}]}]} suffix'
+        )
+        self._write_catalog([
+            {"slug": "custom-only", "display_name": "Custom", "supported_reasoning_levels": [{"effort": "low"}]}
+        ])
+        self._write_config(str(self.catalog_path))
+
+        info = self._discover()
+
+        self.assertIn("custom-only", info["available_models"])
+        self.assertNotIn("embedded-only", info["available_models"])
+        self.assertFalse(info["embedded_catalog_loaded"])
+        self.assertTrue(info["custom_catalog_loaded"])
+
+    def test_invalid_catalog_falls_back_to_embedded_catalog(self):
+        embedded_path = self.home / "AppData" / "Local" / "OpenAI" / "Codex" / "bin" / "codex.exe"
+        embedded_path.parent.mkdir(parents=True)
+        embedded_path.write_bytes(
+            b'prefix {"models": [{"slug": "embedded-only", "display_name": "Embedded", '
+            b'"supported_reasoning_levels": [{"effort": "low"}]}]} suffix'
+        )
+        self.catalog_path.write_text("{invalid", encoding="utf-8")
+        self._write_config(str(self.catalog_path))
+
+        info = self._discover()
+
+        self.assertFalse(info["custom_catalog_loaded"])
+        self.assertTrue(info["embedded_catalog_loaded"])
+        self.assertIn("embedded-only", info["available_models"])
+        self.assertEqual(info["default_model"], "gpt-6.2-sol")
+
+
 if __name__ == "__main__":
     unittest.main()

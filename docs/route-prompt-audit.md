@@ -11,8 +11,8 @@
 - Astra 只有用户明确点名时可用。
 - ready、握手和“真实任务稍后提供”返回 defer。
 - 分类只看实际动作；Minecraft、GUI、远程等词不能单独触发高档模型。
-- DSH 任务失败 → `gpt-6.1-sol xhigh`。
-- DSH 不可用 → `gemini-4-argon high`；该 AGY fallback 失败后才 → `gpt-6.1-sol xhigh`。
+- DSH 任务失败 → `gpt-6.2-sol xhigh`。
+- DSH 不可用 → `gemini-4-argon high`；该 AGY fallback 失败后才 → `gpt-6.2-sol xhigh`。
 - Companion 只做并行查缺补漏，不是升级链；普通实现、文档、静态调查、离线分析、GUI 代码和纯截图采集均为 null。
 
 ## 边界场景覆盖

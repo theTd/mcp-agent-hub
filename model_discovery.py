@@ -517,7 +517,7 @@ class AgentModelDiscovery:
         )
         cfg_path = self.home / ".codex" / "config.toml"
         global_state_path = self.home / ".codex" / ".codex-global-state.json"
-        default_model = "gpt-6.1-sol"
+        default_model = "gpt-6.2-sol"
         default_provider = "clay"
         default_effort = "medium"
         thinking_levels: List[str] = ["low", "medium", "high", "xhigh", "max", "ultra"]
@@ -526,6 +526,7 @@ class AgentModelDiscovery:
         codex_toml_profiles: Dict[str, Any] = {}
         recent_configs: List[Dict[str, Any]] = []
         exe_candidates: List[Path] = []
+        custom_catalog_path: Optional[Path] = None
 
         if cfg_path.exists():
             try:
@@ -535,6 +536,13 @@ class AgentModelDiscovery:
                 default_effort = cfg.get("model_reasoning_effort") or default_effort
                 if isinstance(cfg.get("profiles"), dict):
                     codex_toml_profiles = cfg["profiles"]
+                raw_catalog_path = cfg.get("model_catalog_json")
+                if isinstance(raw_catalog_path, str) and raw_catalog_path.strip():
+                    candidate = Path(os.path.expandvars(os.path.expanduser(raw_catalog_path.strip())))
+                    if not candidate.is_absolute():
+                        candidate = cfg_path.parent / candidate
+                    if candidate.is_file():
+                        custom_catalog_path = candidate
                 # Check if CODEX_CLI_PATH is specified in mcp_servers.node_repl.env
                 cli_env_path = (
                     cfg.get("mcp_servers", {})
@@ -547,7 +555,70 @@ class AgentModelDiscovery:
             except Exception:
                 pass
 
-        # Locate codex.exe binary to extract embedded bundled models.json
+        def _parse_catalog(catalog_obj: Dict[str, Any]):
+            parsed_models: List[Dict[str, Any]] = []
+            parsed_ids: List[str] = []
+            catalog_efforts: List[str] = []
+            for m_entry in catalog_obj.get("models") or []:
+                if not isinstance(m_entry, dict):
+                    continue
+                slug = str(m_entry.get("slug") or "").strip()
+                if not slug or slug in parsed_ids:
+                    continue
+                eff_list = [
+                    str(r.get("effort")).strip()
+                    for r in (m_entry.get("supported_reasoning_levels") or [])
+                    if isinstance(r, dict) and r.get("effort") and str(r.get("effort")).strip()
+                ]
+                for effort in eff_list:
+                    if effort not in catalog_efforts:
+                        catalog_efforts.append(effort)
+                eff_pct_raw = m_entry.get("effective_context_window_percent")
+                eff_pct = (
+                    int(round(eff_pct_raw))
+                    if isinstance(eff_pct_raw, (int, float)) and not isinstance(eff_pct_raw, bool) and eff_pct_raw > 0
+                    else None
+                )
+                parsed_ids.append(slug)
+                parsed_models.append(
+                    {
+                        "id": slug,
+                        "display_name": m_entry.get("display_name") or slug,
+                        "visibility": m_entry.get("visibility", "list"),
+                        "default_thinking_level": m_entry.get("default_reasoning_level") or default_effort,
+                        "supported_thinking_levels": eff_list or thinking_levels,
+                        "provider": default_provider,
+                        "context_window_tokens": parse_token_count(m_entry.get("context_window")),
+                        "auto_compact_token_limit": parse_token_count(m_entry.get("auto_compact_token_limit")),
+                        "effective_context_window_percent": eff_pct,
+                    }
+                )
+            return parsed_models, parsed_ids, catalog_efforts
+
+        # Codex's `model_catalog_json` replaces its bundled catalog. Load it first so a valid
+        # custom catalog is authoritative; the executable catalog remains the fallback.
+        custom_catalog_loaded = False
+        custom_catalog_obj: Optional[Dict[str, Any]] = None
+        if custom_catalog_path is not None:
+            try:
+                candidate_obj = json.loads(custom_catalog_path.read_text(encoding="utf-8", errors="replace"))
+                if isinstance(candidate_obj, dict) and isinstance(candidate_obj.get("models"), list) and candidate_obj["models"]:
+                    custom_catalog_obj = candidate_obj
+            except Exception:
+                pass
+
+        if custom_catalog_obj is not None:
+            parsed_models, parsed_ids, catalog_efforts = _parse_catalog(custom_catalog_obj)
+            if parsed_models:
+                models = parsed_models
+                discovered_models = parsed_ids
+                if catalog_efforts:
+                    thinking_levels = catalog_efforts
+                custom_catalog_loaded = True
+            else:
+                custom_catalog_obj = None
+
+        # Locate codex.exe binary to extract embedded bundled models.json when no custom catalog won.
         local_codex_bin_dir = self.home / "AppData" / "Local" / "OpenAI" / "Codex" / "bin"
         if local_codex_bin_dir.exists():
             exe_candidates.extend(sorted(local_codex_bin_dir.rglob("codex.exe"), key=lambda p: p.stat().st_mtime, reverse=True))
@@ -556,7 +627,8 @@ class AgentModelDiscovery:
             exe_candidates.extend(npm_codex_dir.rglob("codex.exe"))
 
         embedded_catalog_loaded = False
-        for exe_path in exe_candidates:
+        catalog_candidates = exe_candidates if custom_catalog_obj is None else []
+        for exe_path in catalog_candidates:
             if not exe_path.exists():
                 continue
             try:
@@ -571,43 +643,9 @@ class AgentModelDiscovery:
                         if brace_pos != -1:
                             chunk_str = raw_bytes[brace_pos : brace_pos + 850_000].decode("utf-8", errors="ignore")
                             catalog_obj, _ = json.JSONDecoder().raw_decode(chunk_str)
-                            all_efforts_seen: List[str] = []
-                            for m_entry in catalog_obj.get("models", []):
-                                slug = m_entry.get("slug")
-                                if not slug:
-                                    continue
-                                eff_list = [
-                                    r.get("effort")
-                                    for r in (m_entry.get("supported_reasoning_levels") or [])
-                                    if isinstance(r, dict) and r.get("effort")
-                                ]
-                                for ef in eff_list:
-                                    if ef not in all_efforts_seen:
-                                        all_efforts_seen.append(ef)
-                                vis = m_entry.get("visibility", "list")
-                                if slug not in discovered_models:
-                                    discovered_models.append(slug)
-                                ctx_win = parse_token_count(m_entry.get("context_window"))
-                                auto_compact_lim = parse_token_count(m_entry.get("auto_compact_token_limit"))
-                                eff_pct_raw = m_entry.get("effective_context_window_percent")
-                                eff_pct = (
-                                    int(round(eff_pct_raw))
-                                    if isinstance(eff_pct_raw, (int, float)) and not isinstance(eff_pct_raw, bool) and eff_pct_raw > 0
-                                    else None
-                                )
-                                models.append({
-                                    "id": slug,
-                                    "display_name": m_entry.get("display_name") or slug,
-                                    "visibility": vis,
-                                    "default_thinking_level": m_entry.get("default_reasoning_level") or default_effort,
-                                    "supported_thinking_levels": eff_list or thinking_levels,
-                                    "provider": default_provider,
-                                    "context_window_tokens": ctx_win,
-                                    "auto_compact_token_limit": auto_compact_lim,
-                                    "effective_context_window_percent": eff_pct,
-                                })
-                            if all_efforts_seen:
-                                thinking_levels = all_efforts_seen
+                            models, discovered_models, catalog_efforts = _parse_catalog(catalog_obj)
+                            if catalog_efforts:
+                                thinking_levels = catalog_efforts
                             embedded_catalog_loaded = True
                             break
             except Exception:
@@ -666,6 +704,8 @@ class AgentModelDiscovery:
             "recent_configurations": recent_configs,
             "config_profiles": codex_toml_profiles,
             "embedded_catalog_loaded": embedded_catalog_loaded,
+            "custom_catalog_path": str(custom_catalog_path) if custom_catalog_path is not None else None,
+            "custom_catalog_loaded": custom_catalog_loaded,
             "cli_flags_template": {
                 "model": "-m {model}",
                 "thinking_level": '-c model_reasoning_effort="{thinking_level}"',
