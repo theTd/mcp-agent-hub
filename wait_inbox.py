@@ -368,8 +368,17 @@ class WaitInbox:
         row = self._row(handle)
         if not row:
             raise WaitHandleError("unknown wait handle")
-        event = await self._next_event(handle)
-        if event:
+        # An open parent decision is actionable and must not be hidden behind a queued
+        # completion, undelivered message, or a provider snapshot that already says done.
+        asks = await self._all_open_asks(handle)
+        if asks:
+            first = asks[0]
+            return {"state": "ask", "requests": asks,
+                    "result_id": first.get("result_id") or first.get("request_id")}
+        while True:
+            event = await self._next_event(handle)
+            if not event:
+                break
             kind = event.get("type")
             if kind in ("approval_request", "question"):
                 asks = await self._all_open_asks(handle)
@@ -401,7 +410,10 @@ class WaitInbox:
                         return self._done_payload(
                             result_id, state.get("final_response") or result.get("final_response", ""), results
                         )
-                return {"state": "waiting", "wait_handle": handle}
+                # A member completion is only an intermediate event for an all-settled
+                # group.  Keep draining the durable inbox so a later ask or failure is
+                # visible without requiring another external notification.
+                continue
             if kind == UNDELIVERED_EVENT_TYPE:
                 # Every undelivered message waiting in the inbox comes back at once; the handle
                 # stays waiting, so the next GET waits for the turn's result again.

@@ -62,6 +62,40 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         again = await self.inbox.wait(info["wait_handle"], 0.1)
         self.assertEqual(again["result_id"], done["result_id"])
 
+    async def test_intermediate_group_completion_does_not_hide_a_later_approval(self):
+        info = await self.inbox.create(["a", "b"])
+        self.states["a"] = {"status": "completed", "final_response": "A"}
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "A"})
+        await self.inbox.publish_event({"session_id": "b", "type": "approval_request", "request_id": "r1", "content": "allow?"})
+
+        result = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", "r1"))
+
+    async def test_open_approval_precedes_group_done_snapshot(self):
+        info = await self.inbox.create(["a", "b"])
+        self.states["a"] = {"status": "completed", "final_response": "A"}
+        self.states["b"] = {"status": "completed", "final_response": "B"}
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "A"})
+        await self.inbox.publish_event({"session_id": "b", "type": "approval_request", "request_id": "r1", "content": "allow?"})
+
+        result = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", "r1"))
+
+    async def test_multiple_intermediate_completions_are_drained_before_undelivered(self):
+        self.states["c"] = {"status": "running", "final_response": None}
+        info = await self.inbox.create(["a", "b", "c"])
+        self.states["a"] = {"status": "completed", "final_response": "A"}
+        self.states["b"] = {"status": "completed", "final_response": "B"}
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta", "content": "A"})
+        await self.inbox.publish_event({"session_id": "b", "type": "turn_completed", "turn_id": "tb", "content": "B"})
+        await self.inbox.publish_event({"session_id": "c", "type": "delivery_failed", "seq": "inj-1",
+                                        "result_id": "undelivered:c:inj-1",
+                                        "data": {"message_id": "inj-1", "reason": "write_failed"}})
+
+        result = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual(result["state"], "undelivered")
+        self.assertEqual(result["messages"][0]["message_id"], "inj-1")
+
     async def test_open_ask_repeats_until_answered_by_any_path(self):
         open_requests = {"r1"}
         self.inbox.set_request_check(lambda sid, rid: sid == "a" and rid in open_requests)
