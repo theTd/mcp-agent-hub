@@ -46,6 +46,9 @@ pub struct SplashView {
     pub log_path: String,
     pub can_recover: bool,
     pub recovery_detail: String,
+    /// Set while the hub answers: the splash page sends the window here itself, so a window that
+    /// came back to the splash never stays on it.
+    pub console_url: Option<String>,
 }
 
 struct ShellState {
@@ -71,6 +74,11 @@ pub struct HubShell {
     close_hint_shown: AtomicBool,
     splash_url: Mutex<Option<Url>>,
     log_dir: PathBuf,
+}
+
+/// The bundled splash page's URL: the app's own origin, on either platform form.
+pub fn is_splash_url(url: &Url) -> bool {
+    url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost")
 }
 
 pub fn reveal_main_window(app: &AppHandle) {
@@ -136,6 +144,7 @@ impl HubShell {
                     log_path,
                     can_recover: false,
                     recovery_detail: String::new(),
+                    console_url: None,
                 },
                 counts: SessionCounts::default(),
                 pending_session: None,
@@ -184,7 +193,7 @@ impl HubShell {
     pub fn set_splash_url(&self, url: Url) {
         // A fresh WebView can still report about:blank during setup. Never save it as
         // the splash destination, or progress updates will navigate away from the UI.
-        if url.scheme() != "tauri" && url.host_str() != Some("tauri.localhost") {
+        if !is_splash_url(&url) {
             return;
         }
         *self.splash_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
@@ -251,6 +260,29 @@ impl HubShell {
         }
     }
 
+    /// A window that landed back on the splash while the hub answers: send it to the console
+    /// without showing or unminimizing it (the splash page can be reloaded by a stray navigation).
+    pub fn reconcile_console_if_ready(&self, app: &AppHandle) {
+        let Some(cfg) = self.ready_config() else {
+            return;
+        };
+        let Ok(url) = Url::parse(&cfg.console_url(None)) else {
+            return;
+        };
+        let Some(w) = app.get_webview_window("main") else {
+            return;
+        };
+        let on_console = w
+            .url()
+            .map(|c| c.origin() == url.origin())
+            .unwrap_or(false);
+        if on_console {
+            return;
+        }
+        self.log(&format!("reconcile main window: {url}"));
+        let _ = w.navigate(url);
+    }
+
     fn navigate_splash(&self, app: &AppHandle) {
         let Some(splash) = self
             .splash_url
@@ -272,18 +304,35 @@ impl HubShell {
     }
 
     fn set_starting(&self, app: &AppHandle, message: &str, detail: &str) {
-        {
-            let mut st = self.st();
-            st.mode = HubMode::Starting;
-            st.splash.phase = "starting".into();
-            st.splash.message = message.into();
-            st.splash.detail = detail.into();
-            st.splash.log_tail.clear();
-            st.splash.can_recover = false;
-            st.splash.recovery_detail.clear();
-        }
+        self.set_starting_state(message, detail);
         self.navigate_splash(app);
         tray_menu::refresh(app);
+    }
+
+    fn set_starting_state(&self, message: &str, detail: &str) {
+        let mut st = self.st();
+        st.mode = HubMode::Starting;
+        st.splash.phase = "starting".into();
+        st.splash.message = message.into();
+        st.splash.detail = detail.into();
+        st.splash.log_tail.clear();
+        st.splash.can_recover = false;
+        st.splash.recovery_detail.clear();
+        st.splash.console_url = None;
+    }
+
+    /// The hub answers: switch the mode and the splash view in one step, so the splash page can
+    /// send the window to the console itself even when the shell's own navigation is not applied.
+    fn mark_ready_state(&self, mode: HubMode, cfg: &HubConfig) {
+        let mut st = self.st();
+        st.mode = mode;
+        st.splash.phase = "ready".into();
+        st.splash.message = "Hub 已就绪，正在打开总控台…".into();
+        st.splash.detail = format!("127.0.0.1:{} · {}", cfg.port, cfg.repo_dir.display());
+        st.splash.log_tail.clear();
+        st.splash.can_recover = false;
+        st.splash.recovery_detail.clear();
+        st.splash.console_url = Some(cfg.console_url(None));
     }
 
     fn fail(&self, app: &AppHandle, message: &str, with_log: bool) {
@@ -296,28 +345,31 @@ impl HubShell {
         } else {
             String::new()
         };
-        {
-            let mut st = self.st();
-            st.mode = HubMode::Failed;
-            st.counts = SessionCounts::default();
-            st.splash.phase = "error".into();
-            st.splash.message = message.into();
-            st.splash.detail.clear();
-            st.splash.log_tail = tail;
-            #[cfg(feature = "portable")]
-            {
-                st.splash.can_recover = message.contains("占用") || message.contains("残留 Hub");
-                st.splash.recovery_detail = if st.splash.can_recover {
-                    "仅会结束已验证属于本便携版的残留 Hub；无法验证归属的进程不会被结束".into()
-                } else {
-                    String::new()
-                };
-            }
-        }
+        self.set_failed_state(message, tail);
         self.bump_generation();
         self.navigate_splash(app);
         reveal_main_window(app);
         tray_menu::refresh(app);
+    }
+
+    fn set_failed_state(&self, message: &str, tail: String) {
+        let mut st = self.st();
+        st.mode = HubMode::Failed;
+        st.counts = SessionCounts::default();
+        st.splash.phase = "error".into();
+        st.splash.message = message.into();
+        st.splash.detail.clear();
+        st.splash.log_tail = tail;
+        st.splash.console_url = None;
+        #[cfg(feature = "portable")]
+        {
+            st.splash.can_recover = message.contains("占用") || message.contains("残留 Hub");
+            st.splash.recovery_detail = if st.splash.can_recover {
+                "仅会结束已验证属于本便携版的残留 Hub；无法验证归属的进程不会被结束".into()
+            } else {
+                String::new()
+            };
+        }
     }
 
     fn owned_exit(&self) -> Option<String> {
@@ -431,7 +483,7 @@ impl HubShell {
                     if let Some(owned) = self.st().owned.take() { owned.terminate(); }
                     return self.fail(app, "启动期间端口被其他 Hub 占用，请重试。便携版不会连接外部 Hub。", false);
                 }
-                self.st().mode = HubMode::Owned;
+                self.mark_ready_state(HubMode::Owned, &cfg);
                 self.bump_generation();
                 self.log(&format!(
                     "hub ready on port {} (hub pid {}, repo {}, started {})",
@@ -465,7 +517,7 @@ impl HubShell {
 
     #[cfg(not(feature = "portable"))]
     async fn attach_external(&self, app: &AppHandle, cfg: &HubConfig, info: &HubInfo) {
-        self.st().mode = HubMode::External;
+        self.mark_ready_state(HubMode::External, cfg);
         self.bump_generation();
         self.log(&format!(
             "attached to an external hub on port {} (pid {}, repo {}, started {}, shutdown_enabled {})",
@@ -724,5 +776,61 @@ impl HubShell {
             self.log("app exit: terminating the owned hub's job");
             owned.terminate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(port: u16) -> HubConfig {
+        HubConfig {
+            repo_dir: PathBuf::from("C:/repo"),
+            python: PathBuf::from("C:/repo/.venv/Scripts/python.exe"),
+            port,
+        }
+    }
+
+    #[test]
+    fn splash_url_matches_only_the_app_origin() {
+        for url in ["http://tauri.localhost/", "tauri://localhost/"] {
+            assert!(is_splash_url(&Url::parse(url).unwrap()), "{url}");
+        }
+        for url in ["about:blank", "http://127.0.0.1:4444/"] {
+            assert!(!is_splash_url(&Url::parse(url).unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn splash_view_follows_the_hub_state() {
+        let shell = HubShell::new(std::env::temp_dir());
+        let starting = shell.splash_view();
+        assert_eq!(starting.phase, "starting");
+        assert_eq!(starting.console_url, None);
+
+        shell.mark_ready_state(HubMode::Owned, &cfg(4444));
+        let ready = shell.splash_view();
+        assert_eq!(shell.mode(), HubMode::Owned);
+        assert_eq!(ready.phase, "ready");
+        assert_eq!(ready.console_url.as_deref(), Some("http://127.0.0.1:4444/"));
+        assert!(ready.message.contains("总控台"));
+
+        shell.set_starting_state("正在重启 Hub…", "");
+        let restarted = shell.splash_view();
+        assert_eq!(shell.mode(), HubMode::Starting);
+        assert_eq!(restarted.phase, "starting");
+        assert_eq!(restarted.console_url, None);
+
+        shell.mark_ready_state(HubMode::External, &cfg(4465));
+        assert_eq!(
+            shell.splash_view().console_url.as_deref(),
+            Some("http://127.0.0.1:4465/")
+        );
+
+        shell.set_failed_state("端口 4444 已被另一个程序占用", String::new());
+        let failed = shell.splash_view();
+        assert_eq!(shell.mode(), HubMode::Failed);
+        assert_eq!(failed.phase, "error");
+        assert_eq!(failed.console_url, None);
     }
 }

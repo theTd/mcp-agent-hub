@@ -386,7 +386,7 @@ fn on_toast_clicked(app: &AppHandle, click: ToastClick, source: &'static str) {
     match click {
         ToastClick::ShowWindow => {
             shell.log(&format!("toast clicked ({source}): show window"));
-            crate::hub_supervisor::reveal_main_window(app);
+            shell.open_console(app, None);
         }
         ToastClick::OpenSession(session_id) => {
             shell.log(&format!(

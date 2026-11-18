@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
 use crate::desktop_toast::ToastClick;
-use crate::hub_supervisor::{reveal_main_window, HubShell, SplashView};
+use crate::hub_supervisor::{is_splash_url, HubShell, SplashView};
 
 /// The splash page's state (starting / error with the hub.log tail). Local splash page only.
 #[tauri::command]
@@ -84,6 +84,15 @@ fn main() {
             if webview.label() == "main" {
                 page_shell.log(&format!("page {:?}: {}", payload.event(), payload.url()));
                 page_shell.set_splash_url(payload.url().clone());
+                // A back-navigation (or a reload) can land on the splash while the hub answers.
+                // `tauri::Builder` has no global navigation hook for a window declared in
+                // tauri.conf.json, so the splash page's own redirect is the guard; this puts the
+                // window on the console as soon as the splash finishes loading.
+                if payload.event() == tauri::webview::PageLoadEvent::Finished
+                    && is_splash_url(payload.url())
+                {
+                    page_shell.reconcile_console_if_ready(webview.app_handle());
+                }
             }
         })
         // Must be first: a second launch hands over to this one and exits.
@@ -101,7 +110,7 @@ fn main() {
                     .skip(1)
                     .any(|a| a == "--hidden" || a == "--toast-activated")
                 {
-                    reveal_main_window(app);
+                    instance_shell.open_console(app, None);
                 }
             },
         ))

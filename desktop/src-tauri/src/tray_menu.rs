@@ -264,7 +264,11 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                reveal_main_window(tray.app_handle());
+                if let Some(shell) = shell(tray.app_handle()) {
+                    shell.open_console(tray.app_handle(), None);
+                } else {
+                    reveal_main_window(tray.app_handle());
+                }
             }
         });
     if let Some(icon) =

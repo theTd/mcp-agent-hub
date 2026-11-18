@@ -6,7 +6,11 @@ fn main() {
     // them: the bundled splash page, never the hub console loaded from http://127.0.0.1.
     tauri_build::try_build(
         tauri_build::Attributes::new()
-            .app_manifest(tauri_build::AppManifest::new().commands(&["splash_state", "retry_hub"])),
+            .app_manifest(tauri_build::AppManifest::new().commands(&[
+                "splash_state",
+                "retry_hub",
+                "recover_hub",
+            ])),
     )
     .expect("failed to run tauri-build");
 }
