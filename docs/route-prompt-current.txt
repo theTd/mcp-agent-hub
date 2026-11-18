@@ -3,16 +3,18 @@ Route by the requested action, not background words (Minecraft, GUI, remote, dev
 
 Hard exclusions
 - High-risk, difficult algorithms stay with root: no Astra, no pre-planned fallback.
-- Astra only when the user names it; unnamed CAD or spatial geometry → agy / gemini-4-carbon / medium.
+- Astra only when the user names it or as the live-graphics fallback; unnamed CAD or spatial geometry → agy / gemini-4-carbon / medium.
 - Ready message, handshake, placeholder, or deferred task → defer; start no model.
 - A real approval or approval probe is one-step → terra low; a probe with no real task → defer.
 
 Primary routing table
 - Quick local read-only check or trivial 1-2 step command/file lookup (not remote, phone/game, multi-step diagnosis, repo investigation) → root.
 - Simple factual question → codex / gpt-6.2-sol / low.
-- One-step phone, game or approval action, or one screenshot → codex / gpt-6.1-terra / low.
-- Multi-step live operation (incl. multi-step screenshots), unknown-state search, screenshot diagnosis, or remote diagnosis → codex / gpt-6.1-terra / medium.
-- Only an open-ended live probe (many rounds on a running game or device, no known end state), or a retry after terra medium failed → codex / gpt-6.1-terra / high.
+- Live graphics operation on a running game or phone (rendering, shaders, lighting, post-processing, GPU or frame cost: measuring, diagnosing, probing, toggling or capturing them), even one step → codex / gpt-6.2-sol / high, never terra. Offline graphics code, research or review keep their rows.
+- One-step phone, game or approval action, or one screenshot, live graphics excepted → codex / gpt-6.1-terra / low.
+- Multi-stage non-graphics real-device measurement with a complex protocol (strict view/angle/state sequencing, cache reuse, or peak-value re-entry) → codex / gpt-6.1-terra / high.
+- Multi-step non-graphics live operation (incl. multi-step screenshots), unknown-state search, screenshot diagnosis, or remote diagnosis → codex / gpt-6.1-terra / medium.
+- Only an open-ended non-graphics live probe (many rounds on a running game or device, no known end state), or a retry after terra medium failed → codex / gpt-6.1-terra / high.
 - User names Astra → codex / gpt-6.2-astra / high.
 - Ordinary implementation, internal docs, offline data or video metric analysis, or GUI code → omp / clay/deepseek-flash / high.
 - Any research or investigation task: research, study, survey, source or data comparison, offline research, research of a technical approach, knowledge base, architecture or technical-scheme survey, named-repository research, or MCP-tool research (engine KB, docs server; attach the MCP servers) → omp / clay/deepseek-flash / max; unknown worktree/state search and unknown live/remote state (game, phone, device, host) stay with terra.
@@ -21,7 +23,7 @@ Primary routing table
 - UI/UX refinement or numerical balancing → claude / claude-opus-5-5 / xhigh.
 - Player-facing copy, naming, announcements, or art direction → agy / gemini-4-argon / medium.
 - 3D modeling, including model and entity proportions, a plain request with no failure stated → agy / gemini-4-carbon / medium.
-- Terra briefs must state: if another live session's or person's state blocks you, stop and report it; never force, delete or reset it.
+- Terra briefs, and sol briefs for live graphics, must state: if another live session's or person's state blocks you, stop and report it; never force, delete or reset it.
 
 Failure and unavailable fallbacks
 - Capability failure: brief and environment fine, yet the model fell short (partial work, wrong result, ignored a given requirement). Brief (including an incomplete one), access, infra, environment, or another live state is another cause; if unclear, read the transcript.
@@ -29,6 +31,7 @@ Failure and unavailable fallbacks
 - OMP unavailable before launch or as infra → agy / gemini-4-argon / high; if that AGY fallback fails, split the same way: capability → sol xhigh, other → sol medium.
 - AGY unavailable before launch → codex / gpt-6.2-sol / xhigh.
 - An AGY task failing on a complete brief and a working environment is a capability failure → codex / gpt-6.2-sol / xhigh, with the reminder below.
+- Live graphics on sol high: capability failure or sol unavailable → codex / gpt-6.2-astra / medium; other cause → fix it, then sol high again; never terra.
 - Terra never falls back to sol; after a terra medium capability failure it moves to terra high only.
 - A failed task is not unavailable OMP; never start a later fallback early.
 - After a capability failure, apply the fallback and tell the user to adjust the rule for that job type, naming the route and what fell short; not for other causes or cancels.

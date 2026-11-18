@@ -2,6 +2,47 @@
 
 日期：2026-11-11
 
+## 现场图形操作不走 terra（2026-11-18）
+
+Owner 要求：涉及图形的工作不再派给 terra，直接派 `codex / gpt-6.2-sol / high`，fallback `codex / gpt-6.2-astra / medium`；随后补充：只有涉及图形的现场操作才这样派，离线的图形工作不变。
+
+改动（以线上原文为基线；线上原文比本仓库旧版多一行 “Multi-stage real-device measurement … → terra high”，本次一并同步进 `docs/route-prompt-current.txt`）：
+- 主路由表新增一行：在运行中的游戏或手机上的图形现场操作（渲染、着色器、光照、后处理、GPU 或帧耗时；测量、诊断、试探、切换或截图）即使只有一步 → `codex / gpt-6.2-sol / high`，不走 terra；离线的图形代码、调研、审查仍按原行路由。
+- terra 行自己带上排除：单步行末尾加 “live graphics excepted”，另 3 条 terra 行写明 non-graphics。
+- Astra 例外：除用户点名外，也可作为现场图形的 fallback。用户点名 Astra 时仍是 astra high。
+- Fallback：现场图形 sol high 能力不足或 sol 不可用 → astra medium；其他原因 → 修好后再派 sol high；不回到 terra。能力不足后照常提醒用户调整规则。
+- 现场图形的 sol brief 与 terra brief 一样，必须写明：被他人会话或状态挡住时停下报告，不强制、不删除、不重置。
+
+`tools/route-prompt-stress.mjs`：新增 `astra-medium` token；`liveprobe` 的现象由“渲染卡顿”改为“存档回档”（原文本按新规则属于现场图形）；新增 16 个场景，共 69 个：
+- 现场图形，期望 sol-high：`gfxprobe`（多轮摸渲染卡顿）、`gfxmeasure`（按视角/状态顺序测光影 GPU 耗时）、`gfxtiers`（手机逐档测帧时间）、`gfxdiag`（截图诊断水面反射闪烁）、`gfxshot`（截一张阴影画面不判断）、`gfxstep`（单步切画质档位）；`gfxastra`（用户点名 Astra）期望 astra-high。
+- 离线图形不被新行吃掉：`gfximpl` omp-high、`gfxresearch` omp-max、`gfxreview` omp-max + kimi-high、`gfxoffline` omp-high。
+- 非图形现场仍归 terra：`livemeasure`（联机延迟分阶段测量）terra-high、`gfxnoise`（单步装一个“兼容光影包”的组件）terra-low。
+- Fallback：`gfxfail`（能力不足）astra-medium + tune，`gfxoff`（sol 额度用完）astra-medium，`gfxdrop`（手机断连）sol-high。
+
+压测（本机 8789 评测器，`--spec` 输出的 spec，每批 5 个、每轮 3 次重复，每个变体 2 轮）：
+
+| 版本 | 结果 | 字节 | 输入 tokens/请求 | 说明 |
+|---|---|---|---|---|
+| 基线（线上原文） | `348/414`（84.1%） | 4,624 | 1,523 | 6 个现场图形场景 0/6（全判 terra），图形 fallback 0/6 |
+| A：只加图形行 + fallback | `191/207`（92.3%，1 轮） | 5,152 | 1,649 | 现场图形仍有 7/18 落到 terra（terra 行胜出） |
+| B：A + 硬性排除一句 + 4 条 terra 行写 non-graphics | `400/414`（96.6%） | 5,331 | 1,688 | 图形全中，但 `shotcapture` 判 root 增多 |
+| C：B 去掉硬性排除句 | `402/414`（97.1%） | 5,217 | 1,662 | 图形全中 |
+| D：B 的单步行恢复原句，末尾加 “live graphics excepted” | `406/414`（98.1%） | 5,329 | 1,686 | 图形全中 |
+| E：D 去掉硬性排除句（定稿） | `407/414`（98.3%） | 5,215 | 1,661 | 图形全中 |
+
+`--only` 单独重问两批敏感场景各 10 次（shotcapture 所在批 + gfxdiag/gfxshot/gfxstep 所在批）：
+
+| 场景 | 基线 | B | D | E | F（E 的 terra medium 行改为 “Non-graphics: …”） |
+|---|---|---|---|---|---|
+| shotcapture | 7/10 | 3/10 | 6/10 | 7/10 | 6/10 |
+| gfxdiag | — | — | 9/10 | 9/10 | 10/10 |
+| gfxshot | — | — | 10/10 | 10/10 | 9/10 |
+
+- E 的新场景在 2 轮全量中全部 6/6：6 个现场图形、3 个 fallback、4 个离线图形守卫、2 个非图形现场守卫。
+- 教训：只加一行图形规则不够，terra 行会胜出；把排除写进 terra 行本身后消除（与 2026-11-15 的教训一致）。单步行写成 “one non-graphics screenshot” 会让纯本地截图 `shotcapture` 更多判成 root（B 3/10），改成原句加 “live graphics excepted” 后回到基线水平。硬性排除句去掉后结果不降，省 114 字节。
+- 残留：现场图形在定向重问里约 1/10 落回 terra，出现的场景随措辞移动（D、E 为 `gfxdiag`，F 为 `gfxshot`），不再继续改措辞。`shotcapture` 判 root 是基线已有的偏差（本地截图本身可算 root 的本机一两步操作）。其余错误（`balance`/`refactor` companion、`opusui`、`lowfail`/`wrongdiag` 偶尔漏 tune）基线同样出现。
+- 定稿 E 比基线多 591 字节（+12.8%），每次请求输入多约 138 tokens（+9.1%）。
+
 ## 2026-11-18 路由规则复核、压缩与压测
 
 本轮同时收紧三处规则，并压缩提示词：

@@ -15,7 +15,22 @@ export const scenarios = [
   ['shotdiag', '检查截图中的布局故障并解释原因，必要时提出修复', 'terra-medium', 'null', 'none'],
   ['search', '跨未知 worktree 查找状态', 'terra-medium', 'null', 'none'],
   ['livediag', '远程主机上服务健康降级，查日志定位根因、修复并验证恢复', 'terra-medium', 'null', 'none'],
-  ['liveprobe', '在运行中的游戏里反复试验多轮，摸清一个未知的渲染卡顿现象，没有明确终点', 'terra-high', 'null', 'none'],
+  ['liveprobe', '在运行中的游戏里反复试验多轮，摸清一个未知的间歇性存档回档现象，没有明确终点', 'terra-high', 'null', 'none'],
+  ['livemeasure', '真机分阶段测量一个联机延迟指标，严格按状态顺序执行并复用缓存', 'terra-high', 'null', 'none'],
+  ['gfxnoise', '手机上单步安装一个背包整理组件并确认，组件说明提到它兼容光影包', 'terra-low', 'null', 'none'],
+  // Live graphics on a running game or phone: sol high, never terra, even one step.
+  ['gfxprobe', '在运行中的游戏里反复试验多轮，摸清一个未知的渲染卡顿现象，没有明确终点', 'sol-high', 'null', 'none'],
+  ['gfxmeasure', '真机分阶段测量光影各效果的 GPU 耗时，严格按视角、角度和状态顺序执行，复用缓存并在峰值处重进', 'sol-high', 'null', 'none'],
+  ['gfxtiers', '在手机上进游戏逐档切换光影画质，测每档帧时间并汇报', 'sol-high', 'null', 'none'],
+  ['gfxdiag', '游戏里水面反射出现闪烁条纹，进游戏截图诊断原因', 'sol-high', 'null', 'none'],
+  ['gfxshot', '进游戏截一张开启阴影后的画面返回，不做判断', 'sol-high', 'null', 'none'],
+  ['gfxstep', '手机上单步切换一次光影画质档位并确认生效', 'sol-high', 'null', 'none'],
+  ['gfxastra', '用户点名 Astra 在游戏里调试光影', 'astra-high', 'null', 'none'],
+  // Offline graphics work keeps its usual rows.
+  ['gfximpl', '按规格实现一个后处理泛光（bloom）着色器并补测试，不运行游戏', 'omp-high', 'null', 'none'],
+  ['gfxresearch', '调研几种实时阴影方案在移动端 GPU 上的取舍，不写代码', 'omp-max', 'null', 'none'],
+  ['gfxreview', '单仓审查一个着色器 commit', 'omp-max', 'kimi-high', 'none'],
+  ['gfxoffline', '离线分析一份已导出的 GPU 帧耗时数据', 'omp-high', 'null', 'none'],
   // Cause not stated: either notice answer is defensible.
   ['retry', 'terra medium 做多步真机操作失败了，重试这项任务', 'terra-high', 'null', ['tune', 'none']],
   ['mcpres', '只读调研，需要引擎知识库 MCP 工具查一个引擎接口的行为', 'omp-max', 'null', 'none'],
@@ -57,6 +72,10 @@ export const scenarios = [
   // Routes with no fallback rule: the next route is open, the reminder is not.
   ['opusui', 'Opus xhigh 做 UI 精修，交回的版本有一半改动违背 brief 里写明的需求；brief 完整、环境正常。给出下一步', ['opus-xhigh', 'root', 'sol-xhigh', 'defer'], ['kimi-max', 'null'], 'tune'],
   ['lowfail', 'terra low 单步手机安装，回报已装好，实际没装上；brief 清楚、手机正常。给出重试路由', ['terra-low', 'terra-medium', 'terra-high'], 'null', 'tune'],
+  // Live graphics fallbacks: capability or sol unavailable → astra medium; another cause → sol high again.
+  ['gfxfail', 'sol high 在真机上诊断光影闪烁，交回的根因与截图证据相反、漏查一半 pass；brief 完整、手机正常。给出下一跳', 'astra-medium', 'null', 'tune'],
+  ['gfxoff', 'gpt-6.2-sol 启动前不可用（额度用完），需要继续在真机上测光影 GPU 耗时', 'astra-medium', 'null', 'none'],
+  ['gfxdrop', 'sol high 在手机上测光影各档帧时间，中途手机断开连接而失败，它此前的操作都正确。重连后给出下一跳', 'sol-high', 'null', 'none'],
   // Failures with another cause: sol medium, never sol xhigh, and no routing reminder.
   ['briefgap', 'OMP high 交回的实现不对，原因是 brief 漏写了接口规格文件路径，worker 按 brief 做的部分都正确。给出补全 brief 后的派发', 'sol-medium', 'null', 'none'],
   ['envfail', 'OMP high 已接手实现，测试依赖的本地数据库没启动，测试跑不起来而失败；代码按规格写对了。环境修好后给出下一跳', 'sol-medium', 'null', 'none'],
@@ -69,7 +88,7 @@ export const scenarios = [
   ['success', 'OMP high 按规格完成实现并补了测试，主代理复核全部正确。给出后续路由', ['defer', 'omp-high'], 'null', 'none'],
 ];
 
-export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'carbon-medium', 'root', 'astra-high', 'sol-medium', 'sol-high', 'sol-xhigh', 'defer'];
+export const primaryTokens = ['sol-low', 'terra-low', 'terra-medium', 'terra-high', 'omp-high', 'omp-max', 'opus-xhigh', 'agy-medium', 'agy-high', 'carbon-medium', 'root', 'astra-high', 'astra-medium', 'sol-medium', 'sol-high', 'sol-xhigh', 'defer'];
 export const companionTokens = ['kimi-high', 'kimi-max', 'null'];
 export const noticeTokens = ['tune', 'none'];
 export const preamble = '你是路由评测器。';
@@ -83,6 +102,7 @@ const accepts = (want) => [want].flat();
 function normalizePrimary(value, id) {
   const v = value.toLowerCase().replace(/\s+/g, ' ').trim();
   if (v === 'defer' || (id === 'ready' && v === '')) return 'defer';
+  if (v.includes('gpt-6.2-astra') && v.includes('medium')) return 'astra-medium';
   if (v.includes('gpt-6.2-astra')) return 'astra-high';
   if (v.includes('opus-5-5') || v.includes('claude-opus-5-5')) return 'opus-xhigh';
   if (v.includes('deepseek') && v.includes('max')) return 'omp-max';
@@ -214,7 +234,7 @@ function skillSpec() {
         name: 'primary',
         tokens: primaryTokens,
         aliases: alias([
-          ['gpt-6.2-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
+          ['gpt-6.2-astra.*medium', 'astra-medium'], ['gpt-6.2-astra', 'astra-high'], ['opus-5-5', 'opus-xhigh'], ['deepseek.*max', 'omp-max'], ['deepseek.*high', 'omp-high'],
           ['terra.*medium', 'terra-medium'], ['terra.*(^|[^a-z])low', 'terra-low'], ['terra.*high', 'terra-high'],
           ['gemini-4-carbon.*medium', 'carbon-medium'],
           ['gemini-4-argon.*medium', 'agy-medium'], ['gemini-4-argon.*high', 'agy-high'], ['gpt-6.2-sol.*xhigh', 'sol-xhigh'],
