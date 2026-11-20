@@ -112,11 +112,11 @@ class _HubCase(unittest.IsolatedAsyncioTestCase):
         self.written.append(text)
         return True
 
-    def patched_trust_timing(self):
+    def patched_trust_timing(self, trust_stable=0.01):
         return patch.multiple(
             "session_manager",
             TUI_DIALOG_POLL_SEC=0.01,
-            TUI_TRUST_STABLE_SEC=0.01,
+            TUI_TRUST_STABLE_SEC=trust_stable,
             TUI_TRUST_CONFIRM_SETTLE_SEC=0.01,
             TUI_TRUST_RETRY_INTERVAL_SEC=0.01,
         )
@@ -217,6 +217,80 @@ class TrustStartupWatcherTests(_HubCase):
         self.sess._startup_watch_active = False
         interaction = await self.hub.poll_tui_screen_interactions_once(self.sess)
         self.assertEqual(interaction["metadata"]["codex_prompt"], "trust")
+
+    def resume_session(self, sid="codex-trust"):
+        """A session resumed from disk: conversation_ref and transcript predate the new process."""
+        sess = self.session(sid)
+        transcript = self.root / f"{sid}.jsonl"
+        transcript.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+        sess.conversation_ref = "existing-rollout"
+        sess.transcript_path = str(transcript)
+        return sess
+
+    async def test_resume_answers_a_folder_page_that_arrives_after_empty_frames(self):
+        """A resume keeps conversation_ref from its last process; an empty first frame is not
+        "past startup", and the page that follows must still be answered by this watcher."""
+        sess = self.resume_session("codex-resume-page")
+        frames = {"n": 0, "screen": "", "dismissed": False}
+
+        def read_screen(**kw):
+            frames["n"] += 1
+            if frames["n"] > 3 and not frames["dismissed"]:
+                frames["screen"] = TRUST_SCREEN
+            return ScreenRead(frames["screen"], 0, 0, 120, 36, 0)
+
+        def write(text):
+            self.written.append(text)
+            if text == "\r":
+                frames["dismissed"] = True
+                frames["screen"] = COMPOSER_SCREEN
+            return True
+
+        sess.read_screen = read_screen
+        sess.write_input = write
+        with self.patched_trust_timing(trust_stable=0.2):
+            task = self.hub._schedule(
+                self.hub._auto_handle_tui_startup_and_trust(sess, None, 0.0, "\r")
+            )
+            try:
+                async with asyncio.timeout(5):
+                    while frames["screen"] != TRUST_SCREEN:
+                        await asyncio.sleep(0.005)
+                    self.assertTrue(sess._startup_watch_active,
+                                    "the watcher must still own the startup window")
+                    # The page is on screen and this watcher owns it: no parent approval.
+                    self.assertIsNone(await self.hub.poll_tui_screen_interactions_once(sess))
+                    self.assertIsNone(sess.pending_interaction)
+                await asyncio.wait_for(task, 5)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(self.written, ["\r"])
+        self.assertFalse(sess._startup_watch_active)
+        self.assertIsNone(sess.pending_interaction)
+
+    async def test_resume_past_the_page_exits_and_releases_the_watch(self):
+        """A resume that lands straight in the composer (idle or busy) has no page to answer:
+        the watcher must exit on the live screen and release the startup window."""
+        busy_screen = "Starting MCP servers\n› \n\n  ? for shortcuts"
+        for label, screen in (("composer", COMPOSER_SCREEN), ("busy", busy_screen)):
+            with self.subTest(label):
+                self.written = []
+                sess = self.resume_session(f"codex-resume-{label}")
+                sess.read_screen = lambda **kw: ScreenRead(screen, 0, 0, 120, 36, 0)
+                sess.write_input = self.record_write
+                with self.patched_trust_timing():
+                    task = self.hub._schedule(
+                        self.hub._auto_handle_tui_startup_and_trust(sess, None, 0.0, "\r")
+                    )
+                    try:
+                        await asyncio.wait_for(task, 5)
+                    finally:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                self.assertFalse(sess._startup_watch_active)
+                self.assertEqual(self.written, [])
+                self.assertIsNone(sess.pending_interaction)
 
 
 class CodexSubmitReasonTests(_HubCase):

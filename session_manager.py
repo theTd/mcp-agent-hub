@@ -12748,6 +12748,23 @@ class HubSessionManager:
             return False, f"busy:{busy}"
         return True, "stable_prompt"
 
+    @classmethod
+    def _tui_startup_past_dialogs(cls, screen_text: str, input_line: Optional[str],
+                                  session: Any = None) -> bool:
+        """A live screen proving this launch is past its startup dialogs.
+
+        Non-blank, the engine's composer row is located, and no known dialog (folder trust,
+        update banner, a pending interaction) is on it. The typed startup window accepts this in
+        place of a conversation claim for a resumed session, whose claim predates the new process.
+        A composer over a busy indicator still counts: every engine draws its dialogs before the
+        composer, and a resumed turn that is already working has nothing left to answer.
+        """
+        if not str(screen_text or "").strip():
+            return False
+        if cls._tui_blocking_dialog(screen_text, session):
+            return False
+        return input_line is not None
+
     @staticmethod
     def _tui_agent_active(screen_text: str) -> bool:
         """W3/K2: the screen shows the agent working or answering, which confirms a submit."""
@@ -13643,6 +13660,16 @@ class HubSessionManager:
         start = time.time()
         deadline = start + TUI_STARTUP_WINDOW_SEC
         typed = not task_to_inject
+        # A resumed session already carries the conversation_ref (and, for Claude, the transcript)
+        # its previous process claimed. Those prove nothing about the TUI launched now:
+        # `codex resume <id>` keeps the same rollout and draws its folder-trust page after the
+        # first frame, so reading them as "past startup" skipped the page and left it to the
+        # parent. Only a claim made during this launch, or the live screen, ends a typed window.
+        preexisting_conv_ref = session.conversation_ref
+        preexisting_transcript = bool(
+            preexisting_conv_ref and session.engine == "claude"
+            and self._session_has_transcript(session)
+        )
         trust_dismissed = 0
         # Codex 0.169.0 draws the folder page after its first frame and discards typeahead pressed
         # before then, so one Enter proves nothing: wait for the page text to hold still, press,
@@ -13793,15 +13820,23 @@ class HubSessionManager:
                 # W4: the text is typed; the readiness wait it could have been lost in is over.
                 return
 
-            # R1: stop early only once the agent is clearly past the dialogs (prompt visible or
-            # conversation claimed). With text still to type the ready branch above owns the exit.
-            # For claude, conversation_ref is pre-seeded with --session-id before launch, so only a
-            # claimed transcript file (or visible composer) proves it has passed startup dialogs.
-            if typed and (
-                input_line is not None
-                or (session.conversation_ref and (session.engine != "claude" or self._session_has_transcript(session)))
-            ):
-                return
+            # R1: stop early only once the agent is clearly past the dialogs. A conversation
+            # claimed during this launch still counts; one inherited from the resume does not, so
+            # then the live screen must show a composer with no dialog left on it. For claude,
+            # conversation_ref is pre-seeded with --session-id before launch, so only a transcript
+            # claimed now (or that visible composer) proves it has passed startup dialogs.
+            if typed:
+                claimed_now = bool(session.conversation_ref) and (
+                    session.conversation_ref != preexisting_conv_ref
+                    or (
+                        session.engine == "claude"
+                        and not preexisting_transcript
+                        and self._session_has_transcript(session)
+                    )
+                )
+                if claimed_now or self._tui_startup_past_dialogs(
+                        screen_txt, input_line, session):
+                    return
             if now >= deadline:
                 if not typed:
                     if rejected is not None:
