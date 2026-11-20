@@ -489,6 +489,10 @@ TRANSCRIPT_RESCAN_INTERVAL_SEC = 1.0
 # so scan up to 512 KB to never miss the session_id marker.
 TRANSCRIPT_MARKER_SCAN_BYTES = 512 * 1024
 TRANSCRIPT_MARKER_RE = re.compile(r"session_id\s*=\s*([A-Za-z0-9_.\-]+)")
+# An unmarked Codex rollout can only be this session's own while it is still being created around
+# the spawn. Hours later it belongs to another conversation (a `--approve-for-me` session's
+# guardian_review rollout was claimed by a session stuck on the trust page and read as "completed").
+CODEX_UNMARKED_CLAIM_WINDOW_SEC = 180.0
 # User-role text an engine writes itself (Codex AGENTS.md and environment blocks, Claude command
 # wrappers and reminders, interrupt markers); not something the user typed.
 ENGINE_INJECTED_PROMPT = re.compile(
@@ -776,7 +780,31 @@ TUI_TRUST_DIALOG_PHRASES = (
     "Yes, I trust these settings",
     "Allow external CLAUDE.md file imports?",
     "WARNING: Claude Code running in Bypass Permissions mode",
+    # Codex 0.169.0's folder page (the capture this fix is based on): the title, and the
+    # "back" row the page offers next to "Trust and continue".
+    "Folder access",
+    "Back to Agent Command Center",
 )
+# The question wraps on a narrow terminal ("Trust\nthis\nfolder?"), so it is matched as
+# whitespace-separated words rather than as one literal line.
+TUI_TRUST_FOLDER_RE = re.compile(r"Trust\s+this\s+folder\s*\?", re.IGNORECASE)
+# Codex 0.169.0 draws its folder-trust page after the TUI is up and then calls
+# discard_pending_input_before_interactive_screen(), throwing away typeahead pressed before the page
+# settled. One Enter therefore proves nothing: wait for the page text to hold still this long, press
+# Enter, re-read the screen, and retry this often until the page is gone (TUI_TRUST_MAX_ATTEMPTS).
+TUI_TRUST_STABLE_SEC = 0.4
+TUI_TRUST_RETRY_INTERVAL_SEC = 1.0
+TUI_TRUST_MAX_ATTEMPTS = 5
+
+
+def tui_trust_dialog_visible(screen: str) -> bool:
+    """True when the screen shows one of the known trust dialogs (wrapped question included)."""
+    text = str(screen or "")
+    if TUI_TRUST_FOLDER_RE.search(text):
+        return True
+    return any(phrase in text for phrase in TUI_TRUST_DIALOG_PHRASES)
+
+
 # Claude Code 2.1+ startup dialogs (workspace trust, external CLAUDE.md imports, bypass permissions
 # warning) render `Jn` with `cancelFirst: true, focus: "cancel"` so the cursor `❯` starts on row 0
 # ("No, exit" / "No, continue..." / "No, disable...") and also remount `Jn` 150ms after opening
@@ -2012,6 +2040,70 @@ def parse_codex_approval_prompt(screen: str) -> Optional[Dict[str, Any]]:
             "destination": destination, "options": opts, "session_key": session_key}
 
 
+_TRUST_FOLDER_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/|\\\\)")
+
+
+def parse_codex_trust_prompt(screen: str) -> Optional[Dict[str, Any]]:
+    """Codex 0.169.0's folder-trust page ("Folder access" / "Trust this folder?") and its options.
+
+    Returns {prompt_kind:"trust", header, folder, options:[{key,label,action}], option_actions,
+    footer} or None. `action` is "approve_once" for the trust/continue row ("1. Trust and continue",
+    Enter) and "deny" for the back row ("2. Back to Agent Command Center", Esc). The question may be
+    wrapped across rows on a narrow terminal; the option block ends at the footer hint.
+    """
+    text = str(screen or "")
+    title = "Folder access" if "Folder access" in text else (
+        "Trust this folder?" if TUI_TRUST_FOLDER_RE.search(text) else ""
+    )
+    if not title:
+        return None
+    lines = text.splitlines()
+    head = next(
+        (i for i, line in enumerate(lines)
+         if "Folder access" in line or TUI_TRUST_FOLDER_RE.search(line)),
+        0,
+    )
+    body: List[str] = []
+    footer = ""
+    for raw in lines[head + 1:]:
+        stripped = raw.strip()
+        low = stripped.lower()
+        if "enter continue" in low or ("esc" in low and "back" in low):
+            footer = " ".join(stripped.split())
+            break
+        body.append(raw)
+    options: List[Dict[str, Any]] = []
+    for opt in _numbered_options(body):
+        label = opt["label"].strip()
+        low = label.lower()
+        if any(word in low for word in ("back", "cancel", "exit", "quit")) or low.startswith("no"):
+            action = "deny"
+        elif "trust" in low or "continue" in low:
+            action = "approve_once"
+        else:
+            action = "unknown"
+        options.append({"key": opt["key"], "label": label, "action": action})
+    if not options:
+        options = [
+            {"key": "1", "label": "Trust and continue", "action": "approve_once"},
+            {"key": "2", "label": "Back to Agent Command Center", "action": "deny"},
+        ]
+    folder = ""
+    for raw in body:
+        stripped = raw.strip().strip("│┃║").strip()
+        if stripped and _TRUST_FOLDER_PATH_RE.match(stripped):
+            folder = stripped
+            break
+    return {
+        "prompt_kind": "trust",
+        "header": title,
+        "folder": folder,
+        "options": options,
+        "option_actions": [opt["action"] for opt in options],
+        "footer": footer,
+    }
+
+
 _CODEX_RECONNECT_STATUS = "Reconnecting..."
 
 
@@ -2523,6 +2615,12 @@ class AgentSession:
         self._scrollback_rev_written: int = -1
         self._seen_tui_tool_lines: Set[str] = set()
         self._seen_tui_prompt_signatures: Set[str] = set()
+        # Codex folder-trust page: the startup watcher owns auto-answering it only while it is
+        # alive (`_startup_watch_active` before `_startup_watch_until`); once it gives up, the flag
+        # lets the screen poll register the page as an approval for the parent instead.
+        self._startup_watch_active: bool = False
+        self._startup_watch_until: float = 0.0
+        self.trust_auto_dismiss_exhausted: bool = False
         # D7: the last screen-detected interaction no machine record has adopted yet, and the
         # moment until which the screen detector leaves a just-answered prompt alone.
         self._unadopted_screen_interaction: Optional[Dict[str, Any]] = None
@@ -4584,27 +4682,95 @@ class HubSessionManager:
     )
 
     @classmethod
-    def _codex_session_id_from_rollout(cls, path: Path) -> Optional[str]:
-        """The uuid of a codex rollout: filename tail, else session_meta.payload.id (research report)."""
-        match = cls._CODEX_ROLLOUT_UUID_RE.search(Path(path).name)
-        if match:
-            return match.group(1)
+    def _codex_session_meta(cls, path: Path) -> Dict[str, Any]:
+        """The payload of a codex rollout's first `session_meta` record ({} when unknown yet).
+
+        A rollout is created empty and its first record is written a moment later, and a half-written
+        record is not JSON: both are ordinary states of a live file, never an error to raise into the
+        watcher. Only the first few records are read because `session_meta` is the first one.
+        """
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for _ in range(20):
                     line = fh.readline()
                     if not line:
                         break
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
                         obj = json.loads(line)
                     except Exception:
                         continue
-                    if obj.get("type") == "session_meta":
-                        value = (obj.get("payload") or {}).get("id")
-                        return str(value) if value else None
+                    if isinstance(obj, dict) and obj.get("type") == "session_meta":
+                        payload = obj.get("payload")
+                        return dict(payload) if isinstance(payload, dict) else {}
         except OSError:
-            return None
-        return None
+            return {}
+        return {}
+
+    @classmethod
+    def _codex_session_id_from_rollout(cls, path: Path) -> Optional[str]:
+        """The uuid of a codex rollout: filename tail, else session_meta.payload.id (research report)."""
+        match = cls._CODEX_ROLLOUT_UUID_RE.search(Path(path).name)
+        if match:
+            return match.group(1)
+        meta = cls._codex_session_meta(Path(path))
+        value = meta.get("id") or meta.get("session_id")
+        return str(value) if value else None
+
+    @staticmethod
+    def _normalize_compare_path(path: str) -> str:
+        """A path comparable across case and separators (Windows: casefold + backslashes)."""
+        expanded = os.path.expanduser(os.path.expandvars(str(path or "").strip()))
+        return os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
+
+    def _codex_session_id_claimed_by_another(self, rollout_id: str, session: AgentSession) -> bool:
+        """True when another live session's conversation_ref already names this codex session id."""
+        if not rollout_id:
+            return False
+        for other in list(self.sessions.values()):
+            if other is session or other.session_id == session.session_id:
+                continue
+            ref = getattr(other, "conversation_ref", None) or {}
+            if str(ref.get("session_id") or "") == rollout_id:
+                return True
+        return False
+
+    def _codex_rollout_ownership_problem(
+        self, session: AgentSession, path: Path, check_cwd: bool = True
+    ) -> str:
+        """Why this rollout cannot be `session`'s own conversation ("" when nothing objects).
+
+        A rollout belongs to this session only when its `session_meta` says so: not a guardian review
+        or another session's subagent (thread_source / parent_thread_id / source.subagent), not a
+        different working folder, and not a session id another live session already owns. The task's
+        own rollout on disk at claim time may still be empty (meta not flushed): that is "unknown",
+        not a reason to reject it, so an empty payload passes.
+
+        `check_cwd=False` is for a rollout that already carries this session's own task marker: the
+        marker is direct evidence, while the folder is a heuristic (a junction or a different drive
+        spelling must not hide the session's own conversation).
+        """
+        meta = self._codex_session_meta(Path(path))
+        if not meta:
+            return ""
+        if str(meta.get("thread_source") or "").strip().lower() == "guardian_review":
+            return "guardian_review"
+        if str(meta.get("parent_thread_id") or "").strip():
+            return "parent_thread_id"
+        source = meta.get("source")
+        if isinstance(source, dict) and source.get("subagent"):
+            return "subagent_source"
+        cwd = str(meta.get("cwd") or "").strip()
+        session_cwd = str(getattr(session, "cwd", "") or "").strip()
+        if (check_cwd and cwd and session_cwd
+                and self._normalize_compare_path(cwd) != self._normalize_compare_path(session_cwd)):
+            return "cwd_mismatch"
+        rollout_id = str(meta.get("id") or meta.get("session_id") or "").strip()
+        if rollout_id and self._codex_session_id_claimed_by_another(rollout_id, session):
+            return "session_id_taken"
+        return ""
 
     @classmethod
     def _conversation_ref_for(cls, engine: str, path: Path) -> Dict[str, Any]:
@@ -4665,6 +4831,19 @@ class HubSessionManager:
         paths = [Path(p) for p in candidates]
         if not paths:
             return None
+        engine = (session.engine or "").strip().lower()
+        is_codex = engine == "codex"
+
+        def owns(path: Path, check_cwd: bool = True) -> bool:
+            """P0: a codex rollout must say it is this session's conversation to be claimable."""
+            if not is_codex:
+                return True
+            problem = self._codex_rollout_ownership_problem(session, path, check_cwd=check_cwd)
+            if problem:
+                logger.debug("[%s] not claiming %s: %s", session.session_id, path, problem)
+                return False
+            return True
+
         marked_for_me: List[Path] = []
         unmarked: List[Path] = []
         for path in paths:
@@ -4682,12 +4861,11 @@ class HubSessionManager:
                 marked_for_me,
                 key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p)),
             ):
-                if self._transcript_claimed_by_other(path, session):
+                if not owns(path, check_cwd=False) or self._transcript_claimed_by_other(path, session):
                     continue
                 if await self._claim_transcript(session, path):
                     return path
 
-        engine = (session.engine or "").strip().lower()
         async with self._engine_transcript_lock(engine):
             live = [
                 s for s in list(self.sessions.values())
@@ -4698,9 +4876,15 @@ class HubSessionManager:
             if not waiting or waiting[0].session_id != session.session_id:
                 # A session launched earlier has no conversation yet: this one waits its turn.
                 return None
+            # P0: without this session's marker a rollout is only looked for right after the spawn;
+            # hours later the unmarked files belong to other conversations (a guardian review).
+            unmarked_open = (
+                not is_codex
+                or (time.time() - self._session_spawn_anchor(session)) <= CODEX_UNMARKED_CLAIM_WINDOW_SEC
+            )
             ordered = [
                 p for p in unmarked
-                if self._conversation_created_after(p, session, levels_up)
+                if unmarked_open and owns(p) and self._conversation_created_after(p, session, levels_up)
             ]
             ordered.sort(
                 key=lambda p: ((self._conversation_creation_time(p, levels_up)[0] or 0.0), str(p))
@@ -6698,6 +6882,8 @@ class HubSessionManager:
 
         if sess.kind == "tui":
             self._schedule(self._watch_tui_interactive_prompts(sess))
+            sess._startup_watch_active = True
+            sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
@@ -9117,7 +9303,23 @@ class HubSessionManager:
         elif eng == "codex":
             if kind == "approval_request":
                 feedback = _one_line(custom_input)
-                if meta.get("codex_prompt") == "mcp":
+                if meta.get("codex_prompt") == "trust":
+                    parsed = parse_codex_trust_prompt(
+                        sess.read_screen(max_lines=max(38, sess.rows)).text
+                    )
+                    if parsed is None:
+                        raise ValueError("Codex 信任页已关闭或变化；未发送按键")
+                    if approval_action in ("deny", "deny_feedback"):
+                        sess.write_input("\x1b")
+                        action_trace = "Codex trust page Esc (Back to Agent Command Center)"
+                        if feedback:
+                            notes.append("信任页没有拒绝反馈输入；只发送了 Esc")
+                    else:
+                        sess.write_input("\r")
+                        action_trace = f"Codex trust page Enter ({chosen_label or 'Trust and continue'})"
+                    sess.trust_auto_dismiss_exhausted = False
+                    delivered = True
+                elif meta.get("codex_prompt") == "mcp":
                     parsed = parse_codex_approval_prompt(sess.read_screen(max_lines=max(38, sess.rows)).text)
                     if not parsed or self._codex_mcp_identity(parsed) != tuple(meta.get("prompt_identity") or ()):
                         raise ValueError("Codex MCP 审批弹窗已变化或关闭；未发送按键")
@@ -10462,6 +10664,8 @@ class HubSessionManager:
                     if candidate == Path(current) or not self._conversation_created_after(candidate, session):
                         continue
                     if session.session_id not in self._transcript_marker_ids(candidate):
+                        continue
+                    if self._codex_rollout_ownership_problem(session, candidate, check_cwd=False):
                         continue
                     if self._transcript_claimed_by_other(candidate, session):
                         continue
@@ -12562,6 +12766,9 @@ class HubSessionManager:
         for phrase in TUI_TRUST_DIALOG_PHRASES + TUI_UPDATE_DIALOG_PHRASES:
             if phrase in text:
                 return phrase
+        if TUI_TRUST_FOLDER_RE.search(text):
+            # The question wrapped; no literal phrase above can match it.
+            return "Trust this folder?"
         return ""
 
     @staticmethod
@@ -12875,7 +13082,16 @@ class HubSessionManager:
             return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
         screen = session.read_screen(max_lines=40).text
         line = self._tui_input_line(screen, "codex")
-        if session.pending_interaction or self._tui_blocking_dialog(screen, session) or line is None:
+        # Three different problems, three different recovery hints: the parent is waiting on a
+        # prompt, a dialog owns the screen, or the composer simply is not there (yet).
+        if session.pending_interaction:
+            return {"ok": False, "reason": "waiting_for_interaction", "attempts": 0, "label": "失败",
+                    "interaction_id": (session.pending_interaction or {}).get("request_id")}
+        dialog = self._tui_blocking_dialog(screen, session)
+        if dialog:
+            return {"ok": False, "reason": "blocked_by_dialog", "attempts": 0, "label": "失败",
+                    "dialog": dialog}
+        if line is None:
             return {"ok": False, "reason": "composer_unavailable", "attempts": 0, "label": "失败"}
         if not self._codex_composer_empty(session, line):
             session._tui_draft_pending = {"reason": "existing_draft"}
@@ -13317,6 +13533,15 @@ class HubSessionManager:
         if result.get("reason") in ("process_gone", "write_failed") or not session.is_process_alive():
             return ("The worker's terminal took nothing (its process is gone or refused the text): "
                     "GET wait_url again for the session's end, then resume_subagent with this message.")
+        if result.get("reason") == "waiting_for_interaction":
+            return ("The worker is waiting for the parent on a prompt, so nothing was typed. Answer it first: "
+                    "respond_to_subagent with the request_id from get_subagent_status_and_trace (or "
+                    "deliver_parent_message '1' to approve / '2' to go back on a Codex trust page), then send "
+                    "this message again.")
+        if result.get("reason") == "blocked_by_dialog":
+            return ("A trust/update dialog owns the worker's screen and the hub never types behind it. Answer "
+                    "or clear it first (respond_to_subagent / deliver_parent_message), then send this message "
+                    "again.")
         if result.get("ok") is None:
             return ("The hub pressed Enter, but the worker's transcript does not show the message yet; Codex "
                     "holds a message sent mid-turn until its next tool call. Do not resend it: GET wait_url "
@@ -13394,11 +13619,16 @@ class HubSessionManager:
         after it, never into the middle of it or into a TUI that is still booting.
         """
         claim = self._tui_writer_queue(session).claim("startup_task") if task_to_inject else None
+        # The screen poll registers a trust page for the parent only when this watcher no longer
+        # owns it: a normal spawn must never flash a fake approval while Enter is being retried.
+        session._startup_watch_active = True
+        session._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
         try:
             if claim is not None:
                 await claim.wait_turn()
             await self._watch_tui_startup_and_type(session, task_to_inject, startup_delay, submit_key)
         finally:
+            session._startup_watch_active = False
             if claim is not None:
                 claim.release()
 
@@ -13414,9 +13644,13 @@ class HubSessionManager:
         deadline = start + TUI_STARTUP_WINDOW_SEC
         typed = not task_to_inject
         trust_dismissed = 0
-        # The same dialog is often redrawn (resize, spinner); press Enter once per distinct
-        # dialog text, not once per poll, so a slow redraw can never receive a second Enter.
-        last_dialog: Optional[str] = None
+        # Codex 0.169.0 draws the folder page after its first frame and discards typeahead pressed
+        # before then, so one Enter proves nothing: wait for the page text to hold still, press,
+        # verify, and press again up to TUI_TRUST_MAX_ATTEMPTS (never dedupe by dialog text).
+        trust_screen: Optional[str] = None
+        trust_stable_since = time.time()
+        trust_presses = 0
+        trust_last_press = 0.0
         last_text: Optional[str] = None
         stable_since = time.time()
         ready: Dict[str, Any] = {"ready": False, "reason": "no_screen"}
@@ -13434,9 +13668,9 @@ class HubSessionManager:
                 return
             now = time.time()
             screen_txt = session.read_screen(max_lines=40).text
-            if any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES):
+            if tui_trust_dialog_visible(screen_txt):
                 # R1/W4: answer it wherever it appears in the window; never type behind it.
-                if TUI_TRUST_NO_FOCUSED_RE.search(screen_txt):
+                if TUI_TRUST_NO_FOCUSED_RE.search(screen_txt) and trust_presses == 0:
                     # Wait past Claude's 150ms held->settled remount guard before moving focus down
                     # from "No, exit" to "Yes, I trust this folder", and NEVER press Enter while
                     # "No" is still the focused option.
@@ -13448,21 +13682,54 @@ class HubSessionManager:
                     if session.status not in ("starting", "running"):
                         return
                     screen_txt = session.read_screen(max_lines=40).text
-                if (
-                    any(phrase in screen_txt for phrase in TUI_TRUST_DIALOG_PHRASES)
-                    and not TUI_TRUST_NO_FOCUSED_RE.search(screen_txt)
-                    and screen_txt != last_dialog
-                ):
-                    session.write_input("\r")
-                    last_dialog = screen_txt
-                    trust_dismissed += 1
+                    trust_screen = None
+                if trust_screen != screen_txt:
+                    trust_screen = screen_txt
+                    trust_stable_since = time.time()
+                if not getattr(session, "trust_auto_dismiss_exhausted", False):
+                    stable_for_trust = (time.time() - trust_stable_since) >= TUI_TRUST_STABLE_SEC
+                    retry_due = (
+                        trust_presses == 0
+                        or (time.time() - trust_last_press) >= TUI_TRUST_RETRY_INTERVAL_SEC
+                    )
+                    if (stable_for_trust and retry_due
+                            and trust_presses < TUI_TRUST_MAX_ATTEMPTS
+                            and not TUI_TRUST_NO_FOCUSED_RE.search(screen_txt)):
+                        session.write_input("\r")
+                        trust_presses += 1
+                        trust_last_press = time.time()
+                        trust_dismissed += 1
+                        await asyncio.sleep(TUI_TRUST_CONFIRM_SETTLE_SEC)
+                        if session.status not in ("starting", "running"):
+                            return
+                        after = session.read_screen(max_lines=40).text
+                        if not tui_trust_dialog_visible(after):
+                            trust_screen = None
+                            trust_presses = 0
+                            last_text = None
+                            stable_since = time.time()
+                            banner_anchor = time.time()
+                            await asyncio.sleep(TUI_DIALOG_POLL_SEC)
+                            continue
+                        if trust_presses >= TUI_TRUST_MAX_ATTEMPTS:
+                            # Give up pressing: the parent answers it through the approval the
+                            # screen poll registers (trust_auto_dismiss_exhausted gates that).
+                            session.trust_auto_dismiss_exhausted = True
+                            logger.warning(
+                                "[%s] trust page still on screen after %d Enter(s); leaving it to the "
+                                "parent", session.session_id, trust_presses,
+                            )
                 last_text = None
                 stable_since = time.time()
                 # K1 (fix 9): the banner's fallback clock starts when the last dialog is answered.
                 banner_anchor = time.time()
-                await asyncio.sleep(TUI_TRUST_CONFIRM_SETTLE_SEC)
+                if (getattr(session, "trust_auto_dismiss_exhausted", False)
+                        and time.time() >= deadline):
+                    return
+                await asyncio.sleep(TUI_DIALOG_POLL_SEC)
                 continue
-            last_dialog = None
+            trust_screen = None
+            trust_presses = 0
             if screen_txt != last_text:
                 last_text = screen_txt
                 stable_since = now
@@ -14316,6 +14583,38 @@ class HubSessionManager:
             },
         )
 
+    async def _register_codex_trust_approval(
+        self, session: AgentSession, parsed: Dict[str, Any], scr: str
+    ) -> Dict[str, Any]:
+        """The Codex folder-trust page, surfaced to the parent once auto-dismiss gave up.
+
+        Approve/option 1 presses Enter ("Trust and continue"), deny/option 2 presses Esc
+        ("Back to Agent Command Center") -- the page's own `enter continue · esc back` footer.
+        """
+        folder = str(parsed.get("folder") or "")
+        lines = ["Codex is asking whether to trust this folder before it accepts any input."]
+        if folder:
+            lines.append(f"Folder: {folder}")
+        lines.append(
+            "approve (or option 1) sends Enter = Trust and continue; deny (or option 2) sends Esc = "
+            "Back to Agent Command Center."
+        )
+        return await self.register_pending_interaction(
+            session=session,
+            kind="approval_request",
+            title="Codex Folder Trust",
+            prompt="\n".join(lines),
+            options=[str(opt.get("label") or "") for opt in parsed.get("options") or []],
+            source="codex_tui_screen_detector",
+            metadata={
+                "codex_prompt": "trust",
+                "folder": folder,
+                "option_actions": list(parsed.get("option_actions") or []),
+                "trust_footer": str(parsed.get("footer") or ""),
+                "screen_tail": scr.strip()[-400:],
+            },
+        )
+
     async def _register_agy_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7: agy's options are offered by label; the one that persists to settings.json never is.
 
@@ -14880,6 +15179,24 @@ class HubSessionManager:
                 session._seen_tui_prompt_signatures.add(sig)
                 return await self._register_codex_screen_approval(session, codex_prompt, scr)
             return None
+
+        # 1b) Codex folder-trust page ("Folder access" / "Trust this folder?"). The startup watcher
+        # answers it normally; it is registered for the parent only after that watcher gave up
+        # (trust_auto_dismiss_exhausted) or is no longer alive inside its window, so a healthy spawn
+        # never flashes a fake approval while Enter is being retried.
+        if eng == "codex":
+            trust_prompt = parse_codex_trust_prompt(scr)
+            if trust_prompt is not None:
+                watcher_owns = bool(getattr(session, "_startup_watch_active", False)) and (
+                    time.time() < float(getattr(session, "_startup_watch_until", 0.0) or 0.0)
+                )
+                if watcher_owns and not getattr(session, "trust_auto_dismiss_exhausted", False):
+                    return None
+                sig = f"codex_trust:{hash(scr.strip()[-400:])}"
+                if sig not in session._seen_tui_prompt_signatures:
+                    session._seen_tui_prompt_signatures.add(sig)
+                    return await self._register_codex_trust_approval(session, trust_prompt, scr)
+                return None
 
         # 2) AGY TUI permission prompt ("Run this command?" + numbered options, mapped by label)
         agy_prompt = parse_agy_approval_prompt(scr) if eng == "agy" else None
@@ -15697,6 +16014,8 @@ class HubSessionManager:
             prompt_to_send: Optional[str] = None
             if delivered_task and task_mode == "pty_input":
                 prompt_to_send = self._task_with_session_marker(sess.session_id, delivered_task)
+            sess._startup_watch_active = True
+            sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
