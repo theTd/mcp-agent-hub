@@ -1,0 +1,137 @@
+{
+  "name": "wait-transport",
+  "about": "Wait transport after 2026-11-20: a host that can run a background command (even one that auto-backgrounds after a 10-second sync limit, e.g. AGY) must run tools/hub_wait.py as one background command; wait_for_hub is fallback-only for hosts with no background shell or async tasks. No prompt file: pass a snapshot of agent_guidance.SERVER_INSTRUCTIONS plus wait_for_hub's docstring, e.g. python tools/wait-transport-prompt.py > snapshot.txt, then the prompt-stress-test runner with --prompt snapshot.txt.",
+  "repeats": 3,
+  "batch": 5,
+  "preamble": "You are a protocol evaluator. Read the Agent Hub instructions and the wait_for_hub tool description below; the cases to decide follow after the output instruction.",
+  "fields": [
+    {
+      "name": "action",
+      "tokens": [
+        "hub_wait",
+        "wait_for_hub",
+        "poll_status",
+        "inspect",
+        "respond_all",
+        "respond_once",
+        "resend",
+        "escalate",
+        "terminate"
+      ],
+      "aliases": [
+        {
+          "pattern": "hub_wait\\.py|hub waiter|background (shell|command|waiter)",
+          "token": "hub_wait"
+        },
+        {
+          "pattern": "respond_to_subagents",
+          "token": "respond_all"
+        },
+        {
+          "pattern": "respond_to_subagent(?!s)",
+          "token": "respond_once"
+        },
+        {
+          "pattern": "get_subagent_status_and_trace|check (its )?progress|inspect",
+          "token": "inspect"
+        },
+        {
+          "pattern": "/api/sessions|session status|poll",
+          "token": "poll_status"
+        },
+        {
+          "pattern": "collect_and_terminate|terminate_subagent",
+          "token": "terminate"
+        }
+      ]
+    }
+  ],
+  "token_notes": "hub_wait means run the hub's waiter script (tools/hub_wait.py) as ONE background shell command and let its exit notify you; wait_for_hub means call the wait_for_hub MCP tool and repeat after each state=waiting, because the host has no background shell or async tasks; poll_status means poll the session status endpoint (/api/sessions/<id>) instead of the wait handle; inspect means call get_subagent_status_and_trace; respond_all means answer every open request with respond_to_subagents; respond_once means answer one request with respond_to_subagent; resend means send the turn again with a message; escalate means tell the user about the quota or auth problem; terminate means close the session with collect_and_terminate.",
+  "scenarios": [
+    {
+      "id": "bg_normal",
+      "input": "You are an omp parent whose shell keeps a command running in the background and notifies you when it exits; you hold a wait_url for a running worker. Decide how you wait.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "bg_agy",
+      "input": "You are an AGY parent: a synchronous shell call is cut off and moved to the background after 10 seconds, and you are told when the background command exits; you hold a wait_url. Decide how you wait.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "bg_mcp_listed",
+      "input": "Your MCP client lists wait_for_hub among its tools; your shell also keeps a background command running until it exits and notifies you. Decide how you wait on a running worker's wait_url.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "bg_restart",
+      "input": "The hub waiter you started in the background exits 2 at its max-seconds cap with the last waiting JSON; the worker is still running and its wait_url is unchanged.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "no_bg",
+      "input": "Your host has no background shell or async task support at all: every shell call must finish inside one synchronous tool call, and you hold a wait_url.",
+      "expect": "wait_for_hub"
+    },
+    {
+      "id": "kill_10s",
+      "input": "Your shell kills every command after 10 seconds and has no background mode at all; you hold a wait_url for a running worker.",
+      "expect": "wait_for_hub"
+    },
+    {
+      "id": "sync_cap",
+      "input": "Your host's only shell runs synchronously, and your MCP client caps a wait_for_hub call at 20 seconds; you hold a wait_url for a running worker.",
+      "expect": "wait_for_hub"
+    },
+    {
+      "id": "docstring_only",
+      "input": "You only read wait_for_hub's tool description, not the full server instructions, and your shell runs background commands to completion and notifies you when they exit.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "poll_status",
+      "input": "While waiting for a running worker you notice GET /api/sessions/<id> shows its status and pending approval, and polling it from a loop looks simpler than the wait_url. Decide how you wait.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "progress",
+      "input": "The user asks what a running subagent is doing right now; its wait_url still says waiting.",
+      "expect": "inspect"
+    },
+    {
+      "id": "ask_three",
+      "input": "wait_for_hub returned state=ask with three open requests in requests: two approvals and one question.",
+      "expect": "respond_all"
+    },
+    {
+      "id": "bg_exit_ask",
+      "input": "Your background hub waiter exited 0 with state=ask listing two open requests for the same worker.",
+      "expect": "respond_all"
+    },
+    {
+      "id": "answered_repeat",
+      "input": "The wait_url keeps returning an ask for request int-1, which you answered successfully several minutes ago.",
+      "expect": "inspect"
+    },
+    {
+      "id": "unconfirmed",
+      "input": "respond_to_subagent returned delivered=true with response_state=unconfirmed, and the worker is still running.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "undelivered",
+      "input": "wait_url returned state=undelivered: your steering message is still in the worker's composer; the worker is still running and the note can wait for the next turn.",
+      "expect": "hub_wait"
+    },
+    {
+      "id": "done_rate_limit",
+      "input": "A done result reports outcome=error and error.kind=rate_limit for the worker's only turn; no answer was produced.",
+      "expect": "resend"
+    },
+    {
+      "id": "done_quota",
+      "input": "A done result reports outcome=error and error.kind=quota for the worker's only turn; no answer was produced.",
+      "expect": "escalate"
+    }
+  ]
+}

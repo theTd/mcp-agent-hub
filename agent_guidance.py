@@ -6,46 +6,45 @@ HUB_WAIT_CLI = Path(__file__).resolve().parent / "tools" / "hub_wait.py"
 
 CLEANUP_HINT = (
     "After collecting a result, close the session: collect_and_terminate(wait_handle) collects and closes every "
-    "finished session in one call; terminate_subagent closes one. Completion leaves the session open. "
-    "Close started sessions before finishing unless handed off or cancelled. "
-    "Results remain readable and resumable."
+    "finished session in one call, terminate_subagent one. Completion leaves the session open; close started "
+    "sessions before finishing unless handed off or cancelled. Results remain readable and resumable."
 )
 
 WAIT_HANDLE_HINT = (
     "Waiting: spawn, send, resume and respond return at once with wait_url, one URL per session or spawn group "
-    "for all its turns, with no cursor or session parameters. GET it; a timeout returns state=waiting. "
-    "If you can run background commands, loop the GET inside one background command while the reply is waiting "
-    "and exit on anything else (ask, undelivered, done, failed, an HTTP error), so a timeout never wakes you. "
-    f'The hub ships that waiter: python "{HUB_WAIT_CLI}" <wait_url> [--max-seconds N] (any Python 3.8+) '
-    "exits 0 with the JSON on ask, undelivered, done or failed, 2 when N seconds (default 3000) pass still waiting, "
-    "so the cap doubles as a heartbeat, and 3 on an HTTP error or a hub unreachable for 2 minutes. "
-    "Hosts that cannot keep that background GET running, or cap synchronous waits (AGY: 10 seconds), "
-    "call wait_for_hub(wait_handle, timeout_seconds=8) instead, again after each state=waiting. "
-    "States are waiting, ask, undelivered, done, failed. "
-    "undelivered lists in messages your sent messages the worker never read (the hub could not submit them, "
-    "or could not prove it); the worker is still working: follow each entry's recovery_hint, then GET wait_url "
-    "again. A done result lists the turn's unread messages under undelivered_messages. "
-    "Every ask is an open approval or question: answer it at once "
-    "with respond_to_subagent and its request_id (idempotent), or respond_to_subagents for several. "
-    "An ask answer lists every open request in requests: answer every entry. "
-    "Never make a waiter skip, filter or dedupe asks by request_id; that hides the next request. "
-    "After answering, and while any task is unfinished, "
-    "wait again; it returns the next ask or the result. "
-    "After a response with response_state=unconfirmed, GET wait_url; never inspect or resend. "
-    "An answered request never comes back: if wait_url repeats one, call get_subagent_status_and_trace and report a hub fault. "
-    "A done result whose outcome is error (also listed in engine_errors) means the engine stopped on an error, not an answer: "
-    "error.kind is quota, rate_limit, network, server, auth, request or other; quota and auth need the user, "
-    "rate_limit, network and server can be retried by sending a message, request needs a smaller or changed request. "
-    "Wait on wait_url or wait_for_hub only, never by polling session status; call get_subagent_status_and_trace only to inspect progress. "
+    "for all its turns, with no cursor or session parameters; a timeout GET returns state=waiting (states: waiting, "
+    "ask, undelivered, done, failed). "
+    "Default: any host that can run a background command, including a shell that auto-backgrounds after 10 seconds "
+    "(AGY) and notifies you on exit, runs the hub's waiter as ONE background shell command: "
+    f'python "{HUB_WAIT_CLI}" <wait_url> [--max-seconds N] (Python 3.8+) exits 0 with the JSON on ask, undelivered, '
+    "done or failed, 2 after N seconds (default 3000) still waiting (run it again; that cap is a heartbeat), and 3 on "
+    "an HTTP error or a hub unreachable for 2 minutes. Do not call wait_for_hub instead. "
+    "Fallback only, for a host with no background shell or async tasks at all: call "
+    "wait_for_hub(wait_handle, timeout_seconds=50), shorter if the MCP call itself is capped, repeating on each "
+    "state=waiting. "
+    "undelivered lists every sent message the worker never read (the hub could not submit or confirm it); the worker "
+    "still works: follow each entry's recovery_hint, then GET wait_url again; a done result lists them under "
+    "undelivered_messages. "
+    "Every ask is an open approval or question: answer it at once with respond_to_subagent and its request_id "
+    "(idempotent), or respond_to_subagents for several. An ask answer lists every open request in requests: answer "
+    "every entry. After answering, and while any task is unfinished, wait again; it returns the next ask or the "
+    "result. After a response with response_state=unconfirmed, GET wait_url; never inspect or resend. "
+    "An answered request never comes back: never make a waiter skip, filter or dedupe asks by request_id (that hides "
+    "the next request); if wait_url repeats one, call get_subagent_status_and_trace and report a hub fault. "
+    "A done result whose outcome is error (also in engine_errors) means the engine stopped on an error, not an "
+    "answer: quota and auth need the user, rate_limit, network and server retry by sending a message, request needs "
+    "a smaller or changed request. "
+    "Wait only on wait_url or wait_for_hub; polling /api/sessions is never waiting. Call "
+    "get_subagent_status_and_trace only when you need to see progress, not to wait. "
     + CLEANUP_HINT
 )
 
 # list_active_sessions is intentionally compact for routine orchestration; request the legacy payload only
 # when a diagnostic caller needs it.
 SESSION_LIST_HINT = (
-    "list_active_sessions returns a compact view by default; use view=\"full\" for the legacy payload. "
-    "Each entry names spawned_by (the spawning hub session's id and title, or an outside parent's process); "
-    "mine=true lists only the sessions you spawned."
+    "list_active_sessions returns a compact view by default; view=\"full\" gives the legacy payload. Each entry "
+    "names spawned_by (the spawning hub session's id and title, or an outside parent's process); mine=true lists "
+    "only the sessions you spawned."
 )
 
 # Prepended to a spawn's task when the parent passes leaf_worker=true. Advice only: nothing blocks the
@@ -62,9 +61,9 @@ def with_leaf_worker_note(task: str) -> str:
 
 
 ROUTING_RULES = (
-    "Use a short title and choose enabled profile/model/thinking_level from the catalog.",
+    "Use a short title.",
     "leaf_worker is required on every spawn: true (the usual choice for a self-contained job) puts a note before "
-    "the task telling the worker to do it itself and never spawn subagents; false, only for a worker meant to "
+    "the task telling it to do the job itself and never spawn subagents; false, only for a worker meant to "
     "dispatch others, sends the task unchanged. The note is advice, not a block: Codex/Claude also take "
     'disabled_mcp_servers=["agent-hub"] to remove the tools.',
     'env={"KEY":"VALUE"} overrides profile env across resume; extra_args=["--flag","value"] '
@@ -81,31 +80,30 @@ ROUTING_RULES = (
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them. "
     "When the task must use a folder outside cwd (a shared lock folder, say), pass extra_roots=[absolute folders] (claude, codex, omp, kimi, agy): "
     "the worker may then read AND write there as in cwd, so list each folder the task needs, never a parent that holds them (it grants everything inside); "
-    "drive roots, home, credential, system and hub-data folders are refused. DSH takes no extra_roots: leave a folder the task did not create in place and answer its approvals.",
+    "drive roots, home, credential, system and hub-data folders are refused. DSH takes no extra_roots: leave such a folder in place and answer its approvals.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
     "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet; to reduce approvals, spawn omp or agy with auto_approve_once_prefixes.",
-    "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never approve for the session, for a high-risk command that starts with one of these prefixes. "
-    "Each prefix starts with the program's absolute path. "
+    "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never for the session, when a high-risk command starts with one of these prefixes, each starting with the program's absolute path. "
     "A command with ; | & > <, a backtick, $(, ( or ) or a control character is never approved automatically. "
     "At most 20 automatic approvals per session. "
-    "The arguments after the prefix are not checked, so name a specific program and subcommand, never a shell or interpreter alone (python.exe, cmd.exe /c, env). "
+    "Only the prefix is checked, so name a specific program and subcommand, never a shell or interpreter alone (python.exe, cmd.exe /c, env). "
     "Each automatic approval leaves an approval_auto_resolved event.",
     "brief_markdown: for a task description longer than a few lines. The hub writes it to its data folder, starts the task with a one-line pointer to the file, and deletes it when the session closes. Limit: 200 000 characters.",
-    "A live measurement brief (numbers read from a running game, device or service under conditions the worker sets) must make the worker "
-    "read back every controlled variable it set (setting, mode, build, scene, load) on every recorded row, write the readback values into that row, "
-    "and mark a row whose readback differs from the intended value invalid instead of keeping it.",
+    "A live measurement brief (numbers read from a running game, device or service under the worker's conditions) must make the worker "
+    "read back every controlled variable it set (setting, mode, build, scene, load) on every recorded row, write those values into the row, "
+    "and mark a row whose readback differs from the intended value invalid, not keep it.",
     "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
 
 SERVER_INSTRUCTIONS = (
     "Manage interactive subagents in the Hub console. Call list_agent_profiles for enabled "
-    "profiles, models, thinking levels and routing guidance. Use spawn_subagent to start work, "
-    "send_to_subagent to steer it, and resume_subagent to restore an ended session. "
+    "profiles, models, thinking levels and routing guidance. spawn_subagent starts work, "
+    "send_to_subagent steers it, resume_subagent restores an ended session. "
     "Never blindly resend a failed/unconfirmed Codex submission: inspect it, then clear an idle "
     "nonempty draft with send_to_subagent(text='', clear_input=true) before sending new text. "
     "Keep sent text short: put a follow-up longer than a few lines in a file under the session cwd "
-    "and send a one-line pointer to it; long text is typed into the terminal slowly and can fail to land. "
+    "and send a one-line pointer; long text is typed into the terminal slowly and can fail to land. "
     "Retrieve persisted answers with get_subagent_final_response only when an HTTP result is unavailable.\n"
     + "\n".join(f"- {rule}" for rule in ROUTING_RULES)
 )

@@ -720,9 +720,13 @@ async def wait_for_hub(
 ) -> Dict[str, Any]:
     """Wait on a wait_handle or complete wait_url, returning waiting, ask, undelivered, done or failed.
 
-    Hosts that cannot keep a background GET running (including shells capped at 10 seconds)
-    should use this tool. A timeout is a normal ``state=waiting`` result. When asking, ``requests``
-    contains every currently open request; answer all of them before waiting again.
+    Fallback only. If your host can run a background shell command, even one that auto-backgrounds
+    after a 10-second synchronous limit and notifies you on exit (AGY), do NOT call this tool: run
+    ``tools/hub_wait.py <wait_url>`` (its absolute path is in the server instructions) as ONE
+    background command. Use this tool only on hosts with no background shell or async tasks at all.
+
+    A timeout is a normal ``state=waiting`` result; call again. On ``state=ask``, ``requests`` lists
+    every open request: answer all of them before waiting again.
     """
     handle = str(wait_handle or "").rstrip("/").rsplit("/", 1)[-1]
     if not handle.startswith("wh_"):
