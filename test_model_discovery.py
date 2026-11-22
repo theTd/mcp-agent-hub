@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -493,6 +494,159 @@ class CodexModelCatalogJsonTests(unittest.TestCase):
         self.assertTrue(info["embedded_catalog_loaded"])
         self.assertIn("embedded-only", info["available_models"])
         self.assertEqual(info["default_model"], "gpt-6.2-sol")
+
+
+def _omp_models_stdout(rows):
+    """Builds `omp models` output with one provider table; rows are (model, thinking column)."""
+    lines = [
+        f"clay ({len(rows)})",
+        "┌───────┬─────────┬─────────┬──────────┬────────┐",
+        "│ model │ context │ max-out │ thinking │ images │",
+        "├───────┼─────────┼─────────┼──────────┼────────┤",
+    ]
+    lines.extend(f"│ {model} │ 1M │ 66K │ {thinking} │ yes │" for model, thinking in rows)
+    lines.append("└───────┴─────────┴─────────┴──────────┴────────┘")
+    return "\n".join(lines)
+
+
+class OmpThinkingColumnTests(unittest.TestCase):
+    """`omp models` prints one effort (`high`) for single-level models, not a comma list or `yes`."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="hub-omp-discovery-")
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.omp_exe = self.home / "AppData" / "Local" / "omp" / "omp.exe"
+        self.omp_exe.parent.mkdir(parents=True)
+        self.omp_exe.write_bytes(b"fake")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _discover(self, rows):
+        stdout = _omp_models_stdout(rows)
+        disc = AgentModelDiscovery()
+        disc.home = self.home
+        with patch("model_discovery.shutil.which", return_value=str(self.omp_exe)), \
+                patch("model_discovery.subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
+            return disc._discover_omp()
+
+    def _levels(self, rows):
+        return {m["id"]: m["supported_thinking_levels"] for m in self._discover(rows)["model_details"]}
+
+    def test_single_effort_token_is_preserved(self):
+        levels = self._levels([
+            ("hy4-flash-free", "high"),
+            ("probe-minimal", "minimal"),
+            ("probe-xhigh", "xhigh"),
+        ])
+
+        self.assertEqual(levels["clay/hy4-flash-free"], ["high"])
+        self.assertEqual(levels["clay/probe-minimal"], ["minimal"])
+        self.assertEqual(levels["clay/probe-xhigh"], ["xhigh"])
+
+    def test_comma_separated_levels_preserve_order(self):
+        levels = self._levels([
+            ("a", "low,high,max"),
+            ("b", "minimal, low , medium, high, xhigh"),
+        ])
+
+        self.assertEqual(levels["clay/a"], ["low", "high", "max"])
+        self.assertEqual(levels["clay/b"], ["minimal", "low", "medium", "high", "xhigh"])
+
+    def test_disabled_tokens_map_to_off(self):
+        rows = [("dash", "-"), ("no", "no"), ("none", "NONE"), ("off", "Off"), ("blank", "")]
+        levels = self._levels(rows)
+
+        for model, _thinking in rows:
+            with self.subTest(model=model):
+                self.assertEqual(levels[f"clay/{model}"], ["off"])
+
+    def test_legacy_yes_expands_to_classic_levels(self):
+        self.assertEqual(self._levels([("legacy", "YES")])["clay/legacy"], ["low", "medium", "high", "max"])
+
+    def test_models_yml_efforts_are_used_when_cli_table_is_unavailable(self):
+        agent_dir = self.home / ".omp" / "agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "models.yml").write_text(
+            "providers:\n"
+            "  clay:\n"
+            "    models:\n"
+            "      - id: hy4-flash-free\n"
+            "        thinking:\n"
+            "          mode: effort\n"
+            "          efforts: [high]\n"
+            "        contextWindow: 1048576\n"
+            "      - id: deepseek-flash\n"
+            "        contextWindow: 1048576\n",
+            encoding="utf-8",
+        )
+        disc = AgentModelDiscovery()
+        disc.home = self.home
+        with patch("model_discovery.shutil.which", return_value=None), \
+                patch("model_discovery.subprocess.run", return_value=SimpleNamespace(stdout="")):
+            info = disc._discover_omp()
+
+        levels = {m["id"]: m["supported_thinking_levels"] for m in info["model_details"]}
+        self.assertEqual(levels["clay/hy4-flash-free"], ["high"])
+        self.assertEqual(levels["clay/deepseek-flash"], ["low", "medium", "high", "max"])
+
+
+class OmpSingleLevelLaunchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().set_debug(False)
+        self.temp = tempfile.TemporaryDirectory(prefix="hub-omp-single-level-")
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.omp_exe = self.home / "AppData" / "Local" / "omp" / "omp.exe"
+        self.omp_exe.parent.mkdir(parents=True)
+        self.omp_exe.write_bytes(b"fake")
+        profiles = self.root / "profiles.json"
+        profiles.write_text(
+            json.dumps({
+                "profiles": {
+                    "omp": {
+                        "id": "omp", "name": "OMP", "engine": "omp", "kind": "tui",
+                        "command": str(self.omp_exe), "args": [], "enabled": True,
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            self.hub = HubSessionManager(profiles, base_dir=Path(__file__).parent, data_dir=self.root)
+        await self.hub.start()
+
+        stdout = _omp_models_stdout([("hy4-flash-free", "high")])
+        disc = AgentModelDiscovery()
+        disc.home = self.home
+        with patch("model_discovery.shutil.which", return_value=str(self.omp_exe)), \
+                patch("model_discovery.subprocess.run", return_value=SimpleNamespace(stdout=stdout)):
+            omp_info = disc._discover_omp()
+        self.hub.load_profiles(discovery={"engines": {"omp": omp_info}})
+
+    async def asyncTearDown(self):
+        await self.hub.archive_all_sessions_on_shutdown()
+        self.temp.cleanup()
+
+    async def test_single_level_model_accepts_high_and_rejects_unsupported_low(self):
+        launch = self.hub.resolve_launch(
+            "omp", model="clay/hy4-flash-free", thinking_level="high", cwd=str(self.root)
+        )
+        self.assertEqual(launch["model"], "clay/hy4-flash-free")
+        self.assertEqual(launch["thinking_level"], "high")
+        self.assertIn("--model=clay/hy4-flash-free", launch["args"])
+        self.assertIn("--thinking=high", launch["args"])
+
+        default_launch = self.hub.resolve_launch("omp", model="clay/hy4-flash-free", cwd=str(self.root))
+        self.assertEqual(default_launch["thinking_level"], "high")
+        self.assertIn("--thinking=high", default_launch["args"])
+
+        with self.assertRaises(ValueError) as caught:
+            self.hub.resolve_launch(
+                "omp", model="clay/hy4-flash-free", thinking_level="low", cwd=str(self.root)
+            )
+        self.assertIn("high", str(caught.exception))
 
 
 if __name__ == "__main__":

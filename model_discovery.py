@@ -51,6 +51,37 @@ def parse_token_count(raw: Any) -> Optional[int]:
     return val if val > 0 else None
 
 
+_OMP_DISABLED_THINKING_TOKENS = frozenset({"", "-", "no", "none", "off"})
+_OMP_LEGACY_YES_THINKING_LEVELS = ["low", "medium", "high", "max"]
+
+
+def parse_omp_thinking_levels(raw: Any) -> List[str]:
+    """Parses the `thinking` column of `omp models` into supported effort levels.
+
+    `low,high,max` -> those levels in order; legacy `yes` -> the four classic levels;
+    `-` / `no` / `none` / `off` / empty -> `["off"]`; any other single token
+    (`high`, `minimal`, `xhigh`, ...) -> that token alone.
+    """
+    text = str(raw or "").strip()
+    if "," in text:
+        levels = [part.strip() for part in text.split(",") if part.strip()]
+        return levels or ["off"]
+    lowered = text.lower()
+    if lowered in _OMP_DISABLED_THINKING_TOKENS:
+        return ["off"]
+    if lowered == "yes":
+        return list(_OMP_LEGACY_YES_THINKING_LEVELS)
+    return [text]
+
+
+def _parse_yaml_inline_list(value: str) -> List[str]:
+    """Parses `[low, high]` / `low, high` into stripped items."""
+    text = str(value or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return [part.strip().strip("'\"") for part in text.split(",") if part.strip()]
+
+
 def _strip_yaml_inline_comment(text: str) -> str:
     in_quote: Optional[str] = None
     for idx, ch in enumerate(text):
@@ -64,8 +95,8 @@ def _strip_yaml_inline_comment(text: str) -> str:
     return text.rstrip()
 
 
-def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, int]]:
-    """Extracts exact {provider/model: {context_window_tokens, max_output_tokens}} from ~/.omp/agent/models.yml."""
+def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Extracts {provider/model: {context_window_tokens, max_output_tokens, thinking_levels}} from ~/.omp/agent/models.yml."""
     if not path.exists():
         return {}
     try:
@@ -73,7 +104,7 @@ def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, int]]:
     except Exception:
         return {}
 
-    result: Dict[str, Dict[str, int]] = {}
+    result: Dict[str, Dict[str, Any]] = {}
     providers_indent: Optional[int] = None
     current_provider: Optional[str] = None
     provider_indent: Optional[int] = None
@@ -88,11 +119,13 @@ def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, int]]:
             return
         mid = str(current_item.get("id") or "").strip().strip("'\"")
         if mid:
-            entry: Dict[str, int] = {}
+            entry: Dict[str, Any] = {}
             if current_item.get("context_window_tokens"):
                 entry["context_window_tokens"] = current_item["context_window_tokens"]
             if current_item.get("max_output_tokens"):
                 entry["max_output_tokens"] = current_item["max_output_tokens"]
+            if current_item.get("thinking_levels"):
+                entry["thinking_levels"] = current_item["thinking_levels"]
             if entry:
                 result[f"{current_provider}/{mid}"] = entry
         current_item = None
@@ -183,6 +216,10 @@ def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, int]]:
                 tok = parse_token_count(v)
                 if tok:
                     current_item["max_output_tokens"] = tok
+            elif k == "efforts":
+                levels = _parse_yaml_inline_list(v)
+                if levels:
+                    current_item["thinking_levels"] = levels
 
     flush_item()
     return result
@@ -270,11 +307,7 @@ class AgentModelDiscovery:
                             full_id = f"{current_provider}/{m_name}"
                             if full_id not in seen_ids:
                                 seen_ids.add(full_id)
-                                m_thinks = (
-                                    [x.strip() for x in think_col.split(",") if x.strip()]
-                                    if "," in think_col
-                                    else (["low", "medium", "high", "max"] if think_col == "yes" else ["off"])
-                                )
+                                m_thinks = parse_omp_thinking_levels(think_col)
                                 yml_info = yml_models.get(full_id) or {}
                                 ctx_tokens = yml_info.get("context_window_tokens") or parse_token_count(ctx)
                                 models.append(
@@ -307,7 +340,7 @@ class AgentModelDiscovery:
                     "context_window": str(ctx_tokens) if ctx_tokens else "",
                     "context_window_tokens": ctx_tokens,
                     "max_output": str(max_out_tokens) if max_out_tokens else "",
-                    "supported_thinking_levels": ["low", "medium", "high", "max"],
+                    "supported_thinking_levels": yml_info.get("thinking_levels") or ["low", "medium", "high", "max"],
                 }
             )
 
