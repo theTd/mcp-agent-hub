@@ -41,6 +41,7 @@ Hub 只服务本机页面和本机客户端：`Host` 必须是 `127.0.0.1`、`lo
 ### 1. 准备
 
 - 构建新 EXE：`cd desktop; pnpm build:portable`，产物是 `desktop\dist\mcp-agent-hub-0.1.0-windows-x64-portable.exe`。
+- 构建要在正常的交互式 Windows 桌面会话（`WinSta0\Default`）里运行。离屏或无头会话里，`tauri-build` 生成的 `build-script-build` 可能以 `0xc0000142 (STATUS_DLL_INIT_FAILED)` 失败（它静态链接了 `shell32.dll`、`ole32.dll`）。
 - 不要从 `desktop\dist` 直接运行它（WebView2 0x800700AA 崩溃）。也不要在线上 Hub 运行时试启动任何一份 EXE：4444 被占时，它会在 4445 用同一个数据目录再起一个 Hub，把所有会话归档为「已中断」，恢复请求就落空了。
 - 看一眼现状，记下哪些会话在运行：
 
@@ -88,6 +89,8 @@ if ((Get-FileHash $new).Hash -ne (Get-FileHash $exe).Hash) { throw "EXE copy mis
 explorer.exe $exe
 "started $exe sha256 $((Get-FileHash $exe).Hash)"
 ```
+
+`explorer.exe $exe` 要运行在交互式桌面（`WinSta0\Default`）上，并且要等这个短命的 `explorer.exe` 进程退出、把启动交给常驻的桌面 shell 之后再结束命令。Agent 的命令运行器退出时会结束自己的 Job 对象：直接启动 `$exe`，新 App 会在命令返回时一起被杀掉；不等 shim 交接完就结束，则 shim 先被杀，App 根本没起来（`desktop.log` 里不会出现新的 `app start`）。交接成功的标志是 `desktop.log` 出现新的 `app start: pid <pid>` 行，且该 pid 的 `ParentProcessId` 是桌面 shell（`explorer.exe`），不是 Agent 的 shell。
 
 停机期间，你自己和其他父 Agent 的 agent-hub MCP 连接会断开，Hub 回来后自动重连；恢复进行时，除 `/health` 和桌面端探测外的请求都先等着（最多 30 秒）。
 
@@ -156,7 +159,7 @@ explorer.exe $exe
 "rolled back $exe sha256 $((Get-FileHash $exe).Hash)"
 ```
 
-然后照第 3、4 步核对。只有数据库损坏时，才在 Hub 停止期间把 `$B` 里的 `hub_state.db*` 和 `wait_inbox.db` 拷回数据目录：那会丢掉备份之后的所有记录，先问 owner。
+启动方式和第 2 步相同：`explorer.exe $exe` 在交互式桌面上运行，并等它完成交接。然后照第 3、4 步核对。只有数据库损坏时，才在 Hub 停止期间把 `$B` 里的 `hub_state.db*` 和 `wait_inbox.db` 拷回数据目录：那会丢掉备份之后的所有记录，先问 owner。
 
 ### 6. 收尾
 

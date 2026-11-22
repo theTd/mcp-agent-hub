@@ -16,6 +16,8 @@ pnpm build:portable
 
 需要 Node.js、pnpm、Rust MSVC 工具链和 Windows WebView2 开发环境。首次构建会编译 Rust 依赖，后续构建会使用 `desktop/src-tauri/target` 的增量缓存。
 
+构建要在正常的交互式 Windows 桌面会话（`WinSta0\Default`）里运行。离屏或无头会话里，`tauri-build` 生成的 `build-script-build` 可能以 `0xc0000142 (STATUS_DLL_INIT_FAILED)` 失败：它静态链接了 `shell32.dll`、`ole32.dll`，在那种会话里无法完成 DLL 初始化。
+
 默认构建使用一个 Cargo 任务以控制资源占用；机器资源充足时可以提高并行度：
 
 ```powershell
