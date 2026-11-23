@@ -38,6 +38,13 @@ from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
     build_mcp_args, merge_claude_settings, replace_claude_settings,
 )
+from mcp_session_pool import PoolRegistry, error_result
+from session_mcp_bridge import (
+    build_mcp_bridge_note, derive_mcp_bridge_token, load_or_create_bridge_secret,
+    mcp_cli_script_path, prune_stale_bridge_dirs, remove_session_bridge_dir,
+    session_bridge_jobs_dir, session_bridge_output_dir, uses_mcp_bridge,
+    verify_mcp_bridge_token, with_mcp_bridge_note, write_session_bridge_file,
+)
 from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES, with_leaf_worker_note
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
@@ -3375,6 +3382,12 @@ class HubSessionManager:
         self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
         self.runtime_configs_dir = self.data_dir / ".runtime_mcp_configs"
         self.runtime_configs_dir.mkdir(exist_ok=True)
+        # Scheme B: the Hub itself holds one MCP connection per (session, server) for engines that
+        # cannot start native MCP servers (Doubao TUI), and exposes them through its own HTTP API.
+        self.mcp_pool_registry = PoolRegistry(self.runtime_configs_dir)
+        # The Hub-wide HMAC secret behind every session bridge token; loaded on first use so a
+        # test or a Hub that never bridges MCP never writes it.
+        self._mcp_bridge_secret: Optional[bytes] = None
 
         self.db = HubPersistence(self.data_dir / "hub_state.db")
         self.wait_inbox = WaitInbox(self.data_dir / "wait_inbox.db")
@@ -3490,6 +3503,16 @@ class HubSessionManager:
         if self._loop is not None:
             return
         self._loop = asyncio.get_running_loop()
+        # A Hub that died while an MCP stdio child was still running leaves that child behind. The
+        # sweep kills only leftovers whose command line still matches the recorded one; it never
+        # blocks the start, and a failure there must not cost the Hub its own startup.
+        try:
+            swept = await asyncio.to_thread(self.mcp_pool_registry.sweep_orphan_pids)
+            if swept:
+                logger.info("MCP pool: reaped %d orphaned stdio server process(es) from a previous run",
+                            swept)
+        except Exception as exc:
+            logger.warning("MCP pool: orphan sweep failed; continuing startup: %s", exc)
         # §5.1: the one Core is built on the first session that needs it, so a hub that never opens
         # a terminal (and every test that injects a fake) never loads the extension (F14).
         try:
@@ -3520,12 +3543,20 @@ class HubSessionManager:
             # them. Either way the brief goes at the next start, or when the resumed session closes.
             keep_briefs = set(live_at_stop) | self._take_briefs_kept_at_stop()
             self._prune_stale_briefs(keep=keep_briefs)
+            # Same moment, same rule for the MCP bridge folders: an mcp_<sid>/ tree belongs to a
+            # live or resumable session, and everyone else's is a leftover.
+            try:
+                prune_stale_bridge_dirs(self.runtime_configs_dir, keep_session_ids=keep_briefs)
+            except Exception as exc:  # a locked folder must not cost the Hub its startup
+                logger.warning("MCP bridge: stale folder prune failed; continuing startup: %s", exc)
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
         self._schedule(self._omp_turn_end_sweep_loop())
+        # Idle MCP actors are dropped off the loop by the registry's own reaper, not by a session.
+        self.mcp_pool_registry.start_reaper()
         if request is not None:
             targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
             for sid in sorted(request.session_ids or ()):
@@ -6641,6 +6672,143 @@ class HubSessionManager:
             removed += 1
         return removed
 
+    # -- session MCP bridge (Scheme B) --------------------------------------
+    #
+    # Doubao CLI starts PowerShell through one shared background service, so a per-session env
+    # override never reaches the shell that would start a native MCP server (probe, 2026-11-24).
+    # The Hub therefore holds the connections itself, writes `mcp_<sid>/bridge.json` naming only the
+    # Hub, the session id and an HMAC token, and the worker calls tools/hub_mcp_cli.py.
+
+    def _get_mcp_bridge_secret(self) -> bytes:
+        """The Hub-wide token secret, created on first use so a Hub that never bridges keeps no file."""
+        if self._mcp_bridge_secret is None:
+            self._mcp_bridge_secret = load_or_create_bridge_secret(self.data_dir)
+        return self._mcp_bridge_secret
+
+    def _mcp_call_reporter(self, session_id: str) -> Callable[[Dict[str, Any]], None]:
+        """The pool's per-call hook: one compact progress event, never an argument or a secret."""
+
+        def report(event: Dict[str, Any]) -> None:
+            if not isinstance(event, dict):
+                return
+            server = str(event.get("server") or "")
+            tool = str(event.get("tool") or "")
+            ok = bool(event.get("ok"))
+            duration = event.get("durationMs")
+            payload = {
+                "type": "mcp_bridge_call",
+                "category": "progress",
+                "status": "info" if ok else "warning",
+                "content": f"MCP {server}.{tool} {'完成' if ok else '失败'}",
+                "data": {
+                    "server": server,
+                    "tool": tool,
+                    "ok": ok,
+                    "isError": bool(event.get("isError")),
+                    "durationMs": duration if isinstance(duration, int) else None,
+                    "kind": event.get("kind"),
+                    "status": event.get("status"),
+                    "job": event.get("job"),
+                },
+            }
+            coro = None
+            try:
+                coro = self.record_worker_event(session_id, payload)
+                self._schedule(coro)
+                coro = None
+            except Exception:
+                logger.debug("[%s] could not queue an MCP bridge call event", session_id)
+                if coro is not None:
+                    coro.close()
+
+        return report
+
+    async def _setup_mcp_bridge(
+        self,
+        session_id: str,
+        engine: str,
+        kind: str,
+        mcp_config: Dict[str, Any],
+        cwd: str,
+        env_overrides: Dict[str, str],
+    ) -> str:
+        """Mount the session's MCP servers in the Hub and return the first-turn note ("" if unused)."""
+        if not uses_mcp_bridge(engine, kind, mcp_config):
+            return ""
+        servers = dict(mcp_config.get("mcp_servers") or {})
+        if not servers:
+            return ""
+        token = derive_mcp_bridge_token(self._get_mcp_bridge_secret(), session_id)
+        bridge_file = write_session_bridge_file(
+            self.runtime_configs_dir, session_id, hub_api_base_url(), token)
+        pool = self.mcp_pool_registry.register_session(
+            session_id,
+            servers,
+            cwd=cwd,
+            output_dir=session_bridge_output_dir(self.runtime_configs_dir, session_id),
+            jobs_dir=session_bridge_jobs_dir(self.runtime_configs_dir, session_id),
+            on_call_event=self._mcp_call_reporter(session_id),
+        )
+        # Best effort: a slow npx cold start must never fail the session's spawn. A call that
+        # arrives later dials the actor itself.
+        counts: Dict[str, Optional[int]] = {}
+        try:
+            counts = await pool.prefetch(budget_sec=2.0, start_connections=True)
+        except Exception as exc:  # pragma: no cover - prefetch never raises by contract
+            logger.warning("[%s] MCP prefetch failed; the pool connects on demand: %s", session_id, exc)
+        shared_urls: Set[str] = set()
+        try:
+            shared_urls = set(self.mcp_pool_registry.shared_http_urls())
+        except Exception:  # pragma: no cover - defensive
+            shared_urls = set()
+        shared_servers = {
+            name for name, spec in servers.items()
+            if isinstance(spec, dict) and str(spec.get("url") or "") in shared_urls
+        }
+        if isinstance(env_overrides, dict):
+            # Harmless for Doubao (its env never reaches the shell) and the hook a later engine needs.
+            env_overrides.setdefault("HUB_MCP_BRIDGE", str(bridge_file))
+        return build_mcp_bridge_note(
+            session_id, servers, bridge_file, mcp_cli_script_path(self.base_dir), sys.executable,
+            server_tool_counts=counts, shared_servers=shared_servers,
+        )
+
+    async def _release_mcp_bridge(self, session_id: str) -> None:
+        """Drop the session's pool and its folder; each step is guarded so the other still runs."""
+        try:
+            await self.mcp_pool_registry.close_session(session_id)
+        except Exception:
+            logger.exception("[%s] MCP pool: closing the session pool failed", session_id)
+        try:
+            remove_session_bridge_dir(self.runtime_configs_dir, session_id)
+        except Exception:
+            logger.exception("[%s] MCP bridge: removing the bridge folder failed", session_id)
+
+    async def handle_session_mcp_action(
+        self, session_id: str, token: Optional[str], payload: Any
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Serve ``POST /api/sessions/<sid>/mcp``: token first, then the live pool."""
+        if not verify_mcp_bridge_token(self._get_mcp_bridge_secret(), session_id, token):
+            return 401, error_result("auth", "MCP 桥鉴权失败：无效的会话令牌")
+        if not isinstance(payload, dict):
+            return 400, error_result("bad_request", "请求体必须是 JSON 对象")
+        pool = self.mcp_pool_registry.get(session_id)
+        if pool is None:
+            return 404, error_result("session_closed", f"会话 {session_id} 未启用或已关闭 MCP 桥")
+        return 200, await pool.handle_action(
+            payload, shared_urls=self.mcp_pool_registry.shared_http_urls())
+
+    async def handle_session_mcp_job(
+        self, session_id: str, token: Optional[str], job_id: str, wait_ms: int = 0
+    ) -> Tuple[int, Dict[str, Any]]:
+        """Serve ``GET /api/sessions/<sid>/mcp/jobs/<job>``: an async call's result."""
+        if not verify_mcp_bridge_token(self._get_mcp_bridge_secret(), session_id, token):
+            return 401, error_result("auth", "MCP 桥鉴权失败：无效的会话令牌")
+        pool = self.mcp_pool_registry.get(session_id)
+        if pool is None:
+            return 404, error_result("session_closed", f"会话 {session_id} 未启用或已关闭 MCP 桥")
+        return 200, await pool.get_job(job_id, wait_ms=wait_ms)
+
     def _resume_task_text(self, session_id: str, text: str, engine: str) -> str:
         clean = str(text).replace("\r", " ").strip()
         return self._task_with_session_marker(session_id, clean)
@@ -6670,55 +6838,83 @@ class HubSessionManager:
                 prompt_for_tui = self._resume_task_text(session_id, message, engine)
                 injection = "pending"
 
-        sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
-        if message and injection == "argv":
-            sess.last_injection = {
-                "at": round(time.time(), 3),
-                "ok": True,
-                "reason": "argv_positional",
-                "attempts": 1,
-                "mode": "resume_task",
-                "label": "成功",
-            }
-        startup_delay = 2.5
-        try:
-            startup_delay = float(snapshot.get("startup_delay_sec") or 2.5)
-        except (TypeError, ValueError):
-            startup_delay = 2.5
-        submit_key = str(snapshot.get("submit_key") or "\r")
-
-        old = self.sessions.get(session_id)
-        # A1: browser sockets opened on the old object keep streaming without any Python step: the
-        # handle belongs to the session id and the core's spawn carries the sink fan-out over, so
-        # `ws_prefix` reaches them after the predecessor's last bytes.
-        # R1: the incarnation is bumped first, which drops a retire still pending for the
-        # predecessor, so the drain below cannot schedule the drop that would close the fan-out the
-        # spawn is about to take over. The predecessor keeps its own ending because `sessions[id]`
-        # still maps to it until the spawn replaces the entry (kimi 5).
-        # r4 #3: the bump also drops the closed id's tombstone, which is where a code the core still
-        # owes would be rewritten; a resume that fails below puts both back for the old generation.
+        # Scheme B: a resumed bridged session re-writes bridge.json against the Hub's current URL
+        # and rebuilds its pool before the PTY starts; the note rides in front of the startup text
+        # (parent_messages keeps the caller's own words, see resume_subagent).
+        session_kind = str(snapshot.get("kind") or record.get("kind") or "tui")
+        mcp_config = normalize_mcp_config(
+            snapshot.get("mcp_servers") or {},
+            snapshot.get("disabled_mcp_servers") or [],
+            bool(snapshot.get("strict_mcp_config")),
+        )
+        mcp_note = ""
+        sess: Optional[AgentSession] = None
+        old: Optional[AgentSession] = None
+        bridge_created = False
+        # r4 #3: the bump below drops the closed id's tombstone, which is where a code the core still
+        # owes would be rewritten; a resume that fails puts both back for the old generation.
         previous_incarnation = self._incarnations.get(session_id, 0)
         previous_tombstone = self._closed_sessions.get(session_id)
-        self._next_incarnation(session_id)
-        await self._end_predecessor(session_id, old)
-        if self.sessions.get(session_id) is not old and old is not None:
-            # The predecessor's exit path ran and dropped the object; nothing else owns the id.
-            old = None
-        # A7: install the new object before the spawn. A resume that dies immediately then reports
-        # its own exit (the callback carries the object), never the old dead object's.
-        self.sessions[session_id] = sess
-        resume_env = dict(built.get("env") or {})
-        if engine == "claude":
-            hook_log = self._claude_hook_log_path(sess)
-            if hook_log is not None:
-                resume_env.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
-                try:
-                    sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
-                except OSError:
-                    sess._claude_hook_offset = 0
-        elif engine == "omp":
-            self._prime_omp_approval_log(sess, resume_env)
         try:
+            # Scheme B: the bridge is built first so its settings ride in the startup text; from
+            # here to the end of the spawn anything may fail, and a failure must not leave the pool,
+            # its bridge folder or a spawned child behind.
+            if uses_mcp_bridge(engine, session_kind, mcp_config):
+                bridge_created = True
+                mcp_note = await self._setup_mcp_bridge(
+                    session_id, engine, session_kind, mcp_config,
+                    str(built.get("cwd") or ""), built.setdefault("env", {}))
+                if prompt_for_tui:
+                    prompt_for_tui = with_mcp_bridge_note(prompt_for_tui, mcp_note)
+
+            # A DB/scrollback read with its own awaits: a slow or broken store fails here, and the
+            # bridge above must already be undoable.
+            sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
+            if mcp_note and not prompt_for_tui:
+                sess._pending_mcp_bridge_note = mcp_note
+            if message and injection == "argv":
+                sess.last_injection = {
+                    "at": round(time.time(), 3),
+                    "ok": True,
+                    "reason": "argv_positional",
+                    "attempts": 1,
+                    "mode": "resume_task",
+                    "label": "成功",
+                }
+            startup_delay = 2.5
+            try:
+                startup_delay = float(snapshot.get("startup_delay_sec") or 2.5)
+            except (TypeError, ValueError):
+                startup_delay = 2.5
+            submit_key = str(snapshot.get("submit_key") or "\r")
+
+            old = self.sessions.get(session_id)
+            # A1: browser sockets opened on the old object keep streaming without any Python step: the
+            # handle belongs to the session id and the core's spawn carries the sink fan-out over, so
+            # `ws_prefix` reaches them after the predecessor's last bytes.
+            # R1: the incarnation is bumped first, which drops a retire still pending for the
+            # predecessor, so the drain below cannot schedule the drop that would close the fan-out the
+            # spawn is about to take over. The predecessor keeps its own ending because `sessions[id]`
+            # still maps to it until the spawn replaces the entry (kimi 5).
+            self._next_incarnation(session_id)
+            await self._end_predecessor(session_id, old)
+            if self.sessions.get(session_id) is not old and old is not None:
+                # The predecessor's exit path ran and dropped the object; nothing else owns the id.
+                old = None
+            # A7: install the new object before the spawn. A resume that dies immediately then reports
+            # its own exit (the callback carries the object), never the old dead object's.
+            self.sessions[session_id] = sess
+            resume_env = dict(built.get("env") or {})
+            if engine == "claude":
+                hook_log = self._claude_hook_log_path(sess)
+                if hook_log is not None:
+                    resume_env.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
+                    try:
+                        sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
+                    except OSError:
+                        sess._claude_hook_offset = 0
+            elif engine == "omp":
+                self._prime_omp_approval_log(sess, resume_env)
             # A9: a failed spawn (bad command, missing binary) must leave the archived record exactly
             # as it was — no zombie row, and the old ended object back in the live list.
             await self._start_with_claim_retry(
@@ -6727,7 +6923,10 @@ class HubSessionManager:
                 env_overrides=resume_env or None,
                 ws_prefix=resume_banner(sess.resume_count) if old is not None else None,
             )
-        except Exception as e:
+        except BaseException as e:
+            # Scheme B: the pool and bridge folder a failed resume just created are not leftovers.
+            if bridge_created:
+                await self._release_mcp_bridge(session_id)
             # r5 #2: the id's entry goes back before this path awaits anything. What the queue
             # still holds is applied by the consumer (its at-end drain) through the object the id
             # lists, and the worker guard accepts any of them: left as the failed object, a request
@@ -6736,12 +6935,12 @@ class HubSessionManager:
             # predecessor left, nothing at all.
             if old is not None:
                 self.sessions[session_id] = old
-            else:
+            elif self.sessions.get(session_id) is sess:
                 self.sessions.pop(session_id, None)
             # R9: a spawn that raised after the PTY had already started must not leave that process
             # behind while the old (archived) object is put back in the live list. The core's kill
             # blocks its caller for its grace, so it runs off the loop; the id then leaves the core.
-            if sess.has_process:
+            if sess is not None and sess.has_process:
                 await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
             # r4 #3: what the pane asked for before the failure is the old incarnation's; end the
             # queue and its consumer the way the close does, so a retry resume never applies it.
@@ -6756,7 +6955,10 @@ class HubSessionManager:
             # spawn that never got that far leaves only a pending drop behind.
             await self._retire_ended_session(
                 session_id, previous_incarnation if previous_tombstone is not None else None)
-            raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
+            if isinstance(e, Exception):
+                raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
+            # A cancelled resume (shutdown, a timeout) gets the same cleanup, then stays cancelled.
+            raise
         if old is not None:
             self._release_transcripts(session_id)
         await self.db.reset_session_after_resume(session_id)
@@ -7079,6 +7281,8 @@ class HubSessionManager:
         if terminated:
             self._user_terminated.add(session_id)
         self._release_transcripts(session_id)
+        # The bridge goes with the session: its pool, its MCP child processes and its folder.
+        await self._release_mcp_bridge(session_id)
         if terminated or (was_alive and sess.status == "terminated") or source == "auto_cleanup":
             await self.record_worker_event(
                 session_id,
@@ -7144,6 +7348,22 @@ class HubSessionManager:
         if self._retry_timer is not None:
             self._retry_timer.cancel()
             self._retry_timer = None
+        # Scheme B: each MCP pool owns real stdio child processes. Close them early, inside what is
+        # left of the budget, so a server is gone before the sessions' own teardown starts; the
+        # bridge folders go too (a restart resumes the session and writes bridge.json again).
+        # This runs after the fence, so a cancelled call's event is dropped rather than written late.
+        bridged_ids = set(self.mcp_pool_registry.sessions())
+        self.mcp_pool_registry.stop_reaper()
+        try:
+            await self.mcp_pool_registry.close_all(
+                timeout_sec=max(0.1, min(5.0, deadline - time.monotonic())))
+        except Exception:
+            logger.exception("Shutdown could not close the MCP pools")
+        for _bridged_id in bridged_ids:
+            try:
+                remove_session_bridge_dir(self.runtime_configs_dir, _bridged_id)
+            except Exception:
+                logger.warning("Shutdown could not remove the MCP bridge folder of %s", _bridged_id)
         # r4b #2: what the panes asked for before the stop is still each session's, so every
         # consumer applies its queue now (bounded, inside the shared budget) and ends. The tasks
         # are cancelled below with the other producers, so nothing of this reaches the core after
@@ -9210,7 +9430,11 @@ class HubSessionManager:
         return engine in TUI_LIVE_SUBMIT_CHECKED and self._tui_composer_located(session)
 
     async def _deliver_live_text_to_tui(
-        self, sess: AgentSession, text: str, turn_before: Optional[Dict[str, Any]]
+        self,
+        sess: AgentSession,
+        text: str,
+        turn_before: Optional[Dict[str, Any]],
+        pending_note: Optional[str] = None,
     ) -> Dict[str, Any]:
         """K6 (fix 9c): a live message with Enter to a TUI session; {pty_written, injection, queued}.
 
@@ -9251,7 +9475,9 @@ class HubSessionManager:
         submit_id = f"inj-{uuid.uuid4().hex[:8]}"
         sess.last_injection = self._live_submitting_record(submit_id)
         self._schedule(
-            self._submit_queued_live_text(sess, text, submit_key, claim, turn_before, submit_id)
+            self._submit_queued_live_text(
+                sess, text, submit_key, claim, turn_before, submit_id, pending_note
+            )
         )
         return {"pty_written": False, "injection": "pending", "queued": True,
                 "submit_id": submit_id}
@@ -9289,6 +9515,7 @@ class HubSessionManager:
         claim: TuiWriterClaim,
         turn_before: Optional[Dict[str, Any]],
         submit_id: str = "",
+        pending_note: Optional[str] = None,
     ) -> None:
         """K6 (fix 9c): type one live message once its turn in the writer queue comes, and record it.
 
@@ -9383,9 +9610,30 @@ class HubSessionManager:
                 self._restore_turn_after_failed_message(sess, turn_before)
             elif result.get("ok") is False and turn_before is not None:
                 self._restore_turn_after_failed_message(sess, turn_before)
+            if result.get("ok") is False and pending_note:
+                # A definite failure: the worker never read the [Hub MCP] block either, so it goes
+                # back on the session for the next message that really lands.  ok is None means the
+                # submit could not be proved -- the text may be sitting in the composer, so re-adding
+                # the block would duplicate it.
+                self._restore_pending_mcp_bridge_note(sess, pending_note)
             await self._record_tui_injection(sess, result)
         finally:
             claim.release()
+
+    @staticmethod
+    def _restore_pending_mcp_bridge_note(sess: Optional["AgentSession"], note: Optional[str]) -> None:
+        """Give the bridge note back to a session whose message certainly never reached the worker.
+
+        Called only on a definite failure: an unconfirmed submit (ok is None) may well have been
+        typed, so re-injecting would duplicate the block on the next message.
+        """
+        if sess is None or not note:
+            return
+        if getattr(sess, "_pending_mcp_bridge_note", None):
+            return
+        sess._pending_mcp_bridge_note = note
+        logger.info("[%s] bridge note kept: the message that carried it was never delivered",
+                    getattr(sess, "session_id", "?"))
 
     def _restore_turn_after_failed_message(
         self, sess: AgentSession, turn_before: Dict[str, Any]
@@ -9519,23 +9767,36 @@ class HubSessionManager:
         }
         box.append(msg_rec)
 
+        # Scheme B: a bridged session created without an initial task carries the [Hub MCP] block
+        # pending, and the first text really typed gets it in front once. The mailbox record above
+        # keeps the caller's own words.
+        pty_text = text
+        pending_note: Optional[str] = None
+        if sess is not None and also_write_pty and not resolved_question_id:
+            pending_note = getattr(sess, "_pending_mcp_bridge_note", None)
+            if pending_note:
+                sess._pending_mcp_bridge_note = None
+                pty_text = with_mcp_bridge_note(text, pending_note)
+
         pty_written = False
         # K6 (fix 9c): a live message handed to the background submit (typed and proved there).
         live_queued = False
         live_injection: Optional[str] = None
         live_submit_id: Optional[str] = None
         if sess and also_write_pty and not resolved_question_id:
-            if (press_enter and sess.kind == "tui" and text.rstrip("\r\n").strip()
+            if (press_enter and sess.kind == "tui" and pty_text.rstrip("\r\n").strip()
                   and sess.is_process_alive()):
                 # K6 (fix 9c): a live message with Enter goes through the same checked submit as
                 # the startup text when the composer can be located, one writer at a time.
-                live = await self._deliver_live_text_to_tui(sess, text.rstrip("\r\n"), turn_before)
+                live = await self._deliver_live_text_to_tui(
+                    sess, pty_text.rstrip("\r\n"), turn_before, pending_note=pending_note
+                )
                 pty_written = live["pty_written"]
                 live_injection = live["injection"]
                 live_queued = live["queued"]
                 live_submit_id = live.get("submit_id")
             else:
-                clean_txt = text.rstrip("\r\n") if press_enter else text
+                clean_txt = pty_text.rstrip("\r\n") if press_enter else pty_text
                 if sess.engine == "codex":
                     claim = self._tui_writer_queue(sess).claim("draft_input")
                     try:
@@ -9574,6 +9835,13 @@ class HubSessionManager:
                         loop.call_later(TUI_UNCHECKED_ENTER_DELAY_SEC, sess.write_input, "\r")
                     except Exception:
                         sess.write_input("\r")
+
+        if pending_note and not pty_written and not live_queued:
+            # The [Hub MCP] block was taken off the session but the text demonstrably never
+            # reached the worker (write refused, or the process is gone): put it back so the next
+            # message that does land still teaches the worker the bridge.  A queued hand-off
+            # restores it only on a definite failure, inside _submit_queued_live_text.
+            self._restore_pending_mcp_bridge_note(sess, pending_note)
 
         if sess and starts_new_turn and press_enter and (pty_written or live_queued) and not resolved_question_id:
             # T1: send_to_subagent's live write, the console's send and a parent reply all land
@@ -15120,7 +15388,12 @@ class HubSessionManager:
                     args, work_dir, approval_path=claude_overlay_path(mode),
                     disabled=mcp_config['disabled_mcp_servers'])
                 mcp_settings['mcp_settings_base'] = settings_base
-            notes.append('本次 MCP 配置已生成；连接、认证和工具发现由 Agent 启动后执行')
+            if eng == 'doubao':
+                # No MCP flag reaches doubao.exe: the Hub opens the connections and hands the
+                # worker a bridge note, so say that instead of implying a native connection.
+                notes.append('本次豆包 MCP 配置将由 Hub 会话级连接池代理提供；连接、认证与工具发现按需执行')
+            else:
+                notes.append('本次 MCP 配置已生成；连接、认证和工具发现由 Agent 启动后执行')
 
         return {
             'profile_id': pid,
@@ -15252,127 +15525,154 @@ class HubSessionManager:
             task_text = f"{pointer}\n\n{task}" if task else pointer
         delivered_task = with_leaf_worker_note(task_text) if leaf_worker else task_text
 
-        if task_mode == "omp_positional":
-            omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
-            omp_sess_dir.mkdir(exist_ok=True)
-            args.extend([
-                f"--session-dir={omp_sess_dir}",
-            ])
-            if delivered_task:
-                args.append(self._task_with_session_marker(session_id, delivered_task))
-        elif task_mode == "claude_positional":
-            claude_session_uuid = str(uuid.uuid4())
-            args.extend([
-                "--session-id",
-                claude_session_uuid,
-            ])
-            if delivered_task:
-                args.append(self._task_with_session_marker(session_id, delivered_task))
-        elif task_mode == "agy_interactive_flag":
-            if delivered_task:
-                args.extend(["-i", self._task_with_session_marker(session_id, delivered_task)])
-        elif task_mode == "codex_positional":
-            if delivered_task:
-                args.append(self._task_with_session_marker(session_id, delivered_task))
-
-        prof_name = str(prof.get("name", profile_id))
-        sess = AgentSession(
-            session_id=session_id,
-            profile_id=profile_id,
-            profile_name=prof_name,
-            kind=kind,
-            title=derive_readable_session_title(title, task, prof_name, session_id),
-            cwd=work_dir,
-            command=launch["command"],
-            args=args,
-            cols=self.default_cols,
-            rows=self.default_rows,
-            core=self._ensure_core(),
-            on_exit_cb=self._exit_callback,
-            on_tui_tool_cb=self._tool_callback,
-        )
-        sess.effective_model = effective_model
-        sess.effective_thinking_level = effective_thinking
-        sess.engine = engine
-        if claude_session_uuid:
-            sess.conversation_ref = {"session_id": claude_session_uuid}
-        sess.profile_snapshot = {
-            "launch_source": launch_source,
-            "profile_id": profile_id,
-            "engine": engine,
-            "kind": kind,
-            "command": launch["command"],
-            "config_dir": launch.get("config_dir"),
-            "args": launch_args,
-            "extra_args": list(launch.get("extra_args") or []),
-            # Folders beyond cwd the worker may read and write (their --add-dir flags are in args).
-            "extra_roots": list(launch.get("extra_roots") or []),
-            **{key: launch[key] for key in ("mcp_servers", "disabled_mcp_servers", "strict_mcp_config")},
-            **({"mcp_settings_base": launch["mcp_settings_base"]} if "mcp_settings_base" in launch else {}),
-            "env": dict(launch.get("env") or {}),
-            "model": launch.get("model"),
-            "thinking_level": launch.get("thinking_level"),
-            "cli_model": launch.get("cli_model"),
-            "cwd": work_dir,
-            "task_mode": task_mode,
-            "startup_delay_sec": startup_delay,
-            "submit_key": submit_key,
-            "compaction_threshold": compaction,
-            "auto_approval_rules": auto_approval_rules,
-            # Spawn-time approve-once prefixes and their per-session use count (a resume keeps both).
-            "auto_approve_once_prefixes": auto_approve_once_prefixes,
-            "auto_approve_once_uses": 0,
-            # Where the brief file lives, so a close/archive deletes the right one.
-            "brief_path": str(brief_path) if brief_path is not None else None,
-            # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
-            "leaf_worker": leaf_worker,
-            # Who spawned it: {"pid", "process", "hub_session_id", "hub_session_title"} or None.
-            "spawned_by": dict(spawned_by) if isinstance(spawned_by, dict) else None,
-            # Round 2: whether this launch had the profile's approval off switch on (a resume
-            # re-reads the profile's current value and overwrites this).
-            "bypass_approvals": bool(launch.get("bypass_approvals")),
-            **resolve_session_approval_fields(launch),
-        }
-        sess.launch_notes = list(launch.get("notes") or [])
-
-        if delivered_task:
-            # B9: last_task is the initial task and is never overwritten afterwards. A brief-only
-            # spawn shows the brief's first line, not the hub's pointer to it.
-            shown_task = task or brief_first_line(brief_text) or delivered_task
-            sess.last_task = shown_task
-            sess.current_activity = f"Running initial task: {shown_task[:80]}"
-            if task_mode in ("claude_positional", "omp_positional", "agy_interactive_flag", "codex_positional"):
-                sess.last_injection = {
-                    "at": round(time.time(), 3),
-                    "ok": True,
-                    "reason": "argv_positional",
-                    "attempts": 1,
-                    "mode": "startup_task",
-                    "label": "成功",
-                }
-
-        self._ensure_session_context_tracker(sess)
-        if brief_path is not None:
-            # Written only now: every validation above has passed, so a refused spawn leaves no file.
-            self._write_session_brief(session_id, brief_text)
-        if engine == "claude":
-            hook_log = self._claude_hook_log_path(sess)
-            if hook_log is not None:
-                env_overrides.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
-                try:
-                    sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
-                except OSError:
-                    sess._claude_hook_offset = 0
-        elif engine == "omp":
-            self._prime_omp_approval_log(sess, env_overrides)
+        # Scheme B: the Hub mounts the session's MCP servers itself and the worker is told how to
+        # reach them. This runs before any task is handed over and before the PTY starts, so nothing
+        # is typed into a terminal that has no pool behind it yet.
+        mcp_note = ""
+        mcp_note_pending = False
+        bridge_created = False
         try:
+            # From the bridge to the registration the launch may still fail: a DB/scrollback
+            # read, a broken snapshot, a brief that cannot be written, a spawn that raises.
+            # Any of those must undo the pool, its bridge folder and the brief file, exactly
+            # as a refused spawn did before -- and a cancelled launch does it too.
+            if uses_mcp_bridge(engine, kind, mcp_config):
+                bridge_created = True
+                mcp_note = await self._setup_mcp_bridge(
+                    session_id, engine, kind, mcp_config, work_dir, env_overrides)
+                if delivered_task:
+                    delivered_task = with_mcp_bridge_note(delivered_task, mcp_note)
+                else:
+                    # No initial task: an interactive session would only get the note typed at it, so it
+                    # rides in front of the first parent message instead.
+                    mcp_note_pending = True
+
+            if task_mode == "omp_positional":
+                omp_sess_dir = self.runtime_configs_dir / f"omp_sess_{session_id}"
+                omp_sess_dir.mkdir(exist_ok=True)
+                args.extend([
+                    f"--session-dir={omp_sess_dir}",
+                ])
+                if delivered_task:
+                    args.append(self._task_with_session_marker(session_id, delivered_task))
+            elif task_mode == "claude_positional":
+                claude_session_uuid = str(uuid.uuid4())
+                args.extend([
+                    "--session-id",
+                    claude_session_uuid,
+                ])
+                if delivered_task:
+                    args.append(self._task_with_session_marker(session_id, delivered_task))
+            elif task_mode == "agy_interactive_flag":
+                if delivered_task:
+                    args.extend(["-i", self._task_with_session_marker(session_id, delivered_task)])
+            elif task_mode == "codex_positional":
+                if delivered_task:
+                    args.append(self._task_with_session_marker(session_id, delivered_task))
+
+            prof_name = str(prof.get("name", profile_id))
+            sess = AgentSession(
+                session_id=session_id,
+                profile_id=profile_id,
+                profile_name=prof_name,
+                kind=kind,
+                title=derive_readable_session_title(title, task, prof_name, session_id),
+                cwd=work_dir,
+                command=launch["command"],
+                args=args,
+                cols=self.default_cols,
+                rows=self.default_rows,
+                core=self._ensure_core(),
+                on_exit_cb=self._exit_callback,
+                on_tui_tool_cb=self._tool_callback,
+            )
+            sess.effective_model = effective_model
+            sess.effective_thinking_level = effective_thinking
+            sess.engine = engine
+            if claude_session_uuid:
+                sess.conversation_ref = {"session_id": claude_session_uuid}
+            sess.profile_snapshot = {
+                "launch_source": launch_source,
+                "profile_id": profile_id,
+                "engine": engine,
+                "kind": kind,
+                "command": launch["command"],
+                "config_dir": launch.get("config_dir"),
+                "args": launch_args,
+                "extra_args": list(launch.get("extra_args") or []),
+                # Folders beyond cwd the worker may read and write (their --add-dir flags are in args).
+                "extra_roots": list(launch.get("extra_roots") or []),
+                **{key: launch[key] for key in ("mcp_servers", "disabled_mcp_servers", "strict_mcp_config")},
+                **({"mcp_settings_base": launch["mcp_settings_base"]} if "mcp_settings_base" in launch else {}),
+                "env": dict(launch.get("env") or {}),
+                "model": launch.get("model"),
+                "thinking_level": launch.get("thinking_level"),
+                "cli_model": launch.get("cli_model"),
+                "cwd": work_dir,
+                "task_mode": task_mode,
+                "startup_delay_sec": startup_delay,
+                "submit_key": submit_key,
+                "compaction_threshold": compaction,
+                "auto_approval_rules": auto_approval_rules,
+                # Spawn-time approve-once prefixes and their per-session use count (a resume keeps both).
+                "auto_approve_once_prefixes": auto_approve_once_prefixes,
+                "auto_approve_once_uses": 0,
+                # Where the brief file lives, so a close/archive deletes the right one.
+                "brief_path": str(brief_path) if brief_path is not None else None,
+                # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
+                "leaf_worker": leaf_worker,
+                # Who spawned it: {"pid", "process", "hub_session_id", "hub_session_title"} or None.
+                "spawned_by": dict(spawned_by) if isinstance(spawned_by, dict) else None,
+                # Round 2: whether this launch had the profile's approval off switch on (a resume
+                # re-reads the profile's current value and overwrites this).
+                "bypass_approvals": bool(launch.get("bypass_approvals")),
+                **resolve_session_approval_fields(launch),
+            }
+            sess.launch_notes = list(launch.get("notes") or [])
+            if mcp_note_pending:
+                sess._pending_mcp_bridge_note = mcp_note
+
+            if delivered_task:
+                # B9: last_task is the initial task and is never overwritten afterwards. A brief-only
+                # spawn shows the brief's first line, not the hub's pointer to it.
+                shown_task = task or brief_first_line(brief_text) or delivered_task
+                sess.last_task = shown_task
+                sess.current_activity = f"Running initial task: {shown_task[:80]}"
+                if task_mode in ("claude_positional", "omp_positional", "agy_interactive_flag", "codex_positional"):
+                    sess.last_injection = {
+                        "at": round(time.time(), 3),
+                        "ok": True,
+                        "reason": "argv_positional",
+                        "attempts": 1,
+                        "mode": "startup_task",
+                        "label": "成功",
+                    }
+
+            self._ensure_session_context_tracker(sess)
+            if brief_path is not None:
+                # Written only now: every validation above has passed, so a refused spawn leaves no file.
+                self._write_session_brief(session_id, brief_text)
+            if engine == "claude":
+                hook_log = self._claude_hook_log_path(sess)
+                if hook_log is not None:
+                    env_overrides.setdefault("HUB_CLAUDE_HOOK_LOG", str(hook_log))
+                    try:
+                        sess._claude_hook_offset = hook_log.stat().st_size if hook_log.is_file() else 0
+                    except OSError:
+                        sess._claude_hook_offset = 0
+            elif engine == "omp":
+                self._prime_omp_approval_log(sess, env_overrides)
+
             sess.start_pty(loop, env_overrides=env_overrides or None)
-        except Exception:
-            # No session exists, so its brief must not outlive the refused spawn.
+            self.sessions[session_id] = sess
+        except BaseException:
+            # Nothing exists yet, so the brief must not outlive the refused launch, and the MCP
+            # pool and its bridge file go with it (the worker would have nothing to talk to).
+            if bridge_created:
+                await self._release_mcp_bridge(session_id)
             if brief_path is not None:
                 self._delete_session_brief(session_id)
             raise
-        self.sessions[session_id] = sess
         await self.persist_session(sess)
 
         if engine == "codex":

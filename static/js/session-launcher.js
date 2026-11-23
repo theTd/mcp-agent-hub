@@ -113,10 +113,16 @@ function renderProfileDetails({ reset }) {
   const p = currentProfile();
   $('#extraArgsField').hidden = (p.kind || 'tui') !== 'tui';
   if (reset || $('#extraArgsField').hidden) $('#extraArgsInput').value = '';
-  $('#mcpConfigField').hidden = !['codex', 'claude'].includes(p.engine) || (p.kind || 'tui') !== 'tui';
-  $('#strictMcpField').hidden = $('#mcpConfigField').hidden || p.engine !== 'claude';
+  $('#mcpConfigField').hidden = !['codex', 'claude', 'doubao'].includes(p.engine) || (p.kind || 'tui') !== 'tui';
+  // Doubao has no inherited MCP source (its servers come from the Hub's session proxy), so it
+  // accepts strict_mcp_config but refuses disabled_mcp_servers: hide the list and clear it.
+  const bridged = p.engine === 'doubao' && (p.kind || 'tui') === 'tui';
+  $('#strictMcpField').hidden = $('#mcpConfigField').hidden || !['claude', 'doubao'].includes(p.engine);
+  $('#disabledMcpField').hidden = $('#mcpConfigField').hidden || bridged;
   $('#codexMcpHint').hidden = $('#mcpConfigField').hidden || p.engine !== 'codex';
+  $('#doubaoMcpHint').hidden = !bridged;
   if (reset || $('#mcpConfigField').hidden) resetMcpConfig();
+  if ($('#disabledMcpField').hidden) $('#disabledMcpInput').value = '';
   if ($('#strictMcpField').hidden) $('#strictMcpInput').checked = false;
   $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy', 'doubao'].includes(p.engine);
   if (reset || $('#approvalField').hidden) $('#approvalSelect').value = '';
@@ -382,10 +388,17 @@ function sessionMcpConfig() {
     try { return raw ? JSON.parse(raw) : fallback; }
     catch { throw new Error(`${label}必须是有效 JSON`); }
   };
+  const p = currentProfile();
+  // Mirrors session_mcp_config.validate_mcp_engine: Doubao's servers run in the Hub's own pool.
+  const bridged = p.engine === 'doubao' && (p.kind || 'tui') === 'tui';
   const servers = parse('#mcpServersInput', {}, '新增 MCP 服务器');
-  const disabled = parse('#disabledMcpInput', [], '禁用 MCP 服务器');
+  const disabled = $('#disabledMcpField').hidden ? [] : parse('#disabledMcpInput', [], '禁用 MCP 服务器');
   const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   const string = (v) => typeof v === 'string' && !v.includes('\u0000');
+  const shells = new Set(['cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
+    'bash', 'bash.exe', 'sh', 'sh.exe', 'wsl', 'wsl.exe']);
+  const base = (v) => v.replace(/\\/g, '/').split('/').pop().toLowerCase();
+  const bareShell = (command) => shells.has(base(String(command).trim().split(/\s+/)[0] || ''));
   if (!object(servers)) throw new Error('新增 MCP 服务器必须是 JSON 对象');
   for (const [name, spec] of Object.entries(servers)) {
     if (!/^[A-Za-z0-9_-]+$/.test(name) || !object(spec)) throw new Error('MCP 名称只能含英文字母、数字、下划线、连字符；配置必须是对象');
@@ -399,6 +412,7 @@ function sessionMcpConfig() {
       if (key === 'args' && (!Array.isArray(value) || !value.every(string))) throw new Error(`MCP ${name}.args 必须是字符串数组`);
       if (['headers', 'env'].includes(key) && (!object(value) || !Object.entries(value).every(([k, v]) => string(k) && k.trim() && string(v)))) throw new Error(`MCP ${name}.${key} 必须是字符串键值对象`);
     }
+    if (bridged && !http && bareShell(spec.command)) throw new Error(`豆包桥接会话不能把 shell 解释器注册为 MCP ${name} 的 command`);
   }
   if (!Array.isArray(disabled) || !disabled.every((v) => string(v) && v.trim() && v === v.trim())) throw new Error('禁用 MCP 服务器必须是非空名称的 JSON 字符串数组');
   if (disabled.some((name) => Object.hasOwn(servers, name))) throw new Error('同一 MCP 不能同时新增和禁用');

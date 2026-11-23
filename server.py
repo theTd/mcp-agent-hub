@@ -33,6 +33,7 @@ from session_manager import (
     resolve_session_approval_fields,
 )
 from transcript_summarizer import sanitize_tui_screen_text
+from mcp_session_pool import error_result as mcp_error_result
 from hub_persistence import PersistenceUnavailable
 from loopback_request_guard import LoopbackRequestGuard
 from agent_guidance import SERVER_INSTRUCTIONS
@@ -441,6 +442,11 @@ async def spawn_subagent(
     ``brief_markdown`` carries a task description longer than a few lines: the hub writes it under
     its data folder, starts the task with a one-line pointer to the file, and deletes it when the
     session closes (limit 200 000 characters).
+    ``mcp_servers`` mounts this session's own MCP servers: HTTP ``{"url","headers"}`` or stdio
+    ``{"command","args","env"}``. Codex and Claude take them natively; Doubao TUI takes them through
+    the Hub's session-level proxy instead (the worker is told how to call the tools),
+    ``strict_mcp_config`` is accepted and ``disabled_mcp_servers`` is refused there because Doubao
+    inherits no MCP source. A bare shell interpreter is refused as a stdio ``command``.
     ``wait_seconds`` is deprecated and ignored for waiting; use ``wait_url``.
     """
     await ensure_profiles_loaded()
@@ -484,8 +490,9 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
     approval_mode follows the same default (auto). A spec may also carry
     auto_approve_once_prefixes (omp and agy, approve once for a high-risk command starting with
     one), brief_markdown (a task description longer than a few lines, written to a file the hub
-    deletes when the session closes) and extra_roots (folders beyond cwd the worker may read and
-    write)."""
+    deletes when the session closes), extra_roots (folders beyond cwd the worker may read and
+    write) and mcp_servers / strict_mcp_config (Codex and Claude natively, Doubao TUI through the
+    Hub's session-level proxy; Doubao refuses disabled_mcp_servers)."""
     if not specs:
         raise ValueError("specs must contain at least one subagent")
     for spec in specs:
@@ -1291,6 +1298,37 @@ async def api_parent_respond(session_id: str, req: Request):
         return {**_control_status(session), "response": result}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Session MCP bridge (Scheme B). The worker's tools/hub_mcp_cli.py is the only caller: it sends
+# `X-Hub-Mcp-Token` (an HMAC of the session id under a Hub-wide secret) and JSON in, JSON out.
+# Both routes sit behind the loopback guard and the shutdown / restart-resume middlewares above.
+# ---------------------------------------------------------------------------
+@app.post("/api/sessions/{session_id}/mcp")
+async def api_session_mcp_action(session_id: str, req: Request):
+    """One tool action against the session's own MCP pool: list / ping / tools / call / batch / cancel."""
+    token = req.headers.get("x-hub-mcp-token")
+    try:
+        payload = await req.json()
+    except Exception:
+        return JSONResponse(mcp_error_result("bad_request", "请求体必须是 JSON 对象"), status_code=400)
+    status, body = await hub.handle_session_mcp_action(session_id, token, payload)
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/api/sessions/{session_id}/mcp/jobs/{job_id}")
+async def api_session_mcp_job(
+    session_id: str,
+    job_id: str,
+    req: Request,
+    wait_ms: int = Query(0, ge=0, le=60000),
+):
+    """Collect an async call's result (status="running" answers with a job id)."""
+    token = req.headers.get("x-hub-mcp-token")
+    status, body = await hub.handle_session_mcp_job(
+        session_id, token, job_id, wait_ms=wait_ms)
+    return JSONResponse(body, status_code=status)
 
 
 # ============================================================================

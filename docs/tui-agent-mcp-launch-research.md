@@ -239,3 +239,21 @@ Claude 转为本次 `--settings` 中的 `deniedMcpServers:[{"serverName":"unused
 ## 验证
 
 test_session_mcp_config、test_session_launch_args 与 test_session_approvals 合计 31 项通过。mock PTY 测试覆盖 MCP/HTTP 接口一致、校验/冲突、JSON/TOML 转义、结构化配置持久化与恢复、Claude settings 内容快照和审批切换，及原有 5 种 CLI 参数恢复回归。前端通过语法检查，在隔离静态站点配合 mock API 验证 MCP 区域显示、预览名称与模式、非法输入阻止启动、Claude 空 strict、DSH 切换清空、提交 payload 正确、成功后清空与收起、不存浏览器偏好。假会话的 PTY WebSocket 因静态测试服务器无该端点而返回预期 404。原生 CLI 另按上节连接本地假 MCP，未提交模型任务。
+
+## Doubao CLI（Hub 会话级连接池桥接）
+
+豆包 CLI 2.37.2 没有任何原生 MCP 入口：`doubao.exe` 的 argv 不认 MCP 参数，`mcp_servers` 在旧规则下直接报「仅支持 Codex / Claude TUI」。探针发现真正的阻碍不是缺参数，而是进程模型：桌面版把终端交给共享的后台服务 `doubao.exe --type=service`，会话级 `env_overrides` 到不了那个 PowerShell，父进程链也归属服务进程而非 Hub 会话。因此没有可用的「会话级环境变量」通道去启动 stdio 服务器，也没法让服务器只属于某个会话。
+
+方案 B（Hub 自己持有连接）：
+
+- 每个会话一个 `SessionPool`，每台服务器一条长连接（`fastmcp.Client`，`stdio` 或 streamable HTTP）。有状态的服务器（浏览器、计数器、数据库句柄）在两次调用之间保持状态。空闲 actor 由池的 reaper 回收，Hub 崩溃遗留的 stdio 子进程由 `mcp_pool_pids.json` + 启动时的 `sweep_orphan_pids()` 按命令行精确匹配清理。
+- 会话目录 `runtime_configs/.runtime_mcp_configs/mcp_<sid>/` 只放 `bridge.json`（`hub_url`、`session_id`、由 Hub 级密钥 `.mcp_token_secret` 派生的 HMAC-SHA256 token、`outputs/` 与 `jobs/` 路径）。上游服务器的 `headers` / `env` 永远不出 Hub。
+- `POST /api/sessions/<sid>/mcp` 与 `GET /api/sessions/<sid>/mcp/jobs/<job>` 先校验 `X-Hub-Mcp-Token`（`hmac.compare_digest`），再看池是否存活：缺池给 404，令牌不对给 401。会话关闭即释放池、删目录，旧 token 随之失效。
+- 工作侧只有一条命令面：`tools/hub_mcp_cli.py`（纯标准库，随包发布，`--bridge` 也可由 `HUB_MCP_BRIDGE` 提供）。`list` / `ping` / `tools` / `call` / `batch` / `job`；`--arg` 永远是字符串，`--arg-json` 解析 JSON；退出码 0=成功（工具自身 `isError` 仍是 0）、2=用法错误或仍在运行、1=桥接失败。
+- 首轮注入：`create_session` 在 `start_pty` 之前建池、限时预连（预算 2 秒，失败不影响启动），把 `[Hub MCP]` 说明块放在任务前面；无初始任务的交互会话把它挂到 `sess._pending_mcp_bridge_note`，等第一条父消息再前置一次，不向空白终端自顾自打字。`resume_subagent` 用当前 live 的 `hub_api_base_url()` 重写 `bridge.json` 并重建池。
+- 字段口径：接受 `mcp_servers` 与 `strict_mcp_config`；`disabled_mcp_servers` 报错（豆包没有可禁用的继承来源）；任何 `command` 是裸 shell 解释器（`cmd`/`powershell`/`pwsh`/`bash`/`sh`/`wsl`）都拒绝，否则模型可以把控制台文本当代码执行。`doubao.exe` argv 始终不含任何 MCP 参数。
+
+代价与边界：预连最多花 2 秒启动预算；`npx` 冷启动超过预算时只是 `list` 里工具数显示 `?`，调用时会自行补齐；Hub 关闭时先关池再停会话，重启恢复的会话下次 resume 重新生成 `bridge.json`。
+
+集成测试 `test_doubao_mcp_bridge.py` 走真实 FastAPI + 真实 `fastmcp.FastMCP`（stdio 与 HTTP）+ 真实 `hub_mcp_cli.py` 子进程：预览不建池、首轮说明、`list`→`ping`→`tools`→连续 3 次有状态 `inc()` 同一 PID → 中文往返与 `00123` 保持字符串 → `batch` → 慢工具溢出为 `running` 再由 `job` 取回、401/404、关闭后子进程确认消失、resume 重建、spawn 失败回滚、前端 gating。
+

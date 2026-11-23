@@ -15,6 +15,8 @@ native_session_launch.py
 compaction_threshold.py
 context_window_usage.py
 session_mcp_config.py
+session_mcp_bridge.py
+mcp_session_pool.py
 model_discovery.py
 doubao_session_record.py
 windows_accept_guard.py
@@ -25,6 +27,7 @@ engine_errors.py
 mcp_caller_identity.py
 spawn_extra_roots.py
 tools/hub_wait.py
+tools/hub_mcp_cli.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/claude-auto-approval.json

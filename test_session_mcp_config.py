@@ -159,7 +159,7 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings(self.hub.build_resume_launch(record)["args"]), merged)
 
     async def test_reject_before_spawn_and_preserve_legacy_behavior(self):
-        for engine in ("pwsh", "agy", "kimi", "omp", "doubao"):
+        for engine in ("pwsh", "agy", "kimi", "omp"):
             with self.subTest(engine=engine), self.assertRaises(ValueError):
                 await self.hub.create_session(engine, mcp_servers=SERVERS)
         with self.assertRaises(ValueError):
@@ -172,6 +172,24 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             self.hub.resolve_launch("codex", mcp_servers=SERVERS)
         self.assertFalse(self.hub.sessions)
+
+    async def test_doubao_tui_bridges_servers_instead_of_native_flags(self):
+        """Doubao never sees an MCP flag: the Hub's pool and its note carry the servers."""
+        config = dict(mcp_servers=SERVERS, strict_mcp_config=True)
+        preview = self.hub.resolve_launch("doubao", cwd=str(self.root), **config)
+        self.assertEqual(preview["mcp_servers"], SERVERS)
+        self.assertTrue(preview["strict_mcp_config"])
+        self.assertFalse([a for a in preview["args"] if a.startswith("--mcp")
+                          or a == "--strict-mcp-config" or "mcp_servers" in a])
+        self.assertTrue(any("Hub 会话级连接池" in note for note in preview["notes"]))
+        # A bridge-only engine has nothing to disable and must not take a bare shell as a server.
+        with self.assertRaises(ValueError):
+            self.hub.resolve_launch("doubao", disabled_mcp_servers=["old"])
+        with self.assertRaises(ValueError):
+            self.hub.resolve_launch("doubao", mcp_servers={"bad": {"command": "pwsh"}})
+        self.hub.profiles["doubao"]["kind"] = "web_gui"
+        with self.assertRaises(ValueError):
+            self.hub.resolve_launch("doubao", mcp_servers=SERVERS)
 
     async def test_unreadable_or_conflicting_settings_fail_closed(self):
         for value in ("missing.json", "[]", '{"deniedMcpServers":[]}'):
@@ -208,7 +226,11 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
 
     def test_portable_manifest_contains_helper(self):
         root = Path(__file__).parent
-        self.assertIn("session_mcp_config.py", (root / "desktop/portable/payload.txt").read_text(encoding="utf-8").splitlines())
+        listed = (root / "desktop/portable/payload.txt").read_text(encoding="utf-8").splitlines()
+        for name in ("session_mcp_config.py", "session_mcp_bridge.py", "mcp_session_pool.py",
+                     "tools/hub_mcp_cli.py"):
+            self.assertIn(name, listed)
+            self.assertTrue((root / name).is_file(), name)
 
 
 if __name__ == "__main__":

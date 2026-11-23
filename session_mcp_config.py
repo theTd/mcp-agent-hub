@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import re
 
+from session_mcp_bridge import validate_bridge_mcp_servers
+
 
 def _string(value, label, *, nonempty=False):
     if not isinstance(value, str) or "\x00" in value or (nonempty and not value.strip()):
@@ -75,10 +77,16 @@ def mcp_config_active(config):
 
 
 def validate_mcp_engine(engine, kind, config):
-    if mcp_config_active(config) and (engine not in ("codex", "claude") or kind != "tui"):
-        raise ValueError("会话级 MCP 配置仅支持 Codex / Claude TUI")
-    if config["strict_mcp_config"] and engine != "claude":
-        raise ValueError("strict_mcp_config 仅支持 Claude；Codex 不提供完整 MCP 白名单")
+    if mcp_config_active(config) and (engine not in ("codex", "claude", "doubao") or kind != "tui"):
+        raise ValueError("会话级 MCP 配置仅支持 Codex / Claude / Doubao TUI")
+    if engine == "doubao":
+        # Doubao has no inherited MCP source to disable, and its servers are proxied by the Hub pool.
+        if config["disabled_mcp_servers"]:
+            raise ValueError("豆包 CLI 桥接模式没有继承 MCP 来源，不支持 disabled_mcp_servers")
+        if config["mcp_servers"]:
+            validate_bridge_mcp_servers(config["mcp_servers"])
+    if config["strict_mcp_config"] and engine not in ("claude", "doubao"):
+        raise ValueError("strict_mcp_config 仅支持 Claude / Doubao；Codex 不提供完整 MCP 白名单")
 
 
 def _settings_tokens(args):
@@ -193,6 +201,8 @@ def _toml(value):
 
 
 def build_mcp_args(engine, config):
+    # Doubao TUI takes no MCP flag at all: its servers live in the Hub's session pool (see
+    # session_mcp_bridge), so doubao.exe argv must stay free of MCP arguments.
     args = []
     if engine == "codex":
         servers = {}

@@ -69,7 +69,9 @@ ROUTING_RULES = (
     'env={"KEY":"VALUE"} overrides profile env across resume; extra_args=["--flag","value"] '
     "are literal per-session TUI argv (non-TUI launches reject them).",
     'Codex/Claude mcp_servers use HTTP {"url","headers"} or stdio {"command","args","env"}; '
-    "disabled_mcp_servers and Claude strict_mcp_config are session-only. Do not mix these with native overrides; config does not prove connection/authentication.",
+    'Doubao TUI takes the same mcp_servers and strict_mcp_config through the Hub session proxy, but '
+    "refuses disabled_mcp_servers (no inherited source). Session-only: do not mix with native overrides, and "
+    "config does not prove connection/authentication.",
     "Approvals: leave approval_mode unset, even to be explicit or careful: the default, auto, is the safe choice. Codex and Claude then run their own auto-approval reviewer (Codex --approve-for-me, Claude auto mode) and only what it escalates comes to you; other engines bring you their high-risk actions. "
     'Set approval_mode="ask" only when you or the user want to approve every high-risk action yourselves, "bypass" (no checks) only when the user asked for it or the task needs it. '
     "bypass_approvals is the legacy switch (true = bypass, false = the default); never pass both.",

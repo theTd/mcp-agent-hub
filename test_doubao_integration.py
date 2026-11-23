@@ -502,10 +502,14 @@ class DoubaoLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess.resume_count, 1)
 
     def test_unsupported_boundaries_are_rejected_not_ignored(self):
-        with self.assertRaisesRegex(ValueError, "MCP"):
+        # Session MCP itself is supported now (Hub session pool); the inherited-source list and a
+        # bare shell interpreter are the two shapes it still refuses.
+        with self.assertRaisesRegex(ValueError, "disabled_mcp_servers"):
             self.hub.resolve_launch(
-                "doubao", cwd=str(self.root), mcp_servers={"x": {"url": "https://example.invalid"}}
-            )
+                "doubao", cwd=str(self.root), disabled_mcp_servers=["x"])
+        with self.assertRaisesRegex(ValueError, "shell"):
+            self.hub.resolve_launch(
+                "doubao", cwd=str(self.root), mcp_servers={"x": {"command": "cmd"}})
         shared = Path(__file__).parent / "docs"
         with self.assertRaisesRegex(ValueError, "extra_roots"):
             self.hub.resolve_launch("doubao", cwd=str(self.root), extra_roots=[str(shared)])
