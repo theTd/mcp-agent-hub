@@ -99,6 +99,31 @@ class ApprovalParserTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 resolve_session_approval("codex", {}, None, bad)
 
+    def test_deny_session_and_persistent_deny_rows_follow_the_decision(self):
+        resolve = HubSessionManager._resolve_approval_choice
+        labels = ["Allow once", "No, always deny", "Reject always"]
+        actions = ["approve_once", "deny_session", "persist"]
+        for index in (2, 3):
+            with self.subTest(index=index):
+                # An allowing decision naming a deny-shaped row would deny the call: conflict.
+                with self.assertRaisesRegex(ValueError, "冲突"):
+                    resolve("approve", index, None, labels, actions)
+                # The same rows under a deny decision are a plain deny, not a false conflict.
+                self.assertEqual(
+                    resolve("deny", index, None, labels, actions),
+                    ("deny", labels[index - 1], index),
+                )
+        # The detector's own classification of `No, always deny` is `deny_session` too.
+        with self.assertRaisesRegex(ValueError, "冲突"):
+            resolve("approve", 2, None, ["Allow once", "No, always deny"], None)
+        self.assertEqual(
+            resolve("deny", 2, None, ["Allow once", "No, always deny"], None)[0], "deny"
+        )
+        # A persisting ALLOW still never conflicts and still falls back to approve_once.
+        self.assertEqual(
+            resolve("approve", 2, None, ["Allow once", "Always allow"], None)[0], "approve_once"
+        )
+
     def test_d13_flags_replace_profile_modes(self):
         self.assertEqual(apply_approval_flags("codex", ["-a", "never", "--full-auto", "--x"], mode="auto"),
                          ["--approve-for-me", "--x"])
