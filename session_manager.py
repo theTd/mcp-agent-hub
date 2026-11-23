@@ -2603,6 +2603,11 @@ class AgentSession:
         self._pending_engine_error: Optional[
             Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]
         ] = None
+        # omp: the monotonic moment its live screen last showed work while an error row was the
+        # file's last record. The tail watcher and the tail sweep BOTH read and update this one
+        # mark and hold the error turn open for a full quiet window from it, so neither path can
+        # end the turn on an older clock after the other saw omp retrying.
+        self._omp_error_busy_at: Optional[float] = None
         # A10: the real outcome of typing a startup/resume text into the TUI (never guessed).
         # K8 (fix 9d): every record set here is also kept in recent_injections (see the property).
         self._recent_injections: List[Dict[str, Any]] = []
@@ -9554,8 +9559,15 @@ class HubSessionManager:
         session.last_turn_error = None
         session.undelivered_messages = []
         session._pending_engine_error = None
+        session._omp_error_busy_at = None
         session._codex_reconnect = None
         session._seen_tui_prompt_signatures.clear()
+        # A turn also begins with no server call at all: a telemetry/transcript watcher sees a
+        # completed session working again (omp's own retry after a false engine error). The parent's
+        # handles still name the previous turn and hold its uncollected completion, so re-arm them
+        # exactly as send_to_subagent/resume_subagent do for a follow-up message; otherwise the next
+        # poll answers with the stale turn's result and its new completion is never awaited.
+        self.wait_inbox.rearm_session_turn(session.session_id, session.turn_id)
         # Everything already in the transcript belongs to the turn that just ended; the turn-end
         # sweep may only complete this new turn from a record appended after it (a resumed session
         # attaches to a file that already holds the old answer).
@@ -10765,6 +10777,7 @@ class HubSessionManager:
                     except Exception:
                         continue
                     error_hold = None
+                    session._omp_error_busy_at = None
                     applying = (record_start, record_end)
                     self._observe_context_record(session, obj)
                     otype = obj.get("type")
@@ -10994,19 +11007,37 @@ class HubSessionManager:
                                 # it again (begin_new_turn raises the floor for the next turn).
                                 session._native_turn_end_offset = record_end
                     applying = None
-                if error_hold is not None and time.monotonic() - error_hold[1] >= OMP_ERROR_TURN_END_SEC:
-                    info = error_hold[0]
-                    # Claim every row read so far: the sweep and the next turn treat this error
-                    # as the end of the current turn, not as an answer to complete twice. Only
-                    # once the turn really ends: an interaction awaiting the parent declines the
-                    # end, and claiming past the row would lose it for the rest of the session.
-                    if await self._end_engine_error_turn(session, "omp", info):
-                        session._native_turn_end_offset = offset
-                        error_hold = None
-                    else:
-                        # Restart the window: the engine's retry record gets its full time from
-                        # the moment the parent answers the interaction, not from the first row.
-                        error_hold = (info, time.monotonic())
+                if error_hold is not None:
+                    # The quiet window is shared with the tail sweep: both paths read and update
+                    # the same monotonic mark, so a "still working" screen seen by either one
+                    # gives the retried record a full window before the old error may end the turn.
+                    now = time.monotonic()
+                    busy_at = session._omp_error_busy_at
+                    quiet_since = max(error_hold[1], busy_at) if busy_at is not None else error_hold[1]
+                    if now - quiet_since >= OMP_ERROR_TURN_END_SEC:
+                        if self._tui_screen_shows_work(session):
+                            # omp is still retrying/thinking on screen (a retry with max thinking
+                            # plus TTFT can outlast the hold by minutes), so the error row is not
+                            # the turn's end yet. The error class does not decide this: only the
+                            # live screen says whether omp actually stopped, and a later record
+                            # clears the hold either way.
+                            session._omp_error_busy_at = time.monotonic()
+                        else:
+                            info = error_hold[0]
+                            # Claim every row read so far: the sweep and the next turn treat this
+                            # error as the end of the current turn, not as an answer to complete
+                            # twice. Only once the turn really ends: an interaction awaiting the
+                            # parent declines the end, and claiming past the row would lose it for
+                            # the rest of the session.
+                            if await self._end_engine_error_turn(session, "omp", info):
+                                session._native_turn_end_offset = offset
+                                error_hold = None
+                            else:
+                                # Restart the window: the engine's retry record gets its full time
+                                # from the moment the parent answers the interaction, not from the
+                                # first row.
+                                error_hold = (info, time.monotonic())
+                                session._omp_error_busy_at = None
             except PersistenceRecordTooLarge as exc:
                 # An unstorable record is skipped; the batch's remaining records are still read
                 # on the next pass instead of being thrown away with it.
@@ -11124,11 +11155,23 @@ class HubSessionManager:
                 if error_info is not None:
                     # The file's own mtime is the durable retry window: an error row still last
                     # after OMP_ERROR_TURN_END_SEC means omp did not retry, so the turn is over.
+                    # A live screen that still shows omp working outranks the file: it is retrying
+                    # (backoff + thinking + TTFT can outlast the window by minutes), and ending the
+                    # turn now would publish a false engine_error. The quiet window restarts at
+                    # the last busy observation on the mark shared with the watcher, so the
+                    # retried record gets a full window to flush once the screen clears.
+                    now = time.monotonic()
+                    if self._tui_screen_shows_work(session):
+                        session._omp_error_busy_at = now
+                        continue
                     try:
                         age = time.time() - Path(str(session.transcript_path)).stat().st_mtime
                     except OSError:
                         age = 0.0
                     if age < OMP_ERROR_TURN_END_SEC:
+                        continue
+                    busy_at = getattr(session, "_omp_error_busy_at", None)
+                    if busy_at is not None and now - busy_at < OMP_ERROR_TURN_END_SEC:
                         continue
                 if error_info is not None:
                     # Only a turn that really ended is claimed: declining to end it (an
@@ -11895,6 +11938,7 @@ class HubSessionManager:
             data.update(extra_data)
         session._inflight_transcript_tool = None
         session._agy_response_tools = []
+        session._omp_error_busy_at = None
         # The helper's own outcome fields also cover the duplicate guard below (a turn_completed
         # already emitted by another observer returns before the event data is applied).
         session.last_turn_outcome = "error"
@@ -12704,8 +12748,8 @@ class HubSessionManager:
         return cls._tui_input_line(screen_text, engine) is not None
 
     @classmethod
-    def _tui_busy_indicator(cls, screen_text: str, engine: str = "") -> str:
-        """K1: the startup/busy indicator currently on screen, or "" when the engine is settled.
+    def _tui_chrome_rows(cls, screen_text: str, engine: str = "") -> List[str]:
+        """The rows an indicator may occupy: the bottom chrome, minus the composer's own rows.
 
         Only the bottom rows are read: a startup banner still visible far above the composer (kimi's
         welcome box, omp's MCP list) does not mean the engine is still starting, and a transcript row
@@ -12714,15 +12758,20 @@ class HubSessionManager:
         right above a tall composer ("⠋ Preparing Kimi Code…" over kimi's 12-row box) are still
         read; the composer's own rows are not (they hold the typed text, not an indicator).
         """
-        eng = (engine or "").strip().lower()
         lines = [ln.rstrip() for ln in str(screen_text or "").splitlines()]
-        span = cls._tui_composer_span(lines, eng)
+        span = cls._tui_composer_span(lines, (engine or "").strip().lower())
         wrapped = span[3] if span is not None else 0
         first = max(0, len(lines) - TUI_PROMPT_SCAN_ROWS - wrapped)
-        rows = [
+        return [
             ln for idx, ln in enumerate(lines)
             if idx >= first and (span is None or not span[1] <= idx <= span[2])
         ]
+
+    @classmethod
+    def _tui_busy_indicator(cls, screen_text: str, engine: str = "") -> str:
+        """K1: the startup/busy indicator currently on screen, or "" when the engine is settled."""
+        eng = (engine or "").strip().lower()
+        rows = cls._tui_chrome_rows(screen_text, eng)
         for phrase in TUI_BUSY_PHRASES.get(eng, ()):
             if any(phrase in ln for ln in rows):
                 return phrase
@@ -12769,6 +12818,42 @@ class HubSessionManager:
     def _tui_agent_active(screen_text: str) -> bool:
         """W3/K2: the screen shows the agent working or answering, which confirms a submit."""
         return bool(TUI_AGENT_ACTIVE_RE.search(str(screen_text or "")))
+
+    @classmethod
+    def _tui_status_row_shows_work(cls, screen_text: str, engine: str = "") -> bool:
+        """True when the engine's live status row carries a busy indicator.
+
+        Only the row's own shape counts (its spinner glyph plus timer, or a bare state word), read
+        in the bottom chrome only: a transcript answer that says "Worked for 12s" or "Generating
+        report..." higher up is history, not a live indicator, and must never be read as work.
+        """
+        eng = (engine or "").strip().lower()
+        line_re = TUI_BUSY_LINE_RES.get(eng)
+        if line_re is None:
+            return False
+        return any(line_re.match(ln) for ln in cls._tui_chrome_rows(screen_text, eng))
+
+    def _tui_screen_shows_work(self, session: AgentSession) -> bool:
+        """True while this session's live screen visibly shows the engine working.
+
+        omp is read from its status row alone: "Thinking"/"Working…" are drawn only in that row
+        while a model call is in flight, and the row is what the idle screen replaces with the
+        model line (π). Its scrollback keeps finished answers, so the cross-engine active phrases
+        ("Worked for", "Generating", "Running a command") must not be read there: a dead turn would
+        otherwise never end while its old output stayed on screen. The other engines keep that
+        reader, whose in-flight rows are part of the conversation rather than a status bar.
+        Only positive evidence counts: an empty screen -- a headless session, a core without a
+        grid, a test fixture -- is not work, or a timer that waits on this answer could never fire.
+        """
+        screen = session.read_screen(max_lines=40).text
+        if not str(screen or "").strip():
+            return False
+        engine = (session.engine or "").strip().lower()
+        if engine == "omp":
+            return self._tui_status_row_shows_work(screen, engine)
+        return bool(
+            self._tui_busy_indicator(screen, engine) or self._tui_agent_active(screen)
+        )
 
     @classmethod
     def _tui_blocking_dialog(cls, screen_text: str, session: Any = None) -> str:

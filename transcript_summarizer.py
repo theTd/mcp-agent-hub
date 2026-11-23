@@ -27,11 +27,28 @@ ENGINE_BUSY_PHRASES = {
 # a logo) is not: the rule is anchored to the start of the line. No box bar is allowed in front of
 # the glyph: a glyph INSIDE a box row is the box's own content (kimi's composer can hold one as
 # text), while every spinner in the captures starts the row.
+# omp's spinner frames: the star/asterisk frames its status row cycles through (the live captures
+# show ✸ ✹ ✺ ✻ ✼ ❉ ❊), the rest of that family, plus ⎋ for a tool/"working" state. Braille frames
+# are matched by the range in each pattern, not listed here.
+OMP_STATUS_GLYPHS = "✢✣✤✥✦✧✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❉❊❋⎋"
 ENGINE_BUSY_LINE_RES = {
     "kimi": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
     "agy": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
     "codex": re.compile(r"^\s*loading\s*$", re.IGNORECASE),
     "claude": re.compile(r"^\s*[\u2800-\u28FF✻✽✶✢]\s+\S.*(?:…|\.\.\.)"),
+    # omp's status row, read off the live omp captures: a state glyph, the state, then the timer
+    # and model ("❉ Thinking ⠹ 3s · ⦸ DeepSeek Flash (clay) · …", "⎋ Working… ⠦ 3s · …"). The word
+    # is only drawn while working (idle reads "π · ⦸ DeepSeek Flash …"), and the whole row shape is
+    # required, so a transcript line that merely starts with the word stays an answer.
+    # The spinner frames are the live set (✸ ✹ ✺ ✻ ✼ ❉ ❊), the family's neighbours, braille, and
+    # ⎋; the row also appears without its state word (just "⠴ 4s · …") and, mid-redraw, without the
+    # timer ("✻ Thinking", "⎋ Working…", "⎋ Listing folder contents").
+    "omp": re.compile(
+        r"^\s*[" + OMP_STATUS_GLYPHS + r"\u2800-\u28FF]\s+"
+        r"(?:[^\n]*?[\u2800-\u28FF]\s+)?(?:\d+[smh]\s+)+·"
+        r"|^\s*[" + OMP_STATUS_GLYPHS + r"]\s+"
+        r"(?:Thinking|Working…|Working\.\.\.|Listing [^\n]*?)\s*$"
+    ),
 }
 TUI_NOISE_PATTERNS = [
     re.compile(r"Welcome to Kimi Code!", re.IGNORECASE),

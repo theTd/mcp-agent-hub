@@ -12,6 +12,7 @@ from unittest.mock import patch
 from engine_errors import classify_engine_error, engine_error_summary
 from fake_terminal_core import FakeTerminal
 from session_manager import AgentSession, HubSessionManager, parent_turn_outcome_fields
+from transcript_summarizer import ENGINE_BUSY_LINE_RES
 
 
 class EngineErrorClassifierTests(unittest.TestCase):
@@ -461,6 +462,34 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         return {"type": "message", "message": {"role": "assistant", "stopReason": "stop",
                                                "content": [{"type": "text", "text": text}]}}
 
+    # Rows of real live-omp captures (tools/fixtures/terminal/live-omp-approval-box): the status
+    # row reads "Thinking"/"Working…" only while a model call is in flight; an idle omp settles to
+    # the π row (tools/fixtures/terminal/live-omp/screen_final.txt).
+    OMP_BUSY_SCREEN = (
+        "❯ \n"
+        "──────────────────────────────────────────────────────────────────────────────\n"
+        "  ❉ Thinking ⠹ 3s · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.8%/1M ⟲ · $0.00 ↓\n"
+    )
+    OMP_IDLE_SCREEN = (
+        "❯ \n"
+        "──────────────────────────────────────────────────────────────────────────────\n"
+        " π · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.8%/1M ⟲ · $0.00 ↓\n"
+    )
+    # The idle screen still shows the finished answer above the prompt. Its prose contains the
+    # cross-engine active phrases, which are history here, never a live indicator.
+    OMP_IDLE_WITH_HISTORY_SCREEN = (
+        " [Hub Session: session_id=abc] list the files in this folder\n"
+        " Worked for 12s · 3 tool calls\n"
+        " Generating report...\n"
+        " Running a command\n"
+        "\n"
+        " Three files, no subdirectories.\n"
+        "\n"
+        "❯ \n"
+        "──────────────────────────────────────────────────────────────────────────────\n"
+        " π · ⦸ DeepSeek Flash (clay) · 📁 …<SCRATCH> · ◫ 0.8%/1M ⟲ · $0.00 ↓\n"
+    )
+
     def omp_wire(self, suffix=""):
         sess = self.session("omp", suffix)
         work = self.root / f"omp{suffix}"
@@ -503,6 +532,177 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.events(sess.session_id, "turn_completed")[0].get("data") or {}).get("outcome"), None)
         self.assertEqual(sess.final_response_source, "native_transcript")
 
+    async def test_omp_error_turn_is_deferred_while_the_live_screen_shows_work(self):
+        # Incident 2026-11-23 (omp-9f5cc488): after stopReason "error" omp retried on its own and
+        # the screen showed "❉ Thinking" for 126 s. The hold used to end the turn at +60 s and
+        # report a false engine error although the retried record was still coming.
+        sess, work, path = self.omp_wire("-busy")
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_BUSY_SCREEN
+                self.append(path, self.omp_error())
+                await self.until(lambda: "Engine error (server)" in sess.current_activity)
+                await asyncio.sleep(0.9)  # several windows, each deferred by the busy screen
+                self.assertEqual(sess.status, "running")
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                self.assertFalse(getattr(sess, "_native_turn_end_offset", 0))
+                # The screen clears: the quiet window restarts at that observation, so the turn
+                # ends one full window later (not on the first silent pass).
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_IDLE_SCREEN
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "server"))
+
+    async def test_omp_error_turn_ends_cleanly_when_history_says_worked_for_and_the_prompt_is_idle(self):
+        # The incident's other half: the idle screen keeps the finished answer, and its prose
+        # ("Worked for 12s", "Generating report...", "Running a command") used to match the
+        # cross-engine active reader over the whole 40-line screen, so the error hold restarted
+        # forever although omp sat at its prompt and never retried.
+        sess, work, path = self.omp_wire("-idle-history")
+        self.fake.sessions[sess.session_id].screen_text = self.OMP_IDLE_WITH_HISTORY_SCREEN
+        self.assertFalse(self.hub._tui_screen_shows_work(sess))
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+                self.append(path, self.omp_error())
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "server"))
+        self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
+
+    async def test_omp_retry_after_a_long_busy_stretch_completes_with_the_real_answer(self):
+        sess, work, path = self.omp_wire("-busy-retry")
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_BUSY_SCREEN
+                self.append(path, self.omp_error())
+                await self.until(lambda: "Engine error (server)" in sess.current_activity)
+                await asyncio.sleep(0.8)  # well past several hold windows
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                # The incident's own shape: the retried call first flushes an assistant toolUse
+                # record (09:59:02.953Z), which must clear the hold, and only then the answer.
+                self.append(path, {"type": "message", "message": {
+                    "role": "assistant", "stopReason": "toolUse",
+                    "content": [{"type": "toolCall", "id": "call-retry", "name": "bash",
+                                 "arguments": {"command": "ls"}}]}})
+                # The screen is idle now, so only the toolUse row itself can keep the turn alive:
+                # past a full hold window it must still be running, not ended as the old error.
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_IDLE_SCREEN
+                await asyncio.sleep(0.35)
+                self.assertEqual(sess.status, "running")
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                self.append(path, self.omp_final("retried answer"))
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(sess.final_response, "retried answer")
+        self.assertIsNone(sess.last_turn_outcome)
+        done = self.events(sess.session_id, "turn_completed")
+        self.assertEqual(len(done), 1)
+        self.assertNotIn("outcome", done[0].get("data") or {})
+
+    async def test_omp_watcher_and_tail_sweep_share_one_quiet_window(self):
+        # The two paths must not each keep a private timer: the sweep's "still working" sighting
+        # gives the watcher a full window too, so it cannot end the turn on its own older clock.
+        sess, work, path = self.omp_wire("-shared-window")
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 1.2):
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_BUSY_SCREEN
+                self.append(path, self.omp_error("Connection reset by peer", 0))
+                await self.until(lambda: "Engine error (network)" in sess.current_activity)
+                await asyncio.sleep(0.55)
+                # The sweep samples the busy screen later than the watcher's own error start, so
+                # its mark is the newer of the two clocks.
+                self.assertEqual(await self.hub._sweep_omp_turn_ends(), 0)
+                self.assertIsNotNone(sess._omp_error_busy_at)
+                # Idle now: the watcher's own window has elapsed (past the 1.2 s that would let it
+                # end the turn alone), but the shared mark still holds it for another full window.
+                self.fake.sessions[sess.session_id].screen_text = self.OMP_IDLE_SCREEN
+                await asyncio.sleep(0.85)
+                self.assertEqual(sess.status, "running")
+                self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
+
+    def test_omp_status_rows_are_work_only_while_thinking_or_working(self):
+        thinking = "  ❉ Thinking ⠹ 3s · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓"
+        working = "  ⎋ Working… ⠦ 3s · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓"
+        idle = " π · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓"
+        answer = "❉ Thinking about the two options: the first one is simpler."
+        for row in (thinking, working):
+            self.assertTrue(HubSessionManager._tui_busy_indicator(row, "omp"), row)
+        self.assertFalse(HubSessionManager._tui_busy_indicator(idle, "omp"))
+        # A transcript line that merely starts with the word is still an answer, not a status row.
+        self.assertFalse(HubSessionManager._tui_busy_indicator(answer, "omp"))
+
+    def test_every_real_omp_status_glyph_and_row_shape_is_recognised(self):
+        # The live captures cycle these frames (tools/fixtures/terminal/live-omp*-*/resumed):
+        # ✸ ✹ ✺ ✻ ✼ ❉ ❊ around "Thinking", ⎋ around "Working…"/"Listing folder contents".
+        frames = "✸✹✺✻✼❉❊⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        for glyph in frames:
+            row = f"  {glyph} Thinking ⠹ 3s · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓"
+            self.assertTrue(ENGINE_BUSY_LINE_RES["omp"].match(row), row)
+            self.assertTrue(HubSessionManager._tui_busy_indicator(row, "omp"), row)
+        # The status row also drops its state word ("⠴ 4s · …") and, mid-redraw, its timer.
+        for row in (
+            "  ⠴ 4s · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓",
+            "  ⎋ Listing folder contents ⠇ 17s · ⦸ DeepSeek Flash (clay) · …",
+            "  ✹ Thinking",
+            "  ✻ Thinking",
+            "  ⎋ Working…",
+            "  ⎋ Listing folder contents",
+        ):
+            self.assertTrue(ENGINE_BUSY_LINE_RES["omp"].match(row), row)
+            self.assertTrue(HubSessionManager._tui_busy_indicator(row, "omp"), row)
+        for row in (
+            " π · ⦸ DeepSeek Flash (clay) · 📁 … · ◫ 0.8%/1M ⟲ · $0.00 ↓",
+            "❉ Thinking about the two options: the first one is simpler.",
+            " Worked for 12s · 3 tool calls",
+            " Generating report...",
+            " Running a command",
+        ):
+            self.assertFalse(ENGINE_BUSY_LINE_RES["omp"].match(row), row)
+            self.assertFalse(HubSessionManager._tui_busy_indicator(row, "omp"), row)
+
+    async def test_a_session_that_resumes_working_rearms_its_parent_wait_handle(self):
+        # The same incident's tail: the hub had already ended the turn as an error, then omp's retry
+        # record flipped the session back to running with a new turn id. The parent's handle must
+        # not answer the next poll with the stale error result.
+        sess, work, path = self.omp_wire("-rearm")
+        info = await self.hub.wait_inbox.create([sess.session_id], {sess.session_id: sess.turn_id})
+        sess.wait_handle = info["wait_handle"]
+        task = self.hub._schedule(self.hub._watch_omp_session(sess, work))
+        try:
+            with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+                self.append(path, self.omp_error())
+                await self.until(lambda: sess.status == "completed")
+                self.append(path, {"type": "custom", "customType": "tool_execution_start",
+                                   "data": {"toolCallId": "call-1", "toolName": "bash",
+                                            "args": {"command": "ls"}}})
+                await self.until(lambda: sess.status == "running")
+                self.assertEqual((await self.hub.wait_inbox.wait(info["wait_handle"], 0.1))["state"],
+                                 "waiting")
+                self.append(path, self.omp_final("real answer after retry"))
+                await self.until(lambda: sess.status == "completed")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        done = await self.hub.wait_inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((done["state"], done["final_response"]), ("done", "real answer after retry"))
+        self.assertEqual(done["results"][0]["outcome"], "answered")
+        self.assertEqual((sess.last_turn_outcome, sess.final_response), (None, "real answer after retry"))
+
     async def test_omp_tail_sweep_ends_an_error_row_only_after_the_hold_and_never_twice(self):
         sess, _work, path = self.omp_wire("-sweep")
         self.append(path, self.omp_error("Connection reset by peer", 0))
@@ -516,6 +716,27 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess.status, "completed")
         self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
         self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
+
+    async def test_omp_tail_sweep_defers_an_error_row_while_the_live_screen_shows_work(self):
+        sess, _work, path = self.omp_wire("-sweep-busy")
+        self.append(path, self.omp_error("Connection reset by peer", 0))
+        sess.transcript_path = path
+        self.fake.sessions[sess.session_id].screen_text = self.OMP_BUSY_SCREEN
+        with patch("session_manager.OMP_ERROR_TURN_END_SEC", 0.2):
+            old = time.time() - 5
+            os.utime(path, (old, old))
+            self.assertEqual(await self.hub._sweep_omp_turn_ends(), 0)
+            self.assertEqual(await self.hub._sweep_omp_turn_ends(), 0)
+            self.assertEqual(sess.status, "running")
+            self.assertEqual(self.events(sess.session_id, "turn_completed"), [])
+            # Idle now: the quiet window restarts at the last busy observation, so the row is held
+            # for one more full window before the turn may end on it.
+            self.fake.sessions[sess.session_id].screen_text = self.OMP_IDLE_SCREEN
+            self.assertEqual(await self.hub._sweep_omp_turn_ends(), 0)
+            await asyncio.sleep(0.25)
+            self.assertEqual(await self.hub._sweep_omp_turn_ends(), 1)
+        self.assertEqual(sess.status, "completed")
+        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
 
     async def test_dsh_failed_job_ends_the_turn_as_an_error(self):
         sess = self.session("dsh", "-failed")

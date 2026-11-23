@@ -168,6 +168,67 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.inbox.wait(handle, 0.1))["final_response"], "B")  # another member's: kept
         self.assertEqual((await self.inbox.wait(handle, 0.1))["final_response"], "new")
 
+    async def test_rearming_a_session_reaches_every_open_handle_that_waits_on_it(self):
+        # A turn can begin with no server call (omp retrying after the hub ended the turn), so the
+        # handle re-arm must find the handles itself instead of being handed one per request.
+        single = (await self.inbox.create(["a"]))["wait_handle"]
+        group = (await self.inbox.create(["a", "b"]))["wait_handle"]
+        other = (await self.inbox.create(["b"]))["wait_handle"]
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta",
+                                        "content": "false engine error"})
+        self.inbox.rearm_session_turn("a", "ta2")
+        self.assertEqual(self.inbox._row(single)["turn_ids"], {"a": "ta2"})
+        self.assertEqual(self.inbox._row(group)["turn_ids"], {"a": "ta2"})
+        self.assertEqual(self.inbox._row(other)["turn_ids"], {})
+        self.assertEqual((await self.inbox.wait(single, 0.1))["state"], "waiting")
+        self.states["a"] = {"status": "completed", "final_response": "real answer"}
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed", "turn_id": "ta2",
+                                        "content": "real answer"})
+        self.assertEqual((await self.inbox.wait(single, 0.1))["final_response"], "real answer")
+        self.states["b"] = {"status": "completed", "final_response": "B"}
+        await self.inbox.publish_event({"session_id": "b", "type": "turn_completed", "turn_id": "tb",
+                                        "content": "B"})
+        done = await self.inbox.wait(group, 0.1)
+        self.assertEqual(done["state"], "done")
+        self.assertEqual([r["final_response"] for r in done["results"]], ["real answer", "B"])
+        self.assertEqual((await self.inbox.wait(other, 0.1))["final_response"], "B")
+
+    async def test_a_rearm_during_the_provider_await_is_not_overwritten_by_a_stale_done(self):
+        # omp's retry re-arms the handle while a poll's state provider is still awaiting; the
+        # provider then answers with the replaced turn's "done", which must neither be written
+        # nor returned: the parent would otherwise be answered with the false engine error.
+        info = await self.inbox.create(["a", "b"])
+        self.states["a"] = {"status": "completed", "final_response": "false engine error"}
+        self.states["b"] = {"status": "completed", "final_response": "B"}
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_provider(ids):
+            entered.set()
+            await release.wait()
+            values = [self.states[sid] for sid in ids]
+            return {"state": "done", "result_id": "stale-result",
+                    "final_response": values[0]["final_response"], "results": values}
+
+        self.inbox.set_state_provider(slow_provider)
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed",
+                                        "turn_id": "ta", "content": "false engine error"})
+        snapshot = asyncio.create_task(self.inbox._snapshot(info["wait_handle"]))
+        await asyncio.wait_for(entered.wait(), 2)
+        self.inbox.rearm_session_turn("a", "ta2")
+        release.set()
+        result = await asyncio.wait_for(snapshot, 2)
+        self.assertEqual(result["state"], "waiting")
+        row = self.inbox._row(info["wait_handle"])
+        self.assertEqual((row["state"], row["result"]), ("waiting", None))
+        self.assertEqual(row["turn_ids"], {"a": "ta2"})
+        # The new turn still settles with its own completion, never with the stale one.
+        self.states["a"] = {"status": "completed", "final_response": "real answer"}
+        await self.inbox.publish_event({"session_id": "a", "type": "turn_completed",
+                                        "turn_id": "ta2", "content": "real answer"})
+        done = await self.inbox.wait(info["wait_handle"], 0.1)
+        self.assertEqual((done["state"], done["final_response"]), ("done", "real answer"))
+
     async def test_new_waiter_supersedes_old_connection(self):
         info = await self.inbox.create(["a"])
         old = asyncio.create_task(self.inbox.wait(info["wait_handle"], 2))

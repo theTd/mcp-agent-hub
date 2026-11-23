@@ -306,24 +306,46 @@ class WaitInbox:
             return True
         return bool(self._request_check(str(event.get("session_id") or ""), str(request_id or event.get("request_id") or "")))
 
+    def _rearm_handle(self, conn: sqlite3.Connection, handle: str, session_id: str, turn_id: str) -> None:
+        """Point one handle at this session's new turn and drop its uncollected earlier result."""
+        row = conn.execute("SELECT turn_ids_json FROM wait_handles WHERE handle=?", (handle,)).fetchone()
+        if not row:
+            raise WaitHandleError("unknown wait handle")
+        turns = self._load(row["turn_ids_json"], {})
+        turns[str(session_id)] = str(turn_id)
+        # A turn end of this session's earlier turn that nobody collected is superseded: the new
+        # message must not be answered with it (a codex deny ends the turn at once, and parents
+        # often send new instructions right after the deny without reading the wait URL).
+        for event in conn.execute(
+            "SELECT id,payload_json FROM wait_inbox_events WHERE handle=? AND consumed=0 AND event_type='turn_completed'",
+            (handle,),
+        ).fetchall():
+            payload = self._load(event["payload_json"], {})
+            if str(payload.get("session_id") or "") == str(session_id) and str(payload.get("turn_id") or "") != str(turn_id):
+                conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (event["id"],))
+        conn.execute("UPDATE wait_handles SET turn_ids_json=?,state='waiting',updated_at=? WHERE handle=?", (self._json(turns), time.time(), handle))
+
     async def update_turn(self, handle: str, session_id: str, turn_id: str) -> None:
         with self._connect() as conn:
-            row = conn.execute("SELECT turn_ids_json FROM wait_handles WHERE handle=?", (handle,)).fetchone()
-            if not row:
-                raise WaitHandleError("unknown wait handle")
-            turns = self._load(row["turn_ids_json"], {})
-            turns[str(session_id)] = str(turn_id)
-            # A turn end of this session's earlier turn that nobody collected is superseded: the new
-            # message must not be answered with it (a codex deny ends the turn at once, and parents
-            # often send new instructions right after the deny without reading the wait URL).
-            for event in conn.execute(
-                "SELECT id,payload_json FROM wait_inbox_events WHERE handle=? AND consumed=0 AND event_type='turn_completed'",
-                (handle,),
-            ).fetchall():
-                payload = self._load(event["payload_json"], {})
-                if str(payload.get("session_id") or "") == str(session_id) and str(payload.get("turn_id") or "") != str(turn_id):
-                    conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (event["id"],))
-            conn.execute("UPDATE wait_handles SET turn_ids_json=?,state='waiting',updated_at=? WHERE handle=?", (self._json(turns), time.time(), handle))
+            self._rearm_handle(conn, handle, session_id, turn_id)
+
+    def rearm_session_turn(self, session_id: str, turn_id: str) -> None:
+        """Re-arm every open handle that waits on this session for its new turn.
+
+        A turn can begin without any server call: a transcript/telemetry watcher sees a session
+        the hub had marked completed working again (omp's own retry after an error stopReason).
+        The handles still name the previous turn and hold its uncollected completion, so without
+        this the parent's next poll would be answered with the stale turn's result and the new
+        completion would never be awaited.
+        """
+        sid = str(session_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT handle,session_ids_json FROM wait_handles WHERE state != 'closed'"
+            ).fetchall()
+            for row in rows:
+                if sid in [str(item) for item in self._load(row["session_ids_json"], [])]:
+                    self._rearm_handle(conn, row["handle"], sid, turn_id)
 
     async def _next_event(self, handle: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
@@ -364,10 +386,21 @@ class WaitInbox:
         entry.setdefault("result_id", event.get("result_id") or event.get("request_id"))
         return entry
 
+    def _turn_ids_json(self, handle: str) -> Optional[str]:
+        """The handle's raw turn map: an await-time generation stamp against a re-arm."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT turn_ids_json FROM wait_handles WHERE handle=?", (handle,)).fetchone()
+        return row["turn_ids_json"] if row else None
+
     async def _snapshot(self, handle: str) -> Dict[str, Any]:
         row = self._row(handle)
         if not row:
             raise WaitHandleError("unknown wait handle")
+        # A re-arm (rearm_session_turn, update_turn) that lands while this snapshot is awaiting
+        # the state provider must win: a "done" computed from the old turn map describes a turn the
+        # handle no longer waits on, and writing it would overwrite the waiting state the re-arm
+        # just set. Both provider branches compare against this stamp before answering done.
+        turn_stamp = self._turn_ids_json(handle)
         # An open parent decision is actionable and must not be hidden behind a queued
         # completion, undelivered message, or a provider snapshot that already says done.
         asks = await self._all_open_asks(handle)
@@ -406,7 +439,15 @@ class WaitInbox:
                         results = [with_wait_outcome(item) for item in (state.get("results") or [result])]
                         saved = {**state, "results": results}
                         with self._connect() as conn:
-                            conn.execute("UPDATE wait_handles SET result_json=?,result_id=?,state='done',updated_at=? WHERE handle=?", (self._json(saved), result_id, time.time(), handle))
+                            written = conn.execute(
+                                "UPDATE wait_handles SET result_json=?,result_id=?,state='done',updated_at=?"
+                                " WHERE handle=? AND turn_ids_json=?",
+                                (self._json(saved), result_id, time.time(), handle, turn_stamp),
+                            ).rowcount
+                        if not written:
+                            # The handle was re-armed (or closed) while the provider ran: this done
+                            # belongs to the turn it no longer waits on. Leave the new turn waiting.
+                            return {"state": "waiting", "wait_handle": handle}
                         return self._done_payload(
                             result_id, state.get("final_response") or result.get("final_response", ""), results
                         )
@@ -441,6 +482,9 @@ class WaitInbox:
             }
         if self._state_provider:
             state = await self._state_provider(list(row["session_ids"]))
+            if state.get("state") == "done" and self._turn_ids_json(handle) != turn_stamp:
+                # A re-arm landed while the provider ran: this done describes the replaced turn.
+                return {"state": "waiting", "wait_handle": handle}
             if state.get("state") in ("done", "failed", "ask"):
                 if state.get("state") == "failed" and not state.get("errors"):
                     state = {**state, "errors": [{"message": state.get("error") or "wait failed"}]}
