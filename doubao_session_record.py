@@ -14,6 +14,7 @@ pure-text turn that the local trajectory file does not hold.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -84,28 +85,92 @@ _ERROR_BANNERS = (
 _JSON_ERROR_RE = re.compile(r'"is_error"\s*:\s*true', re.IGNORECASE)
 _JSON_ERRORS_KEY_RE = re.compile(r'"errors"\s*:', re.IGNORECASE)
 
-_DOUBAO_APPROVAL_TITLES = (
-    "Allow this command?",
-    "Allow all operations?",
-    "Allow access to these directories?",
-    "Files will be deleted",
-)
-_DOUBAO_OPTION_RE = re.compile(r"^\s*(?:[❯›>]\s*)?(\d+)\.\s+(.+?)\s*$")
 # The idle composer of the Doubao TUI (drawn in place of typed text).
 DOUBAO_COMPOSER_PLACEHOLDER = "Ask Doubao to do anything"
-_DOUBAO_PROMPT_RE = re.compile(r"^\s*❯\s?(.*)$")
-# The card's own chrome: a real card carries a footer/hint row, never only numbered prose.
-_CARD_FOOTER_HINTS = (
-    "submit",
-    "press enter",
-    "enter / esc",
-    "↑↓",
-    "navigate",
-    "to select",
-    "number to select",
-    "esc to cancel",
-    "esc to exit",
+# The card's busy footer while the CLI is closing it (`Submitting, waiting for confirmation…`).
+DOUBAO_SUBMITTING_TEXT = "Submitting, waiting for confirmation"
+# Negations that must beat every affirmative token in a rendered label (`不允许` holds `允许`).
+_DOUBAO_NEGATION_TOKENS = (
+    "不允许",
+    "禁止",
+    "不同意",
+    "不批准",
+    "不继续",
+    "拒绝",
+    "取消",
+    "跳过",
 )
+# Ink wraps the card footer at narrow widths: at most this many trailing rows are one footer.
+_DOUBAO_FOOTER_MAX_LINES = 3
+_CURSOR_GLYPHS = ("❯", "›")
+# One rendered card row: an optional Ink cursor, then nothing else this parser owns.
+_CURSOR_PREFIX_RE = re.compile(r"^(?P<cursor>[❯›>])[ ]?(?P<rest>.*)$")
+# The server sends the confirmation labels; the TUI never numbers them.
+_DOUBAO_CONFIRM_LABELS = (
+    "allow once",
+    "allow similar commands",
+    "allow similar actions",
+    "allow folder access once",
+    "allow listed folders once",
+    "always allow",
+    "allow always",
+    "allow all",
+    "reject and stop",
+    "deny and stop",
+    "reject",
+    "deny",
+    "skip",
+    "cancel",
+    "允许一次",
+    "仅允许一次",
+    "允许类似",
+    "允许类似操作",
+    "本会话允许",
+    "允许所有",
+    "全部允许",
+    "始终允许",
+    "总是允许",
+    "拒绝并停止",
+    "拒绝并终止",
+    "拒绝",
+    "取消",
+    "跳过",
+)
+_DOUBAO_ACTION_LABELS = {
+    "submit": "submit",
+    "answer": "submit",
+    "skip": "skip",
+    "cancel": "deny",
+    "reject": "deny",
+    "reject and stop": "deny_feedback",
+    "deny": "deny",
+    "deny and stop": "deny_feedback",
+    "提交": "submit",
+    "回答": "submit",
+    "跳过": "skip",
+    "取消": "deny",
+    "拒绝": "deny",
+    "拒绝并停止": "deny_feedback",
+    "拒绝并终止": "deny_feedback",
+}
+_DOUBAO_TOOL_NAMES = frozenset({
+    "bash", "terminal", "powershell", "shell", "cmd", "read", "write", "edit",
+    "glob", "grep", "webfetch", "websearch", "web_fetch", "web_search",
+    "delete", "move", "copy", "task", "agent", "patch",
+})
+# Trailing `[Enter]` / `[Esc]` / `[1]` shortcut badge the server may attach to an action.
+_SHORTCUT_BADGE_RE = re.compile(r"\s*\[[^\]\n]{1,16}\]\s*$")
+# The dim placeholder the renderer appends to a text option: `Other:  [type your answer]`.
+_TEXT_PLACEHOLDER_RE = re.compile(r"\s*\[[^\]\n]{0,80}\]\s*$")
+_RADIO_MARK_RE = re.compile(r"^\(([ ●✓]?)\)\s?(.*)$")
+_CHECKBOX_MARK_RE = re.compile(r"^\[([ ✓xX]?)\]\s?(.*)$")
+# Rows the CLI draws above a card while a tool runs; the payload after the verb is the command.
+_DOUBAO_COMMAND_VERB_RE = re.compile(
+    r"^(?P<verb>正在执行代码|正在执行命令|执行终端命令|执行代码|执行命令|运行命令|"
+    r"Running command|Running code|Executing command|Executing code)\s+(?P<cmd>.+)$",
+    re.IGNORECASE,
+)
+_RUNNING_SUFFIX_RE = re.compile(r"\s*[·•]\s*Running\s*$")
 
 
 def doubao_data_root() -> Path:
@@ -434,80 +499,552 @@ def _doubao_error_info(line: str, code: str) -> Dict[str, Any]:
     return info
 
 
-def _last_numbered_options(lines: List[str]) -> List[Dict[str, Any]]:
-    """The last block of `N. label` rows; wrapped continuation rows join the label before them.
-
-    The block stops at horizontal rules, the `model · effort · cwd` status row, key-hint footers
-    (`↑↓`, `Enter / Esc`, `number to select`) and the composer prompt, so the last option never
-    swallows the screen chrome drawn under the card.
-    """
-    blocks: List[List[Dict[str, Any]]] = []
-    current: Optional[List[Dict[str, Any]]] = None
-    for row in lines:
-        match = _DOUBAO_OPTION_RE.match(row)
+def _doubao_clean_label(label: str) -> str:
+    """A rendered row label without its cursor, radio/checkbox marker or shortcut badge."""
+    text = str(label or "").strip()
+    match = _CURSOR_PREFIX_RE.match(text)
+    if match:
+        text = match.group("rest").strip()
+    for pattern in (_RADIO_MARK_RE, _CHECKBOX_MARK_RE):
+        match = pattern.match(text)
         if match:
-            number = int(match.group(1))
-            label = match.group(2).strip()
-            if current is None or number == 1:
-                current = []
-                blocks.append(current)
-            current.append({"index": number, "label": label})
-            continue
-        stripped = row.strip()
-        low = stripped.lower()
-        if (
-            not stripped
-            or _RULE_ROW_RE.match(stripped)
-            or _STATUS_ROW_RE.match(stripped)
-            or stripped.startswith(("❯", "›", ">", "─", "━", "═"))
-            or any(hint in low for hint in _CARD_FOOTER_HINTS)
-        ):
-            current = None
-            continue
-        if current:
-            current[-1]["label"] = f"{current[-1]['label']} {stripped}".strip()
-    if not blocks:
-        return []
-    # Drop repeated indexes inside one block (a redraw can repeat a row).
-    seen = set()
-    cleaned = []
-    for item in blocks[-1]:
-        if item["index"] in seen:
-            continue
-        seen.add(item["index"])
-        cleaned.append(item)
-    cleaned.sort(key=lambda item: item["index"])
-    return cleaned
+            text = match.group(2).strip()
+            break
+    return _SHORTCUT_BADGE_RE.sub("", text).strip()
+
+
+def _doubao_question_label(raw: str) -> str:
+    """Display label of a question row: placeholder and the renderer's ` · description` gone."""
+    text = _doubao_clean_label(raw)
+    text = _TEXT_PLACEHOLDER_RE.sub("", text).strip()
+    if " · " in text:
+        text = text.split(" · ", 1)[0].strip()
+    if text.lower().rstrip(":：") == "other":
+        return "Other"
+    return text
+
+
+def _doubao_question_detail(raw: str) -> str:
+    """Signature material of a question row: cursor, checked mark, typed text and placeholder gone.
+
+    The renderer draws `(●) label · description`, `Other: <typed>`/`Answer: <typed>`, so both the
+    checked state and whatever the user typed must not reach the card identity; the description
+    and the label itself must.
+    """
+    text = _SHORTCUT_BADGE_RE.sub("", str(raw or "").strip()).strip()
+    low = text.lower()
+    if low.startswith("answer:"):
+        return "Answer"
+    if low.startswith("other:"):
+        return "Other"
+    return _TEXT_PLACEHOLDER_RE.sub("", text).strip()
+
+
+def _doubao_action_decision(raw: str) -> Optional[str]:
+    """The decision (`submit` / `skip` / `deny` / `deny_feedback`) of a trailing action row."""
+    low = _SHORTCUT_BADGE_RE.sub("", str(raw or "").strip()).strip().rstrip(":：").lower()
+    return _DOUBAO_ACTION_LABELS.get(low)
+
+
+def _doubao_question_row(raw: str) -> Tuple[Optional[str], bool, bool, str, str]:
+    """(kind, cursor, checked, text, marker) for one rendered card row; kind may be None."""
+    body = str(raw or "").lstrip()
+    cursor = body[:1] in _CURSOR_GLYPHS
+    if cursor:
+        body = body[1:].lstrip(" ")
+    radio = _RADIO_MARK_RE.match(body)
+    check = _CHECKBOX_MARK_RE.match(body)
+    marker = radio or check
+    if marker:
+        text = marker.group(2).strip()
+        checked = marker.group(1).strip().lower() in ("●", "✓", "x")
+        kind = "option"
+        low = text.lower()
+        if low.startswith(("other:", "answer:")):
+            kind = "text"
+        return kind, cursor, checked, text, "checkbox" if check else "radio"
+    text = body.strip()
+    if text.lower().startswith(("other:", "answer:")):
+        return "text", cursor, False, text, ""
+    if _doubao_action_decision(text):
+        return "action", cursor, False, text, ""
+    return None, cursor, False, text, ""
+
+
+def _doubao_confirm_row(raw: str) -> Optional[Tuple[bool, str]]:
+    """(cursor, label) for one confirmation-card row, else None.
+
+    A real confirmation card draws only the server's own action labels, unnumbered, optionally
+    with a trailing `[Enter]`/`[Esc]` shortcut badge. Numbered prose never matches.
+    """
+    body = str(raw or "").lstrip()
+    cursor = body[:1] in _CURSOR_GLYPHS
+    if cursor:
+        body = body[1:].lstrip(" ")
+    text = _SHORTCUT_BADGE_RE.sub("", body.strip()).strip()
+    low = text.lower()
+    if not text or not any(low.startswith(label) for label in _DOUBAO_CONFIRM_LABELS):
+        return None
+    return cursor, text
 
 
 def classify_doubao_option(label: str) -> str:
-    """approve_once | approve_session | deny | deny_feedback for one Doubao option label."""
-    low = str(label or "").strip().lower()
-    if "reject and stop" in low or "deny and stop" in low or "拒绝并停止" in low or "拒绝并终止" in low:
-        return "deny_feedback"
-    if low.startswith("allow once") or low.startswith("允许一次") or low.startswith("仅允许一次"):
-        return "approve_once"
-    if (
-        low.startswith("allow similar")
-        or low.startswith("allow all")
-        or "always" in low
-        or "允许类似" in low
-        or "允许所有" in low
-        or "全部允许" in low
+    """approve_once | approve_session | persist | deny | deny_feedback | submit for one label.
+
+    A negation wins over every affirmative token: `不允许` / `禁止删除` carry `允许` / `删除` as
+    substrings, and loose substring matching would read them as approvals. English affirmatives are
+    the label's leading word, Chinese ones its opening characters.
+
+    `persist` (`Always allow` / `Allow all`) is the CLI's global, account-wide allow setting: it is
+    reported so the responder can refuse it, never folded into a session approval. An unknown label
+    is a deny, never an approval.
+    """
+    low = _doubao_clean_label(label).lower()
+    if low.startswith(("reject and stop", "deny and stop")) or any(
+        token in low for token in ("拒绝并停止", "拒绝并终止")
     ):
-        return "approve_session"
-    if low.startswith(("reject", "deny", "cancel", "no", "拒绝", "取消")):
+        return "deny_feedback"
+    if any(token in low for token in _DOUBAO_NEGATION_TOKENS) or low.startswith(
+        ("reject", "deny", "cancel", "skip", "no")
+    ):
         return "deny"
-    if low.startswith("submit"):
-        return "submit"
-    if low.startswith(("yes", "allow", "approve", "proceed", "delete", "continue", "允许", "批准", "继续", "删除")):
+    if low.startswith(("always allow", "allow always", "allow all")) or any(
+        token in low for token in ("始终允许", "总是允许", "允许所有", "全部允许")
+    ):
+        return "persist"
+    if low.startswith("allow similar") or any(token in low for token in ("允许类似", "本会话允许")):
+        return "approve_session"
+    if low.startswith(("allow once", "allow folder access once", "allow listed folders once")) or any(
+        token in low for token in ("允许一次", "仅允许一次")
+    ):
         return "approve_once"
-    # A label the bundle did not describe is never read as an approval.
+    if low.startswith(("submit", "提交")):
+        return "submit"
+    if low.startswith(
+        ("yes", "allow", "approve", "proceed", "delete", "continue",
+         "允许", "批准", "同意", "继续", "删除")
+    ):
+        return "approve_once"
     return "deny"
 
 
+def _doubao_signature(kind: str, *parts: Any) -> str:
+    """Card identity: the cursor (and checked state) are deliberately not part of it."""
+    payload = json.dumps([kind, *parts], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _doubao_collapsed(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _doubao_running_command(rows: List[str]) -> str:
+    """The command the CLI drew above the card (`◇ 正在执行代码 … · Running`), wrapped rows kept."""
+    for pos in range(len(rows) - 1, -1, -1):
+        text = rows[pos].strip()
+        if not text.startswith(TOOL_GLYPH):
+            continue
+        match = _DOUBAO_COMMAND_VERB_RE.match(text[len(TOOL_GLYPH):].strip())
+        if not match:
+            continue
+        parts = [_RUNNING_SUFFIX_RE.sub("", match.group("cmd").strip())]
+        for continuation in rows[pos + 1:]:
+            stripped = continuation.strip()
+            if (
+                not stripped
+                or stripped.startswith((TOOL_GLYPH, ASSISTANT_GLYPH, USER_GLYPH))
+                or _RULE_ROW_RE.match(stripped)
+            ):
+                break
+            parts.append(_RUNNING_SUFFIX_RE.sub("", stripped))
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
+def _doubao_last_question(rows: List[str]) -> str:
+    """The `◇ …？` question above a card, including a wrap that Ink re-prefixed with `◇`."""
+    blocks = [
+        row.strip()[len(TOOL_GLYPH):].strip()
+        for row in rows
+        if row.strip().startswith(TOOL_GLYPH)
+    ]
+    for end in range(len(blocks) - 1, -1, -1):
+        payload = blocks[end]
+        if not payload.endswith(("?", "？")):
+            continue
+        parts = [payload]
+        for start in range(end - 1, max(-1, end - 4), -1):
+            previous = blocks[start]
+            if (
+                not previous
+                or previous.endswith(("?", "？", "。", "！", "!", ".", "· Running"))
+                or _DOUBAO_COMMAND_VERB_RE.match(previous)
+            ):
+                break
+            parts.insert(0, previous)
+        return "\n".join(parts)
+    return ""
+
+
+def _doubao_permissions_menu(rows: List[str]) -> bool:
+    """The `/permissions` setting menu is a numbered list, never a card."""
+    texts = [row.strip() for row in rows]
+    if any("Permissions ·" in text or text.startswith("Permissions") for text in texts):
+        if any(re.match(r"^[❯›>]?\s*[1-9]\.\s", text) for text in texts):
+            return True
+    return False
+
+
+def _parse_doubao_confirm_card(
+    lines: List[str], mask: List[bool], rule_line: int, footer_line: int, footer: str
+) -> Optional[Dict[str, Any]]:
+    body = [lines[i] for i in range(rule_line + 1, footer_line) if not mask[i]]
+    while body and not body[-1].strip():
+        body.pop()
+    block: List[Tuple[bool, str]] = []
+    index = len(body) - 1
+    while index >= 0:
+        if not body[index].strip():
+            break
+        row = _doubao_confirm_row(body[index])
+        if row is None:
+            break
+        block.insert(0, row)
+        index -= 1
+    if not block:
+        return None
+    selected = next((i + 1 for i, (cursor, _text) in enumerate(block) if cursor), None)
+    if selected is None:
+        return None
+    options = [text for _cursor, text in block]
+    actions = [classify_doubao_option(text) for text in options]
+    header_rows = [row.strip() for row in body[: index + 1] if row.strip()]
+    # The renderer draws the environment and tool name as dim rows above the server's title.
+    tool = ""
+    while header_rows and header_rows[0].lower() in _DOUBAO_TOOL_NAMES:
+        name = header_rows.pop(0)
+        if name.lower() not in ("terminal", "shell", "cmd"):
+            tool = tool or name
+    question_text = "\n".join(header_rows).strip()
+    above = [lines[i] for i in range(0, rule_line) if not mask[i]]
+    command = _doubao_running_command(above)
+    fallback = _doubao_last_question(above)
+    details = question_text or fallback
+    title = ""
+    if question_text:
+        title = question_text.splitlines()[0].strip()
+    elif fallback:
+        title = fallback.splitlines()[0].strip()
+    if not title:
+        title = "Doubao Confirmation"
+    prompt_parts: List[str] = []
+    if command and _doubao_collapsed(command) not in _doubao_collapsed(details):
+        prompt_parts.append(command)
+    if details:
+        prompt_parts.append(details)
+    if not prompt_parts:
+        prompt_parts.append(title)
+    return {
+        "kind": "approval_request",
+        "title": title,
+        "prompt": "\n".join(prompt_parts),
+        "options": options,
+        "option_actions": actions,
+        "selected_index": selected,
+        "tool": tool,
+        "command": command,
+        "esc_action": _doubao_esc_action(footer),
+        # The card's own details are part of its identity: two folder-access cards that differ only
+        # in the directory (or the consequence text) they name must never share a signature.
+        "signature": _doubao_signature(
+            "approval_request",
+            _doubao_collapsed(title),
+            # `details` (header text or the whole multi-line `◇` fallback question), never just the
+            # first line: two cards differing only in a later fallback line are different cards.
+            _doubao_collapsed(details),
+            _doubao_collapsed(command),
+            options,
+        ),
+        "doubao_prompt": "approval",
+        "raw_options_count": len(options),
+    }
+
+
+def _doubao_question_header_row(text: str) -> bool:
+    """A `◆`-less body row that reads as a question title rather than a wrapped row's tail."""
+    low = str(text or "").strip().lower()
+    return low.startswith("(required)") or bool(re.search(r"[?？]\s*$", low))
+
+
+def _parse_doubao_question_card(
+    lines: List[str], mask: List[bool], rule_line: int, footer_line: int, footer: str
+) -> Optional[Dict[str, Any]]:
+    if rule_line >= 0:
+        start = rule_line + 1
+    else:
+        last_tool = max(
+            (
+                i
+                for i in range(0, footer_line)
+                if not mask[i] and lines[i].strip().startswith(TOOL_GLYPH)
+            ),
+            default=-1,
+        )
+        start = last_tool + 1
+    body = [lines[i] for i in range(start, footer_line) if not mask[i]]
+    first = next(
+        (i for i, row in enumerate(body) if _doubao_question_row(row)[0] is not None), None
+    )
+    if first is None:
+        return None
+    header_rows = [row.strip() for row in body[:first] if row.strip()]
+    entries: List[Dict[str, Any]] = []
+    # Rows between two card rows: a wrapped label's tail, or the next question's title.
+    interleaved: List[str] = []
+    for row in body[first:]:
+        if not row.strip():
+            if entries:
+                break
+            continue
+        kind, cursor, checked, text, marker = _doubao_question_row(row)
+        if kind is None:
+            if not entries:
+                continue
+            if _doubao_question_header_row(text):
+                interleaved.append(text)
+            else:
+                entries[-1]["text"] = f"{entries[-1]['text']} {text}".strip()
+            continue
+        entries.append(
+            {"kind": kind, "cursor": cursor, "checked": checked, "text": text, "marker": marker}
+        )
+    # The renderer flattens every question of the card into ONE list in visual order: each
+    # question's options, then that question's text row (`Other:`/`Answer:`), then the actions.
+    # Row numbers must come from that list, never from `len(options) + 1`.
+    nav_rows: List[Dict[str, Any]] = []
+    options: List[str] = []
+    actions: List[str] = []
+    action_decisions: List[str] = []
+    checked_indices: List[int] = []
+    other_index: Optional[int] = None
+    answer_rows = 0
+    option_rows = 0
+    multi_select = False
+    selected: Optional[int] = None
+    for entry in entries:
+        detail = _doubao_question_detail(entry["text"])
+        if entry["kind"] == "option":
+            label = _doubao_question_label(entry["text"])
+            option_rows += 1
+            options.append(label)
+            nav_rows.append(
+                {"kind": "option", "label": label, "detail": detail,
+                 "checked": bool(entry["checked"]), "marker": entry["marker"]}
+            )
+            if entry["marker"] == "checkbox":
+                multi_select = True
+            if entry["checked"]:
+                checked_indices.append(len(nav_rows))
+        elif entry["kind"] == "text":
+            kind = "Answer" if entry["text"].lower().startswith("answer") else "Other"
+            if kind == "Answer":
+                answer_rows += 1
+            else:
+                options.append("Other")
+                if other_index is None:
+                    other_index = len(nav_rows) + 1
+            nav_rows.append({"kind": "text", "label": kind, "detail": kind})
+        else:
+            label = _doubao_question_label(entry["text"])
+            decision = _doubao_action_decision(entry["text"]) or ""
+            actions.append(label)
+            action_decisions.append(decision)
+            nav_rows.append(
+                {"kind": "action", "label": label, "detail": label, "decision": decision}
+            )
+        if entry["cursor"]:
+            selected = len(nav_rows)
+    prompt_text = "\n".join(header_rows).strip()
+    if prompt_text.startswith("(required)"):
+        prompt_text = prompt_text[len("(required)"):].strip()
+    if not prompt_text:
+        return None
+    # A text row BEFORE a later option row, an `Answer:` row beside radio/checkbox rows, two
+    # `Answer:` rows or two question titles can only come from several questions flattened into
+    # one card: an answer keyed to the wrong question would be submitted otherwise.
+    text_before_option = any(
+        row["kind"] == "text"
+        and any(later["kind"] == "option" for later in nav_rows[pos + 1:])
+        for pos, row in enumerate(nav_rows)
+    )
+    header_count = 1 + sum(1 for row in interleaved if _doubao_question_header_row(row))
+    multi_question = bool(
+        answer_rows > 1
+        or (answer_rows >= 1 and option_rows >= 1)
+        or text_before_option
+        or header_count > 1
+    )
+    # Structural, never from the footer: the footer switches to `Type to answer` only while the
+    # cursor sits on the text row, and moving onto `Skip` must keep the same card identity.
+    free_text_only = answer_rows > 0 and not options
+    if not (nav_rows or free_text_only):
+        return None
+    if not (options or free_text_only):
+        return None
+    if selected is None:
+        selected = 1
+    return {
+        "kind": "question",
+        "title": "Doubao Question",
+        "prompt": prompt_text,
+        "options": options,
+        "option_actions": [],
+        "actions": actions,
+        "action_decisions": action_decisions,
+        "nav_rows": nav_rows,
+        "selected_index": selected,
+        "other_option_index": other_index,
+        "multi_select": multi_select,
+        "multi_question": multi_question,
+        "free_text_only": free_text_only,
+        "checked_indices": checked_indices,
+        "esc_action": _doubao_esc_action(footer),
+        # Identity: the prompt, every row's label/description and its kind. The cursor, the
+        # checked marks, the typed text and the footer's `Type to answer` switch all move without
+        # changing which card this is.
+        "signature": _doubao_signature(
+            "question",
+            _doubao_collapsed(prompt_text),
+            [[row["kind"], _doubao_collapsed(row["detail"])] for row in nav_rows],
+            # Every later question's heading is part of the card's identity too.
+            [_doubao_collapsed(row) for row in interleaved],
+        ),
+        "doubao_prompt": "question",
+        "raw_options_count": len(options) - (1 if other_index else 0),
+    }
+
+
+def _doubao_esc_action(footer: str) -> str:
+    match = re.search(r"\bEsc\s+(stop|skip|back)\b", str(footer or ""), re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
+
+def _doubao_footer_kind(text: str) -> str:
+    """`confirm` / `question` / "" for one footer text (a joined wrapped footer included)."""
+    low = str(text or "").lower()
+    if "number to select" in low:
+        return ""
+    if (
+        ("↑↓" in text or "navigate" in low)
+        and ("enter / shortcut confirm" in low or "enter confirm" in low)
+        and "esc" in low
+        and "ctrl+s submit" not in low
+    ):
+        return "confirm"
+    if (
+        "ctrl+s submit" in low
+        and "esc" in low
+        and ("space/enter select" in low or "type to answer" in low or "↑↓ move" in low)
+    ):
+        return "question"
+    return ""
+
+
+def _doubao_footer(lines: List[str], active: List[int]) -> Tuple[Optional[int], str]:
+    """`(first row of the footer, joined footer text)` for the bottom of the active region.
+
+    Ink wraps the footer at narrow widths (`↑↓ navigate | Enter / shortcut confirm` /
+    `| Esc stop`), so the last 1..3 contiguous non-empty rows are joined; a blank row, a card row,
+    a rule, the idle composer or a row that is already a whole footer above them ends the footer.
+    """
+    indexes = [i for i in active if lines[i].strip()]
+    if not indexes:
+        return None, ""
+    end = len(indexes) - 1
+    start = end
+    while end - start + 1 < _DOUBAO_FOOTER_MAX_LINES and start - 1 >= 0:
+        previous = indexes[start - 1]
+        if indexes[start] - previous != 1:
+            break
+        text = lines[previous].strip()
+        if (
+            _RULE_ROW_RE.match(text)
+            or text[:1] in _CURSOR_GLYPHS
+            or _RADIO_MARK_RE.match(text)
+            or _CHECKBOX_MARK_RE.match(text)
+            or _doubao_confirm_row(text) is not None
+            or _doubao_action_decision(text) is not None
+            or DOUBAO_COMPOSER_PLACEHOLDER in text
+            or bool(_doubao_footer_kind(text))
+        ):
+            break
+        start -= 1
+    return indexes[start], " ".join(lines[i].strip() for i in indexes[start:end + 1])
+
+
+def _doubao_active_lines(lines: List[str]) -> List[int]:
+    """Rows below the newest `◆`/`▍` block: the region the CLI draws its live UI in."""
+    mask = _assistant_block_mask(lines)
+    last_content = max((i for i in range(len(lines)) if mask[i]), default=-1)
+    return [i for i in range(last_content + 1, len(lines)) if not mask[i]]
+
+
+def doubao_card_submitting(screen_text: str) -> bool:
+    """True while a card's busy footer (`Submitting, waiting for confirmation…`) is on screen.
+
+    The busy footer replaces the card's own footer, so the card no longer parses; it is still the
+    same card being closed by the CLI, never proof that the answer landed.
+    """
+    lines = [line.rstrip() for line in str(screen_text or "").splitlines()]
+    needle = DOUBAO_SUBMITTING_TEXT.lower()
+    return any(
+        needle in lines[i].lower() for i in _doubao_active_lines(lines)
+    )
+
+
+def doubao_has_idle_composer(screen_text: str) -> bool:
+    """True only when the LIVE region (below the last answer) draws the idle composer.
+
+    An answer that quotes `Ask Doubao to do anything` must not look like the composer: that phrase
+    above a live card is prose, not proof that the card is gone.
+    """
+    lines = [line.rstrip() for line in str(screen_text or "").splitlines()]
+    return any(
+        lines[i].strip()[:1] in _CURSOR_GLYPHS
+        and DOUBAO_COMPOSER_PLACEHOLDER in lines[i]
+        for i in _doubao_active_lines(lines)
+    )
+
+
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+# A row that starts a genuine top-level TUI region, so a `◆` block ends above it.
+_BLOCK_BOUNDARY_PREFIXES = (ASSISTANT_GLYPH, USER_GLYPH, TOOL_GLYPH, "❯", "›", ">")
+
+
+def _doubao_top_level_row(line: str) -> bool:
+    """A row the CLI draws as chrome around the conversation rather than inside an answer."""
+    text = line.strip()
+    return (
+        not text
+        or text.startswith(_BLOCK_BOUNDARY_PREFIXES)
+        or bool(_RULE_ROW_RE.match(line))
+        or _doubao_question_row(text)[0] is not None
+        or _doubao_confirm_row(text) is not None
+        or _doubao_action_decision(text) is not None
+        or bool(re.search(r"(?:↑↓.*Esc|Ctrl\+S submit|Enter / shortcut confirm)", text))
+        or DOUBAO_SUBMITTING_TEXT.lower() in text.lower()
+    )
+
+
 def _assistant_block_mask(lines: List[str]) -> List[bool]:
-    """True for rows that are `◆` assistant prose (the glyph row and its wrapped rows)."""
+    """True for rows that are `◆` assistant prose (the glyph row, its wrapped rows, its fences).
+
+    An answer may quote a whole card — rule, `❯ Allow once`, even its footer — and it may be
+    separated by a single blank line. Inside a Markdown code fence nothing is a boundary; outside
+    one, a real top-level row (`▍`, `◇`, `◆`, the composer cursor, a card row, a card footer, a
+    horizontal rule) ends the block. A card the CLI draws BELOW an answer therefore still parses:
+    its rows are outside every fence.
+    """
     mask = [False] * len(lines)
     index = 0
     while index < len(lines):
@@ -516,120 +1053,77 @@ def _assistant_block_mask(lines: List[str]) -> List[bool]:
             index += 1
             continue
         mask[index] = True
+        in_fence = False
         index += 1
         while index < len(lines):
             row = lines[index].strip()
-            if (
-                not row
-                or row.startswith((ASSISTANT_GLYPH, USER_GLYPH, TOOL_GLYPH, "❯", "›", ">"))
-                or _RULE_ROW_RE.match(lines[index])
-            ):
+            if _FENCE_RE.match(lines[index]):
+                in_fence = not in_fence
+                mask[index] = True
+                index += 1
+                continue
+            if in_fence:
+                mask[index] = True
+                index += 1
+                continue
+            if not row:
+                # One blank line inside a paragraph; a genuine boundary below still ends the block.
+                following = next(
+                    (lines[i] for i in range(index + 1, len(lines)) if lines[i].strip()), ""
+                )
+                mask[index] = True
+                index += 1
+                if not following or _doubao_top_level_row(following):
+                    break
+                continue
+            if _doubao_top_level_row(lines[index]):
                 break
             mask[index] = True
             index += 1
     return mask
 
 
-def _composer_rows(lines: List[str]) -> set:
-    """Indexes of the CLI's composer (the bottom `❯` row, or the row framed by rules).
-
-    A card's cursor row can start with `❯` too; it is kept when it is an option row and a card
-    footer sits under it. Everything else at the bottom is the input box, not card content.
-    """
-    prompt_rows = [i for i, row in enumerate(lines) if _DOUBAO_PROMPT_RE.match(row)]
-    excluded: set = set()
-    if not prompt_rows:
-        return excluded
-    last = prompt_rows[-1]
-    text = _DOUBAO_PROMPT_RE.match(lines[last]).group(1).strip()
-    below = [row.strip().lower() for row in lines[last + 1:] if row.strip()]
-    footer_below = any(hint in row for row in below for hint in _CARD_FOOTER_HINTS)
-    # An option row stays when the card continues under it (another numbered row or a footer);
-    # a lone `❯ 1. draft text` is the user's composer, not the card's first choice.
-    option_below = any(_DOUBAO_OPTION_RE.match(row) for row in lines[last + 1:])
-    is_card_row = bool(_DOUBAO_OPTION_RE.match(lines[last])) and (footer_below or option_below)
-    if not (text and is_card_row):
-        excluded.add(last)
-    # A composer framed by rules is the input box, never a card row.
-    if last > 0 and _RULE_ROW_RE.match(lines[last - 1]):
-        for index in range(last + 1, min(len(lines), last + 4)):
-            if _RULE_ROW_RE.match(lines[index]):
-                excluded.update(range(last - 1, index + 1))
-                break
-    return excluded
-
-
 def parse_doubao_prompt(screen_text: str) -> Optional[Dict[str, Any]]:
-    """An approval card or a numbered question card on a Doubao screen, else None.
+    """The live Ink card on a Doubao screen, or None.
 
-    Only the bottom active region counts: below the last `◆`/`▍` block and outside the composer.
-    Approval titles are the bundle's own, and a question needs a `?`/`？` prompt row plus a
-    numbered list whose cursor (`❯`/`›`) is drawn on an option row. A numbered list quoted inside
-    an assistant answer, or the idle composer's own `1. …` draft, is never taken for a card.
+    Verified against `doubao` 2.37.2 (`entry-cli-router/main.js`, module 5501): a real card ends
+    with its own footer row and replaces the composer while it is open —
+
+    - confirmation: `↑↓ navigate | Enter / shortcut confirm | Esc stop|skip|back`, options are the
+      server's unnumbered labels (`Allow once`, `Reject`, …) with the Ink cursor on one of them;
+    - question (`ask`): `Ctrl+S submit | Space/Enter select | ↑↓ move | Esc skip` (or
+      `Type to answer | Ctrl+S submit`), radio `( )`/`(●)` and checkbox `[ ]`/`[✓]` rows, then
+      `Submit` / `Skip` / `Reject and stop` action rows.
+
+    The footer must be the bottom row of the active region (below the last `◆`/`▍` block): a card
+    that scrolled above the idle composer, a half-drawn frame, assistant prose quoting a card and
+    the numbered `/permissions` menu all fail that anchor and return None. A footer Ink wrapped
+    over 2–3 rows at a narrow width is joined before it is matched.
     """
     if not str(screen_text or "").strip():
         return None
     lines = [line.rstrip() for line in str(screen_text).splitlines()]
     mask = _assistant_block_mask(lines)
-    composer = _composer_rows(lines)
     last_content = max((i for i in range(len(lines)) if mask[i]), default=-1)
-    scan = [
-        lines[i]
-        for i in range(last_content + 1, len(lines))
-        if not mask[i] and i not in composer
-    ]
-    title = ""
-    for row in scan:
-        for phrase in _DOUBAO_APPROVAL_TITLES:
-            if phrase in row:
-                title = phrase
-                break
-        if title:
-            break
-    options = _last_numbered_options(scan)
-    cursor_led = any(
-        _DOUBAO_OPTION_RE.match(row) and row.strip().startswith(("❯", "›")) for row in scan
+    active = [i for i in range(last_content + 1, len(lines)) if not mask[i]]
+    if not active:
+        return None
+    footer_line, footer = _doubao_footer(lines, active)
+    if footer_line is None:
+        return None
+    kind = _doubao_footer_kind(footer)
+    if not kind:
+        return None
+    if _doubao_permissions_menu([lines[i] for i in active]):
+        return None
+    rule_line = next(
+        (i for i in reversed(active) if i < footer_line and _RULE_ROW_RE.match(lines[i])), -1
     )
-    footer = any(
-        any(hint in row.strip().lower() for hint in _CARD_FOOTER_HINTS) for row in scan
-    )
-    if title:
-        # A quoted title in prose is not a card: a real card draws its cursor or a footer hint.
-        if not (cursor_led or footer):
+    if kind == "confirm":
+        if rule_line < 0:
             return None
-        labels = [item["label"] for item in options if item["label"].lower() != "submit"]
-        actions = [classify_doubao_option(label) for label in labels]
-        if not labels:
-            return None
-        return {
-            "kind": "approval_request",
-            "title": title,
-            "prompt": title,
-            "options": labels,
-            "option_actions": actions,
-            "doubao_prompt": "approval",
-        }
-    if not options:
-        return None
-    if not cursor_led:
-        return None
-    prompt = ""
-    for row in reversed(scan):
-        text = row.strip()
-        if text.endswith(("?", "？")) and not _is_chrome(row):
-            prompt = text
-            break
-    if not prompt:
-        return None
-    labels = [item["label"] for item in options]
-    return {
-        "kind": "question",
-        "title": "Doubao Question",
-        "prompt": prompt,
-        "options": labels,
-        "option_actions": [],
-        "raw_options_count": len(labels),
-    }
+        return _parse_doubao_confirm_card(lines, mask, rule_line, footer_line, footer)
+    return _parse_doubao_question_card(lines, mask, rule_line, footer_line, footer)
 
 
 def doubao_screen_reply_after_user_prompt(lines: Any) -> bool:

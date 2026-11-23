@@ -49,7 +49,9 @@ from doubao_session_record import (
     DOUBAO_COMPOSER_PLACEHOLDER,
     classify_doubao_option,
     detect_doubao_error,
+    doubao_card_submitting,
     doubao_data_root,
+    doubao_has_idle_composer,
     export_doubao_session,
     extract_doubao_screen_reply,
     find_doubao_session_by_marker,
@@ -880,6 +882,21 @@ DOUBAO_EXPORT_PROBE_SEC = 3.0
 # The marker scan only has to catch the first turn's `assignment.md`; after this window the screen
 # banner/`/status` (and the resume ref) are the remaining sources.
 DOUBAO_DISCOVERY_WINDOW_SEC = 300.0
+# Ink drops key input for 400 ms after it paints a card (`Date.now() + 400` in module 5501); the
+# hub waits this long before the first key so an arrow or Enter is never lost.
+DOUBAO_PROMPT_KEY_GUARD_SEC = 0.55
+# An unanswered card the user dismissed in the console/terminal is cleared only after this long
+# without a repaint; the idle composer returning clears it at once.
+DOUBAO_CARD_DISAPPEAR_GRACE_SEC = 1.0
+# One arrow step per option row, with a pause so Ink repaints the cursor before the next read.
+DOUBAO_ARROW_STEP_DELAY_SEC = 0.08
+# A card whose answer was sent but never natively confirmed cannot wedge the parent forever: after
+# this long with the same card still drawn (and no busy footer) the interaction is dropped and the
+# live card is registered again under a brand-new request id, never the old one.
+DOUBAO_UNCONFIRMED_TIMEOUT_SEC = 15.0
+# The states in which a prompt already has an answer in flight: a second respond call must not
+# write another keystroke, and the parent must not be asked again.
+APPROVAL_ANSWERED_STATES = ("sending", "sent", "unconfirmed", "confirmed")
 # K1 (fix 9): a banner that never shows (a kimi update that changes the text) must not hang the
 # spawn: this long after the trust dialog was answered (or after spawn without one) the gate falls
 # back to composer + busy + stable, with a warning in the log. The fallback always leaves the
@@ -1768,6 +1785,22 @@ def classify_approval_label(label: str) -> str:
     return "approve_once"
 
 
+def _normalized_approval_action(action: str, label: str) -> str:
+    """The action a row really performs once its never-sent variants are folded in.
+
+    A permanent rule is the owner's call, never a sub-agent approval, so a persisting row is never
+    sent as itself: a persisting allow becomes `approve_once`, a persisting deny becomes `deny`
+    (round 3). `deny_session` is not offered either; a caller naming it gets a plain deny. Both the
+    conflict check and the chosen row go through this one mapping.
+    """
+    if action == "persist":
+        low = str(label or "").strip().lower()
+        return "deny" if low.startswith(("no", "deny", "reject")) else "approve_once"
+    if action == "deny_session":
+        return "deny"
+    return action
+
+
 def _numbered_options(lines: List[str]) -> List[Dict[str, Any]]:
     """The last block of `N. label` lines; a wrapped label's continuation lines are joined to it."""
     blocks: List[List[Dict[str, Any]]] = []
@@ -2373,6 +2406,15 @@ def _one_line(text: Optional[str]) -> str:
     return re.sub(r"[\r\n]+", " ", str(text or "")).strip()
 
 
+def _doubao_text_answer(text: Optional[str]) -> str:
+    """One sanitized line for a Doubao card's text row.
+
+    Every C0 byte and DEL becomes a space: `\\x13` would submit the card and `\\x1b` would skip it,
+    so neither (nor a newline) may ride along inside the parent's text.
+    """
+    return re.sub(r"[\x00-\x1f\x7f]", " ", _one_line(text)).strip()
+
+
 OSC_TERMINAL_REPLY_RE = re.compile(r"\x1b\](?:4;\d+|1[0-9]|52|1[01]\d);[^\x07\x1b]*(?:\x07|\x1b\\)")
 NPM_CMD_SHIM_JS_RE = re.compile(r'"%(?:~dp0|dp0%)\\([^"]+?\.m?c?js)"\s+%\*', re.IGNORECASE)
 
@@ -2648,6 +2690,15 @@ class AgentSession:
         # seeding call succeeded), not just the default 0 of a session that never exported.
         self._doubao_export_rows: int = 0
         self._doubao_export_baseline_known: bool = False
+        # doubao cards: transient observations keyed by request id, never persisted into the
+        # interaction's metadata (a stale value there would follow the card into the archive and
+        # into a replacement card's dict). `absent_since` is when the card last failed to draw,
+        # `replaced_count` counts consecutive different-card observations, `unconfirmed_since` is
+        # when an answer was sent without native confirmation (the escape hatch in
+        # `_refresh_doubao_prompt_state`).
+        self._doubao_absent_since: Dict[str, float] = {}
+        self._doubao_replaced_count: Dict[str, int] = {}
+        self._doubao_unconfirmed_since: Dict[str, float] = {}
         self.trust_auto_dismiss_exhausted: bool = False
         # D7: the last screen-detected interaction no machine record has adopted yet, and the
         # moment until which the screen detector leaves a just-answered prompt alone.
@@ -3589,7 +3640,7 @@ class HubSessionManager:
             return False
         inter = sess.pending_interaction
         if inter and request_id in self._interaction_ids(inter):
-            return (inter.get("metadata") or {}).get("response_state") not in ("sent", "unconfirmed")
+            return (inter.get("metadata") or {}).get("response_state") not in APPROVAL_ANSWERED_STATES
         entry = self.pending_questions.get(request_id)
         return bool(entry and not entry.get("answered") and sess.pending_question_id == request_id)
 
@@ -8398,20 +8449,15 @@ class HubSessionManager:
         if len(known) != len(options):
             known = []
 
-        def action_of(idx: int) -> str:
+        def raw_action(idx: int) -> str:
             return str(known[idx]) if known else classify_approval_label(options[idx])
+
+        def action_of(idx: int) -> str:
+            return _normalized_approval_action(raw_action(idx), options[idx])
 
         def by_label(idx: int, with_feedback: bool) -> tuple:
             label = options[idx]
             action = action_of(idx)
-            if action == "persist":
-                # Never sent: a permanent rule is the owner's call, not a sub-agent approval.
-                # Round 3: agy also has persisting deny options; those fall back to a plain deny.
-                low = str(label or "").strip().lower()
-                action = "deny" if low.startswith(("no", "deny", "reject")) else "approve_once"
-            elif action == "deny_session":
-                # Not offered (round 3); a plain deny if a caller names it anyway.
-                action = "deny"
             if action == "deny" and with_feedback and feedback:
                 action = "deny_feedback"
             if action == "deny_feedback" and not (with_feedback and feedback):
@@ -8421,13 +8467,33 @@ class HubSessionManager:
         def label_for(action: str) -> str:
             want = "deny" if action == "deny_feedback" else action
             for i, opt in enumerate(options):
-                if action_of(i) == want:
+                if raw_action(i) == want:
                     return opt
             return action
 
         idx = option_index
         if idx is None and dec_norm.isdigit():
             idx = int(dec_norm)
+        if dec_norm and dec_norm in APPROVAL_DENY_DECISIONS:
+            # A deny that names an allowing row would approve the very call it refuses: the two
+            # parameters disagree and neither may win silently.
+            if idx is not None and 1 <= int(idx) <= len(options) and action_of(int(idx) - 1) not in (
+                "deny",
+                "deny_feedback",
+            ):
+                raise ValueError(
+                    "冲突的审批参数：decision=deny 不能与允许类 option_index 同时使用"
+                )
+        elif dec_norm and (
+            dec_norm in APPROVAL_APPROVE_DECISIONS or dec_norm in APPROVAL_SESSION_DECISIONS
+        ):
+            if idx is not None and 1 <= int(idx) <= len(options) and action_of(int(idx) - 1) in (
+                "deny",
+                "deny_feedback",
+            ):
+                raise ValueError(
+                    "冲突的审批参数：允许类 decision 不能与拒绝类 option_index 同时使用"
+                )
         if idx is not None:
             if not 1 <= int(idx) <= len(options):
                 raise ValueError(f"option_index 超出范围：可选 1..{len(options)}")
@@ -8613,6 +8679,454 @@ class HubSessionManager:
             trace += f" + feedback as next message {feedback!r}"
         return trace, note, downgraded
 
+    @staticmethod
+    def _claim_doubao_send(inter: Dict[str, Any]) -> Dict[str, Any]:
+        """Claim a Doubao card for this call: `response_state="sending"` on the LIVE interaction.
+
+        Runs with no `await` between the check and the write, so two concurrent responses (identical
+        or conflicting) can never both reach the PTY. Returns the metadata dict the answer writes
+        `sent`/`unconfirmed` into. A failure before any confirming keystroke pops the claim again.
+        """
+        meta = inter.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            inter["metadata"] = meta
+        if meta.get("response_state") in APPROVAL_ANSWERED_STATES:
+            raise ValueError("该请求已发送回应，正在等待原生确认；不会重复发送按键")
+        meta["response_state"] = "sending"
+        return meta
+
+    def _read_doubao_card(self, sess: AgentSession) -> Optional[Dict[str, Any]]:
+        """The card the CLI draws right now, or None when the active region has no card footer."""
+        screen = sess.read_screen(max_lines=max(38, int(getattr(sess, "rows", 38) or 38))).text
+        if not screen.strip():
+            return None
+        return parse_doubao_prompt(screen)
+
+    def _read_doubao_card_if(self, sess: AgentSession, signature: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The live card only when it is still the registered one (signature identity)."""
+        parsed = self._read_doubao_card(sess)
+        if parsed is None or not signature or parsed.get("signature") != signature:
+            return None
+        return parsed
+
+    async def _await_doubao_card(
+        self, sess: AgentSession, signature: str, timeout: float, target: Optional[int] = None
+    ) -> tuple:
+        """Poll until the card shows `target` on its cursor; ("gone"/"replaced"/"stale") otherwise."""
+        deadline = time.monotonic() + timeout
+        while True:
+            parsed = self._read_doubao_card(sess)
+            if parsed is None:
+                return None, "gone"
+            if parsed.get("signature") != signature:
+                return parsed, "replaced"
+            if target is None or parsed.get("selected_index") == target:
+                return parsed, "ok"
+            if time.monotonic() >= deadline:
+                return parsed, "stale"
+            await asyncio.sleep(0.05)
+
+    async def _navigate_doubao_cursor(
+        self, sess: AgentSession, signature: str, target_idx: int
+    ) -> Dict[str, Any]:
+        """Move Ink's cursor to `target_idx` with relative arrows, verified against the screen.
+
+        Ink clamps at both ends, so exact relative steps are safe; Enter is only ever sent after the
+        live parse shows the cursor on the target row (a stray Enter would approve row 1).
+        """
+        parsed = self._read_doubao_card_if(sess, signature)
+        if parsed is None:
+            raise ValueError("豆包卡片在导航期间已关闭或变化；未发送确认回车")
+        for _attempt in range(2):
+            current = parsed.get("selected_index")
+            if current == target_idx:
+                return parsed
+            if not isinstance(current, int):
+                raise ValueError("豆包卡片没有可用的光标；未发送按键")
+            step = "\x1b[B" if target_idx > current else "\x1b[A"
+            for _ in range(abs(target_idx - current)):
+                sess.write_input(step)
+                await asyncio.sleep(DOUBAO_ARROW_STEP_DELAY_SEC)
+            parsed, state = await self._await_doubao_card(sess, signature, 0.45, target_idx)
+            if state in ("gone", "replaced"):
+                raise ValueError("豆包卡片在导航期间已关闭或变化；未发送确认回车")
+        if parsed.get("selected_index") != target_idx:
+            raise ValueError("豆包卡片光标未能移动到目标选项；已中止发送回车以防误操作")
+        return parsed
+
+    async def _doubao_await_clear(
+        self, sess: AgentSession, inter: Dict[str, Any], timeout: float = 0.6
+    ) -> bool:
+        """Post-send proof: THE card that was answered left the screen.
+
+        The session's pending interaction is compared by identity: a card the user replaced while
+        the CLI was closing the old one is a different dict, and this answer is done either way —
+        the replacement's own metadata is never touched.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            await asyncio.sleep(0.15)
+            if sess.pending_interaction is not inter:
+                return True
+            await self._refresh_doubao_prompt_state(sess)
+            if sess.pending_interaction is not inter:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+
+    async def _answer_doubao_interaction(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        decision: str,
+        approval_action: Optional[str],
+        chosen_index: Optional[int],
+        chosen_label: str,
+        custom_input: Optional[str],
+        explicit_option_index: Optional[int] = None,
+    ) -> tuple:
+        """Answer one Doubao Ink card, verified live (bundle 2.37.2, module 5501).
+
+        Ink ignores keys for 400 ms after painting a card, digits are a no-op on the real cards,
+        and Enter confirms whatever row the cursor sits on. So: re-read the card, wait out the
+        guard, move the cursor with relative arrows, prove the cursor arrived, and only then press
+        Enter (confirmation card) or Enter + `Ctrl+S` (question card). `Always allow` persists a
+        global allow rule and is never auto-selected. A card that changed or closed sends nothing.
+
+        The caller has already claimed the card (`response_state="sending"`). If anything fails
+        before the first confirming keystroke (`\\r`, `\\x13`, `\\x1b`), the claim is released so the
+        parent can retry cleanly; once a key went out the state stays `sent`.
+        """
+        signature = str(meta.get("prompt_signature") or "")
+        try:
+            if not signature:
+                raise ValueError("豆包卡片缺少签名；未发送按键")
+            parsed = await self._read_doubao_card_if_retry(sess, signature)
+            if parsed is None:
+                raise ValueError("豆包卡片已关闭或变化；未发送按键")
+            created = float(inter.get("created_at") or 0.0)
+            remaining = DOUBAO_PROMPT_KEY_GUARD_SEC - (time.time() - created) if created else 0.0
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                parsed = self._read_doubao_card_if(sess, signature)
+                if parsed is None:
+                    raise ValueError("豆包卡片在输入保护期内已关闭或变化；未发送按键")
+            notes: List[str] = []
+            text = _doubao_text_answer(custom_input)
+            return await self._answer_doubao_card(
+                sess, inter, meta, signature, parsed, decision, approval_action,
+                chosen_index, chosen_label, text, explicit_option_index, notes,
+            )
+        except BaseException:
+            if meta.get("response_state") == "sending":
+                meta.pop("response_state", None)
+            raise
+
+    async def _answer_doubao_card(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        signature: str,
+        parsed: Dict[str, Any],
+        decision: str,
+        approval_action: Optional[str],
+        chosen_index: Optional[int],
+        chosen_label: str,
+        text: str,
+        explicit_option_index: Optional[int],
+        notes: List[str],
+    ) -> tuple:
+        if parsed.get("kind") == "approval_request":
+            options = list(parsed.get("options") or [])
+            actions = list(parsed.get("option_actions") or [])
+            if len(actions) != len(options):
+                actions = [classify_doubao_option(label) for label in options]
+
+            def index_of(action: str) -> Optional[int]:
+                for i, act in enumerate(actions):
+                    if act == action:
+                        return i + 1
+                return None
+
+            target: Optional[int] = (
+                chosen_index if isinstance(chosen_index, int) and 1 <= chosen_index <= len(options) else None
+            )
+            if target is not None and actions[target - 1] == "persist":
+                notes.append(
+                    "豆包的「Always allow / 允许所有」会写入全局账号授权，绝不自动选择；"
+                    "本次按「允许一次」处理"
+                )
+                target = None
+                approval_action = "approve_once"
+            if target is not None:
+                approval_action = actions[target - 1]
+                chosen_label = options[target - 1]
+            if target is None:
+                if approval_action == "approve_session":
+                    target = index_of("approve_session")
+                    if target is None:
+                        target = index_of("approve_once")
+                        approval_action = "approve_once"
+                        notes.append("豆包卡片没有「允许类似操作」选项，已降级为「允许一次」")
+                    else:
+                        notes.append("豆包的「允许类似操作」覆盖同类操作，并不等于允许所有操作")
+                elif approval_action == "deny_feedback":
+                    target = index_of("deny_feedback") or index_of("deny")
+                    notes.append(
+                        "豆包确认卡不接受内联拒绝反馈；已选择拒绝，反馈请另用 send_to_subagent 发送"
+                    )
+                elif approval_action == "deny":
+                    target = index_of("deny") or index_of("deny_feedback")
+                elif approval_action == "approve_once":
+                    target = index_of("approve_once")
+                    if target is None:
+                        raise ValueError("当前豆包确认卡没有可用的允许选项；未发送按键")
+            if target is None:
+                # No Reject row (or a deny the card cannot express): the footer's own Esc stops it.
+                meta["response_state"] = "sent"
+                sess.write_input("\x1b")
+                chosen_label = "Esc"
+                return await self._finish_doubao_answer(
+                    sess, inter, notes, "Doubao confirmation Esc (deny)", None, chosen_label,
+                    approval_action,
+                )
+            chosen_label = options[target - 1]
+            approval_action = actions[target - 1]
+            await self._navigate_doubao_cursor(sess, signature, target)
+            meta["response_state"] = "sent"
+            sess.write_input("\r")
+            trace = f"Doubao confirmation cursor -> {chosen_label} + Enter"
+            return await self._finish_doubao_answer(
+                sess, inter, notes, trace, target, chosen_label, approval_action
+            )
+
+        # ── Question card (`ask`): radio/checkbox rows + Submit/Skip actions, Ctrl+S submits ──
+        nav_rows = list(parsed.get("nav_rows") or [])
+        if not nav_rows:
+            raise ValueError("豆包问题卡片没有可读的行；未发送按键")
+        if explicit_option_index is not None and not (
+            1 <= int(explicit_option_index) <= len(nav_rows)
+        ):
+            # Never fall back to row 1: that would answer a question nobody chose.
+            raise ValueError(f"option_index 超出范围：可选 1..{len(nav_rows)}")
+        denied = decision in APPROVAL_DENY_DECISIONS or decision in ("skip", "cancel")
+        if denied:
+            # A deny answers the card itself (Esc/Skip), never the `Other:` text row.
+            if text:
+                notes.append("decision 为拒绝/跳过：custom_input 未发送")
+            return await self._doubao_skip_question(sess, inter, meta, parsed, signature, notes)
+        if parsed.get("multi_question"):
+            raise ValueError(
+                "豆包多问题/混合卡片暂不支持自动填写，请在终端直接回答或发送 deny 跳过"
+            )
+
+        target = int(explicit_option_index) if explicit_option_index is not None else None
+        if target is None and text:
+            # `custom_input` alone answers the card's own text row (`Other:` / `Answer:`).
+            target = next(
+                (i + 1 for i, row in enumerate(nav_rows) if row.get("kind") == "text"), None
+            )
+            if target is not None:
+                return await self._doubao_type_answer(
+                    sess, inter, meta, signature, notes, target, text
+                )
+        if target is None and isinstance(chosen_index, int) and 1 <= chosen_index <= len(nav_rows):
+            target = chosen_index
+        if target is None and chosen_label:
+            low = str(chosen_label).strip().lower()
+            target = next(
+                (
+                    i + 1
+                    for i, row in enumerate(nav_rows)
+                    if str(row.get("label") or "").strip().lower() == low
+                ),
+                None,
+            )
+        if target is None:
+            raise ValueError("豆包问题卡片没有可选的答案行；未发送按键")
+        row = nav_rows[target - 1]
+        label = str(row.get("label") or "")
+        if row.get("kind") == "text":
+            if not text:
+                raise ValueError("选择 Other 选项时必须提供 custom_input")
+            return await self._doubao_type_answer(
+                sess, inter, meta, signature, notes, target, text
+            )
+        if row.get("kind") == "option" and text:
+            notes.append("custom_input 已忽略：所选的是选项而不是文本行")
+        if row.get("kind") == "option":
+            return await self._doubao_select_option(
+                sess, inter, meta, signature, notes, parsed, target, label
+            )
+        # An action row (`Submit` / `Skip` / `Reject and stop`): Enter runs it, no Ctrl+S.
+        await self._navigate_doubao_cursor(sess, signature, target)
+        meta["response_state"] = "sent"
+        sess.write_input("\r")
+        return await self._finish_doubao_answer(
+            sess, inter, notes, f"Doubao question action {target} ({label}) + Enter",
+            target, label, None,
+        )
+
+    async def _doubao_skip_question(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        parsed: Dict[str, Any],
+        signature: str,
+        notes: List[str],
+    ) -> tuple:
+        """Reject a question card: Esc when the footer's Esc skips, else the card's own Skip row."""
+        esc_action = str(parsed.get("esc_action") or "")
+        nav_rows = list(parsed.get("nav_rows") or [])
+        skip_index = next(
+            (i + 1 for i, row in enumerate(nav_rows) if row.get("decision") == "skip"), None
+        )
+        if esc_action != "skip" and skip_index is not None:
+            await self._navigate_doubao_cursor(sess, signature, skip_index)
+            meta["response_state"] = "sent"
+            sess.write_input("\r")
+            return await self._finish_doubao_answer(
+                sess, inter, notes, "Doubao question cursor -> Skip + Enter", skip_index, "Skip", None
+            )
+        meta["response_state"] = "sent"
+        sess.write_input("\x1b")
+        return await self._finish_doubao_answer(
+            sess, inter, notes, f"Doubao question Esc ({esc_action or 'stop'})", None,
+            f"Esc {esc_action}".strip(), None,
+        )
+
+    async def _doubao_type_answer(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        signature: str,
+        notes: List[str],
+        target: int,
+        text: str,
+    ) -> tuple:
+        """Type into the card's `Other:`/`Answer:` row and submit it with Ctrl+S.
+
+        `Ctrl+U` is the renderer's own clear (`i.ctrl && "u" === t → a.replace(0, a.chars.length)`),
+        so a row that already carries text (`Other: old`) is emptied before the new text, never
+        appended to. The card is re-read after typing and again just before `Ctrl+S`.
+        """
+        await self._navigate_doubao_cursor(sess, signature, target)
+        if self._read_doubao_card_if(sess, signature) is None:
+            raise ValueError("豆包卡片在填写期间已关闭或变化；未发送文本")
+        sess.write_input("\x15")
+        await asyncio.sleep(DOUBAO_ARROW_STEP_DELAY_SEC)
+        sess.write_input(text)
+        await asyncio.sleep(DOUBAO_ARROW_STEP_DELAY_SEC)
+        if self._read_doubao_card_if(sess, signature) is None:
+            raise ValueError("豆包卡片在提交前已关闭或变化；未发送 Ctrl+S")
+        meta["response_state"] = "sent"
+        sess.write_input("\x13")
+        return await self._finish_doubao_answer(
+            sess, inter, notes, f"Doubao question text {text!r} + Ctrl+S", target, text, None
+        )
+
+    async def _doubao_select_option(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        meta: Dict[str, Any],
+        signature: str,
+        notes: List[str],
+        parsed: Dict[str, Any],
+        target: int,
+        label: str,
+    ) -> tuple:
+        """Select one radio/checkbox row, prove it is checked, then submit with Ctrl+S."""
+        checked_before = [int(i) for i in parsed.get("checked_indices") or []]
+        await self._navigate_doubao_cursor(sess, signature, target)
+        already = bool(parsed.get("multi_select")) and target in checked_before
+        if already:
+            # The row is checked: a second Enter would toggle the choice OFF on a multi-select.
+            if self._read_doubao_card_if(sess, signature) is None:
+                raise ValueError("豆包卡片在选择期间已关闭或变化；未发送 Ctrl+S")
+            meta["response_state"] = "sent"
+            sess.write_input("\x13")
+            return await self._finish_doubao_answer(
+                sess, inter, notes,
+                f"Doubao question option {target} ({label}) already checked + Ctrl+S",
+                target, label, None,
+            )
+        meta["response_state"] = "sent"
+        await self._doubao_press_option(sess, signature, target)
+        if self._read_doubao_card_if(sess, signature) is None:
+            # The card left the screen while the row was being selected: nothing is left to submit.
+            return await self._finish_doubao_answer(
+                sess, inter, notes, f"Doubao question option {target} ({label}) + Enter",
+                target, label, None,
+            )
+        sess.write_input("\x13")
+        return await self._finish_doubao_answer(
+            sess, inter, notes, f"Doubao question option {target} ({label}) + Enter + Ctrl+S",
+            target, label, None,
+        )
+
+    async def _doubao_press_option(
+        self, sess: AgentSession, signature: str, target: int
+    ) -> None:
+        """Enter on one option row, proved by the row's own checked mark (retried once if dropped).
+
+        Enter either selects the row or, on a multi-select card, toggles it — so a second press is
+        only ever sent while the row is still provably unchecked.
+        """
+        for _attempt in range(2):
+            sess.write_input("\r")
+            deadline = time.monotonic() + 0.35
+            while True:
+                live = self._read_doubao_card_if(sess, signature)
+                if live is None:
+                    return
+                if target in [int(i) for i in live.get("checked_indices") or []]:
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.05)
+        raise ValueError("豆包卡片没有确认选项已选中；未发送 Ctrl+S")
+
+    async def _read_doubao_card_if_retry(self, sess: AgentSession, signature: str) -> Optional[Dict[str, Any]]:
+        """The registered card, retried once after 0.15 s in case the read caught a mid-redraw."""
+        parsed = self._read_doubao_card_if(sess, signature)
+        if parsed is None:
+            await asyncio.sleep(0.15)
+            parsed = self._read_doubao_card_if(sess, signature)
+        return parsed
+
+    async def _finish_doubao_answer(
+        self,
+        sess: AgentSession,
+        inter: Dict[str, Any],
+        notes: List[str],
+        trace: str,
+        chosen_index: Optional[int],
+        chosen_label: str,
+        approval_action: Optional[str],
+    ) -> tuple:
+        rid = str(inter.get("request_id") or "")
+        cleared = await self._doubao_await_clear(sess, inter)
+        if cleared:
+            # Either the CLI closed the card, or the user replaced it with a new one: this answer
+            # is done. The replacement (if any) keeps its own metadata, untouched.
+            sess._doubao_unconfirmed_since.pop(rid, None)
+            return trace, notes, "confirmed", chosen_index, chosen_label, approval_action
+        if sess.pending_interaction is inter:
+            meta = inter.get("metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+                inter["metadata"] = meta
+            meta["response_state"] = "unconfirmed"
+            sess._doubao_unconfirmed_since[rid] = time.monotonic()
+            notes.append("输入已送达，豆包卡片关闭确认将由后台轮询完成；不会自动重发")
+        return trace, notes, "unconfirmed", chosen_index, chosen_label, approval_action
+
     async def _deliver_deny_feedback(self, session_id: str, text: str) -> None:
         """D7 (agy, claude, codex): the feedback of a deny, typed as the next message once the prompt
         has closed.
@@ -8664,7 +9178,7 @@ class HubSessionManager:
             raise ValueError("没有待处理的审批或选择请求；未发送按键")
         if request_id and request_id not in self._interaction_ids(inter):
             raise ValueError("request_id 已过期或不匹配当前请求；未发送按键")
-        if (inter.get("metadata") or {}).get("response_state") in ("sent", "unconfirmed"):
+        if (inter.get("metadata") or {}).get("response_state") in APPROVAL_ANSWERED_STATES:
             raise ValueError("该请求已发送回应，正在等待原生确认；不会重复发送按键")
         target_qid = request_id or inter.get("request_id") or sess.pending_question_id
         q_entry = self.pending_questions.get(target_qid) if target_qid else None
@@ -8989,68 +9503,23 @@ class HubSessionManager:
                     action_trace = f"Claude AskUserQuestion option key {key_num!r} ({chosen_label}) + '\\r'"
                 delivered = True
 
-        # ── Engine 6: Doubao CLI (approval cards & numbered question cards) ─────────────────
+        # ── Engine 6: Doubao CLI Ink cards (confirm / ask, module 5501 of the bundle) ────────
         elif eng == "doubao":
-            if kind == "approval_request":
-                # The key is the chosen option's own 1-based index on THIS card, never a fixed
-                # "1..4" table: a 2-option card's Abort may be 2, a reordered card may put Reject
-                # first. The detector's `option_actions` says what each drawn row does.
-                labels = list(options)
-                actions = list(meta.get("option_actions") or [])
-                if len(actions) != len(labels):
-                    actions = [classify_doubao_option(label) for label in labels]
-
-                def index_of(action: str) -> Optional[int]:
-                    for i, act in enumerate(actions):
-                        if act == action:
-                            return i + 1
-                    return None
-
-                key_idx: Optional[int] = chosen_idx_1based
-                if key_idx is not None and not 1 <= key_idx <= len(labels):
-                    key_idx = None
-                if key_idx is None and (
-                    approval_action == "approve_session" and index_of("approve_session") is None
-                ):
-                    # Never press the Abort row for a session approval the card does not offer.
-                    notes.append("豆包卡片没有「允许类似/允许所有」选项，已降级为「允许一次」")
-                    approval_action = "approve_once"
-                if key_idx is None and (
-                    approval_action == "deny_feedback" and index_of("deny_feedback") is None
-                ):
-                    notes.append("豆包卡片没有「拒绝并停止」选项；只选择了拒绝，反馈未写入")
-                    if index_of("deny") is not None:
-                        approval_action = "deny"
-                if key_idx is None and approval_action:
-                    key_idx = index_of(approval_action)
-                if key_idx is None and chosen_label:
-                    low = str(chosen_label).strip().lower()
-                    for i, label in enumerate(labels):
-                        if label.strip().lower() == low:
-                            key_idx = i + 1
-                            break
-                if key_idx is None:
-                    key_idx = max(1, len(labels))
-                if 1 <= key_idx <= len(labels):
-                    chosen_label = labels[key_idx - 1]
-                chosen_idx_1based = key_idx
-                key = str(key_idx)
-                self._write_keys_scheduled(sess, loop, [(0.0, key), (0.18, "\r")])
-                action_trace = f"Doubao approval key {key!r} ({chosen_label}) + '\\r'"
-                if approval_action == "approve_session":
-                    notes.append("豆包的「允许类似操作」覆盖同类操作，并不等于允许所有操作")
-                elif approval_action == "deny_feedback":
-                    notes.append("豆包卡片没有拒绝反馈输入；只选择了「拒绝并停止」，未追加反馈")
-                delivered = True
-            else:
-                if custom_input and option_index is None:
-                    self._write_keys_scheduled(sess, loop, [(0.0, custom_input.strip() + "\r")])
-                    action_trace = f"Doubao question text {custom_input.strip()!r} + '\\r'"
-                else:
-                    key = str(chosen_idx_1based or 1)
-                    self._write_keys_scheduled(sess, loop, [(0.0, key), (0.18, "\r")])
-                    action_trace = f"Doubao question key {key!r} ({chosen_label}) + '\\r'"
-                delivered = True
+            # Ink drops keys for 400 ms after paint, digits are a no-op on real cards, and Enter
+            # confirms the highlighted row: keys are only sent after the live card was re-read,
+            # the target row was reached (cursor verified), and the card identity matched.
+            # The claim is the check-and-write of one uninterrupted step of the event loop, so two
+            # concurrent calls can never both send keys.
+            meta = self._claim_doubao_send(inter)
+            action_trace, doubao_notes, response_state, chosen_idx_1based, chosen_label, approval_action = (
+                await self._answer_doubao_interaction(
+                    sess, inter, meta, decision=dec_norm, approval_action=approval_action,
+                    chosen_index=chosen_idx_1based, chosen_label=chosen_label, custom_input=custom_input,
+                    explicit_option_index=option_index,
+                )
+            )
+            notes.extend(doubao_notes)
+            delivered = True
 
         # ── Generic / Fallback TUI ─────────────────────────────────
         else:
@@ -14497,6 +14966,119 @@ class HubSessionManager:
         else:
             meta.pop("absent_since", None)
 
+    @staticmethod
+    def _forget_doubao_card_state(session: AgentSession, request_id: str) -> None:
+        """Drop the in-memory observations of one card (never persisted in its metadata)."""
+        for store in (
+            session._doubao_absent_since,
+            session._doubao_replaced_count,
+            session._doubao_unconfirmed_since,
+        ):
+            store.pop(request_id, None)
+
+    async def _doubao_unconfirmed_timeout(self, session: AgentSession, request_id: str) -> bool:
+        """`True` once an answered card has stayed drawn past `DOUBAO_UNCONFIRMED_TIMEOUT_SEC`.
+
+        The CLI redraws `Submitting, waiting for confirmation…` while it closes an answered card;
+        a footer that never goes away would otherwise keep the interaction `unconfirmed` forever.
+        The still-live card is handed back to the parent as a NEW request (the old id is never
+        repeated), so the session is never permanently wedged.
+        """
+        since = session._doubao_unconfirmed_since.setdefault(request_id, time.monotonic())
+        if time.monotonic() - since < DOUBAO_UNCONFIRMED_TIMEOUT_SEC:
+            return False
+        await self._add_transcript_message(
+            session.session_id,
+            session.step_count,
+            "[Doubao prompt response unconfirmed timeout; re-opening live card for parent]",
+            source="parent_approval_proxy",
+        )
+        await self.clear_pending_interaction(session, request_id)
+        self._forget_doubao_card_state(session, request_id)
+        session._prompt_quiet_until = 0.0
+        session._seen_tui_prompt_signatures.clear()
+        return True
+
+    async def _refresh_doubao_prompt_state(self, session: AgentSession) -> None:
+        """Reconcile a registered Doubao card with the screen the CLI actually draws now.
+
+        The CLI has no resolved event for a card, and a user can dismiss one directly in the
+        terminal, so the screen is the only evidence: the same signature keeps the request pending
+        (with a fresh cursor), a different card or the idle composer proves the old one is gone, and
+        a vanished card is confirmed after a short grace. Nothing is ever re-sent from here.
+
+        A card that stays drawn after an answer is not proof that the answer failed: the CLI draws
+        `Submitting, waiting for confirmation…` while it closes it. If that footer never goes away,
+        `DOUBAO_UNCONFIRMED_TIMEOUT_SEC` hands the still-live card back to the parent as a NEW
+        request (the old id is never repeated). Every observation lives on the session, keyed by
+        request id — never inside the interaction's persisted metadata.
+        """
+        inter = session.pending_interaction
+        if not inter:
+            return
+        meta = inter.get("metadata") or {}
+        if meta.get("doubao_prompt") is None:
+            return
+        state = meta.get("response_state")
+        if state == "sending":
+            # This session is answering the card right now; only the answer itself may change it.
+            return
+        rid = str(inter.get("request_id") or "")
+        screen = session.read_screen(max_lines=max(38, int(getattr(session, "rows", 38) or 38))).text
+        if not screen.strip():
+            return
+        parsed = parse_doubao_prompt(screen)
+        same = parsed is not None and parsed.get("signature") == meta.get("prompt_signature")
+        if same:
+            session._doubao_absent_since.pop(rid, None)
+            session._doubao_replaced_count.pop(rid, None)
+            meta["selected_index"] = parsed.get("selected_index")
+            meta["checked_indices"] = list(parsed.get("checked_indices") or [])
+            if state in ("sent", "unconfirmed"):
+                # The clock runs with or without the busy footer, so even a permanently wedged
+                # `Submitting, waiting for confirmation…` expires instead of pinning the session.
+                await self._doubao_unconfirmed_timeout(session, rid)
+            return
+        if state in ("sent", "unconfirmed") and doubao_card_submitting(screen):
+            # In flight: the busy footer replaced the card's own footer, so it no longer parses.
+            session._doubao_absent_since.pop(rid, None)
+            await self._doubao_unconfirmed_timeout(session, rid)
+            return
+        now = time.monotonic()
+        replaced = parsed is not None
+        idle_composer = doubao_has_idle_composer(screen)
+        if not (replaced or idle_composer):
+            absent_since = session._doubao_absent_since.setdefault(rid, now)
+            grace = (
+                0.15 if state in ("sent", "unconfirmed") else DOUBAO_CARD_DISAPPEAR_GRACE_SEC
+            )
+            if now - absent_since < grace:
+                return
+        elif replaced and not idle_composer and state not in ("sent", "unconfirmed"):
+            # A different card took an UNANSWERED card's place: two consecutive observations, so a
+            # single mid-redraw frame cannot drop a request the parent is about to answer.
+            count = session._doubao_replaced_count.get(rid, 0) + 1
+            session._doubao_replaced_count[rid] = count
+            if count < 2:
+                return
+        if state in ("sent", "unconfirmed"):
+            # The keys went out; the card's absence (or replacement) is the native acknowledgement.
+            meta["response_state"] = "confirmed"
+            await self.clear_pending_interaction(session, rid)
+            self._forget_doubao_card_state(session, rid)
+            session._prompt_quiet_until = 0.0
+            return
+        # Nobody answered it: the user pressed Esc/answered in the console, or the card was closed.
+        await self._add_transcript_message(
+            session.session_id,
+            session.step_count,
+            "[Doubao prompt closed externally before parent response]",
+            source="parent_approval_proxy",
+        )
+        await self.clear_pending_interaction(session, rid)
+        self._forget_doubao_card_state(session, rid)
+        session._prompt_quiet_until = 0.0
+
     async def _watch_codex_network_stall(self, session: AgentSession, screen_text: str) -> None:
         """Codex's "Reconnecting..." status line is shown as progress, never interrupted.
 
@@ -14532,6 +15114,8 @@ class HubSessionManager:
         eng = (session.engine or self._infer_engine(session.profile_id, {})).lower()
         if eng == "codex":
             await self._refresh_codex_mcp_response(session)
+        if eng == "doubao":
+            await self._refresh_doubao_prompt_state(session)
         if eng == "claude":
             await self._drain_claude_hook_events(session)
         elif eng == "kimi":
@@ -14698,10 +15282,11 @@ class HubSessionManager:
                 return await self._register_claude_screen_approval(session, claude_prompt, scr)
             return None
 
-        # 6) Doubao CLI cards: approval titles from the bundle, or a cursor-led numbered question.
+        # 6) Doubao CLI Ink cards (confirm / ask). Identity is the card's own signature over its
+        # title, command, options and actions, so moving the cursor never makes a new request.
         doubao_prompt = parse_doubao_prompt(scr) if eng == "doubao" else None
         if doubao_prompt is not None:
-            sig = f"doubao_{doubao_prompt['kind']}:{hash(scr.strip()[-400:])}"
+            sig = f"doubao_{doubao_prompt['kind']}:{doubao_prompt['signature']}"
             if sig not in session._seen_tui_prompt_signatures:
                 session._seen_tui_prompt_signatures.add(sig)
                 metadata = {
@@ -14710,6 +15295,18 @@ class HubSessionManager:
                     "raw_options_count": int(
                         doubao_prompt.get("raw_options_count") or len(doubao_prompt["options"])
                     ),
+                    "prompt_signature": doubao_prompt["signature"],
+                    "selected_index": doubao_prompt.get("selected_index"),
+                    "command": doubao_prompt.get("command") or "",
+                    "tool": doubao_prompt.get("tool") or "",
+                    "actions": list(doubao_prompt.get("actions") or []),
+                    "nav_rows": list(doubao_prompt.get("nav_rows") or []),
+                    "other_option_index": doubao_prompt.get("other_option_index"),
+                    "multi_select": bool(doubao_prompt.get("multi_select")),
+                    "multi_question": bool(doubao_prompt.get("multi_question")),
+                    "free_text_only": bool(doubao_prompt.get("free_text_only")),
+                    "checked_indices": list(doubao_prompt.get("checked_indices") or []),
+                    "esc_action": doubao_prompt.get("esc_action") or "",
                 }
                 return await self.register_pending_interaction(
                     session=session,
