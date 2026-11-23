@@ -50,7 +50,6 @@ from doubao_session_record import (
     classify_doubao_option,
     detect_doubao_error,
     doubao_data_root,
-    doubao_screen_reply_after_user_prompt,
     export_doubao_session,
     extract_doubao_screen_reply,
     find_doubao_session_by_marker,
@@ -857,7 +856,10 @@ TUI_BUSY_LINE_RES = ENGINE_BUSY_LINE_RES
 # while the ordinary composer + busy + stable gate submitted with one Enter.
 TUI_READY_BANNERS = {
     "kimi": "Welcome to Kimi Code!",
-    "doubao": "DOUBAO CLI",
+    # Doubao draws its title as Unicode block art (`█▀▄ █▀█`), never as "DOUBAO CLI"; the old
+    # banner never matched and every fresh spawn burned the 60 s fallback before its first prompt.
+    # The composer placeholder is drawn by the same screen that can take input (wide and narrow).
+    "doubao": "Ask Doubao to do anything",
 }
 # Doubao's turn markers. "Loading… / sending is paused" is the startup pause, not work on a turn:
 # it must hold the readiness gate (TUI_BUSY_PHRASES) but never counts as a turn in progress here.
@@ -2635,6 +2637,17 @@ class AgentSession:
         # lets the screen poll register the page as an approval for the parent instead.
         self._startup_watch_active: bool = False
         self._startup_watch_until: float = 0.0
+        # The startup task (fresh spawn or resume) has not yet submitted its text. Turn-end
+        # watchers hold completion while it is set, so a resumed screen replaying the previous
+        # answer or an `--export` row from an earlier turn can never end the new turn.
+        self._startup_inject_pending: bool = False
+        # doubao: how many `--export` rows are known to predate the current turn. A resumed
+        # session seeds it from the cloud view (see `_watch_doubao_session`); every turn that
+        # completes from the trajectory or the screen adds one, so a row is only accepted when
+        # the export grew past it. `_doubao_export_baseline_known` says the count is real (the
+        # seeding call succeeded), not just the default 0 of a session that never exported.
+        self._doubao_export_rows: int = 0
+        self._doubao_export_baseline_known: bool = False
         self.trust_auto_dismiss_exhausted: bool = False
         # D7: the last screen-detected interaction no machine record has adopted yet, and the
         # moment until which the screen detector leaves a just-answered prompt alone.
@@ -6770,6 +6783,7 @@ class HubSessionManager:
             self._schedule(self._watch_tui_interactive_prompts(sess))
             sess._startup_watch_active = True
             sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
+            sess._startup_inject_pending = True
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,
@@ -12046,6 +12060,28 @@ class HubSessionManager:
                     session.conversation_ref.get("session_id") or conversation_id
                 ).strip()
 
+        if (
+            session.resume_attach
+            and conversation_id
+            and int(getattr(session, "_doubao_export_rows", 0) or 0) <= 0
+        ):
+            # A resumed conversation's cloud view already holds the earlier turns. Count them
+            # before the watch loop so the replayed history can never complete the new turn: a
+            # turn is done only once `--export` grew past this baseline (or the trajectory/screen
+            # produced a fresh answer). An archive written before this counter existed says 0,
+            # which is exactly what this seeding repairs.
+            binary = str(getattr(session, "command", "") or "").strip() or resolve_doubao_binary()
+            seeded = await asyncio.to_thread(export_doubao_session, binary, conversation_id)
+            if seeded is not None:
+                # An empty export is a real baseline (0 rows); None means the probe failed and
+                # the count stays unknown, so only in-turn evidence may end a turn.
+                session._doubao_export_baseline_known = True
+                if seeded:
+                    session._doubao_export_rows = len(seeded)
+                    if isinstance(session.conversation_ref, dict):
+                        session.conversation_ref["export_rows"] = len(seeded)
+                        await self.persist_session(session)
+
         scan_start = time.time()
         last_discovery = 0.0
         last_screen_at = 0.0
@@ -12205,32 +12241,41 @@ class HubSessionManager:
                         idle_since = now
                     if baseline_reply is None:
                         baseline_reply = screen_reply
+                    injection_pending = bool(getattr(session, "_startup_inject_pending", False))
                     if session.status in ("starting", "running") and session.pending_interaction is None:
-                        screen_fresh = bool(screen_reply) and (
-                            screen_reply != str(baseline_reply or "")
-                            or doubao_screen_reply_after_user_prompt(clean_rows)
-                        )
-                        export_due = now - last_export_probe >= DOUBAO_EXPORT_PROBE_SEC
-                        if now - idle_since >= DOUBAO_IDLE_SETTLE_SEC and (
-                            turn_busy or turn_evidence or screen_fresh or export_due
-                        ):
-                            if export_due:
-                                last_export_probe = now
-                            ended = await self._finish_doubao_turn(
-                                session,
-                                conversation_id,
-                                turn_text,
-                                screen_text,
-                                baseline_reply=str(baseline_reply or ""),
-                                allow_export=export_due or turn_evidence or screen_fresh,
-                            )
-                            if ended:
-                                # A card the parent has not answered yet keeps the turn open: its
-                                # "Reject and stop" also ends the turn without another busy phase.
-                                turn_busy = False
-                                turn_text = None
-                                turn_evidence = False
-                                baseline_reply = screen_reply
+                        if injection_pending:
+                            # The prompt/resume text has not been submitted yet: the screen still
+                            # shows the previous turn and its export rows predate this one, so
+                            # nothing here can end the turn. Keep the baseline untouched.
+                            pass
+                        else:
+                            # Only an answer that DIFFERS from the pre-turn `◆` block is fresh.
+                            # The resume replay draws the previous turn's `▍` + `◆` again, so
+                            # "drawn after a user prompt" alone would accept that old answer.
+                            screen_fresh = bool(screen_reply) and screen_reply != str(baseline_reply or "")
+                            export_due = now - last_export_probe >= DOUBAO_EXPORT_PROBE_SEC
+                            if now - idle_since >= DOUBAO_IDLE_SETTLE_SEC and (
+                                turn_busy or turn_evidence or screen_fresh or export_due
+                            ):
+                                if export_due:
+                                    last_export_probe = now
+                                ended = await self._finish_doubao_turn(
+                                    session,
+                                    conversation_id,
+                                    turn_text,
+                                    screen_text,
+                                    baseline_reply=str(baseline_reply or ""),
+                                    allow_export=export_due or turn_evidence or screen_fresh,
+                                    turn_busy_seen=turn_busy,
+                                )
+                                if ended:
+                                    # A card the parent has not answered yet keeps the turn open:
+                                    # its "Reject and stop" also ends the turn without another
+                                    # busy phase.
+                                    turn_busy = False
+                                    turn_text = None
+                                    turn_evidence = False
+                                    baseline_reply = screen_reply
                     else:
                         # No live turn: this answer is the baseline the next turn must differ from.
                         baseline_reply = screen_reply
@@ -12245,13 +12290,16 @@ class HubSessionManager:
         *,
         baseline_reply: str = "",
         allow_export: bool = True,
+        turn_busy_seen: bool = False,
     ) -> bool:
         """End one Doubao turn; False while an interaction blocks the end or this turn has no answer.
 
-        A turn ends only from THIS turn's evidence: a trajectory assistant row, a new `--export`
-        row, or a `◆` block that differs from the pre-turn baseline (or was drawn after this
-        turn's `▍` prompt). A mid-turn `Worked for 12s` screen that still shows the previous
-        answer is not evidence, so no empty `turn_completed` is ever emitted.
+        A turn ends only from THIS turn's evidence: a trajectory assistant row, an `--export` row
+        grown past the rows counted before it, or a `◆` block that differs from the pre-turn
+        baseline. A mid-turn `Worked for 12s` screen that still shows the previous answer is not
+        evidence, so no empty `turn_completed` is ever emitted. A resumed session never accepts an
+        export row it did not see grow (the seeding in `_watch_doubao_session` sets the count); if
+        that seeding failed, only a turn whose busy frame was observed may use export at all.
         """
         if session.status not in ("starting", "running") or session.pending_interaction is not None:
             return False
@@ -12270,7 +12318,15 @@ class HubSessionManager:
             binary = str(getattr(session, "command", "") or "").strip() or resolve_doubao_binary()
             rows = await asyncio.to_thread(export_doubao_session, binary, conversation_id)
             seen_rows = int(getattr(session, "_doubao_export_rows", 0) or 0)
-            if rows and (seen_rows <= 0 or len(rows) > seen_rows):
+            grown = bool(rows) and len(rows) > seen_rows
+            # On a resume the export holds the previous turns. Without a known baseline only a
+            # turn the watcher saw working may claim its last row.
+            resumed_unknown_baseline = (
+                bool(session.resume_attach)
+                and seen_rows <= 0
+                and not bool(getattr(session, "_doubao_export_baseline_known", False))
+            )
+            if grown and (not resumed_unknown_baseline or turn_busy_seen):
                 reply = str(rows[-1].get("response") or "").strip()
                 session._doubao_export_rows = len(rows)
                 if isinstance(session.conversation_ref, dict):
@@ -12280,14 +12336,21 @@ class HubSessionManager:
                     answer, source = reply, "doubao_export"
         clean = sanitize_tui_screen_text(screen_text, max_lines=20, engine="doubao")
         screen_reply = extract_doubao_screen_reply(clean)
-        screen_fresh = bool(screen_reply) and (
-            screen_reply != str(baseline_reply or "")
-            or doubao_screen_reply_after_user_prompt(clean)
-        )
+        # Equality with the pre-turn answer means a replay of the previous turn (resume), never
+        # this turn's answer -- even when the replayed `▍` row sits above it.
+        screen_fresh = bool(screen_reply) and screen_reply != str(baseline_reply or "")
         if not answer and screen_fresh:
             answer, source = screen_reply, "doubao_screen"
         if not answer:
             return False
+        if source != "doubao_export":
+            # This turn also occupies one `--export` row even though its answer came from
+            # elsewhere; count it so the next turn's probe needs a row past this one. The
+            # archive written before this counter existed says 0, which the resume seeding fixes.
+            session._doubao_export_rows = int(getattr(session, "_doubao_export_rows", 0) or 0) + 1
+            if isinstance(session.conversation_ref, dict):
+                session.conversation_ref["export_rows"] = session._doubao_export_rows
+                await self.persist_session(session)
         session._inflight_transcript_tool = None
         session.set_final_response(answer, source)
         await self.record_worker_event(
@@ -13496,12 +13559,14 @@ class HubSessionManager:
         # owns it: a normal spawn must never flash a fake approval while Enter is being retried.
         session._startup_watch_active = True
         session._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
+        session._startup_inject_pending = True
         try:
             if claim is not None:
                 await claim.wait_turn()
             await self._watch_tui_startup_and_type(session, task_to_inject, startup_delay, submit_key)
         finally:
             session._startup_watch_active = False
+            session._startup_inject_pending = False
             if claim is not None:
                 claim.release()
 
@@ -15324,6 +15389,7 @@ class HubSessionManager:
                 prompt_to_send = self._task_with_session_marker(sess.session_id, delivered_task)
             sess._startup_watch_active = True
             sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
+            sess._startup_inject_pending = True
             self._schedule(
                 self._auto_handle_tui_startup_and_trust(
                     sess,

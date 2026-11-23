@@ -31,6 +31,7 @@ from session_manager import (
     APPROVAL_ENGINES,
     KNOWN_ENGINES,
     RESUME_ENGINES,
+    TUI_READY_BANNERS,
     AgentSession,
     HubSessionManager,
 )
@@ -400,6 +401,24 @@ class DoubaoLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile["submit_key"], "\r")
         self.assertTrue(profile["enabled"])
 
+    def test_ready_banner_is_the_composer_phrase_on_the_block_art_screen(self):
+        # The live 120x36 ConPTY draws the title as Unicode block art, never as "DOUBAO CLI".
+        startup_screen = (
+            "█▀▄ █▀█ █ █ █▀▄ █▀█ █▀█\n"
+            "█▄▀ █▄█ █▄█ █▄█ █▀█ █▄█\n"
+            "\n"
+            "Ask Doubao to do anything\n"
+            "❯  Ask Doubao to do anything\n"
+            "Auto · high · E:\\work\n"
+        )
+        self.assertEqual(TUI_READY_BANNERS["doubao"], "Ask Doubao to do anything")
+        self.assertNotIn("DOUBAO CLI", startup_screen)
+        self.assertTrue(
+            self.hub._tui_banner_visible(
+                SimpleNamespace(), startup_screen, TUI_READY_BANNERS["doubao"]
+            )
+        )
+
     def test_cwd_leads_every_business_flag(self):
         launch = self.hub.resolve_launch("doubao", cwd=str(self.root))
         args = launch["args"]
@@ -604,16 +623,92 @@ class DoubaoWatcherTests(unittest.IsolatedAsyncioTestCase):
         trajectory = self.conversation(sess, "888")
         sess.resume_attach = True
         sess.conversation_ref = {"session_id": "888", "cwd": str(self.root), "transcript_path": str(trajectory)}
+        # The resume seeding sees the pre-turn export (empty here); the turn then adds a row.
+        exported = []
         self.tasks.append(self.hub._schedule(self.hub._watch_doubao_session(sess, self.data_root)))
         with patch("session_manager.export_doubao_session",
-                   return_value=[{"query": "q", "response": "导出的纯文本答案"}]) as export:
+                   side_effect=lambda *a, **k: list(exported)) as export:
             self.fake.set_screen(sess.session_id, BUSY_SCREEN)
             await asyncio.sleep(0.7)
+            exported.append({"query": "q", "response": "导出的纯文本答案"})
             self.fake.set_screen(sess.session_id, idle_screen("导出的纯文本答案"))
             await self.until(lambda: sess.status == "completed")
         self.assertEqual(sess.final_response, "导出的纯文本答案")
         self.assertEqual(sess.final_response_source, "doubao_export")
         export.assert_called()
+
+    async def test_resumed_replay_never_completes_the_new_turn(self):
+        sess = self.session("-resume-replay")
+        trajectory = self.conversation(sess, "901")
+        # The archive predates the export counter: it says nothing, while the cloud view already
+        # holds both earlier turns. The resumed TUI replays them onto the screen as well.
+        sess.resume_attach = True
+        sess.conversation_ref = {"session_id": "901", "cwd": str(self.root), "transcript_path": str(trajectory)}
+        replayed = (
+            "DOUBAO CLI\n"
+            "▍ 第一轮的问题\n◆ DOUBAO_LIVE_OK_1 41\n"
+            "▍ 第二轮的问题\n◆ DOUBAO_LIVE_OK_2 42\n"
+            "❯  Ask Doubao to do anything\nAuto · high · E:\\work"
+        )
+        exported = [
+            {"query": "第一轮的问题", "response": "DOUBAO_LIVE_OK_1 41"},
+            {"query": "第二轮的问题", "response": "DOUBAO_LIVE_OK_2 42"},
+        ]
+        self.fake.set_screen(sess.session_id, replayed)
+        with patch("session_manager.export_doubao_session", return_value=exported):
+            self.tasks.append(self.hub._schedule(self.hub._watch_doubao_session(sess, self.data_root)))
+            await self.until(lambda: sess.conversation_ref.get("export_rows") == 2)
+            # Two idle settle windows plus several export probes: Turn 3 has not run yet.
+            await asyncio.sleep(2.5)
+            self.assertEqual(sess.status, "running")
+            self.assertEqual(self.completed_events(sess), [])
+            self.assertIsNone(sess.final_response)
+            # Turn 3 lands: only its own new answer may complete the turn.
+            self.append(trajectory, {"role": "assistant", "content": "第三轮答案"})
+            self.fake.set_screen(sess.session_id, idle_screen("第三轮答案"))
+            await self.until(lambda: sess.status == "completed")
+        self.assertEqual(sess.final_response, "第三轮答案")
+        self.assertEqual(sess.final_response_source, "doubao_native")
+        # The native turn counted its export row for the next resume.
+        self.assertEqual(sess.conversation_ref.get("export_rows"), 3)
+
+    async def test_startup_submission_pending_holds_turn_completion(self):
+        sess = self.session("-startup-pending")
+        trajectory = self.conversation(sess, "902")
+        sess.resume_attach = True
+        # A resume whose archive already counts one turn: the seeding is skipped, so only the
+        # startup gate keeps the replayed row from ending the new turn.
+        sess.conversation_ref = {
+            "session_id": "902", "cwd": str(self.root), "transcript_path": str(trajectory),
+            "export_rows": 1,
+        }
+        sess._doubao_export_rows = 1
+        sess._startup_inject_pending = True
+        sess.last_task = "第三轮的问题"
+        self.fake.set_screen(sess.session_id, idle_screen("上一轮答案"))
+        exported = [
+            {"query": "上一轮的问题", "response": "上一轮答案"},
+            {"query": "第三轮的问题", "response": "新一轮答案"},
+        ]
+        with patch("session_manager.export_doubao_session", return_value=exported):
+            self.tasks.append(self.hub._schedule(self.hub._watch_doubao_session(sess, self.data_root)))
+            await asyncio.sleep(2.0)
+            self.assertEqual(sess.status, "running")
+            self.assertEqual(self.completed_events(sess), [])
+            # The startup text is submitted: the grown export row may now end the turn.
+            sess._startup_inject_pending = False
+            await self.until(lambda: sess.status == "completed")
+        self.assertEqual(sess.final_response, "新一轮答案")
+        self.assertEqual(sess.final_response_source, "doubao_export")
+
+    async def test_startup_task_clears_the_injection_gate(self):
+        sess = self.session("-startup-clear")
+        self.fake.set_screen(sess.session_id, idle_screen("上一轮答案"))
+        # The spawn sites set this before scheduling the startup task (see create_session and
+        # _resume_process_session); its finally must clear it for every engine, doubao included.
+        sess._startup_inject_pending = True
+        await self.hub._auto_handle_tui_startup_and_trust(sess, None, 0.0, "\r")
+        self.assertFalse(sess._startup_inject_pending)
 
     async def test_screen_reply_is_the_last_resort(self):
         sess = self.session("-screen")
