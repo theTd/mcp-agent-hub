@@ -62,11 +62,11 @@ class TranscriptViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reply["ok"])
         self.assertTrue(reply["resumed"])
         self.assertEqual(resumed.await_args.kwargs, {"text": "接着做", "source": "console"})
-        failed = AsyncMock(return_value={"delivered": False, "injection": "dsh_failed", "reason": "DSH 拒绝了这条消息"})
+        failed = AsyncMock(return_value={"delivered": False, "injection": "rejected", "reason": "会话拒绝了这条消息"})
         with patch.object(session, "is_process_alive", return_value=True), \
                 patch.object(self.hub, "deliver_parent_message", failed):
             reply = await self.send_from_console("再试一次")
-        self.assertEqual((reply["ok"], reply["error"]), (False, "DSH 拒绝了这条消息"))
+        self.assertEqual((reply["ok"], reply["error"]), (False, "会话拒绝了这条消息"))
         empty = await self.send_from_console("   ")
         self.assertEqual(empty.status_code, 400)
 

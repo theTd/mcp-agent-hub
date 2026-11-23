@@ -84,12 +84,8 @@ class RestartResumeRequest:
         return self.session_ids is None or session_id in self.session_ids
 
     def text_for(self, session_id: str, engine: str, status_at_stop: str) -> Optional[str]:
-        """The message a resumed session gets: only a terminal agent whose turn the stop cut off.
-
-        A DSH job keeps running in DSH Host while the hub is down, so its session is only
-        re-attached.
-        """
-        if not self.continue_unfinished_turns or engine == "dsh":
+        """The message a resumed session gets: only a terminal agent whose turn the stop cut off."""
+        if not self.continue_unfinished_turns:
             return None
         if self.continue_session_ids is not None:
             return self.continue_text if session_id in self.continue_session_ids else None

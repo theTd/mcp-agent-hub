@@ -159,7 +159,7 @@ class SessionMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings(self.hub.build_resume_launch(record)["args"]), merged)
 
     async def test_reject_before_spawn_and_preserve_legacy_behavior(self):
-        for engine in ("pwsh", "dsh", "agy", "kimi", "omp"):
+        for engine in ("pwsh", "agy", "kimi", "omp", "doubao"):
             with self.subTest(engine=engine), self.assertRaises(ValueError):
                 await self.hub.create_session(engine, mcp_servers=SERVERS)
         with self.assertRaises(ValueError):

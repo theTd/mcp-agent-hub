@@ -18,8 +18,6 @@ import zlib
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
-import httpx
-
 # §5.1: the hub's one terminal core. The wrapper turns a missing build into the build command, and
 # there is no Python PTY or parser behind it after step 3b.
 from terminal_core import Core
@@ -29,10 +27,6 @@ from transcript_feed import (
     FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, json_valued_arguments, tool_output_text,
     tool_title, interaction_view as transcript_interaction_view,
 )
-from dsh_session_record import (
-    DshSessionRecordReader, RecordDecodeError, locate_dsh_session_record, native_events_to_telemetry,
-)
-from dsh_mailbox_replay import DshMailboxReplay
 from restart_resume_request import RestartResumeGate, RestartResumeRequest, wait_for_port
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from spawn_extra_roots import extra_root_args, normalize_extra_roots
@@ -48,11 +42,25 @@ from agent_guidance import PROFILE_DESCRIPTIONS, ROUTING_RULES, with_leaf_worker
 from parent_waiting import session_targets
 from hub_database import HubDatabase, END_REASON_LABELS, ARCHIVE_COLUMNS
 from hub_persistence import HubPersistence, PersistenceRecordTooLarge, PersistenceUnavailable, logical_write
+from retired_engine_purge import purge_retired_engine_data
 from wait_inbox import WaitInbox, WAKE_EVENT_TYPES, UNDELIVERED_EVENT_TYPE, engine_errors_of
 from engine_errors import classify_engine_error, engine_error_summary
+from doubao_session_record import (
+    DOUBAO_COMPOSER_PLACEHOLDER,
+    classify_doubao_option,
+    detect_doubao_error,
+    doubao_data_root,
+    doubao_screen_reply_after_user_prompt,
+    export_doubao_session,
+    extract_doubao_screen_reply,
+    find_doubao_session_by_marker,
+    parse_doubao_exit_resume_id,
+    parse_doubao_prompt,
+    parse_doubao_status_session_id,
+    parse_doubao_trajectory_record,
+    resolve_doubao_binary,
+)
 
-from dsh_endpoint import dsh_base_url, dsh_tls_context, dsh_url
-from dsh_workspace_permissions import prepare_dsh_workspace
 from model_discovery import AgentModelDiscovery
 from context_window_usage import (
     ContextWindowCatalog,
@@ -79,8 +87,12 @@ FINAL_SOURCE_PRIORITY = {
     # Keep the source label of a stronger native record when multiple observers see the same turn.
     "turn_completed": 3,
     "native_transcript": 4,
+    "doubao_native": 4,
+    "doubao_export": 4,
+    # The screen block is the turn's only answer when the CLI wrote no row; the turn_completed
+    # event that follows must not relabel it (equal-or-lower rank would).
+    "doubao_screen": 4,
     "codex_task_complete": 5,
-    "dsh_hub_completion": 5,
     "report_complete_mcp": 6,  # Historical saved results only; no reporting interface remains.
     # An engine error is the turn's outcome, not an answer: no screen, summarizer or native row
     # may replace it, including after a terminate/archive writes the final record.
@@ -151,7 +163,7 @@ TUI_TOOL_PATTERN = re.compile(
 )
 
 DEFAULT_HUB_PORT = 4444
-KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh", "pwsh")
+KNOWN_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "doubao", "pwsh")
 AGY_THINKING_LEVELS = ("low", "medium", "high", "xhigh")
 AGY_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh)$")
 # A profile with an absurdly long argument list is a mistake, not a launch recipe.
@@ -521,17 +533,20 @@ def normalize_subagent_idle_timeout(value: Any) -> int:
         raise ValueError("subagent_idle_timeout_minutes 必须是非负整数（分钟，0 表示禁用自动关闭）。")
     return value
 # Engines with a revive recipe (spec §4). Anything else cannot be resumed.
-RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "dsh")
+RESUME_ENGINES = ("omp", "kimi", "agy", "codex", "claude", "doubao")
 ENGINE_RESUME_BLOCK_REASONS = {
     "pwsh": "PowerShell 会话结束后无法找回上下文",
+    # The engine was dropped on 2026-11-15. Its rows are purged at the next start, but a start
+    # whose purge was skipped (a failed backup) still lists the old row, and it must say why.
+    "dsh": "DSH 已不再支持，无法恢复此会话。",
 }
 DEFAULT_RESUME_BLOCK_REASON = "该引擎的会话结束后无法恢复上下文"
 RESUME_SCROLLBACK_MAX_BYTES = 512 * 1024
 RESUME_SCROLLBACK_INTERVAL_SEC = 60.0
 # D1: archive records are kept forever. There is no age/count limit and no pruning loop; the only
 # way a record leaves the hub is the manual delete (console 删除记录 / DELETE /api/archive/{id}).
-# R5/R6: a graceful stop must not hang on a CLI that ignores the first signal or a DSH host that
-# takes its time; each session is bounded and so is the whole loop.
+# R5/R6: a graceful stop must not hang on a CLI that ignores the first signal or takes its time;
+# each session is bounded and so is the whole loop.
 SHUTDOWN_MAX_SEC = 8.0
 SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC = 2.0
 # How long the shutdown gives the core to snapshot the screens and to stop itself, both off the loop;
@@ -566,8 +581,8 @@ EMPTY_SNAPSHOT = {
     "raw_text": "",
     "raw_rev": 0,
 }
-# rtc-retire: a refused retire is retried on this timer, so a quiet id (no first-class DSH session
-# ever publishes a record) is not stranded in the core's table for the hub's life. The attempt cap
+# rtc-retire: a refused retire is retried on this timer, so a quiet id (one that publishes no
+# record of its own) is not stranded in the core's table for the hub's life. The attempt cap
 # counts the timer's own attempts only: a busy drain publishes records of its own, and counting those
 # would reach the cap in about a second instead of the nominal ten.
 RETIRE_RETRY_INTERVAL_SEC = 0.25
@@ -600,11 +615,6 @@ LIFECYCLE_CLAIM_RETRY_DELAYS_SEC = (0.05, 0.1)
 AGY_RESUME_FAILURE_MESSAGE = "恢复失败：agy 没有接上原会话，开了一个新会话"
 CODEX_ARCHIVED_MESSAGE = "codex 已把该会话归档，请先运行 codex unarchive {sid}"
 KIMI_LOCKED_MESSAGE = "该 Kimi 会话正被另一个进程使用"
-DSH_UNKNOWN_JOB_MESSAGE = "DSH 服务已不认识这个任务（可能重启过）"
-DSH_STATE_UNAVAILABLE_MESSAGE = "DSH 任务状态不可用：{reason}"
-# R3: these are ENDED jobs. Re-attaching one as "completed" lets the next message /continue it;
-# refusing them made the archive say 可恢复 while 恢复 without text failed.
-DSH_ENDED_JOB_STATUSES = ("done", "failed", "timeout", "cancelled")
 RESUME_FAILED_PREFIX = "恢复失败："
 # A4: a resume failure that no re-check can undo is sticky. agy opened a different conversation
 # (only a real resume can fix it) and codex archived the conversation (only codex unarchive can);
@@ -666,6 +676,7 @@ TUI_COMPOSER_SHAPES = {
     "codex": "glyph",
     "agy": "glyph",
     "claude": "glyph",
+    "doubao": "glyph",
 }
 # Owner decision engines-checked (2026-11-06, decision page kimi-injection-2026-11-06; revised
 # 2026-11-07 to kimi + codex): only these engines type a LIVE message through the checked submit
@@ -673,7 +684,7 @@ TUI_COMPOSER_SHAPES = {
 # saw codex leave a live message in its composer 2 of 5 times. omp and agy keep the old write +
 # Enter, recorded as ok:null "live_write_unchecked". Their composers stay in TUI_COMPOSER_SHAPES for
 # reading the screen.
-TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi", "codex", "claude", "omp", "agy"})
+TUI_LIVE_SUBMIT_CHECKED = frozenset({"kimi", "codex", "claude", "omp", "agy", "doubao"})
 # K7 (fix 9d): a "glyph" composer wraps a long text onto the rows under its prompt row, and those
 # rows end at the engine's own closing row (real screens of the 22b0573 live check):
 #   omp    rule, "❯ …", wrapped rows indented two columns, rule, status line   (o1l2_screens.txt)
@@ -846,7 +857,27 @@ TUI_BUSY_LINE_RES = ENGINE_BUSY_LINE_RES
 # while the ordinary composer + busy + stable gate submitted with one Enter.
 TUI_READY_BANNERS = {
     "kimi": "Welcome to Kimi Code!",
+    "doubao": "DOUBAO CLI",
 }
+# Doubao's turn markers. "Loading… / sending is paused" is the startup pause, not work on a turn:
+# it must hold the readiness gate (TUI_BUSY_PHRASES) but never counts as a turn in progress here.
+# "Worked for" is deliberately absent: it can be drawn mid-turn and never means idle.
+# `Processing` is a tool/status row drawn with a leading glyph (`◇ Processing …`); a bare
+# substring would let an answer like "Processing is complete" hold a finished turn open forever.
+DOUBAO_TURN_BUSY_RE = re.compile(
+    r"Responding…|Responding\.\.\.|esc to interrupt|Running a command"
+    r"|^\s*[◇⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✦✧⋄◈]\s+Processing\b"
+)
+# A turn is over only after the composer has stood idle this long: the CLI appends a tool turn's
+# trajectory rows right around the last spinner frame, and a pure-text turn writes nothing at all.
+DOUBAO_IDLE_SETTLE_SEC = 1.2
+DOUBAO_SCREEN_POLL_SEC = 0.5
+# A live turn whose `--export` row count may have moved without a busy frame: probe the cloud view
+# at this cadence while the composer is idle, so a fast text turn still has native evidence.
+DOUBAO_EXPORT_PROBE_SEC = 3.0
+# The marker scan only has to catch the first turn's `assignment.md`; after this window the screen
+# banner/`/status` (and the resume ref) are the remaining sources.
+DOUBAO_DISCOVERY_WINDOW_SEC = 300.0
 # K1 (fix 9): a banner that never shows (a kimi update that changes the text) must not hang the
 # spawn: this long after the trust dialog was answered (or after spawn without one) the gate falls
 # back to composer + busy + stable, with a warning in the log. The fallback always leaves the
@@ -904,6 +935,15 @@ TUI_SUBMIT_PROOF_RULES = {
         "transcript": "exact_user_message",
         "history_glyph": "",
         "reject_phrases": (),
+    },
+    "doubao": {
+        # The composer clears when Ink accepts the Enter. trajectory.jsonl only holds whole rows
+        # written at the end of a turn, so its growth proves a submit later, not at once; the
+        # submitted user row (`▍`) is the other on-screen proof.
+        "cleared_composer": True,
+        "transcript": "growth",
+        "history_glyph": "▍",
+        "reject_phrases": ("invalid_arguments", "auth_failed", "SESSION_EXPIRED"),
     },
 }
 # K2: how long a submit whose text was never seen on the composer keeps waiting for evidence. The
@@ -1214,7 +1254,7 @@ def _injected_flag_tokens(engine: str, args: List[str]):
                     yield i + 1, "-c"
                     i += 2
                     continue
-        elif eng == "claude":
+        elif eng == "claude" or eng == "doubao":
             if a in ("--model", "--effort"):
                 yield i, a
                 if i + 1 < total:
@@ -1241,6 +1281,31 @@ def strip_injected_flags(engine: str, args: List[str]) -> List[str]:
     """Removes every hub-injected model/thinking flag, so old profile files still launch cleanly."""
     drop = {idx for idx, _label in _injected_flag_tokens(engine, args)}
     return [str(a) for i, a in enumerate(args) if i not in drop]
+
+
+def strip_doubao_cwd(args: List[str]) -> List[str]:
+    """Every `-C <dir>` / `-C=<dir>` token pair removed, so the hub can put the real one first."""
+    kept: List[str] = []
+    index = 0
+    total = len(args)
+    while index < total:
+        token = str(args[index])
+        if token == "-C":
+            index += 2
+            continue
+        if token.startswith("-C="):
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return kept
+
+
+def doubao_launch_args(engine: str, args: List[str], cwd: str) -> List[str]:
+    """Doubao takes `-C <dir>` before every business flag; a later one is an invalid argument."""
+    if (engine or "").strip().lower() != "doubao":
+        return list(args)
+    return ["-C", str(cwd)] + strip_doubao_cwd(args)
 
 
 # ── Approval modes (owner decisions 2026-11-07 D1-D5/D9, 2026-11-12 D13) ──────────────────────
@@ -1396,6 +1461,13 @@ def _approval_flag_tokens(engine: str, args: List[str]):
                 width = 2
             elif a.startswith("--mode=") or a.startswith("--settings="):
                 width, label = 1, a.split("=", 1)[0]
+        elif eng == "doubao":
+            if a in ("--dangerously-bypass-approvals-and-sandbox",):
+                width = 1
+            elif a == "--permission-mode":
+                width = 2
+            elif a.startswith("--permission-mode="):
+                width, label = 1, "--permission-mode"
         elif eng == "claude":
             if a in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"):
                 width = 1
@@ -1478,6 +1550,9 @@ def approval_launch_flags(engine: str, profile_args: Optional[List[str]] = None)
         settings = _agy_profile_settings(list(profile_args or []))
         settings.update(AGY_SESSION_SETTINGS)
         return ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":"))]
+    if eng == "doubao":
+        # `ask_risky` is the CLI's own high-risk gate; `ask_always` would stop every tool call.
+        return ["--permission-mode", "ask_risky"]
     return []
 
 
@@ -1495,8 +1570,8 @@ def auto_approval_launch_flags(engine: str) -> List[str]:
 
 # Round 2 (owner, decision page approval-by-default-2026-11-07): a profile may switch approval off
 # with `bypass_approvals: true`. The hub then injects that engine's full-bypass flag instead of the
-# approval flags. Only the engines below have approval flags; dsh and pwsh ignore the key.
-APPROVAL_ENGINES = ("omp", "kimi", "codex", "claude", "agy")
+# approval flags. Only the engines below have approval flags; pwsh ignores the key.
+APPROVAL_ENGINES = ("omp", "kimi", "codex", "claude", "agy", "doubao")
 BYPASS_APPROVALS_KEY = "bypass_approvals"
 BYPASS_ON_NOTE = "bypass_approvals is on：本次会话已关闭高风险审批（全自动），高风险操作不会暂停等待审批"
 AUTO_ON_NOTE = "approval_mode=auto：由引擎自带的自动审批审核每次操作，只有它升级出来的审批才会交给主 Agent"
@@ -1565,7 +1640,7 @@ def approval_mode_notes(engine: str, policy: Dict[str, Any]) -> List[str]:
 
 def high_risk_approval_state(engine: Optional[str], bypass: bool) -> Optional[bool]:
     """What the session runs with: True = high-risk approval on, False = bypassed, None = the engine
-    has no hub-injected approval (dsh, pwsh)."""
+    has no hub-injected approval (pwsh)."""
     eng = (engine or "").strip().lower()
     if eng not in APPROVAL_ENGINES:
         return None
@@ -1612,6 +1687,9 @@ def bypass_launch_flags(engine: str, profile_args: Optional[List[str]] = None) -
         settings.pop("agentMode", None)
         extra = ["--settings", json.dumps(settings, ensure_ascii=False, separators=(",", ":"))] if settings else []
         return ["--dangerously-skip-permissions"] + extra
+    if eng == "doubao":
+        # Mutually exclusive with --permission-mode; apply_approval_flags strips both first.
+        return ["--dangerously-bypass-approvals-and-sandbox"]
     return []
 
 
@@ -2416,72 +2494,6 @@ class TuiWriterQueue:
         return any(mode is None or c.mode == mode for c in self._open)
 
 
-# Lines of a DSH worker question that instruct the parent agent how to reply; the console shows
-# the options as buttons, so its copy of the prompt leaves them out.
-DSH_PARENT_INSTRUCTION_PREFIXES = (
-    "[approval request from the worker", "[question from the worker", "Options:",
-    "Reply with exactly one option label",
-)
-
-
-def _dsh_display_prompt(text: str) -> str:
-    lines = [line for line in str(text or "").splitlines()
-             if not line.strip().startswith(DSH_PARENT_INSTRUCTION_PREFIXES)]
-    return "\n".join(lines).strip()
-
-
-DSH_RECORD_SEQ_KEY = "dsh_record_seq"
-DSH_RECORD_OFFSET_KEY = "dsh_record_offset"
-# DSH creates the record a moment after the job starts (about 1.7 s measured); the watcher holds
-# the job log back this long while it looks, so no tool is recorded from both sources.
-DSH_RECORD_LOCATE_WAIT_SEC = 20.0
-# After DSH reports the job finished, its last frames can still be on their way to disk.
-DSH_RECORD_SETTLE_INTERVAL_SEC = 0.5
-DSH_RECORD_SETTLE_MAX_PASSES = 6
-
-
-class _DshRecordCursor:
-    """Read position of one DSH watcher in the session record (see _drain_dsh_session_record)."""
-
-    def __init__(self, reader: DshSessionRecordReader, *, after_seq: int, since_ms: Optional[float]):
-        self.reader = reader
-        self.after_seq = after_seq
-        self.since_ms = since_ms
-        self.active = True
-        self.tool_names: Dict[str, str] = {}  # call id -> tool name, for results read later
-
-
-def _keep_dsh_record_seq(old_ref: Optional[Dict[str, Any]], new_ref: Dict[str, Any]) -> Dict[str, Any]:
-    """A rebuilt DSH conversation reference keeps how far the session record was read."""
-    for key in (DSH_RECORD_SEQ_KEY, DSH_RECORD_OFFSET_KEY):
-        value = old_ref.get(key) if isinstance(old_ref, dict) else None
-        if value is not None:
-            new_ref[key] = value
-    return new_ref
-
-
-# The hub records a DSH turn's end a moment after the job's `endedAt` (it polls the job status).
-DSH_END_RECORD_SLACK_SEC = 5.0
-
-
-def _dsh_end_unrecorded(job: Dict[str, Any], last_turn_completed_at: Optional[float]) -> bool:
-    """True when the hub has no turn end recorded since this ended DSH job ended.
-
-    That happens when the job ended while the hub was stopped or killed. Without a readable
-    `endedAt` it cannot be told, and the job is treated as already recorded (the old behaviour).
-    """
-    ended = str((job or {}).get("endedAt") or "")
-    if not ended:
-        return False
-    try:
-        ended_at = datetime.datetime.fromisoformat(ended.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return False
-    if last_turn_completed_at is None:
-        return True
-    return float(last_turn_completed_at) < ended_at - DSH_END_RECORD_SLACK_SEC
-
-
 class CoreCallRefused(KeyError):
     """A queued request's worker refused to enter the core: the hub no longer owns the id (r4 #5).
 
@@ -2503,7 +2515,6 @@ class AgentSession:
         cwd: str,
         command: str,
         args: List[str],
-        gui_url: Optional[str] = None,
         cols: int = 120,
         rows: int = 36,
         # The hub's one Core (§5.1); tests pass a fake of its calls instead.
@@ -2520,12 +2531,11 @@ class AgentSession:
         self.wait_handle: Optional[str] = None
         self.profile_id = profile_id
         self.profile_name = profile_name
-        self.kind = kind  # "tui" | "web_gui"
+        self.kind = kind  # "tui"
         self.title = title
         self.cwd = cwd
         self.command = command
         self.args = args
-        self.gui_url = gui_url
         self.on_exit_cb = on_exit_cb
         self.on_tui_tool_cb = on_tui_tool_cb
 
@@ -2647,29 +2657,17 @@ class AgentSession:
         # arrived and the two revisions, so a seam read that only asks "did it change" costs no call.
         self._pid: Optional[int] = None
         self._alive: bool = False
-        # A text session (`attach_text`) has no process, but the core still owns its id: `kill`
-        # must end it there too, or `retire` refuses the id forever.
-        self._virtual: bool = False
         self._raw_rev: int = 0
         self._screen_rev: int = 0
         # The row count the generic watch was registered with, so a resize can refresh it (F12).
         self._watched_rows: Optional[int] = None
         # The death record's `crashed` (a reader panic): a crash even when no code came with it (F1).
         self._died_crashed: bool = False
-        # The seed the next spawn/attach_text starts its ring with (A1), consumed once.
+        # The archived scrollback the next spawn starts its ring with (A1), consumed once.
         self._seed_history: Optional[str] = None
 
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-        # DeepSeek Harness (dsh-crew in-host) native session bridge fields
-        self.dsh_job_id: Optional[str] = None
-        self.dsh_session_id: Optional[str] = None
-        self.dsh_token: Optional[str] = None
-        self.dsh_spec: Dict[str, Any] = {}
-        self.sandbox_preparation: Optional[Dict[str, Any]] = None
-        self._virtual_line_buf: str = ""
-        self.on_virtual_line_cb: Optional[Callable[[str, str], Any]] = None
 
     @property
     def status(self) -> str:
@@ -2686,40 +2684,11 @@ class AgentSession:
             self._inactive_since = None
         self._status = value
 
-    def start_virtual(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        on_virtual_line_cb: Optional[Callable[[str, str], Any]] = None,
-        seed: Optional[str] = None,
-    ):
-        """`attach_text` (§5.2): a screen and a raw ring without a process (DSH virtual sessions).
-
-        `seed` is the resume separator for sockets already attached to the id; a resume passes it so
-        the banner lands after the predecessor's last bytes and before the first `feed`.
-        """
-        self._loop = loop
-        self.on_virtual_line_cb = on_virtual_line_cb
-        reply = self._core().attach_text(
-            self.session_id,
-            cols=max(20, int(self.cols)),
-            rows=max(5, int(self.rows)),
-            flags=self._spawn_flags(),
-            seed_history=self._seed_history,
-            seed=seed,
-        )
-        self._seed_history = None
-        self._pid = int(reply.get("pid") or 0) or None
-        self._virtual = True
-        self._alive = True
-        self.status = "running"
-        self.current_activity = "Connected to DeepSeek Harness Host"
-        self.last_output_at = time.time()
-
     def emit_virtual_ansi(self, data: str):
-        """`feed` (§5.2): text into a session with no process.
+        """`feed` (§5.2): hub-written lines into the session's screen and raw ring.
 
-        The DSH echo emulation stays here (`write_input`); this is only the byte path into the
-        core's screen and ring, so the drain record carries the new revision on the next tick.
+        The bytes bypass the TUI on purpose (a resumed banner, an exit note): a native TUI repaints
+        differences against its own screen, so hub text must not depend on what it draws next.
         """
         if not data:
             return
@@ -2745,7 +2714,7 @@ class AgentSession:
                 self.final_response = text
                 self.final_response_source = source
         # Spec §1.4: "reported completion" is what separates a clean exit from an abnormal one.
-        if str(source) in ("report_complete_mcp", "codex_task_complete", "dsh_hub_completion"):
+        if str(source) in ("report_complete_mcp", "codex_task_complete"):
             self.completion_reported = True
 
     def _core(self) -> Core:
@@ -2770,7 +2739,7 @@ class AgentSession:
 
     def _wants_tool_line_scan(self) -> bool:
         """Only a generic terminal has no native transcript watcher (design §4, §5.6)."""
-        return (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy", "dsh")
+        return (self.engine or "").strip().lower() not in ("claude", "codex", "omp", "kimi", "agy")
 
     def start_pty(
         self,
@@ -2811,7 +2780,6 @@ class AgentSession:
         )
         self._seed_history = None
         self._pid = int(reply.get("pid") or 0) or None
-        self._virtual = False
         self._alive = True
         self.status = "running"
         self.current_activity = "Interactive session running"
@@ -2861,7 +2829,7 @@ class AgentSession:
         if self.superseded and self.ended_at is not None:
             # R2: a resume replaced this object and `_end_predecessor` ended the entry it owned. The
             # death record of that kill is a hand-over, not an ending: the end state the object
-            # already earned (a completed DSH job, a user termination) stays, and the parent is not
+            # already earned (a user termination) stays, and the parent is not
             # told a session it is resuming crashed.
             return
         self.ended_at = time.time()
@@ -2973,47 +2941,8 @@ class AgentSession:
             except Exception:
                 logger.exception("tui tool-line callback failed for %s", self.session_id)
 
-    def _plan_virtual_input(self, text: str) -> Tuple[str, List[str]]:
-        """The DSH echo and the finished lines for one typed text, edited on the caller's thread.
-
-        `write_input`'s echo emulation, split out so the drain consumer can run it on the loop and
-        still hand the core one `feed`: the line buffer is the hub's, the bytes are the core's.
-        """
-        echo_parts: List[str] = []
-        lines: List[str] = []
-        for ch in text:
-            if ch in ("\r", "\n"):
-                echo_parts.append("\r\n")
-                line = self._virtual_line_buf.strip()
-                self._virtual_line_buf = ""
-                if line:
-                    lines.append(line)
-            elif ch in ("\x7f", "\b"):
-                if self._virtual_line_buf:
-                    self._virtual_line_buf = self._virtual_line_buf[:-1]
-                    echo_parts.append("\b \b")
-            else:
-                self._virtual_line_buf += ch
-                echo_parts.append(ch)
-        return "".join(echo_parts), lines
-
-    def _virtual_input_sync(self, text: str) -> bool:
-        """The echo and the line callbacks, on the caller's thread (every non-drain caller).
-
-        The console's socket input reaches the hub as a drain record's `input_requests`, and the
-        consumer applies that through `write_input_async`; the REST and MCP input paths call
-        `write_input` directly and stay synchronous.
-        """
-        if self.on_virtual_line_cb is None:
-            return False
-        echo, lines = self._plan_virtual_input(text)
-        self.emit_virtual_ansi(echo)
-        for line in lines:
-            self.on_virtual_line_cb(self.session_id, line)
-        return True
-
     def write_input(self, text: str):
-        """`write` (§5.2): the whole text or nothing, then the DSH echo for a process-less session.
+        """`write` (§5.2): the whole text or nothing.
 
         One attempt. A full queue past the core's deadline raises `TimeoutError` with nothing
         queued; the call is reported as not written and the caller surfaces it (F9). A second
@@ -3030,65 +2959,15 @@ class AgentSession:
             except (KeyError, RuntimeError):
                 logger.exception("write to %s failed", self.session_id)
                 return False
-        return self._virtual_input_sync(text)
-
-    def _write_core(self, text: str, guard: Optional[Callable[[], None]] = None) -> int:
-        """The blocking half of `write_input`, on a worker thread (r4b #2, r4 #5)."""
-        if guard is not None:
-            guard()
-        return self.core.write(self.session_id, text)
-
-    def _feed_echo(self, echo: str, guard: Optional[Callable[[], None]] = None) -> None:
-        """The blocking half of a text session's echo, on a worker thread (r4b #2, r4 #5)."""
-        if guard is not None:
-            guard()
-        self.emit_virtual_ansi(echo)
-
-    async def write_input_async(self, text: str,
-                                guard: Optional[Callable[[], None]] = None) -> bool:
-        """`write_input` for the drain consumer (r4b #2): its blocking core call leaves the loop.
-
-        A process session's `write` waits on the core's queue deadline and a text session's echo
-        waits on `feed`; both run in a worker. The line buffer and the line callbacks stay here,
-        on the loop, because a line callback schedules asyncio work and is not thread-safe. r4 #5:
-        `guard` runs in the worker, before the core call it protects.
-        """
-        if self.has_process and self._alive:
-            try:
-                await asyncio.to_thread(self._write_core, text, guard)
-                return True
-            except CoreCallRefused:
-                logger.debug("write to %s refused: the hub no longer owns the id", self.session_id)
-                return False
-            except TimeoutError:
-                logger.warning("write to %s timed out (queue full); input not delivered",
-                               self.session_id)
-                return False
-            except (KeyError, RuntimeError):
-                logger.exception("write to %s failed", self.session_id)
-                return False
-        if self.on_virtual_line_cb is None:
-            return False
-        echo, lines = self._plan_virtual_input(text)
-        if echo:
-            try:
-                await asyncio.to_thread(self._feed_echo, echo, guard)
-            except CoreCallRefused:
-                logger.debug("the echo of %s refused: the hub no longer owns the id", self.session_id)
-                return False
-            except (KeyError, RuntimeError, TimeoutError):
-                logger.exception("terminal core: the echo of %s failed", self.session_id)
-        for line in lines:
-            self.on_virtual_line_cb(self.session_id, line)
-        return True
+        return False
 
     def _resize_target(self, cols: int, rows: int) -> Tuple[int, int]:
         """The console's size after the 20/5 clamp, which is hub policy (design §6.4)."""
         return max(20, int(cols)), max(5, int(rows))
 
     def _has_core_grid(self) -> bool:
-        """Whether the core holds a grid for this id (a process, or a DSH job/spec)."""
-        return self.core is not None and bool(self.has_process or self.dsh_job_id or self.dsh_spec)
+        """Whether the core holds a grid for this id (a live process with a console)."""
+        return self.core is not None and self.has_process
 
     def _record_resize(self, cols: int, rows: int) -> bool:
         """Records the size the hub decided; True when the watched snapshot must be re-taken (F12)."""
@@ -3255,11 +3134,12 @@ class AgentSession:
 
         The core reads `GetExitCodeProcess` before `TerminateJobObject`, so `cmd /c "exit 3"`
         reports 3; a process that outlived the budget answers None and the death record that
-        follows on the drain carries the code. A text session has no process to end, but the core
-        still owns its id: the call ends it there so `retire` can accept the id afterwards.
-        Blocking: callers on the loop go through `asyncio.to_thread`.
+        follows on the drain carries the code. Blocking: callers on the loop go through
+        `asyncio.to_thread`.
         """
-        if not (self.has_process or self._virtual):
+        if not self.has_process and not self._alive:
+            # No process and no live core entry: nothing to end (a text session's entry is alive
+            # until its kill, and that kill is what publishes its death record).
             return None
         try:
             return self._core().kill(self.session_id, grace_ms)
@@ -3281,10 +3161,6 @@ class AgentSession:
         A death the core could not give a code for (`None`: a failed `GetExitCodeProcess`) or one
         it reported as a crash (a reader panic) is a crash for every engine, generic and pwsh
         included (F1): only a real 0 is a clean end.
-
-        A text session has no process at all (`attach_text` reports pid 0) and its kill answers
-        `exit_code=None, crashed=false` by contract, so a missing code says nothing about it: it
-        keeps the end state it reached, or exits. F1's rule needs a process to have died.
         """
         if self.terminated_by_user:
             return "terminated"
@@ -3301,16 +3177,15 @@ class AgentSession:
         return "crashed"
 
     def is_process_alive(self) -> bool:
-        """B9: "live" is the process the core saw, never the status string.
+        """B9: "live" is what the core saw, never the status string.
 
-        A dsh virtual session has no core process (`attach_text` reports pid 0), so that branch keeps
-        the status check the seam always had; anything else with a pid reads the drain record's
-        `alive`, which costs no syscall and never disagrees with the exit code that follows it.
+        A session with a process reads the drain record's `alive`, which costs no syscall and never
+        disagrees with the exit code that follows it; a text session (`attach_text`, no pid) owns a
+        core entry too, so its record is the truth; a window-only session (desktop GUI) keeps the
+        status check the seam always had.
         """
-        if self.has_process:
+        if self.has_process or self._alive:
             return bool(self._alive)
-        if self.dsh_job_id or self.dsh_spec:
-            return self.status in ("starting", "running", "waiting_parent")
         return self.status in ("running", "waiting_parent")
 
     async def terminate(self) -> bool:
@@ -3331,14 +3206,10 @@ class AgentSession:
             self.status = "terminated"
             self.end_reason = "terminated"
             self.current_activity = "Terminated by parent/user"
-        if was_alive and (self.has_process or self._virtual):
+        if was_alive and (self.has_process or self._alive):
+            # A text session has no pid, but the core still holds its entry: the kill publishes the
+            # death record `retire` waits for and ends the ring with the session.
             await asyncio.to_thread(self.kill, KILL_GRACE_MS)
-        if self.dsh_job_id and was_alive:
-            job_id = self.dsh_job_id
-            threading.Thread(
-                target=lambda: httpx.post(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0, verify=dsh_tls_context()),
-                daemon=True,
-            ).start()
         if was_alive:
             return True
         # The process had already ended: keep its real final status and activity untouched.
@@ -3425,7 +3296,6 @@ class AgentSession:
             "kind": self.kind,
             "title": self.title,
             "cwd": self.cwd,
-            "gui_url": self.gui_url,
             "status": self.status,
             "process_alive": alive,
             "step_count": self.step_count,
@@ -3452,14 +3322,11 @@ class AgentSession:
             "last_task": self.last_task,
             "cols": self.cols,
             "rows": self.rows,
-            "dsh_job_id": self.dsh_job_id,
-            "dsh_session_id": self.dsh_session_id,
-            "sandbox_preparation": self.sandbox_preparation,
             "effective_model": self.effective_model,
             "effective_thinking_level": self.effective_thinking_level,
             "context_window": self.context_window_snapshot(),
             # Round 2: true = high-risk approval on, false = the profile's bypass_approvals was on
-            # for this launch, null = the engine has no hub approval (dsh, pwsh).
+            # for this launch, null = the engine has no hub approval (pwsh).
             "high_risk_approval": self.high_risk_approval,
             **resolve_session_approval_fields(self.profile_snapshot),
             "transcript_path": str(self.transcript_path) if self.transcript_path else "",
@@ -3502,8 +3369,8 @@ class HubSessionManager:
         self._retire_pending: Dict[str, int] = {}
         self._incarnations: Dict[str, int] = {}
         self._retire_inflight: Set[str] = set()
-        # A refused retire has no record to wait for when the id never publishes one again (a
-        # first-class DSH session), so it is retried on its own timer; see `_retire_ended_session`.
+        # A refused retire has no record to wait for when the id never publishes one again, so it
+        # is retried on its own timer; see `_retire_ended_session`.
         self._retire_attempts: Dict[str, int] = {}
         # The monotonic time of an id's next timer attempt: the fast interval until the cap, the slow
         # one after it (r2-kimi 6).
@@ -3589,7 +3456,7 @@ class HubSessionManager:
         self.wait_inbox.set_state_provider(self._wait_state_snapshot)
         self.wait_inbox.set_request_check(self._request_awaits_parent)
 
-        # B11: the constructor must never shell out to five CLIs. It loads the profile file at once
+        # B11: the constructor must never shell out to six CLIs. It loads the profile file at once
         # (using whatever discovery already has) and finishes discovery on a background thread, so
         # the very first /api/sessions poll answers immediately.
         self._discovery_ready = threading.Event()
@@ -3610,6 +3477,21 @@ class HubSessionManager:
         try:
             await self.db.start()
             self.global_seq = await self.db.get_max_seq()
+            # Owner decision 2026-11-15 (`dsh-purge-at-start`): the dropped engine's old data goes,
+            # each half after its own backup, before restart-resume reads a row and before the
+            # console is served. Blocking SQLite work stays off the loop (the hub has frozen on
+            # that before); a failed backup changes nothing and the start carries on.
+            try:
+                purged = await asyncio.to_thread(
+                    purge_retired_engine_data, self.db.db_path, self.profiles_path,
+                    self._write_profiles_file,
+                )
+                if purged["profiles"]["removed"]:
+                    # The constructor already loaded the catalog into memory; serve it without the
+                    # removed profile instead of waiting for the next start.
+                    self.load_profiles(discovery=self._cached_discovery)
+            except Exception as exc:
+                logger.warning("Retired-engine purge hook failed; continuing startup: %s", exc)
             request = RestartResumeRequest.take(self.data_dir)
             live_at_stop = await self._normalize_archive_on_startup()
             await self.db.flush()
@@ -3623,8 +3505,6 @@ class HubSessionManager:
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
-        # Built off the loop now, so the first DSH call does not build it on the loop.
-        self._schedule(asyncio.to_thread(dsh_tls_context))
         self._schedule(self._scrollback_flush_loop())
         self._schedule(self._subagent_cleanup_loop())
         self._schedule(self._omp_turn_end_sweep_loop())
@@ -3634,6 +3514,15 @@ class HubSessionManager:
                 rec = None if sid in targets else await self.db.get_session_record(sid)
                 if rec and rec.get("status") == "interrupted" and sid not in self.sessions:
                     targets[sid] = {"engine": str(rec.get("engine") or "").strip().lower(), "status": "interrupted"}
+            # DSH was dropped on 2026-11-15. Its rows are purged at start; a start whose purge was
+            # skipped (a failed backup) still finds them, and they are never resumed.
+            dropped = [sid for sid, info in targets.items()
+                       if str(info.get("engine") or "").strip().lower() == "dsh"]
+            for sid in dropped:
+                targets.pop(sid, None)
+            if dropped:
+                logger.info("Resume-on-start: skipped %d DSH session(s); DSH is no longer supported",
+                            len(dropped))
             logger.info("Resume-on-start request: %d of %d sessions live at the stop", len(targets), len(live_at_stop))
             if targets:
                 self.restart_resume_gate.close()
@@ -3646,16 +3535,14 @@ class HubSessionManager:
 
         It starts once the hub's own port is open: a resumed Codex or Claude connects to the hub's
         MCP endpoint as it starts, and that connection now waits at the gate instead of being
-        refused. DSH sessions go first (they only re-attach to jobs that kept running), so the
-        terminal agents' MCP connections wait as briefly as possible.
+        refused.
         """
         started = time.time()
         results: Dict[str, Dict[str, Any]] = {}
         try:
             if not await wait_for_port(hub_port()):
                 logger.warning("Resume-on-start: port %s did not open; resuming anyway", hub_port())
-            order = sorted(targets, key=lambda sid: (targets[sid].get("engine") != "dsh", sid))
-            for sid in order:
+            for sid in sorted(targets):
                 info = targets[sid]
                 text = request.text_for(sid, info.get("engine", ""), info.get("status", ""))
                 try:
@@ -3954,16 +3841,13 @@ class HubSessionManager:
                     # Its exit record is in hand now, so `retire` will accept the id.
                     self._schedule(self._retire_ended_session(
                         session_id, self._retire_pending.get(session_id), retry="record"))
-                # §6.4: the console's resize and typed input are requests the core recorded and
-                # never applied; the hub's policy runs them off this loop, each kind in its own
-                # arrival order (a record's resizes are applied before its inputs; the core keeps
-                # two lists, so the record carries no interleaving). A
-                # socket's own loss is a diagnostic and stays out of the ring's `dropped_bytes`
-                # (§5.4). Queueing cannot fail: the consumer is created here, on the loop.
+                # §6.4: the console's resize is a request the core recorded and never applied; the
+                # hub's policy runs it off this loop. A socket's own loss is a diagnostic and stays
+                # out of the ring's `dropped_bytes` (§5.4). Queueing cannot fail: the consumer is
+                # created here, on the loop.
                 requests = record.get("resize_requests") or ()
-                texts = record.get("input_requests") or ()
-                if requests or texts:
-                    self._queue_terminal_requests(session_id, requests, texts)
+                if requests:
+                    self._queue_terminal_requests(session_id, requests)
                 self._note_socket_drops(session_id, record.get("socket_drops") or ())
             except Exception:
                 logger.exception("terminal core: drain record for %s failed", session_id)
@@ -3999,25 +3883,20 @@ class HubSessionManager:
         closed.status = closed.end_reason or closed.status
         self._write_late_exit_code(session_id, closed)
 
-    def _queue_terminal_requests(self, session_id: str, requests: Any, texts: Any) -> bool:
-        """Hands one drain record's requests to the id's consumer, each kind in its own order.
+    def _queue_terminal_requests(self, session_id: str, requests: Any) -> bool:
+        """Hands one drain record's resize requests to the id's consumer.
 
-        The core keeps resizes and inputs in two lists (§5.2), so a record carries each kind's own
-        arrival order and nothing about their interleaving: every resize in the record is queued
-        before its inputs, and a resize can therefore land before a keystroke typed before it.
-
-        A resize is the console's unapplied size and text is a session with no PTY's typed input
-        (the echo and the line callback are the hub's, design §8). Both are applied by
-        `_terminal_request_consumer`, which awaits the blocking core calls in worker threads, so
+        The core records the console's size request and never applies it; `_terminal_request_consumer`
+        applies it through `resize_async`, which awaits the blocking core calls in worker threads, so
         this queue (and this tick) never waits on the core (r4b #2).
 
         A record for an id the hub no longer lists queues nothing (omp 4b F4): the pane is gone and
-        its intent must not resize the panes that are still there. `_apply_*` re-checks at apply
-        time, for the window between this call and the consumer's turn.
+        its intent must not resize the panes that are still there. `_apply_resize_request` re-checks
+        at apply time, for the window between this call and the consumer's turn.
         """
         if self.sessions.get(session_id) is None:
-            logger.debug("terminal core: %d request(s) for an unlisted id %s dropped",
-                         len(requests) + len(texts), session_id)
+            logger.debug("terminal core: %d resize request(s) for an unlisted id %s dropped",
+                         len(requests), session_id)
             return False
         queue = self._terminal_request_queues.get(session_id)
         if queue is None:
@@ -4025,8 +3904,6 @@ class HubSessionManager:
             self._terminal_request_queues[session_id] = queue
         for request in requests:
             queue.put_nowait(("resize", request))
-        for text in texts:
-            queue.put_nowait(("input", str(text)))
         existing = self._terminal_request_consumers.get(session_id)
         if existing is None or existing.done():
             # A consumer that ended (its idle exit, or a close's cancel) has its map entry removed by
@@ -4130,8 +4007,6 @@ class HubSessionManager:
         try:
             if kind == "resize":
                 await self._apply_resize_request(session_id, payload)
-            elif kind == "input":
-                await self._apply_input_request(session_id, payload)
         except Exception:
             logger.exception("terminal core: %s request for %s failed%s", kind, session_id,
                              " at drain" if at_end else "")
@@ -4166,16 +4041,6 @@ class HubSessionManager:
         await self.resize_session_from_client(
             session_id, position[0], position[1], propagate_background=position[2],
             guard=self._core_call_guard(session_id))
-        return True
-
-    async def _apply_input_request(self, session_id: str, text: str) -> bool:
-        """One text request for the session the drain record was applied to, if it is still listed."""
-        sess = self.sessions.get(session_id)
-        if sess is None:
-            # The hub already closed this id; the core's text entry has no echo to feed.
-            logger.debug("terminal core: input for an unlisted id %s dropped", session_id)
-            return False
-        await sess.write_input_async(text, guard=self._core_call_guard(session_id))
         return True
 
     async def _await_request_applies(self, session_ids: Any, until: float) -> None:
@@ -4519,11 +4384,10 @@ class HubSessionManager:
         code_before = old.exit_code
         ended_before = old.ended_at is not None
         try:
-            if old._virtual or old.is_process_alive():
-                # A text entry is ended unconditionally; a process that already died is left to
-                # the drain, which still has its death record queued.
-                if old._virtual or old.has_process:
-                    await asyncio.to_thread(old.kill, KILL_GRACE_MS)
+            if old.is_process_alive():
+                # A process that already died is left to the drain, which still has its death
+                # record queued.
+                await asyncio.to_thread(old.kill, KILL_GRACE_MS)
         except Exception:
             logger.debug("terminal core: ending the predecessor of %s failed", session_id, exc_info=True)
         deadline = time.monotonic() + PREDECESSOR_DEATH_WAIT_SEC
@@ -4794,6 +4658,10 @@ class HubSessionManager:
                 return {"session_id": sid or "", "rollout_path": str(p)}
             if eng == "claude":
                 return {"session_id": p.stem, "transcript_path": str(p)}
+            if eng == "doubao":
+                # .../.sessions/<conversation_id>/agents/<agent_id>/system/trajectory.jsonl
+                conversation = p.parents[3]
+                return {"session_id": conversation.name, "transcript_path": str(p)}
         except Exception:
             return {}
         return {}
@@ -4809,8 +4677,11 @@ class HubSessionManager:
         session.transcript_path = Path(path)
         ref = self._conversation_ref_for(session.engine, Path(path))
         if ref:
-            # Spec §3: filled as soon as the watcher claims a conversation.
-            session.conversation_ref = ref
+            # Spec §3: filled as soon as the watcher claims a conversation. Merge, never replace:
+            # keys another path already established (`export_rows`, `cwd`, …) must survive a claim.
+            merged = dict(session.conversation_ref) if isinstance(session.conversation_ref, dict) else {}
+            merged.update(ref)
+            session.conversation_ref = merged
         await self.persist_session(session)
         return True
 
@@ -4907,7 +4778,7 @@ class HubSessionManager:
         if prof.get("engine"):
             return str(prof["engine"]).lower()
         pid = profile_id.lower()
-        for prefix in ("omp", "kimi", "agy", "codex", "claude", "dsh", "pwsh"):
+        for prefix in ("omp", "kimi", "agy", "codex", "claude", "doubao", "pwsh"):
             if pid.startswith(prefix):
                 return prefix
         return "generic"
@@ -5053,6 +4924,8 @@ class HubSessionManager:
                 or shutil.which("claude.cmd")
                 or str(home / ".local" / "bin" / "claude.exe")
             )
+        if engine == "doubao":
+            return resolve_doubao_binary()
         return "pwsh.exe"
 
     def _builtin_profiles(self) -> Dict[str, Dict[str, Any]]:
@@ -5122,19 +4995,18 @@ class HubSessionManager:
                 "enabled": True,
                 "description": "Anthropic Claude Code CLI。模型与思考等级在启动时传入（--model / --effort），默认以 Claude 自带的 auto 模式运行（由分类器逐次批准或拦截工具调用）。",
             },
-            "dsh": {
-                "id": "dsh",
-                "name": "DeepSeek Harness",
-                "engine": "dsh",
+            "doubao": {
+                "id": "doubao",
+                "name": "豆包 CLI",
+                "engine": "doubao",
                 "kind": "tui",
-                "command": "pwsh.exe",
-                "args": ["-NoLogo", "-NoProfile"],
-                "task_mode": "dsh_hub_api",
-                "startup_delay_sec": 0.5,
+                "command": self._default_engine_binary("doubao"),
+                "args": [],
+                "task_mode": "pty_input",
+                "startup_delay_sec": 3.0,
                 "submit_key": "\r",
                 "enabled": True,
-                "description": "通过 DSH Hub API 创建的原生会话，总控台显示其实时事件流。",
-                "dsh_tier": "flash",
+                "description": "豆包 CLI（doubao）。模型用 --model 传入，思考强度用 --effort 传入；-C 指定工作目录。",
             },
             "pwsh": {
                 "id": "pwsh",
@@ -5264,9 +5136,16 @@ class HubSessionManager:
                 raw_profiles[pid] = dict(custom_prof)
 
         enriched: Dict[str, Dict[str, Any]] = {}
+        skipped_dsh_profiles = 0
         for pid, p in raw_profiles.items():
             prof = dict(p)
             eng = self._infer_engine(pid, prof)
+            if eng == "dsh":
+                # DSH was dropped on 2026-11-15 and its saved profile is purged at start; a start
+                # whose purge was skipped (a failed backup) still finds it, and only the catalog
+                # leaves it out here, never the file.
+                skipped_dsh_profiles += 1
+                continue
             prof["engine"] = eng
             prof["enabled"] = bool(prof.get("enabled", True))
             # The global routing guide is authoritative; when_to_use remains a supplemental
@@ -5334,6 +5213,9 @@ class HubSessionManager:
         # B2: discovery may still report ~/.codex [profiles.*] and recent configurations in the
         # catalog, but they no longer synthesise profiles. A Profile is a launch recipe, not a combo.
 
+        if skipped_dsh_profiles:
+            logger.info("Profiles: skipped %d DSH profile(s); DSH is no longer supported",
+                        skipped_dsh_profiles)
         self.profiles = enriched
 
     def _reload_after_write(self, data: Dict[str, Any]) -> None:
@@ -5520,8 +5402,6 @@ class HubSessionManager:
         "enabled",
         "when_to_use",
         "description",
-        "gui_url",
-        "dsh_tier",
         "disabled_models",
         # Round 2: the per-profile approval off switch (bool; missing = false).
         "bypass_approvals",
@@ -5732,10 +5612,8 @@ class HubSessionManager:
             raise ValueError(
                 f"参数里不要写模型或思考等级（{bad[0]}）：Hub 会按启动时的选择自动注入。"
             )
-        if kind not in ("tui", "web_gui"):
-            raise ValueError(f"会话形式「{kind}」无效，只能是 tui 或 web_gui。")
-        if kind == "web_gui" and eng != "dsh":
-            raise ValueError("只有 dsh 引擎可以使用 web_gui 会话形式。")
+        if kind != "tui":
+            raise ValueError(f"会话形式「{kind}」无效，只能是 tui。")
 
         options = self.engine_model_options(eng)
         if not options:
@@ -6183,10 +6061,12 @@ class HubSessionManager:
         snapshot = record.get("profile_snapshot") or {}
         ref = record.get("conversation_ref") or {}
         session_id = str(record.get("session_id") or "")
-        if not isinstance(snapshot, dict) or not snapshot:
-            return False, "未记录启动参数，无法恢复"
+        # An engine without a revive recipe answers its own reason first, so an old row of a dropped
+        # engine (dsh) says why even when its launch record is incomplete.
         if engine not in RESUME_ENGINES:
             return False, ENGINE_RESUME_BLOCK_REASONS.get(engine, DEFAULT_RESUME_BLOCK_REASON)
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False, "未记录启动参数，无法恢复"
         cwd = str(snapshot.get("cwd") or record.get("cwd") or "")
         if not cwd or not os.path.isdir(cwd):
             return False, f"工作目录已不存在：{cwd}"
@@ -6263,9 +6143,11 @@ class HubSessionManager:
                 )
                 if alive:
                     return False, "该 claude 会话正被另一个运行中的会话使用"
-        elif engine == "dsh":
-            if not ref.get("dsh_job_id"):
-                return False, "DSH 任务 ID 缺失，无法恢复"
+        elif engine == "doubao":
+            # The CLI resumes by conversation id inside `-C <cwd>`; the local trajectory file is
+            # optional (a pure-text turn may never have written one).
+            if not str(ref.get("session_id") or "").strip():
+                return False, "未记录到豆包会话 ID，无法恢复"
         return True, ""
 
     def build_resume_launch(self, record: Dict[str, Any]) -> Dict[str, Any]:
@@ -6338,9 +6220,14 @@ class HubSessionManager:
                 )
             built["args"] = ["--resume", str(ref.get("session_id"))] + base_args
             built["message_mode"] = "positional"
-        elif engine == "dsh":
-            built["args"] = []
-            built["message_mode"] = "dsh_continue"
+        elif engine == "doubao":
+            # `-C <cwd>` leads, exactly as a fresh launch; the saved args already hold the model,
+            # effort and approval flags resolve_launch injected (and apply_approval_flags renewed).
+            built["env"].setdefault("DOUBAO_CLI_NO_UPDATE_CHECK", "1")
+            built["args"] = doubao_launch_args(
+                engine, ["--resume", str(ref.get("session_id"))] + base_args, cwd
+            )
+            built["message_mode"] = "pty_input"
         else:
             raise ValueError(ENGINE_RESUME_BLOCK_REASONS.get(engine, DEFAULT_RESUME_BLOCK_REASON))
         return built
@@ -6360,6 +6247,8 @@ class HubSessionManager:
         elif engine == "codex":
             path = str(ref.get("rollout_path") or "")
         elif engine == "claude":
+            path = str(ref.get("transcript_path") or "")
+        elif engine == "doubao":
             path = str(ref.get("transcript_path") or "")
         try:
             return os.path.getsize(path) if path else 0
@@ -6459,7 +6348,6 @@ class HubSessionManager:
             cwd=str(built.get("cwd") or snapshot.get("cwd") or record.get("cwd") or self.hub_default_cwd()),
             command=str(built.get("command") or snapshot.get("command") or ""),
             args=list(built.get("args") or []),
-            gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
             core=self._ensure_core(),
@@ -6483,6 +6371,11 @@ class HubSessionManager:
         sess.profile_snapshot.update(resolve_session_approval_fields(built))
         sess.launch_notes = list(built.get("notes") or [])
         sess.conversation_ref = dict(ref)
+        if engine == "doubao":
+            try:
+                sess._doubao_export_rows = int(ref.get("export_rows") or 0)
+            except (TypeError, ValueError):
+                sess._doubao_export_rows = 0
         known_tp = (
             ref.get("transcript_path")
             or ref.get("session_file")
@@ -6511,11 +6404,6 @@ class HubSessionManager:
         archived = await self._load_scrollback_text(session_id)
         seed = f"{archived}{resume_banner(count)}" if archived else resume_banner(count)
         sess.seed_history(seed)
-        if engine == "dsh":
-            sess.dsh_spec = dict(snapshot.get("dsh_spec") or {})
-            sess.sandbox_preparation = snapshot.get("sandbox_preparation")
-            sess.dsh_job_id = ref.get("dsh_job_id")
-            sess.dsh_session_id = ref.get("dsh_session_id")
         self._ensure_session_context_tracker(
             sess,
             initial_snapshot=record.get("context_window") if isinstance(record.get("context_window"), dict) else None,
@@ -6597,8 +6485,8 @@ class HubSessionManager:
             except PersistenceUnavailable:
                 raise
             except Exception as e:
-                # A9: a spawn OSError / a DB error / a non-JSON DSH reply is a resume failure with
-                # a Chinese 400 detail, never a 500.
+                # A9: a spawn OSError or a DB error is a resume failure with a Chinese 400 detail,
+                # never a 500.
                 raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
 
     async def _resume_locked(
@@ -6631,18 +6519,9 @@ class HubSessionManager:
             raise ValueError(f"找不到会话 {sid}")
         engine = str(record.get("engine") or "").strip().lower()
         ok, reason = self.compute_resumable(record)
-        if ok and engine == "dsh":
-            job_id = str((record.get("conversation_ref") or {}).get("dsh_job_id") or "")
-            if not await self._dsh_job_exists(job_id):
-                ok, reason = False, DSH_UNKNOWN_JOB_MESSAGE
         if not ok:
             await self._mark_resumable(sid, False, reason)
             raise ValueError(reason)
-        if engine == "dsh":
-            if auto_approval_rules is not None:
-                record["profile_snapshot"] = dict(record.get("profile_snapshot") or {})
-                record["profile_snapshot"]["auto_approval_rules"] = auto_approval_rules
-            return await self._resume_dsh_session(sid, record, text)
         if auto_approval_rules is not None:
             record["profile_snapshot"] = dict(record.get("profile_snapshot") or {})
             record["profile_snapshot"]["auto_approval_rules"] = auto_approval_rules
@@ -6879,6 +6758,8 @@ class HubSessionManager:
             self._schedule(self._watch_agy_transcript(sess))
         elif engine == "claude":
             self._schedule(self._watch_claude_session(sess))
+        elif engine == "doubao":
+            self._schedule(self._watch_doubao_session(sess))
 
         if sess.kind == "tui":
             self._schedule(self._watch_tui_interactive_prompts(sess))
@@ -6916,289 +6797,6 @@ class HubSessionManager:
             "resumed": True,
             "already_live": False,
             "delivered": bool(message),
-            "delivery": delivery,
-            "injection": injection,
-        }
-
-    async def _dsh_job_exists(self, job_id: str) -> bool:
-        """A8: only a real job object counts as "DSH still knows this job" — never a bare ok."""
-        if not job_id:
-            return False
-        try:
-            async with httpx.AsyncClient(timeout=8.0, verify=dsh_tls_context()) as client:
-                resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
-                if resp.status_code == 404:
-                    return False
-                data = resp.json()
-        except PersistenceUnavailable:
-            raise
-        except Exception:
-            return False
-        if not resp.is_success or not isinstance(data, dict):
-            return False
-        job = data.get("job")
-        return isinstance(job, dict) and bool(job.get("id"))
-
-    @staticmethod
-    def _dsh_continue_says_running(reason: str) -> bool:
-        """R5: the /continue refusal that means "this job is running, steer it instead"."""
-        text = str(reason or "").lower()
-        return any(marker in text for marker in (
-            "worker is running", "already running", "is running", "正在运行", "运行中",
-        ))
-
-    async def _dsh_post_message(
-        self, job_id: str, token: str, text: str, timeout: float = 10.0
-    ):
-        """R5: posts text to a RUNNING dsh job through /messages (returns the response or None)."""
-        clean = str(text or "").strip()
-        if not job_id or not token or not clean:
-            return None
-        try:
-            async with httpx.AsyncClient(timeout=max(1.0, float(timeout)), verify=dsh_tls_context()) as client:
-                return await client.post(
-                    dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/messages"),
-                    headers={"x-dsh-crew-job-token": token},
-                    json={"message": clean},
-                )
-        except PersistenceUnavailable:
-            raise
-        except Exception:
-            return None
-
-    async def _resume_dsh_session(
-        self, session_id: str, record: Dict[str, Any], text: Optional[str]
-    ) -> Dict[str, Any]:
-        """DSH has no process: continue the recorded job, or only re-attach the virtual terminal (§4)."""
-        loop = asyncio.get_running_loop()
-        snapshot = record.get("profile_snapshot") or {}
-        ref = dict(record.get("conversation_ref") or {})
-        job_id = str(ref.get("dsh_job_id") or "")
-        built = self.build_resume_launch(record)
-        # R5: the job's own messaging token is kept in the conversation reference so the
-        # /messages fallback (and a later steering message) still works after a hub restart.
-        old_token = str(ref.get("dsh_token") or "")
-        token = str(uuid.uuid4())
-        clean = str(text or "").strip()
-        new_job = ""
-        cjob: Dict[str, Any] = {}
-        jstatus: Optional[str] = None
-        jview: Dict[str, Any] = {}
-        dsh_send_mode = "attach"
-
-        preparation = await self._prepare_dsh_workspace(
-            str(built.get("cwd") or snapshot.get("cwd") or record.get("cwd") or ""),
-            repair=bool(clean),
-        )
-        if clean and not preparation["allowed"]:
-            raise ValueError(preparation["reason"])
-
-        # Talk to DSH first: a failed continue/re-attach must not replace the archived record.
-        if clean:
-            try:
-                async with httpx.AsyncClient(timeout=15.0, verify=dsh_tls_context()) as client:
-                    resp = await client.post(
-                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/continue"),
-                        json={"text": clean, "messaging_token": token},
-                    )
-            except PersistenceUnavailable:
-                raise
-            except Exception as e:
-                raise ValueError(f"DSH 恢复失败：{e}") from e
-            try:
-                data = resp.json()
-            except Exception:
-                raise ValueError("DSH 恢复失败：DSH 返回了非 JSON 内容") from None
-            if not resp.is_success or not isinstance(data, dict) or not data.get("ok"):
-                err = data.get("error") if isinstance(data, dict) else None
-                err_text = str(err or f"HTTP {resp.status_code}")
-                # R5: a running job refuses /continue ("worker is running"); a message reaches it.
-                if old_token and self._dsh_continue_says_running(err_text):
-                    fallback = await self._dsh_post_message(job_id, old_token, clean)
-                    if fallback is None or not fallback.is_success:
-                        raise ValueError(
-                            f"DSH 恢复失败：{err_text}（改用 /messages 发送也失败）"
-                        )
-                    jstatus = "running"
-                    new_job = job_id
-                    dsh_send_mode = "message"
-                else:
-                    raise ValueError(f"DSH 恢复失败：{err_text}")
-            else:
-                cjob = data.get("job") or {}
-                new_job = str(cjob.get("id") or "")
-                if not new_job:
-                    raise ValueError("DSH 恢复失败：continue 没有返回新的任务 ID")
-                dsh_send_mode = "continue"
-        else:
-            # No text: nothing is sent, only the virtual terminal is re-attached (§4). A8: an
-            # unreadable / failed / cancelled / unknown job fails the resume with a Chinese reason
-            # instead of leaving a pseudo-live "starting" session behind.
-            try:
-                async with httpx.AsyncClient(timeout=8.0, verify=dsh_tls_context()) as client:
-                    resp = await client.get(
-                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0}
-                    )
-            except PersistenceUnavailable:
-                raise
-            except Exception as e:
-                raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=e)) from e
-            if not resp.is_success:
-                raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=f"HTTP {resp.status_code}"))
-            try:
-                data = resp.json()
-            except Exception:
-                raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason="DSH 返回了非 JSON 内容")) from None
-            jview = (data.get("job") if isinstance(data, dict) else None) or {}
-            if not isinstance(jview, dict) or not jview.get("id"):
-                raise ValueError(DSH_STATE_UNAVAILABLE_MESSAGE.format(reason="DSH 返回的任务信息无法识别"))
-            jstatus = str(jview.get("status") or "")
-            # R3: running / needs_input / every ended status re-attach; only a missing or
-            # unreadable status refuses (A8's message).
-            if jstatus not in ("running", "needs_input") + DSH_ENDED_JOB_STATUSES:
-                raise ValueError(
-                    DSH_STATE_UNAVAILABLE_MESSAGE.format(reason=f"任务状态为 {jstatus or '未知'}")
-                )
-
-        # Watching the same job again replays its whole mailbox; the hub's records say which
-        # messages and questions it already handled before it stopped (dsh_mailbox_replay).
-        replay: Optional[DshMailboxReplay] = None
-        history: Dict[str, Any] = {}
-        if not clean or dsh_send_mode == "message":
-            history = await self.db.read("get_mailbox_history", session_id) or {}
-            pending = record.get("pending_interaction")
-            replay = DshMailboxReplay.from_history(
-                history, self._interaction_ids(pending) if isinstance(pending, dict) else ()
-            )
-        # A job that ended while the hub was stopped has steps and a result nobody has read yet.
-        catch_up = (not clean and jstatus in DSH_ENDED_JOB_STATUSES
-                    and _dsh_end_unrecorded(jview, history.get("last_turn_completed_at")))
-
-        sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
-        sess.sandbox_preparation = preparation
-        sess.profile_snapshot["sandbox_preparation"] = preparation
-        old = self.sessions.get(session_id)
-        # A1: a dsh pane's open socket survives the object replacement too, and typed input has to
-        # reach the virtual terminal — which needs the loop and the parent-delivery callback.
-        if sess.on_virtual_line_cb is None:
-            sess.on_virtual_line_cb = lambda sid, line: self._schedule(self.deliver_parent_message(
-                sid, line, also_write_pty=False
-            ))
-        # R1: the incarnation is bumped before the predecessor is ended, so the pending retire its
-        # drain would schedule cannot close the fan-out the attach is about to take over.
-        # r4 #3: the bump drops the closed id's tombstone and its pending drop; the failure path
-        # below puts both back for the generation that owned them.
-        previous_incarnation = self._incarnations.get(session_id, 0)
-        previous_tombstone = self._closed_sessions.get(session_id)
-        self._next_incarnation(session_id)
-        await self._end_predecessor(session_id, old)
-        if self.sessions.get(session_id) is not old and old is not None:
-            old = None
-        try:
-            # `attach_text`: the ring starts from the archived scrollback plus the separator, and the
-            # separator goes to the sockets already attached to the id before any `feed` can land.
-            await self._start_with_claim_retry(
-                sess.start_virtual,
-                loop,
-                on_virtual_line_cb=sess.on_virtual_line_cb,
-                seed=resume_banner(sess.resume_count) if old is not None else None,
-            )
-        except Exception as e:
-            # A9: a failed attach leaves the archived record exactly as it was, and the predecessor's
-            # ended text entry does not stay in the core's table for the hub's life.
-            # r4 #3: the failed incarnation's queue ends here, and its tombstone and pending drop go
-            # back bound to the old generation.
-            await self._end_terminal_requests(session_id)
-            if previous_tombstone is not None:
-                self._incarnations[session_id] = previous_incarnation
-                self._closed_sessions[session_id] = previous_tombstone
-            await self._retire_ended_session(
-                session_id, previous_incarnation if previous_tombstone is not None else None)
-            if old is not None:
-                self.sessions[session_id] = old
-            else:
-                self.sessions.pop(session_id, None)
-            raise ValueError(f"{RESUME_FAILED_PREFIX}{e}") from e
-        self.sessions[session_id] = sess
-        if old is not None:
-            self._release_transcripts(session_id)
-        await self.db.reset_session_after_resume(session_id)
-        # D2: same shared helper as every other new turn (resume keeps the archived answer).
-        self.begin_new_turn(sess)
-        if clean:
-            # R5: a /messages delivery keeps the job and its original token; a /continue delivery
-            # gets the new job and the new token. Both are persisted with the conversation ref.
-            active_job = new_job
-            active_token = token if dsh_send_mode == "continue" else old_token
-            sess.dsh_job_id = active_job
-            sess.dsh_token = active_token
-            sess.conversation_ref = _keep_dsh_record_seq(sess.conversation_ref, {
-                "dsh_job_id": active_job,
-                "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
-                "dsh_token": active_token,
-            })
-            sess.status = "running"
-            if dsh_send_mode == "message":
-                sess.current_activity = f"Messaged running DSH job ({active_job}): {clean[:60]}"
-                sess.emit_virtual_ansi(
-                    "\r\n\x1b[1;36m➤ [Parent Steer Injected into running DSH job " + str(active_job) + "]: " + str(clean[:120]) + "\x1b[0m\r\n"
-                )
-            else:
-                sess.current_activity = f"Continuing DSH session ({active_job}): {clean[:60]}"
-        elif jstatus in ("running", "needs_input"):
-            sess.dsh_token = old_token or token
-            sess.status = "running"
-            sess.current_activity = f"Re-attached DSH job {job_id}"
-            if old_token:
-                sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
-        elif jstatus in DSH_ENDED_JOB_STATUSES:
-            # R3: ended-but-live. The next message goes through /continue, exactly like the
-            # send_to_subagent path that always accepted a done/failed/cancelled job.
-            sess.dsh_token = old_token or ""
-            sess.status = "completed"
-            sess.current_activity = f"Re-attached ended DSH job {job_id} ({jstatus})"
-            if catch_up:
-                # The watcher reads the rest and ends the turn itself (status, result, parent wake).
-                sess.status = "running"
-                sess.current_activity = f"Reading the end of DSH job {job_id} ({jstatus} while the hub was stopped)"
-            if old_token:
-                sess.conversation_ref = dict(sess.conversation_ref or {}, dsh_token=old_token)
-        await self.persist_session(sess)
-        await self.record_worker_event(
-            session_id,
-            {
-                "type": "resumed",
-                "category": "lifecycle",
-                "status": "resumed",
-                "content": f"会话已恢复（第 {sess.resume_count} 次）",
-            },
-        )
-        if clean:
-            # A message to the still-running job watches that job again: same rules as re-attaching.
-            same_job = dsh_send_mode == "message"
-            self._schedule(self._watch_dsh_hub_job(
-                sess, new_job, sess.dsh_token or token,
-                reattach=same_job, replay=replay if same_job else None,
-            ))
-        elif jstatus in ("running", "needs_input") or catch_up:
-            self._schedule(self._watch_dsh_hub_job(
-                sess, job_id, sess.dsh_token or token, reattach=True, replay=replay
-            ))
-        injection = "dsh_continue" if clean else "dsh_attach"
-        delivery = {
-            "delivered": bool(clean),
-            "session_id": session_id,
-            "resumed": True,
-            "resume_count": sess.resume_count,
-            "pty_written": False,
-            "injection": injection,
-            "note": "" if clean else "仅重新挂接虚拟终端，没有发送文本",
-        }
-        return {
-            "session": sess,
-            "resumed": True,
-            "already_live": False,
-            "delivered": bool(clean),
             "delivery": delivery,
             "injection": injection,
         }
@@ -7438,15 +7036,6 @@ class HubSessionManager:
         # lacked, and it refuses the retire until that record is drained. The object stays as the
         # id's tombstone so that code reaches the row it belongs to; a resume drops it.
         self._closed_sessions[session_id] = sess
-        # F4: a DSH session has no process, so `terminate` never ends its core text entry, and the
-        # core refuses to retire a live one (it would block every later resume of the id). A killed
-        # text entry publishes its death record, drained just below; `terminate` already killed the
-        # live case, so only an ended one is ended here.
-        if self.core is not None and sess._virtual and not terminated:
-            try:
-                await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
-            except Exception:
-                logger.exception("terminal core: ending %s failed", session_id)
         # The death record this kill published is drained now, while the id still has its object,
         # so the exit path and the retire that follows see it (the core refuses an undrained id).
         if self.core is not None:
@@ -7485,21 +7074,6 @@ class HubSessionManager:
                 },
             )
         return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
-
-    @staticmethod
-    def _cancel_dsh_job(job_id: str, timeout: float = SHUTDOWN_JOB_CANCEL_TIMEOUT_SEC) -> bool:
-        """R5: stops a live DSH job at hub shutdown so a restart can /continue it, not meet /cancel."""
-        if not job_id:
-            return False
-        try:
-            resp = httpx.post(
-                dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"),
-                timeout=max(0.2, float(timeout)),
-                verify=dsh_tls_context(),
-            )
-            return bool(resp.is_success)
-        except Exception:
-            return False
 
     async def archive_all_sessions_on_shutdown(self) -> int:
         """Share one shutdown operation between the HTTP stop and lifespan exit."""
@@ -7657,11 +7231,7 @@ class HubSessionManager:
         kill_left = max(SHUTDOWN_STEP_FLOOR_SEC,
                         deadline - time.monotonic() - SHUTDOWN_ARCHIVE_RESERVE_SEC)
         kill_wait = min(SHUTDOWN_KILL_MAX_SEC, kill_left)
-        stops = [
-            asyncio.to_thread(self._cancel_dsh_job, str(sess.dsh_job_id), timeout=kill_wait)
-            for sess in sessions
-            if sess.dsh_job_id and sess.is_process_alive()
-        ]
+        stops = []
         if core is not None:
             stops.append(asyncio.to_thread(core.kill_all, max(100, int(kill_wait * 1000) - 100)))
         if stops:
@@ -8183,7 +7753,7 @@ class HubSessionManager:
 
     async def summarize_transcript(self, session_id: str) -> Dict[str, Any]:
         """
-        Produces a structured, CLI-specific transcript summary (for omp, kimi, codex, agy, dsh, claude)
+        Produces a structured, CLI-specific transcript summary (for omp, kimi, codex, agy, claude)
         so the Parent Agent never needs to read noisy raw TUI screen dumps.
         """
         sess = self.sessions.get(session_id)
@@ -8288,16 +7858,11 @@ class HubSessionManager:
             # K8 (fix 9d): the last few submit records (startup text, live messages), newest last.
             "recent_injections": meta.get("recent_injections") or [],
             # Round 2: false only when the profile's bypass_approvals was on for this launch;
-            # null for engines without hub approval (dsh, pwsh).
+            # null for engines without hub approval (pwsh).
             "high_risk_approval": (
                 sess.high_risk_approval if sess else self._record_high_risk_approval(meta)
             ),
             **resolve_session_approval_fields(sess.profile_snapshot if sess else meta.get("profile_snapshot")),
-            "sandbox_preparation": (
-                sess.sandbox_preparation if sess else
-                (meta.get("profile_snapshot") or {}).get("sandbox_preparation")
-                if isinstance(meta.get("profile_snapshot"), dict) else None
-            ),
             "transcript_summary": transcript_summary,
         }
         # Only a turn that ended on an error / abort names it; an ordinary answer omits both.
@@ -8676,8 +8241,7 @@ class HubSessionManager:
             f"request_id='{req_id}') with decision='approve' / 'approve_session' / 'deny' for approvals, "
             "option_index=1..N for choices, or custom_input for free text. "
             "Free text alone denies an approval; approve_session may persist an engine allow rule. "
-            "On a DSH full-access request it allows full shell access until the session ends: use approve "
-            "unless the user agreed. Repeated approvals outside the worker's cwd mean a wrong layout: "
+            "Repeated approvals outside the worker's cwd mean a wrong layout: "
             "answer this one, then put the task's own outputs under cwd instead of approving each call; "
             "leave files it did not create in place and never widen cwd to cover them."
             f"{cap_note}"
@@ -9063,7 +8627,7 @@ class HubSessionManager:
         """
         Executes the Parent Agent's approval decision (`approve`, `approve_session`, `deny`) or
         multi-choice selection (`option_index` 1-based, or `custom_input`) using the exact protocol
-        verified for each CLI engine (`dsh`, `kimi`, `omp`, `codex`, `agy`).
+        verified for each CLI engine (`kimi`, `omp`, `codex`, `agy`, `claude`, `doubao`).
         """
         sess = self.sessions.get(session_id)
         if not sess:
@@ -9100,7 +8664,7 @@ class HubSessionManager:
         approval_action: Optional[str] = None
         requested_approval_action: Optional[str] = None
         notes: List[str] = []
-        if kind == "approval_request" and eng in ("kimi", "omp", "codex", "claude", "agy") and not sess.dsh_spec:
+        if kind == "approval_request" and eng in ("kimi", "omp", "codex", "claude", "agy", "doubao"):
             approval_action, chosen_label, chosen_idx_1based = self._resolve_approval_choice(
                 dec_norm, option_index, custom_input, options, meta.get("option_actions")
             )
@@ -9154,58 +8718,8 @@ class HubSessionManager:
         except Exception:
             loop = None
 
-        # ── Engine 1: DSH (`@zseven-w/dsh-crew` + `dsh-security-mode`) ──────────────────────────
-        if eng == "dsh" or sess.dsh_spec:
-            dsh_job_id = meta.get("dsh_job_id") or sess.dsh_job_id
-            dsh_token = meta.get("dsh_token") or sess.dsh_token or ""
-            dsh_msg_id = meta.get("dsh_message_id")
-            dsh_needs_continue = bool(meta.get("dsh_needs_continue"))
-            reply_str = custom_input.strip() if (custom_input and not option_index and not decision) else chosen_label
-            if not reply_str:
-                if dec_norm in ("deny", "reject", "no"):
-                    reply_str = "Reject"
-                elif dec_norm in ("approve_session", "allow_session", "always"):
-                    reply_str = "Allow for this session"
-                else:
-                    reply_str = "Allow once"
-
-            if dsh_job_id and dsh_msg_id and not dsh_needs_continue:
-                r = httpx.post(
-                    dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/messages"),
-                    headers={"x-dsh-crew-job-token": dsh_token},
-                    json={"message": reply_str, "reply_to": dsh_msg_id},
-                    timeout=6.0,
-                    verify=dsh_tls_context(),
-                )
-                delivered = r.is_success
-                action_trace = f"DSH mailbox reply_to={dsh_msg_id} message={reply_str!r} (HTTP {r.status_code})"
-                sess.emit_virtual_ansi(
-                    f"\r\n\x1b[1;32m↩ [Parent Approved/Replied to DSH ({dsh_msg_id})]: {reply_str}\x1b[0m\r\n"
-                )
-            elif dsh_job_id:
-                await self._require_dsh_workspace(sess)
-                new_token = str(uuid.uuid4())
-                r = httpx.post(
-                    dsh_url(f"/_dsh/dsh-crew/jobs/{dsh_job_id}/continue"),
-                    json={"text": reply_str, "messaging_token": new_token},
-                    timeout=10.0,
-                    verify=dsh_tls_context(),
-                )
-                cjob = r.json().get("job", {}) if r.is_success else {}
-                if cjob.get("id"):
-                    sess.dsh_job_id = cjob["id"]
-                    sess.dsh_token = new_token
-                    sess.status = "running"
-                    if loop:
-                        self._schedule(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
-                    delivered = True
-                action_trace = f"DSH /continue job={dsh_job_id}->{cjob.get('id')} text={reply_str!r}"
-                sess.emit_virtual_ansi(
-                    f"\r\n\x1b[1;32m↻ [Parent Continued DSH needs_input with]: {reply_str}\x1b[0m\r\n"
-                )
-
-        # ── Engine 2: Kimi CLI (`ApprovalPanelComponent` & `QuestionDialogComponent`) ──────────
-        elif eng == "kimi":
+        # ── Engine 1: Kimi CLI (`ApprovalPanelComponent` & `QuestionDialogComponent`) ──────────
+        if eng == "kimi":
             if kind == "approval_request":
                 # In Kimi ApprovalPanelComponent:
                 # 1 = Approve once, 2 = Approve for this session, 3 = Reject, 4 = Reject with feedback
@@ -9262,7 +8776,7 @@ class HubSessionManager:
                     action_trace = f"Kimi QuestionDialog option key {key_num!r} ({chosen_label}) + Submit('\\r')"
                 delivered = True
 
-        # ── Engine 3: OMP (`ask` tool selector `class qR` & `showHookConfirm`) ────────────────
+        # ── Engine 2: OMP (`ask` tool selector `class qR` & `showHookConfirm`) ────────────────
         elif eng == "omp" and kind == "approval_request":
             action_trace, note = self._answer_omp_approval(sess, loop, inter, meta, approval_action, custom_input)
             if note:
@@ -9299,7 +8813,7 @@ class HubSessionManager:
                 action_trace = f"OMP selector clamp_top + {target_0_idx}xDown + '\\r' ({chosen_label})"
             delivered = True
 
-        # ── Engine 4: Codex CLI (Approval modal & `request_user_input_async`) ─────────────────
+        # ── Engine 3: Codex CLI (Approval modal & `request_user_input_async`) ─────────────────
         elif eng == "codex":
             if kind == "approval_request":
                 feedback = _one_line(custom_input)
@@ -9394,7 +8908,7 @@ class HubSessionManager:
                 action_trace = f"Codex question reply {reply_txt!r} + '\\r'"
                 delivered = True
 
-        # ── Engine 5: AGY CLI (Permission prompt & `ask_question` selector) ───────────────────
+        # ── Engine 4: AGY CLI (Permission prompt & `ask_question` selector) ───────────────────
         elif eng == "agy":
             if kind == "approval_request":
                 action_trace, note = self._answer_agy_approval(
@@ -9432,7 +8946,7 @@ class HubSessionManager:
                     action_trace = f"AGY ask_question clamp_top + {target_0_idx}xDown + '\\r' ({chosen_label})"
                 delivered = True
 
-        # ── Engine 6: Claude Code CLI (Permission prompt & `AskUserQuestion` selector) ──────
+        # ── Engine 5: Claude Code CLI (Permission prompt & `AskUserQuestion` selector) ──────
         elif eng == "claude":
             if kind == "approval_request":
                 action_trace, note, downgraded = self._answer_claude_approval(
@@ -9454,6 +8968,69 @@ class HubSessionManager:
                     key_num = str(chosen_idx_1based or 1)
                     self._write_keys_scheduled(sess, loop, [(0.0, key_num), (0.2, "\r")])
                     action_trace = f"Claude AskUserQuestion option key {key_num!r} ({chosen_label}) + '\\r'"
+                delivered = True
+
+        # ── Engine 6: Doubao CLI (approval cards & numbered question cards) ─────────────────
+        elif eng == "doubao":
+            if kind == "approval_request":
+                # The key is the chosen option's own 1-based index on THIS card, never a fixed
+                # "1..4" table: a 2-option card's Abort may be 2, a reordered card may put Reject
+                # first. The detector's `option_actions` says what each drawn row does.
+                labels = list(options)
+                actions = list(meta.get("option_actions") or [])
+                if len(actions) != len(labels):
+                    actions = [classify_doubao_option(label) for label in labels]
+
+                def index_of(action: str) -> Optional[int]:
+                    for i, act in enumerate(actions):
+                        if act == action:
+                            return i + 1
+                    return None
+
+                key_idx: Optional[int] = chosen_idx_1based
+                if key_idx is not None and not 1 <= key_idx <= len(labels):
+                    key_idx = None
+                if key_idx is None and (
+                    approval_action == "approve_session" and index_of("approve_session") is None
+                ):
+                    # Never press the Abort row for a session approval the card does not offer.
+                    notes.append("豆包卡片没有「允许类似/允许所有」选项，已降级为「允许一次」")
+                    approval_action = "approve_once"
+                if key_idx is None and (
+                    approval_action == "deny_feedback" and index_of("deny_feedback") is None
+                ):
+                    notes.append("豆包卡片没有「拒绝并停止」选项；只选择了拒绝，反馈未写入")
+                    if index_of("deny") is not None:
+                        approval_action = "deny"
+                if key_idx is None and approval_action:
+                    key_idx = index_of(approval_action)
+                if key_idx is None and chosen_label:
+                    low = str(chosen_label).strip().lower()
+                    for i, label in enumerate(labels):
+                        if label.strip().lower() == low:
+                            key_idx = i + 1
+                            break
+                if key_idx is None:
+                    key_idx = max(1, len(labels))
+                if 1 <= key_idx <= len(labels):
+                    chosen_label = labels[key_idx - 1]
+                chosen_idx_1based = key_idx
+                key = str(key_idx)
+                self._write_keys_scheduled(sess, loop, [(0.0, key), (0.18, "\r")])
+                action_trace = f"Doubao approval key {key!r} ({chosen_label}) + '\\r'"
+                if approval_action == "approve_session":
+                    notes.append("豆包的「允许类似操作」覆盖同类操作，并不等于允许所有操作")
+                elif approval_action == "deny_feedback":
+                    notes.append("豆包卡片没有拒绝反馈输入；只选择了「拒绝并停止」，未追加反馈")
+                delivered = True
+            else:
+                if custom_input and option_index is None:
+                    self._write_keys_scheduled(sess, loop, [(0.0, custom_input.strip() + "\r")])
+                    action_trace = f"Doubao question text {custom_input.strip()!r} + '\\r'"
+                else:
+                    key = str(chosen_idx_1based or 1)
+                    self._write_keys_scheduled(sess, loop, [(0.0, key), (0.18, "\r")])
+                    action_trace = f"Doubao question key {key!r} ({chosen_label}) + '\\r'"
                 delivered = True
 
         # ── Generic / Fallback TUI ─────────────────────────────────
@@ -9896,7 +9473,6 @@ class HubSessionManager:
         resolved_question_id = None
 
         target_qid = request_id or (sess.pending_question_id if sess else None)
-        dsh_replied = False
         if target_qid and target_qid in self.pending_questions:
             q_entry = self.pending_questions[target_qid]
             if not q_entry["answered"]:
@@ -9904,25 +9480,6 @@ class HubSessionManager:
                 q_entry["answer"] = text
                 self.db.on_accept(q_entry["event"].set)
                 resolved_question_id = target_qid
-                if q_entry.get("dsh_message_id") and q_entry.get("dsh_job_id"):
-                    try:
-                        httpx.post(
-                            dsh_url(f"/_dsh/dsh-crew/jobs/{q_entry['dsh_job_id']}/messages"),
-                            headers={"x-dsh-crew-job-token": q_entry["dsh_token"]},
-                            json={"message": text, "reply_to": q_entry["dsh_message_id"]},
-                            timeout=5.0,
-                            verify=dsh_tls_context(),
-                        )
-                        dsh_replied = True
-                        if sess:
-                            sess.pending_question_id = None
-                            sess.status = "running"
-                            sess.emit_virtual_ansi(
-                                f"\r\n\x1b[1;32m↩ [Parent Replied to DSH Question {resolved_question_id}]: {text}\x1b[0m\r\n"
-                            )
-                    except Exception as e:
-                        if sess:
-                            sess.emit_virtual_ansi(f"\r\n\x1b[31m✖ Failed to deliver reply to DSH: {e}\x1b[0m\r\n")
 
         box = self.parent_messages.setdefault(session_id, [])
         msg_rec = {
@@ -9941,67 +9498,7 @@ class HubSessionManager:
         live_queued = False
         live_injection: Optional[str] = None
         live_submit_id: Optional[str] = None
-        dsh_error: Optional[str] = None
-        if sess and sess.dsh_spec and not resolved_question_id and not dsh_replied:
-            clean_txt = text.strip()
-            if not clean_txt:
-                dsh_error = "消息为空，未发送给 DSH"
-            else:
-                try:
-                    loop = asyncio.get_running_loop()
-                    if sess.dsh_job_id and sess.status == "running":
-                        r = httpx.post(
-                            dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/messages"),
-                            headers={"x-dsh-crew-job-token": sess.dsh_token or ""},
-                            json={"message": clean_txt},
-                            timeout=5.0,
-                            verify=dsh_tls_context(),
-                        )
-                        if not r.is_success:
-                            dsh_error = f"DSH 拒绝了这条消息（HTTP {r.status_code}）"
-                        else:
-                            sess.emit_virtual_ansi(f"\r\n\x1b[1;36m➤ [Parent Steer Injected into DSH]: {clean_txt}\x1b[0m\r\n")
-                            pty_written = True
-                    elif sess.dsh_job_id and sess.status in ("completed", "exited"):
-                        await self._require_dsh_workspace(sess)
-                        new_token = str(uuid.uuid4())
-                        r = httpx.post(
-                            dsh_url(f"/_dsh/dsh-crew/jobs/{sess.dsh_job_id}/continue"),
-                            json={"text": clean_txt, "messaging_token": new_token},
-                            timeout=10.0,
-                            verify=dsh_tls_context(),
-                        )
-                        cjob = (r.json() or {}).get("job", {}) if r.is_success else {}
-                        if cjob.get("id"):
-                            sess.dsh_job_id = cjob["id"]
-                            sess.dsh_token = new_token
-                            sess.conversation_ref = _keep_dsh_record_seq(sess.conversation_ref, {
-                                "dsh_job_id": cjob["id"],
-                                "dsh_session_id": sess.dsh_session_id or cjob.get("sessionId") or "",
-                                "dsh_token": new_token,
-                            })
-                            sess.status = "running"
-                            # B9: last_task stays the initial task; follow-ups live in current_activity.
-                            if not sess.last_task:
-                                sess.last_task = clean_txt
-                            sess.current_activity = f"Continuing DSH session ({cjob['id']}): {clean_txt[:60]}"
-                            sess.emit_virtual_ansi(
-                                f"\r\n\x1b[1;36m↻ [Continuing DSH Session {sess.dsh_session_id} -> {cjob['id']}]: {clean_txt}\x1b[0m\r\n"
-                            )
-                            self._schedule(self._watch_dsh_hub_job(sess, cjob["id"], new_token))
-                            pty_written = True
-                        else:
-                            dsh_error = f"DSH 无法继续该任务（HTTP {r.status_code}）"
-                    elif not sess.dsh_job_id:
-                        self._schedule(self._spawn_dsh_hub_job(sess, clean_txt))
-                        pty_written = True
-                    else:
-                        # A8: a DSH session in any other status cannot take the text; say so.
-                        dsh_error = f"DSH 会话当前状态（{sess.status}）无法接收消息"
-                except Exception as e:
-                    dsh_error = f"DSH 消息发送失败：{e}"
-                    sess.emit_virtual_ansi(f"\r\n\x1b[31m✖ DSH message delivery error: {e}\x1b[0m\r\n")
-        elif sess and also_write_pty and not resolved_question_id:
+        if sess and also_write_pty and not resolved_question_id:
             if (press_enter and sess.kind == "tui" and text.rstrip("\r\n").strip()
                   and sess.is_process_alive()):
                 # K6 (fix 9c): a live message with Enter goes through the same checked submit as
@@ -10051,20 +9548,6 @@ class HubSessionManager:
                         loop.call_later(TUI_UNCHECKED_ENTER_DELAY_SEC, sess.write_input, "\r")
                     except Exception:
                         sess.write_input("\r")
-
-        if dsh_error is not None:
-            # A8: a message DSH could not take is reported with its reason, never as a canned true.
-            if sess:
-                await self.persist_session(sess, final=True)
-            return {
-                "delivered": False,
-                "reason": dsh_error,
-                "session_id": session_id,
-                "resolved_question_id": resolved_question_id,
-                "pty_written": False,
-                "injection": "dsh_failed",
-                "mailbox_message_id": msg_rec["id"],
-            }
 
         if sess and starts_new_turn and press_enter and (pty_written or live_queued) and not resolved_question_id:
             # T1: send_to_subagent's live write, the console's send and a parent reply all land
@@ -12486,6 +11969,294 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
+    async def _watch_doubao_session(self, session: AgentSession, root: Optional[Path] = None):
+        """Follows one Doubao CLI conversation: `assignment.md` marker, trajectory, screen turn ends.
+
+        `root` points the watcher at a synthetic `doubao_cli` layout for tests; production uses
+        `%LOCALAPPDATA%\\doubao_cli`. The conversation id is learnt from the marker the hub's task
+        carries, so two sessions starting together never bind each other's conversation. A turn's
+        answer comes from `trajectory.jsonl` when that file was appended, else from `--export`
+        (a pure-text turn may leave no local row), else from the screen's `◆` block.
+        """
+        data_root = Path(root) if root is not None else doubao_data_root()
+        conversation_id = ""
+        transcript_paths: List[Path] = []
+        offsets: Dict[str, int] = {}
+
+        if session.resume_attach and session.conversation_ref:
+            conversation_id = str(session.conversation_ref.get("session_id") or "").strip()
+            ref_path = str(session.conversation_ref.get("transcript_path") or "")
+            if ref_path and os.path.isfile(ref_path):
+                path = Path(ref_path)
+                transcript_paths = [path]
+                offsets[self._transcript_key(path)] = int(session.attach_offset or 0)
+                await self._claim_transcript(session, path)
+                session.conversation_ref = {
+                    **dict(session.conversation_ref),
+                    "session_id": conversation_id or path.parents[3].name,
+                    "cwd": session.cwd,
+                    "transcript_path": str(path),
+                }
+                await self.persist_session(session)
+                conversation_id = str(
+                    session.conversation_ref.get("session_id") or conversation_id
+                ).strip()
+
+        scan_start = time.time()
+        last_discovery = 0.0
+        last_screen_at = 0.0
+        last_export_probe = 0.0
+        idle_since = 0.0
+        turn_busy = False
+        turn_text: Optional[str] = None
+        turn_evidence = False
+        baseline_reply: Optional[str] = None
+        seen_turn_id = session.turn_id
+
+        while self._transcript_watch_alive(session):
+            now = time.time()
+            if session.turn_id != seen_turn_id:
+                # A new turn starts with no native or screen output of its own yet.
+                seen_turn_id = session.turn_id
+                turn_text = None
+                turn_evidence = False
+            if (not conversation_id or not transcript_paths) and (
+                now - scan_start < DOUBAO_DISCOVERY_WINDOW_SEC
+            ) and (now - last_discovery >= self._transcript_scan_interval(now - scan_start)):
+                last_discovery = now
+                found = await asyncio.to_thread(
+                    find_doubao_session_by_marker,
+                    session.session_id,
+                    created_at=self._session_spawn_anchor(session),
+                    data_root=data_root,
+                )
+                if not found:
+                    scr_id = session.read_screen(max_lines=40).text
+                    screen_id = parse_doubao_exit_resume_id(scr_id) or parse_doubao_status_session_id(scr_id)
+                    if screen_id:
+                        found = (screen_id, [])
+                if found:
+                    conversation_id, found_paths = found
+                    transcript_paths = [Path(p) for p in found_paths]
+                    # Merge, never replace: `export_rows`/`cwd` recorded earlier must survive.
+                    ref = dict(session.conversation_ref) if isinstance(session.conversation_ref, dict) else {}
+                    ref["session_id"] = conversation_id
+                    ref.setdefault("cwd", session.cwd)
+                    session.conversation_ref = ref
+                    for path in transcript_paths:
+                        offsets.setdefault(self._transcript_key(path), 0)
+                    if transcript_paths:
+                        await self._claim_transcript(session, transcript_paths[0])
+                        session.conversation_ref["transcript_path"] = str(transcript_paths[0])
+                        session.transcript_path = transcript_paths[0]
+                    await self.persist_session(session)
+
+            try:
+                for path in list(transcript_paths):
+                    key = self._transcript_key(path)
+                    try:
+                        records, offset = read_complete_records(path, offsets.get(key, 0))
+                    except OSError:
+                        continue
+                    offsets[key] = offset
+                    for _start, _end, line in records:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        self._observe_context_record(session, obj)
+                        for event in parse_doubao_trajectory_record(obj):
+                            kind = event.get("kind")
+                            if kind == "user_text":
+                                await self.note_native_user_prompt(session, str(event.get("text") or ""))
+                                turn_text = None
+                                turn_evidence = False
+                            elif kind == "assistant_text":
+                                turn_text = str(event.get("text") or "").strip() or turn_text
+                                turn_evidence = True
+                                await self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "doubao_trajectory",
+                                        "hook_event": "AssistantMessage",
+                                        "intermediate_messages": [event.get("text")],
+                                        "final_assistant_text": event.get("text"),
+                                    },
+                                )
+                            elif kind == "reasoning":
+                                await self.record_reasoning_parts(
+                                    session.session_id, "doubao_trajectory", [event.get("text")]
+                                )
+                            elif kind == "tool_call":
+                                session._inflight_transcript_tool = {
+                                    "tool_name": str(event.get("name") or "tool"),
+                                    "command": json.dumps(event.get("arguments"), ensure_ascii=False)
+                                    if isinstance(event.get("arguments"), (dict, list))
+                                    else str(event.get("arguments") or ""),
+                                    "args": event.get("arguments"),
+                                    "call_id": str(event.get("call_id") or ""),
+                                }
+                                await self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "doubao_trajectory",
+                                        "hook_event": "PreToolUse",
+                                        "tool_name": event.get("name") or "tool",
+                                        "tool_input": event.get("arguments"),
+                                        "call_id": event.get("call_id") or None,
+                                    },
+                                )
+                            elif kind == "tool_result":
+                                await self.record_telemetry(
+                                    session.session_id,
+                                    {
+                                        "source": "doubao_trajectory",
+                                        "hook_event": "PostToolUse",
+                                        "tool_response": event.get("content") or "",
+                                        "call_id": event.get("call_id") or None,
+                                    },
+                                )
+            except PersistenceRecordTooLarge as exc:
+                self._skip_unstorable_record(session, "Doubao trajectory watcher", exc)
+            except PersistenceUnavailable:
+                raise
+            except Exception:
+                pass
+
+            if now - last_screen_at >= DOUBAO_SCREEN_POLL_SEC:
+                last_screen_at = now
+                screen_text = session.read_screen(max_lines=max(40, int(getattr(session, "rows", 38) or 38))).text
+                # A busy marker is only drawn near the composer, and `Processing` only as a
+                # status row with a leading glyph; a transcript row that merely quotes it must
+                # not hold the turn open.
+                bottom_rows = screen_text.splitlines()[-12:]
+                busy = any(DOUBAO_TURN_BUSY_RE.search(row) for row in bottom_rows)
+                input_line = self._tui_input_line(screen_text, "doubao")
+                composer_idle = input_line is not None and input_line.strip() in (
+                    "", DOUBAO_COMPOSER_PLACEHOLDER
+                )
+                clean_rows = sanitize_tui_screen_text(screen_text, max_lines=20, engine="doubao")
+                screen_reply = extract_doubao_screen_reply(clean_rows)
+                if busy:
+                    idle_since = 0.0
+                    if baseline_reply is None:
+                        # The turn started before the watcher saw an idle screen: the `◆` block
+                        # drawn right now is still the previous answer and becomes the baseline.
+                        baseline_reply = screen_reply
+                    if not turn_busy:
+                        turn_busy = True
+                        if session.status == "completed":
+                            self.begin_new_turn(session, status="running")
+                            await self.persist_session(session)
+                            turn_text = None
+                            turn_evidence = False
+                elif not composer_idle:
+                    # Text still sits on the composer: a draft, never an idle prompt.
+                    idle_since = 0.0
+                else:
+                    if idle_since <= 0.0:
+                        idle_since = now
+                    if baseline_reply is None:
+                        baseline_reply = screen_reply
+                    if session.status in ("starting", "running") and session.pending_interaction is None:
+                        screen_fresh = bool(screen_reply) and (
+                            screen_reply != str(baseline_reply or "")
+                            or doubao_screen_reply_after_user_prompt(clean_rows)
+                        )
+                        export_due = now - last_export_probe >= DOUBAO_EXPORT_PROBE_SEC
+                        if now - idle_since >= DOUBAO_IDLE_SETTLE_SEC and (
+                            turn_busy or turn_evidence or screen_fresh or export_due
+                        ):
+                            if export_due:
+                                last_export_probe = now
+                            ended = await self._finish_doubao_turn(
+                                session,
+                                conversation_id,
+                                turn_text,
+                                screen_text,
+                                baseline_reply=str(baseline_reply or ""),
+                                allow_export=export_due or turn_evidence or screen_fresh,
+                            )
+                            if ended:
+                                # A card the parent has not answered yet keeps the turn open: its
+                                # "Reject and stop" also ends the turn without another busy phase.
+                                turn_busy = False
+                                turn_text = None
+                                turn_evidence = False
+                                baseline_reply = screen_reply
+                    else:
+                        # No live turn: this answer is the baseline the next turn must differ from.
+                        baseline_reply = screen_reply
+            await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+
+    async def _finish_doubao_turn(
+        self,
+        session: AgentSession,
+        conversation_id: str,
+        turn_text: Optional[str],
+        screen_text: str,
+        *,
+        baseline_reply: str = "",
+        allow_export: bool = True,
+    ) -> bool:
+        """End one Doubao turn; False while an interaction blocks the end or this turn has no answer.
+
+        A turn ends only from THIS turn's evidence: a trajectory assistant row, a new `--export`
+        row, or a `◆` block that differs from the pre-turn baseline (or was drawn after this
+        turn's `▍` prompt). A mid-turn `Worked for 12s` screen that still shows the previous
+        answer is not evidence, so no empty `turn_completed` is ever emitted.
+        """
+        if session.status not in ("starting", "running") or session.pending_interaction is not None:
+            return False
+        # Only the CLI's own non-assistant rows can name an engine failure; `◆` prose cannot.
+        tail = "\n".join(str(screen_text or "").splitlines()[-12:])
+        info = detect_doubao_error(tail)
+        if info is not None:
+            ended = await self._end_or_hold_engine_error(session, "doubao", info)
+            if ended:
+                session._inflight_transcript_tool = None
+            return ended
+
+        answer = str(turn_text or "").strip()
+        source = "doubao_native" if answer else ""
+        if not answer and conversation_id and allow_export:
+            binary = str(getattr(session, "command", "") or "").strip() or resolve_doubao_binary()
+            rows = await asyncio.to_thread(export_doubao_session, binary, conversation_id)
+            seen_rows = int(getattr(session, "_doubao_export_rows", 0) or 0)
+            if rows and (seen_rows <= 0 or len(rows) > seen_rows):
+                reply = str(rows[-1].get("response") or "").strip()
+                session._doubao_export_rows = len(rows)
+                if isinstance(session.conversation_ref, dict):
+                    session.conversation_ref["export_rows"] = len(rows)
+                    await self.persist_session(session)
+                if reply:
+                    answer, source = reply, "doubao_export"
+        clean = sanitize_tui_screen_text(screen_text, max_lines=20, engine="doubao")
+        screen_reply = extract_doubao_screen_reply(clean)
+        screen_fresh = bool(screen_reply) and (
+            screen_reply != str(baseline_reply or "")
+            or doubao_screen_reply_after_user_prompt(clean)
+        )
+        if not answer and screen_fresh:
+            answer, source = screen_reply, "doubao_screen"
+        if not answer:
+            return False
+        session._inflight_transcript_tool = None
+        session.set_final_response(answer, source)
+        await self.record_worker_event(
+            session.session_id,
+            {
+                "type": "turn_completed",
+                "category": "turn_completed",
+                "status": "turn_idle",
+                "content": answer,
+            },
+        )
+        return True
+
     @classmethod
     def _tui_input_line(cls, screen_text: str, engine: str = "") -> Optional[str]:
         """W2/K2: the text on the engine's composer ("" when it is empty), or None when none is drawn.
@@ -13969,600 +13740,19 @@ class HubSessionManager:
         self._release_transcripts(session_id)
         self._user_terminated.discard(session_id)
 
-    async def _prepare_dsh_workspace(self, cwd: str, *, repair: bool = True) -> Dict[str, Any]:
-        return await asyncio.to_thread(
-            prepare_dsh_workspace, cwd, dsh_base_url(), self.data_dir, repair=repair,
-        )
+    
 
-    async def _require_dsh_workspace(self, session: AgentSession) -> Dict[str, Any]:
-        preparation = await self._prepare_dsh_workspace(session.cwd)
-        session.sandbox_preparation = preparation
-        session.profile_snapshot["sandbox_preparation"] = preparation
-        await self.persist_session(session)
-        if not preparation["allowed"]:
-            raise ValueError(preparation["reason"])
-        return preparation
+    
 
-    async def _spawn_dsh_hub_job(self, session: AgentSession, task: Optional[str]):
-        """Spawns a first-class in-host DSH session via <DSH host>/_dsh/dsh-crew/jobs (dsh_base_url)."""
-        if session.terminated_by_user:
-            # Q4: the user terminated the session before this task got its first turn.
-            return
-        spec = session.dsh_spec
-        provider = spec.get("provider", "clay")
-        model = spec.get("model", "deepseek-flash")
-        tier = spec.get("tier", "flash")
-        effort = spec.get("effort", "high")
+    
 
-        dsh_host = dsh_base_url().split("://", 1)[-1]
-        box_w = max(60, min(int(session.cols or 120) - 2, 140))
-        inner_w = max(40, box_w - 18)
-        banner_head = f"╭─── DeepSeek Harness (In-Host Session @ {dsh_host}) "
-        model_info = f"{provider} / {model} (tier={tier}, effort={effort})"
-        banner = (
-            f"\x1b[1;36m{banner_head}{'─' * max(1, box_w - len(banner_head))}╮\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Hub Session : \x1b[1;33m{session.session_id:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Model Route : \x1b[1;32m{model_info[:inner_w]:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m│\x1b[0m Workspace   : {session.cwd[:inner_w]:<{inner_w}}\x1b[1;36m│\x1b[0m\r\n"
-            f"\x1b[1;36m╰{'─' * (box_w - 1)}╯\x1b[0m\r\n"
-        )
-        session.emit_virtual_ansi(banner)
+    
 
-        if not task or not task.strip():
-            session.sandbox_preparation = await self._prepare_dsh_workspace(session.cwd, repair=False)
-            session.profile_snapshot["sandbox_preparation"] = session.sandbox_preparation
-            session.emit_virtual_ansi(
-                "\x1b[90m✦ Ready. Type a task below or call send_to_subagent to dispatch into DSH Web Host.\x1b[0m\r\n> "
-            )
-            await self.persist_session(session)
-            return
+    
 
-        try:
-            await self._require_dsh_workspace(session)
-        except ValueError as error:
-            if session.terminated_by_user:
-                return
-            session.status = "exited"
-            session.end_reason = "crashed"
-            session.ended_at = time.time()
-            session.current_activity = str(error)
-            session.emit_virtual_ansi(f"\x1b[1;31m✖ {error}\x1b[0m\r\n")
-            await self.persist_session(session)
-            await self.record_worker_event(session.session_id, {
-                "type": "error", "category": "lifecycle", "status": "failed",
-                "content": str(error), "sandbox_preparation": session.sandbox_preparation,
-            })
-            return
-        if session.terminated_by_user:
-            return
+    
 
-        token = str(uuid.uuid4())
-        payload = {
-            "task": task.strip(),
-            "tier": tier,
-            "effort": effort,
-            "provider": provider,
-            "model": model,
-            "cwd": session.cwd,
-            "messaging_token": token,
-            "source": "mcp-agent-hub",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=15.0, verify=dsh_tls_context()) as client:
-                r = await client.post(dsh_url("/_dsh/dsh-crew/jobs"), json=payload)
-                data = r.json()
-                if not r.is_success or not data.get("ok"):
-                    err_msg = data.get("error") or f"HTTP {r.status_code}"
-                    if session.terminated_by_user:
-                        # Q4: a failed spawn must not rewrite a session the user already terminated.
-                        return
-                    session.emit_virtual_ansi(f"\x1b[1;31m✖ DSH Spawn Error: {err_msg}\x1b[0m\r\n")
-                    session.status = "exited"
-                    await self.persist_session(session)
-                    return
-                job = data["job"]
-                job_id = job["id"]
-                dsh_sid = job.get("sessionId", "")
-                if session.terminated_by_user:
-                    # Q4: the termination raced the spawn request. Clean up the job that was created,
-                    # but leave the session's status, persistence and events exactly as terminate()
-                    # left them.
-                    threading.Thread(
-                        target=lambda: httpx.post(
-                            dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/cancel"), timeout=3.0,
-                            verify=dsh_tls_context(),
-                        ),
-                        daemon=True,
-                    ).start()
-                    return
-                session.dsh_job_id = job_id
-                session.dsh_session_id = dsh_sid
-                session.dsh_token = token
-                # Spec §3/§4: the dsh conversation reference is the job handle the continue API
-                # takes; R5 also keeps the job's messaging token so /messages still works after a
-                # hub restart.
-                session.conversation_ref = {
-                    "dsh_job_id": job_id,
-                    "dsh_session_id": dsh_sid,
-                    "dsh_token": token,
-                }
-                session.status = "running"
-                session.current_activity = f"DSH Job {job_id} running in {dsh_sid}"
-                session.emit_virtual_ansi(
-                    f"\x1b[1;35m🚀 Spawned DSH Job:\x1b[0m \x1b[1m{job_id}\x1b[0m  "
-                    f"\x1b[90m(DSH Web Session: {dsh_sid})\x1b[0m\r\n"
-                    f"\x1b[90m❯ {task.strip()}\x1b[0m\r\n"
-                )
-                await self.persist_session(session)
-                await self._watch_dsh_hub_job(session, job_id, token)
-        except PersistenceUnavailable:
-            raise
-        except Exception as e:
-            if session.terminated_by_user:
-                # Q4: a spawn that fails after the user terminated must not resurrect the session.
-                return
-            session.emit_virtual_ansi(f"\x1b[1;31m✖ Failed to reach DSH Host on {dsh_host}: {e}\x1b[0m\r\n")
-            session.status = "exited"
-            await self.persist_session(session)
-
-    async def _open_dsh_session_record(
-        self, session: AgentSession, job_id: str, *, reattach: bool = False
-    ) -> Optional["_DshRecordCursor"]:
-        """This DSH session's native record, or None while DSH has not created it (yet)."""
-        if not session.dsh_session_id:
-            return None
-        path = await asyncio.to_thread(locate_dsh_session_record, session.dsh_session_id)
-        if path is None:
-            return None
-        ref = session.conversation_ref if isinstance(session.conversation_ref, dict) else {}
-        try:
-            after_seq = int(ref.get(DSH_RECORD_SEQ_KEY, -1))
-            # The byte position only saves re-reading; it is meaningless without the sequence.
-            start_offset = int(ref.get(DSH_RECORD_OFFSET_KEY) or 0) if after_seq >= 0 else 0
-        except (TypeError, ValueError):
-            after_seq, start_offset = -1, 0
-        since_ms = None
-        try:
-            async with httpx.AsyncClient(timeout=5.0, verify=dsh_tls_context()) as client:
-                resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
-            started = (resp.json().get("job") or {}).get("startedAt") if resp.is_success else None
-            if started:
-                # A continued job shares the record with earlier turns that are already recorded.
-                since_ms = datetime.datetime.fromisoformat(str(started).replace("Z", "+00:00")).timestamp() * 1000 - 2000
-        except Exception:
-            since_ms = None
-        cursor = _DshRecordCursor(DshSessionRecordReader(path, start_offset=start_offset),
-                                  after_seq=after_seq, since_ms=since_ms)
-        if reattach and after_seq < 0:
-            # A Hub that never stored a position (an older version, or a crash before the first
-            # batch was saved) recorded this job from its log: only what DSH writes from now on
-            # is new.  Reading the existing events once also learns the open calls' tool names.
-            try:
-                existing = await asyncio.to_thread(cursor.reader.read_new_events)
-            except Exception as error:
-                logger.warning("[%s] DSH session record unreadable, using the job log: %s", session.session_id, error)
-                return None
-            seqs = [int(ev["seq"]) for ev in existing if isinstance(ev.get("seq"), int)]
-            cursor.after_seq = max(seqs, default=-1)
-            native_events_to_telemetry(existing, after_seq=cursor.after_seq, tool_names=cursor.tool_names)
-        return cursor
-
-    async def _drain_dsh_session_record(self, session: AgentSession, cursor: "_DshRecordCursor") -> bool:
-        """Record tool calls, results, text and reasoning appended to the DSH session record.
-
-        Returns whether anything new was recorded."""
-        if not cursor.active or session.terminated_by_user or self._shutting_down:
-            return False
-        try:
-            events = await asyncio.to_thread(cursor.reader.read_new_events)
-            payloads = native_events_to_telemetry(events, after_seq=cursor.after_seq, since_ms=cursor.since_ms,
-                                                  tool_names=cursor.tool_names)
-        except Exception as error:
-            # Corrupt data, a missing decoder or an unexpected record shape: the job log keeps the
-            # transcript going (tool names only) from here on, and the watcher keeps running.
-            logger.warning("[%s] DSH session record unreadable, using the job log: %s", session.session_id, error)
-            cursor.active = False
-            return False
-        try:
-            for payload in payloads:
-                if session.terminated_by_user or self._shutting_down:
-                    break
-                seq = int(payload.pop("native_seq"))
-                payload.pop("timestamp", None)
-                await self.record_telemetry(session.session_id, payload)
-                cursor.after_seq = max(cursor.after_seq, seq)
-                # Kept current per payload, so a stop mid-batch never records one twice.
-                session.conversation_ref = dict(session.conversation_ref or {}, **{DSH_RECORD_SEQ_KEY: cursor.after_seq})
-                # record_telemetry rarely suspends, and each call renders and stores the session. A
-                # job's first read can return a long backlog; drained in one go, that held the loop
-                # for 1.0-1.4 s in the live hub (2026-11-12).
-                await asyncio.sleep(0)
-        finally:
-            if payloads or events:
-                session.conversation_ref = dict(session.conversation_ref or {}, **{
-                    DSH_RECORD_SEQ_KEY: cursor.after_seq, DSH_RECORD_OFFSET_KEY: cursor.reader.resume_offset})
-                await self.persist_session(session)
-        return bool(payloads)
-
-    async def _settle_dsh_session_record(self, session: AgentSession, cursor: "_DshRecordCursor") -> None:
-        """Read the frames DSH writes just after it reports the job finished."""
-        await self._drain_dsh_session_record(session, cursor)
-        for _ in range(DSH_RECORD_SETTLE_MAX_PASSES):
-            if not cursor.active:
-                return
-            await asyncio.sleep(DSH_RECORD_SETTLE_INTERVAL_SEC)
-            if not await self._drain_dsh_session_record(session, cursor):
-                return
-
-    @staticmethod
-    def _dsh_job_error_info(jstatus: str, error_text: str) -> Dict[str, Any]:
-        """The classified error of a failed/timeout DSH job (its own text decides the kind)."""
-        text = str(error_text or "").strip()
-        info = classify_engine_error(text) if text else {"kind": "other", "retryable": False, "message": ""}
-        if jstatus == "timeout":
-            if str(info.get("kind") or "other") == "other":
-                # "timed out" in our own sentence must not turn an unknown failure into a network
-                # error: only the job's text classifies, and nothing matched it.
-                info = {
-                    "kind": "other",
-                    "retryable": False,
-                    "message": f"DSH job timed out: {text or 'the job reported no error text'}",
-                }
-        elif not text:
-            info = {"kind": "other", "retryable": False, "message": "DSH job failed without an error message"}
-        return info
-
-    async def _watch_dsh_hub_job(self, session: AgentSession, job_id: str, token: str, *,
-                                 log_path: Optional[Path] = None, reattach: bool = False,
-                                 replay: Optional[DshMailboxReplay] = None):
-        """
-        Tails ~/.config/dsh-crew/logs/<job_id>.log for real-time steps/tools/thoughts AND
-        polls /_dsh/dsh-crew/jobs/<job_id>/messages for bidirectional worker->parent messages & questions!
-
-        `replay` (a job watched again after a hub restart): the first mailbox batch is the job's
-        whole mailbox, and entries the hub already handled before it stopped are skipped.
-        """
-        if session.terminated_by_user:
-            # Q4: never attach, persist or emit for a session the user already terminated.
-            return
-        if log_path is not None:
-            log_file = Path(log_path)
-        else:
-            default_log = Path(os.path.expanduser("~")) / ".config" / "dsh-crew" / "logs" / f"{job_id}.log"
-            # A restricted desktop token may be able to call the DSH API while it cannot read the
-            # host's default log directory.  In that case keep the watcher alive and rely on the
-            # job/messages endpoints; a writable Hub-local path also gives the transcript a stable
-            # location if the host is configured to mirror logs there.
-            if _directory_is_writable(default_log.parent):
-                log_file = default_log
-            else:
-                log_file = self.data_dir / "dsh-logs" / f"{job_id}.log"
-                log_file.parent.mkdir(parents=True, exist_ok=True)
-        session.transcript_path = log_file
-        await self.persist_session(session)
-        tail = TranscriptTail(log_file)
-        msg_cursor = 0
-        # The DSH session record carries what the job log leaves out (tool arguments and output,
-        # full assistant text, reasoning).  The source is chosen once per watcher so a tool is never
-        # recorded from both; the job log still drives steps and errors either way.  DSH creates the
-        # record shortly after the job starts, so the job log waits until it is found or given up.
-        record = await self._open_dsh_session_record(session, job_id, reattach=reattach)
-        record_deadline = None if record is not None else time.monotonic() + DSH_RECORD_LOCATE_WAIT_SEC
-
-        async def look_for_record(final: bool = False):
-            nonlocal record, record_deadline
-            if record is not None or record_deadline is None:
-                return
-            record = await self._open_dsh_session_record(session, job_id, reattach=reattach)
-            if record is not None:
-                record_deadline = None
-            elif final or time.monotonic() >= record_deadline:
-                record_deadline = None
-                logger.info("[%s] DSH session record not found; transcript uses the job log", session.session_id)
-
-        async def drain_log_lines():
-            try:
-                lines = await tail.read_batch()
-            except (OSError, PermissionError):
-                # Log access is auxiliary; DSH job status and mailbox polling remain authoritative.
-                lines = []
-            for next_offset, line in lines:
-                if session.terminated_by_user or self._shutting_down:
-                    return False
-                try:
-                    ev = json.loads(line)
-                except (ValueError, TypeError):
-                    logger.warning("Skipping malformed DSH log line for %s", session.session_id)
-                    tail.acknowledge(next_offset)
-                    continue
-                kind = ev.get("kind")
-                summary = ev.get("summary", "")
-                if kind == "step":
-                    s_num = int(ev.get("step") or (session.step_count + 1))
-                    t_num = ev.get("turn", 1)
-                    session.step_count = max(session.step_count, s_num)
-                    session.current_activity = f"Step {s_num} (Turn {t_num})"
-                    session.emit_virtual_ansi(f"\r\n\x1b[1;36m▶ [Step {s_num} · Turn {t_num}]\x1b[0m\r\n")
-                    await self.persist_session(session)
-                elif kind in ("tool_call", "tool_result", "text") and record is not None and record.active:
-                    pass  # recorded from the session record with full detail
-                elif kind == "tool_call":
-                    tname = ev.get("tool") or summary or "dsh_tool"
-                    await self.record_telemetry(
-                        session.session_id,
-                        {
-                            "source": "dsh_job_log",
-                            "hook_event": "PreToolUse",
-                            "tool_name": tname,
-                            "tool_input": summary,
-                        },
-                    )
-                    session.emit_virtual_ansi(f"\x1b[33m  ⚙ Tool Call: {tname}\x1b[0m\r\n")
-                elif kind == "tool_result":
-                    await self.record_telemetry(
-                        session.session_id,
-                        {
-                            "source": "dsh_job_log",
-                            "hook_event": "PostToolUse",
-                            "tool_response": summary,
-                        },
-                    )
-                    session.emit_virtual_ansi(f"\x1b[32m  ✓ {summary}\x1b[0m\r\n")
-                elif kind == "text" and summary:
-                    await self.record_telemetry(
-                        session.session_id,
-                        {
-                            "source": "dsh_job_log",
-                            "hook_event": "AssistantMessage",
-                            "intermediate_messages": [summary],
-                            "final_assistant_text": summary,
-                        },
-                    )
-                    session.emit_virtual_ansi(f"\x1b[37m  💬 {summary}\x1b[0m\r\n")
-                elif kind == "error" and summary:
-                    session.emit_virtual_ansi(f"\x1b[1;31m  ✖ {summary}\x1b[0m\r\n")
-                tail.acknowledge(next_offset)
-                # A screen/history snapshot is a core call with its own deadline. Let socket I/O run
-                # between records as well as between the bounded file-read batches.
-                await asyncio.sleep(0.001)
-            await asyncio.sleep(0)
-            return len(lines) == tail.batch_lines
-
-        async with httpx.AsyncClient(timeout=10.0, verify=dsh_tls_context()) as client:
-            while (
-                session.dsh_job_id == job_id
-                and not session.terminated_by_user
-                and session.status in ("starting", "running", "waiting_parent")
-            ):
-                await look_for_record()
-                if record is not None:
-                    await self._drain_dsh_session_record(session, record)
-                if record_deadline is None and await drain_log_lines():
-                    continue
-
-                # Poll DSH WorkerMailbox for worker->parent messages or blocking questions
-                try:
-                    m_resp = await client.get(
-                        dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}/messages"),
-                        params={"after": msg_cursor, "wait": 1},
-                        headers={"x-dsh-crew-job-token": token},
-                    )
-                    if session.terminated_by_user:
-                        # Q4: the user terminated while this poll was in flight; stop before any
-                        # status / persistence / event change.
-                        return
-                    if m_resp.is_success:
-                        m_res = m_resp.json().get("result") or {}
-                        for m in m_res.get("messages") or []:
-                            seq = int(m.get("sequence", 0))
-                            mkind = m.get("kind")
-                            mtext = m.get("text", "")
-                            mid = m.get("message_id") or f"dsh-msg-{seq}"
-                            if (replay is not None and mkind == "message"
-                                    and replay.already_handled(mid, mtext, bool(m.get("expects_reply")))):
-                                msg_cursor = max(msg_cursor, seq)
-                                continue
-                            if mkind == "message":
-                                if m.get("expects_reply"):
-                                    # Parse options from DSH worker-question handoff format: `Options: A | B | C`
-                                    parsed_opts: List[str] = []
-                                    for mline in mtext.splitlines():
-                                        if mline.strip().startswith("Options:"):
-                                            raw_part = mline.split("Options:", 1)[1]
-                                            parsed_opts = [x.strip() for x in raw_part.split("|") if x.strip()]
-                                            break
-                                    is_sec_approval = (
-                                        "[Security mode]" in mtext
-                                        or "Allow this call?" in mtext
-                                        or ("Allow once" in parsed_opts and "Reject" in parsed_opts)
-                                    )
-                                    int_kind = "approval_request" if is_sec_approval else "question"
-                                    int_title = "DSH Security Mode High-Risk Approval" if is_sec_approval else "DSH Worker Question"
-                                    if not parsed_opts and is_sec_approval:
-                                        parsed_opts = ["Allow once", "Allow for this session", "Reject"]
-                                    session.emit_virtual_ansi(
-                                        f"\r\n\x1b[1;35m{'🛡️' if is_sec_approval else '❓'} [DSH Worker {'Approval Request' if is_sec_approval else 'Asking Parent'} (request_id={mid})]:\x1b[0m\r\n"
-                                        f"\x1b[35m   {mtext}\x1b[0m\r\n"
-                                    )
-                                    await self.register_pending_interaction(
-                                        session=session,
-                                        kind=int_kind,
-                                        title=int_title,
-                                        prompt=mtext,
-                                        options=parsed_opts,
-                                        source="dsh_worker_question_handoff",
-                                        request_id=mid,
-                                        metadata={
-                                            "dsh_job_id": job_id,
-                                            "dsh_token": token,
-                                            "dsh_message_id": mid,
-                                            "display_prompt": _dsh_display_prompt(mtext),
-                                        },
-                                    )
-                                else:
-                                    session.emit_virtual_ansi(
-                                        f"\r\n\x1b[1;34m📨 [DSH Worker Message to Parent]: {mtext}\x1b[0m\r\n"
-                                    )
-                                    if mtext.lstrip().startswith("[approval granted without asking"):
-                                        await self._add_transcript_message(
-                                            session.session_id,
-                                            session.step_count,
-                                            mtext.strip(),
-                                            source="dsh_auto_approval_notice",
-                                        )
-                                    else:
-                                        await self.record_worker_event(
-                                            session.session_id,
-                                            {
-                                                "type": "message_to_parent",
-                                                "category": "message",
-                                                "status": "running",
-                                                "content": mtext,
-                                            },
-                                        )
-                            msg_cursor = max(msg_cursor, seq)
-                        # Only the first batch read after re-attaching is the replay.
-                        replay = None
-                except PersistenceRecordTooLarge as exc:
-                    self._skip_unstorable_record(session, "DSH record reader", exc)
-                except PersistenceUnavailable:
-                    raise
-                except Exception:
-                    pass
-
-                # Check job status & final result
-                try:
-                    j_resp = await client.get(dsh_url(f"/_dsh/dsh-crew/jobs/{job_id}"), params={"wait": 0})
-                    if session.terminated_by_user:
-                        # Q4: same rule for the job-status poll.
-                        return
-                    if j_resp.is_success:
-                        jview = j_resp.json().get("job") or {}
-                        jstatus = jview.get("status")
-                        if jview.get("step"):
-                            session.step_count = max(session.step_count, int(jview["step"]))
-                        if jstatus == "needs_input":
-                            qs = jview.get("questions") or []
-                            if qs and not session.pending_interaction:
-                                q0 = qs[0] if isinstance(qs[0], dict) else {}
-                                q_header = str(q0.get("header") or "DSH Input Required")
-                                q_prompt = str(q0.get("question") or "DSH worker paused waiting for parent input")
-                                if q0.get("detail"):
-                                    q_prompt += f"\n{q0.get('detail')}"
-                                raw_opts = q0.get("options") or []
-                                opt_labels = [
-                                    str(o.get("label") or o) if isinstance(o, dict) else str(o)
-                                    for o in raw_opts
-                                ]
-                                is_sec = q_header == "Security mode" or "Allow this call?" in q_prompt
-                                await self.register_pending_interaction(
-                                    session=session,
-                                    kind="approval_request" if is_sec else "question",
-                                    title=q_header,
-                                    prompt=q_prompt,
-                                    options=opt_labels,
-                                    source="dsh_job_needs_input",
-                                    request_id=f"dsh-ni-{job_id}",
-                                    metadata={
-                                        "dsh_job_id": job_id,
-                                        "dsh_token": token,
-                                        "dsh_needs_continue": True,
-                                    },
-                                )
-                        elif jstatus in ("done", "failed", "cancelled", "timeout"):
-                            if session.terminated_by_user:
-                                # Q4: the job ended, but the user's termination is the final word on
-                                # this session's status, persistence and events.
-                                return
-                            await look_for_record(final=True)
-                            while await drain_log_lines():
-                                pass  # Each batch yields; preserve every trailing telemetry record.
-                            if record is not None:
-                                await self._settle_dsh_session_record(session, record)
-                            full_res = (jview.get("result") or jview.get("error") or "").strip()
-                            session.ended_at = time.time()
-                            if jstatus == "done":
-                                if full_res:
-                                    session.set_final_response(full_res, "dsh_hub_completion")
-                                    await self.record_telemetry(
-                                        session.session_id,
-                                        {
-                                            "source": "dsh_hub_api",
-                                            "hook_event": "TurnComplete",
-                                            "intermediate_messages": [full_res],
-                                            "final_assistant_text": full_res,
-                                        },
-                                    )
-                            elif jstatus in ("failed", "timeout"):
-                                # The error used to be the turn's answer. It is an engine error.
-                                extra: Dict[str, Any] = {"dsh_job_id": job_id, "job_status": jstatus}
-                                if full_res:
-                                    extra["partial_response"] = full_res
-                                await self._end_engine_error_turn(
-                                    session, "dsh", self._dsh_job_error_info(jstatus, full_res), extra,
-                                )
-                            elif full_res:
-                                session.set_final_response(full_res, "dsh_hub_completion")
-                                await self.record_telemetry(
-                                    session.session_id,
-                                    {
-                                        "source": "dsh_hub_api",
-                                        "hook_event": "TurnComplete",
-                                        "intermediate_messages": [full_res],
-                                        "final_assistant_text": full_res,
-                                    },
-                                )
-                            if jstatus == "done":
-                                session.status = "completed"
-                                session.end_reason = "exited"
-                                session.exit_code = 0
-                                session.completion_reported = True
-                            else:
-                                # Spec §2: a failed/cancelled/timeout DSH job is an abnormal end.
-                                session.status = "crashed"
-                                session.end_reason = "crashed"
-                                session.exit_code = 1
-                            session.conversation_ref = _keep_dsh_record_seq(session.conversation_ref, {
-                                "dsh_job_id": job_id,
-                                "dsh_session_id": session.dsh_session_id or "",
-                            })
-                            tokens_info = jview.get("tokens") or {}
-                            session.current_activity = (
-                                f"DSH {jstatus} (steps={session.step_count}, tools={jview.get('toolCalls', 0)}, "
-                                f"tokens={tokens_info.get('input', 0)}/{tokens_info.get('output', 0)})"
-                            )
-                            formatted_res = full_res.replace("\r\n", "\n").replace("\n", "\r\n")
-                            done_w = max(60, min(int(session.cols or 120) - 2, 140))
-                            done_head = f"╭─── DSH Turn Completed ({jstatus.upper()}) "
-                            session.emit_virtual_ansi(
-                                f"\r\n\x1b[1;32m{done_head}{'─' * max(1, done_w - len(done_head))}╮\x1b[0m\r\n"
-                                f"{formatted_res}\r\n"
-                                f"\x1b[1;32m╰{'─' * (done_w - 1)}╯\x1b[0m\r\n"
-                                f"\x1b[90m(Session {session.dsh_session_id} stays warm in DSH Host — send input to continue)\x1b[0m\r\n> "
-                            )
-                            await self.persist_session(session)
-                            # TurnComplete above emitted the native result. An empty result still
-                            # ends the turn without creating an answer from a status sentence; a
-                            # failed/timeout job already ended as an engine error above.
-                            if not full_res and jstatus in ("done", "cancelled"):
-                                await self.record_worker_event(
-                                    session.session_id,
-                                    {
-                                        "type": "turn_completed",
-                                        "category": "turn_completed",
-                                        "status": "turn_idle",
-                                        "content": "",
-                                    },
-                                )
-                            break
-                except PersistenceRecordTooLarge as exc:
-                    self._skip_unstorable_record(session, "DSH job watcher", exc)
-                except PersistenceUnavailable:
-                    raise
-                except Exception:
-                    pass
-
-                await asyncio.sleep(0.4)
+    
 
     async def _register_codex_screen_approval(self, session: AgentSession, parsed: Dict[str, Any], scr: str):
         """D7 + round 2 (owner): every option on the screen is offered, each with the action its
@@ -15352,6 +14542,30 @@ class HubSessionManager:
                 return await self._register_claude_screen_approval(session, claude_prompt, scr)
             return None
 
+        # 6) Doubao CLI cards: approval titles from the bundle, or a cursor-led numbered question.
+        doubao_prompt = parse_doubao_prompt(scr) if eng == "doubao" else None
+        if doubao_prompt is not None:
+            sig = f"doubao_{doubao_prompt['kind']}:{hash(scr.strip()[-400:])}"
+            if sig not in session._seen_tui_prompt_signatures:
+                session._seen_tui_prompt_signatures.add(sig)
+                metadata = {
+                    "doubao_prompt": doubao_prompt.get("doubao_prompt") or doubao_prompt["kind"],
+                    "option_actions": list(doubao_prompt.get("option_actions") or []),
+                    "raw_options_count": int(
+                        doubao_prompt.get("raw_options_count") or len(doubao_prompt["options"])
+                    ),
+                }
+                return await self.register_pending_interaction(
+                    session=session,
+                    kind=doubao_prompt["kind"],
+                    title=doubao_prompt["title"],
+                    prompt=doubao_prompt["prompt"],
+                    options=list(doubao_prompt["options"]),
+                    source="doubao_tui_screen_detector",
+                    metadata=metadata,
+                )
+            return None
+
         # N1: when no interactive prompt is on screen anymore, clear seen signatures so a later
         # identical command prompt in the same or next turn is never suppressed.
         if session._seen_tui_prompt_signatures:
@@ -15365,7 +14579,7 @@ class HubSessionManager:
     async def _watch_tui_interactive_prompts(self, session: AgentSession):
         """
         Secondary TUI screen fallback detector for high-risk approval modals and multi-choice questions
-        across Codex, Kimi, OMP, Claude, and AGY (catches prompts that only render in the TUI without a separate JSONL event).
+        across Codex, Kimi, OMP, Claude, AGY and Doubao (catches prompts that only render in the TUI without a separate JSONL event).
         """
         # Round 3 live check: "completed" (the worker reported completion, the TUI is still alive)
         # keeps the watch going. Leaving the loop there stopped all prompt detection for the rest
@@ -15425,7 +14639,7 @@ class HubSessionManager:
         command = str(prof.get('command') or '')
         base_args = strip_legacy_worker_bridge_args([str(a) for a in (prof.get('args') or [])], self.runtime_configs_dir)
         caller_args = normalize_extra_args(extra_args)
-        if caller_args and (eng == 'dsh' or kind != 'tui'):
+        if caller_args and kind != 'tui':
             raise ValueError(f"{name} 不通过 TUI 命令行启动，不支持 extra_args")
         base_args.extend(caller_args)
         roots = normalize_extra_roots(extra_roots, forbidden=(str(self.data_dir), str(self.runtime_configs_dir)))
@@ -15668,11 +14882,20 @@ class HubSessionManager:
             if resolved_level:
                 injected.extend(['--effort', resolved_level])
             args = injected + args
-        # dsh injects no args at all: provider/model split and effort travel in the hub API payload.
+        elif eng == 'doubao':
+            injected = []
+            if resolved_model:
+                injected.extend(['--model', resolved_model])
+            if resolved_level:
+                injected.extend(['--effort', resolved_level])
+            args = injected + args
 
         # Caller-supplied env vars override both profile defaults and engine-computed defaults.
         if caller_env:
             resolved_env.update(caller_env)
+        if eng == 'doubao':
+            # The npm wrapper's update check stalls a launch; an explicit caller value still wins.
+            resolved_env.setdefault("DOUBAO_CLI_NO_UPDATE_CHECK", "1")
         if compaction:
             if eng == 'claude':
                 # The session's own value beats a profile default; a caller env copy was rejected above.
@@ -15724,26 +14947,13 @@ class HubSessionManager:
                 raise ValueError(f'工作目录不存在：{candidate_cwd}')
             work_dir = resolved_cwd
 
+        if eng == 'doubao':
+            # Native pre-flag rule: `-C <cwd>` must lead every business argument, so the typed
+            # task, --resume, --model, --effort and the permission flags all follow it.
+            args = doubao_launch_args(eng, args, work_dir)
+
         if eng == 'agy' and cli_model is None and resolved_model:
             cli_model = f'{resolved_model}-{resolved_level}' if resolved_level else resolved_model
-
-        # V-3: dsh travels as an API payload, not as CLI args, so the preview must carry the same spec
-        # the session will really use.
-        dsh_spec: Optional[Dict[str, Any]] = None
-        if eng == 'dsh':
-            dsh_provider = 'clay'
-            dsh_model_name = 'deepseek-flash'
-            if resolved_model:
-                if '/' in resolved_model:
-                    dsh_provider, dsh_model_name = resolved_model.split('/', 1)
-                else:
-                    dsh_model_name = resolved_model
-            dsh_spec = {
-                'tier': str(prof.get('dsh_tier') or 'flash'),
-                'provider': dsh_provider,
-                'model': dsh_model_name,
-                'effort': resolved_level or 'high',
-            }
 
         mcp_settings = {}
         if mcp_config_active(mcp_config):
@@ -15775,7 +14985,6 @@ class HubSessionManager:
             'thinking_level': resolved_level,
             'thinking_source': thinking_source,
             'cli_model': cli_model,
-            'dsh_spec': dsh_spec,
             'compaction_threshold': compaction,
             'bypass_approvals': bypass,
             **policy,
@@ -15920,7 +15129,6 @@ class HubSessionManager:
             cwd=work_dir,
             command=launch["command"],
             args=args,
-            gui_url=prof.get("gui_url"),
             cols=self.default_cols,
             rows=self.default_rows,
             core=self._ensure_core(),
@@ -15953,7 +15161,6 @@ class HubSessionManager:
             "task_mode": task_mode,
             "startup_delay_sec": startup_delay,
             "submit_key": submit_key,
-            "dsh_spec": dict(launch.get("dsh_spec") or {}) or None,
             "compaction_threshold": compaction,
             "auto_approval_rules": auto_approval_rules,
             # Spawn-time approve-once prefixes and their per-session use count (a resume keeps both).
@@ -15971,14 +15178,6 @@ class HubSessionManager:
             **resolve_session_approval_fields(launch),
         }
         sess.launch_notes = list(launch.get("notes") or [])
-
-        if kind == "web_gui":
-            if delivered_task:
-                sess.args = ["-NoLogo", "-NoProfile", "-Command", f"dsh headless {json.dumps(delivered_task)}; pwsh -NoLogo"]
-            else:
-                sess.args = ["-NoLogo", "-NoProfile"]
-            # "args (as launched)": web_gui really runs the dsh headless command, not the profile args.
-            sess.profile_snapshot["args"] = list(sess.args)
 
         if delivered_task:
             # B9: last_task is the initial task and is never overwritten afterwards. A brief-only
@@ -16000,19 +15199,6 @@ class HubSessionManager:
         if brief_path is not None:
             # Written only now: every validation above has passed, so a refused spawn leaves no file.
             self._write_session_brief(session_id, brief_text)
-        if task_mode == "dsh_hub_api":
-            # B6 rule 4 / V-3: dsh injects no args. resolve_launch already built the dsh spec
-            # (tier, provider/model split, effort), so the session and the preview use one value.
-            sess.dsh_spec = dict(launch.get("dsh_spec") or {})
-            sess.start_virtual(
-                loop,
-                on_virtual_line_cb=lambda sid, line: self._schedule(self.deliver_parent_message(sid, line, also_write_pty=False)),
-            )
-            self.sessions[session_id] = sess
-            await self.persist_session(sess)
-            self._schedule(self._spawn_dsh_hub_job(sess, delivered_task))
-            return sess
-
         if engine == "claude":
             hook_log = self._claude_hook_log_path(sess)
             if hook_log is not None:
@@ -16043,6 +15229,8 @@ class HubSessionManager:
             self._schedule(self._watch_agy_transcript(sess))
         elif engine == "claude":
             self._schedule(self._watch_claude_session(sess))
+        elif engine == "doubao":
+            self._schedule(self._watch_doubao_session(sess))
 
         if kind == "tui":
             self._schedule(self._watch_tui_interactive_prompts(sess))

@@ -94,8 +94,8 @@ function contextRingSvg(ratio, markRatio, estimated) {
 
 /**
  * The context window gauge for the reply / message box: a 26px chip (ring + used share) whose
- * hover or focus opens a details card. `ctx` is the feed's `context_window`; no window (DSH,
- * PowerShell, desktop GUI, or nothing measured yet) renders nothing.
+ * hover or focus opens a details card. `ctx` is the feed's `context_window`; no window (PowerShell,
+ * desktop GUI, or nothing measured yet) renders nothing.
  */
 export function renderContextWindowHtml(ctx) {
   if (!ctx || typeof ctx !== 'object') return '';

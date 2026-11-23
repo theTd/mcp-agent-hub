@@ -1124,81 +1124,6 @@ class LifecycleClaimTests(_ManagerCase):
                       f"the queued request reached no incarnation that owns the id: {applied}")
 
 
-class DshResumeTests(_ManagerCase):
-    async def test_a_completed_text_predecessor_is_not_a_crash(self):
-        # R2: the core's kill of a text entry publishes `exit_code=None, crashed=false`, and F1
-        # turned that into a crash: a completed DSH session was archived as crashed and the parent
-        # was told a session it is resuming had crashed.
-        sess = _session(self.hub, "dsh-resume", command="", args=[])
-        sess.engine = "dsh"
-        sess.kind = "virtual"
-        sess.dsh_job_id = "job-1"
-        sess.profile_snapshot = {"engine": "dsh", "kind": "virtual", "cwd": str(self.root),
-                                 "dsh_spec": {}}
-        sess.conversation_ref = {"dsh_job_id": "job-1", "dsh_token": "tok"}
-        sess._loop = asyncio.get_running_loop()
-        sess.start_virtual(sess._loop)
-        self.hub._on_core_tick()
-        # The job watcher saw the job finish; the core's text entry stays live until a resume ends it.
-        sess.status = "completed"
-        sess.end_reason = "exited"
-        sess.exit_code = 0
-        sess.completion_reported = True
-        sess.ended_at = time.time()
-        await self.hub.persist_session(sess)
-        record = {
-            "session_id": "dsh-resume", "engine": "dsh", "cwd": str(self.root),
-            "profile_snapshot": dict(sess.profile_snapshot),
-            "conversation_ref": dict(sess.conversation_ref),
-        }
-        answer = httpx.Response(200, json={"job": {"id": "job-1", "status": "done"}})
-        with patch.object(session_manager, "prepare_dsh_workspace",
-                          return_value={"allowed": True, "status": "ready", "reason": ""}), \
-                patch.object(self.hub, "build_resume_launch", return_value={"cwd": str(self.root)}), \
-                patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=answer):
-            await self.hub._resume_dsh_session("dsh-resume", record, None)
-        events = [e for e in self.hub.get_worker_events("dsh-resume")
-                  if e["type"] in ("exited", "crashed")]
-        self.assertEqual(events, [], "the completed predecessor was announced as crashed")
-        self.assertEqual((sess.status, sess.end_reason, sess.exit_code),
-                         ("completed", "exited", 0),
-                         "the supersede overwrote the end state the session had earned")
-        row = await self.hub.db.get_session_record("dsh-resume")
-        self.assertEqual(row["status"], "completed")
-        self.assertNotEqual(row["end_reason"], "crashed",
-                            "the completed predecessor's row was archived as a crash")
-
-
-class DshLifecycleTests(_ManagerCase):
-    async def test_a_completed_text_session_closes_and_can_be_attached_again(self):
-        # F4/kimi 1: a DSH session's liveness is its remote job, so `terminate` never ended the core
-        # text entry; the id could neither be retired nor attached again.
-        sess = _session(self.hub, "dsh-done", command="", args=[])
-        sess.engine = "dsh"
-        sess.kind = "virtual"
-        sess.dsh_job_id = "job-1"
-        sess._loop = asyncio.get_running_loop()
-        sess.start_virtual(sess._loop)
-        self.hub._on_core_tick()
-        # T1: the fake gives a text session no process, like the real core's `attach_text`.
-        self.assertFalse(sess.has_process, "a text session claimed a process")
-
-        sess.emit_virtual_ansi("远程任务已完成\r\n")
-        self.hub._on_core_tick()
-        sess.status = "completed"
-        await self.hub.persist_session(sess)
-        with patch.object(self.hub, "_cancel_dsh_job", new_callable=AsyncMock) as cancel:
-            closed = await self.hub.close_session("dsh-done", source="console")
-            cancel.assert_not_awaited()  # the remote job is not live; nothing to cancel there
-        self.assertTrue(closed["found"])
-        self.assertEqual(self.hub.core.stats()["sessions"], 0,
-                         "the core text entry outlived its session")
-        self.assertEqual(self.hub.core.retired, ["dsh-done"])
-        self.assertNotIn("dsh-done", self.hub._retire_pending)
-        # the freed id can carry a later incarnation again
-        self.hub.core.attach_text("dsh-done", cols=120, rows=36)
-
-
 class DrainRequestTests(_ManagerCase):
     """§6.4/§5.2: what the console's socket recorded is applied by the hub, in order, once."""
 
@@ -1237,45 +1162,10 @@ class DrainRequestTests(_ManagerCase):
         self.assertEqual((target.cols, target.rows), (20, 5))
         self.assertEqual(self.hub.core.session("resize-clamp").resize_requests, [])
 
-    async def test_text_input_requests_reach_the_echo_and_the_line_callback_once(self):
-        # A session with no PTY: the core records the socket's input and never writes it, because
-        # the DSH echo and its line callback are the hub's (design §8, gaps 9).
-        sess = _session(self.hub, "text-input", command="", args=[])
-        sess.engine = "dsh"
-        sess.kind = "virtual"
-        lines = []
-        sess.start_virtual(asyncio.get_running_loop(),
-                           on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
-        self.hub._on_core_tick()
-        self.hub.core.request_input("text-input", "hi")
-        self.hub.core.request_input("text-input", "there\r")
-        self.hub._on_core_tick()
-        await _requests_applied(self.hub, "text-input")
-        self.assertEqual(lines, [("text-input", "hithere")], "the line callback missed the typed text")
-        self.assertIn("hithere", sess.read_raw().text, "the echo never reached the text screen")
-        self.assertEqual(self.hub.core.inputs_of("text-input"), [],
-                         "text-session input was written to the core")
-        self.hub._on_core_tick()
-        await _requests_applied(self.hub, "text-input")
-        self.assertEqual(lines, [("text-input", "hithere")], "the request was delivered twice")
-
-    async def test_a_text_session_echoes_a_backspace_and_delivers_one_line(self):
-        sess = _session(self.hub, "text-edit", command="", args=[])
-        sess.kind = "virtual"
-        lines = []
-        sess.start_virtual(asyncio.get_running_loop(),
-                           on_virtual_line_cb=lambda sid, line: lines.append(line))
-        self.hub.core.request_input("text-edit", "ab\x7f\r")
-        self.hub._on_core_tick()
-        await _requests_applied(self.hub, "text-edit")
-        self.assertEqual(lines, ["a"], "backspace did not edit the virtual line")
-
     async def test_a_bad_request_costs_that_request_only(self):
         # master 3874299: one record (or request) that raises must not stop the next one.
         target = await _live(self.hub, "request-bad")
-        sess = _session(self.hub, "request-bad-2", command="", args=[])
-        sess.start_virtual(asyncio.get_running_loop())
-        self.hub._on_core_tick()
+        sess = await _live(self.hub, "request-bad-2")
         self.hub.core.request_resize("request-bad", "not-a-number", 24, propagate=False)
         self.hub.core.request_resize("request-bad-2", 88, 22, propagate=False)
         with self.assertLogs("mcp-agent-hub.session_manager", level="ERROR") as logs:
@@ -1348,17 +1238,11 @@ class DrainRequestTests(_ManagerCase):
         core.resize = slow_resize
         core.feed = slow_feed
         core.watch_delay = 0.12
-        text = _session(self.hub, "consumer-text", command="", args=[])
-        text.kind = "virtual"
-        lines = []
-        text.start_virtual(asyncio.get_running_loop(),
-                           on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
         core.request_resize("consumer-target", 100, 30, propagate=True)
         core.request_resize("consumer-target", 90, 28, propagate=True)
-        core.request_input("consumer-text", "typed\r")
 
         worst = await _worst_loop_lag(lambda: self._drain_and_apply(
-            "consumer-target", "consumer-background", "consumer-text"))
+            "consumer-target", "consumer-background"))
         self.assertLess(worst, 0.08, f"the drain held the loop for {worst:.3f}s")
         self.assertEqual(applied, [
             ("resize", "consumer-target", 100, 30),
@@ -1368,7 +1252,6 @@ class DrainRequestTests(_ManagerCase):
         ], "the console's requests were not applied once and in order")
         self.assertEqual((target.cols, target.rows), (90, 28))
         self.assertEqual((background.cols, background.rows), (90, 28))
-        self.assertEqual(lines, [("consumer-text", "typed")], "the text input was applied")
 
     async def _drain_and_apply(self, *session_ids):
         self.hub._on_core_tick()
@@ -1422,12 +1305,6 @@ class DrainRequestTests(_ManagerCase):
                          "a gone pane's resize reached a listed session")
         self.assertEqual((self.hub.default_cols, self.hub.default_rows), (120, 36),
                          "a gone pane's resize changed the console defaults")
-        # The input half of the same rule.
-        self.hub.core.request_input("unlisted-gone", "typed\r")
-        self.hub._on_core_tick()
-        await _requests_applied(self.hub, "unlisted-gone")
-        self.assertEqual(self.hub.core.inputs_of("unlisted-gone"), [],
-                         "typed input for a gone pane reached the core")
 
     async def test_a_close_forgets_the_socket_diagnostics_on_the_loop(self):
         # omp 4b F5 + r4 #6: `_socket_drops` is written by the tick on the loop, so a close's forget

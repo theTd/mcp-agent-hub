@@ -3,7 +3,7 @@
 At step 6 the pyte oracle (``tools/pyte_oracle.py``) was deleted, so its two screen test files,
 ``test_terminal_screen_zero_width.py`` and ``test_terminal_stream_csi.py``, moved here: the same
 inputs and the same expected screens, driven through ``hub_terminal_core`` (``attach_text`` +
-``feed``, as a DSH virtual session does) instead of through ``HubTerminalScreen``/``HubTerminalStream``.
+``feed``, a session with a screen but no process) instead of through ``HubTerminalScreen``/``HubTerminalStream``.
 
 The core's screen keeps text only — the hub's ``ScreenRead`` has no attributes — so where the pyte
 tests asserted a cell's ``bold``/``fg``/``underscore`` to prove that a sequence applied, this file

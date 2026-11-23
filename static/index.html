@@ -297,7 +297,7 @@
                       <option value="agy">agy · Antigravity CLI</option>
                       <option value="codex">codex · OpenAI Codex CLI</option>
                       <option value="claude">claude · Claude Code CLI</option>
-                      <option value="dsh">dsh · DeepSeek Harness</option>
+                      <option value="doubao">doubao · 豆包 CLI</option>
                       <option value="pwsh">pwsh · PowerShell 终端</option>
                     </select>
                     <span class="field-help">决定可选模型列表与参数注入方式</span>
@@ -361,7 +361,6 @@
                       <option value="codex_positional">codex_positional · Codex 位置参数</option>
                       <option value="agy_interactive_flag">agy_interactive_flag · AGY -i 交互参数</option>
                       <option value="pty_input">pty_input · 进入 TUI 后自动注入</option>
-                      <option value="dsh_hub_api">dsh_hub_api · DSH Crew 原生会话</option>
                     </select>
                   </label>
                   <label class="field">
@@ -382,26 +381,6 @@
                     </label>
                     <span class="field-help warn" id="editBypassHelp">打开后递归删除、强推、发布等高风险操作会直接执行，不再交给主 Agent 审批；已归档会话恢复时也按此开关的当前值启动。</span>
                   </div>
-                </div>
-              </section>
-
-              <section class="form-section" id="groupDsh" hidden>
-                <h5 class="form-section-title">DSH</h5>
-                <div class="form-grid">
-                  <label class="field">
-                    <span class="field-label">档位 <code>dsh_tier</code></span>
-                    <select id="editDshTier">
-                      <option value="flash">flash</option>
-                      <option value="pro">pro</option>
-                    </select>
-                  </label>
-                  <label class="field">
-                    <span class="field-label">会话形式 <code>kind</code></span>
-                    <select id="editKind">
-                      <option value="tui">tui · 终端</option>
-                      <option value="web_gui">web_gui · 在终端里运行 dsh headless</option>
-                    </select>
-                  </label>
                 </div>
               </section>
 

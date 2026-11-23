@@ -43,7 +43,7 @@ class EngineErrorClassifierTests(unittest.TestCase):
         )
         self.assertEqual(nginx["message"], "unexpected status 413 Payload Too Large")
 
-    def test_real_claude_kimi_omp_dsh_failures(self):
+    def test_real_claude_kimi_omp_failures(self):
         self.assertEqual(self.kind("Not logged in · Please run /login", code="authentication_failed")["kind"], "auth")
         self.assertEqual(self.kind("API Error: 429 too many requests")["kind"], "rate_limit")
         self.assertEqual(self.kind("invalid x-api-key")["kind"], "auth")
@@ -516,55 +516,6 @@ class EngineErrorTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sess.status, "completed")
         self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "network"))
         self.assertEqual(len(self.events(sess.session_id, "turn_completed")), 1)
-
-    async def test_dsh_failed_job_ends_the_turn_as_an_error(self):
-        sess = self.session("dsh", "-failed")
-        sess.dsh_job_id = "job-1"
-        log = self.root / "dsh-1.log"
-        log.touch()
-
-        class Response:
-            is_success = True
-            def __init__(self, payload):
-                self.payload = payload
-            def json(self):
-                return self.payload
-
-        job = {"id": "job-1", "status": "failed", "error": "429 Too Many Requests",
-               "step": 3, "toolCalls": 2, "tokens": {"input": 10, "output": 4}}
-
-        class Client:
-            def __init__(self, *args, **kwargs):
-                pass
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                return False
-            async def get(self, url, params=None, headers=None):
-                if url.endswith("/messages"):
-                    return Response({"result": {"messages": []}})
-                return Response({"job": job})
-
-        with patch("session_manager.httpx.AsyncClient", Client):
-            task = self.hub._schedule(self.hub._watch_dsh_hub_job(sess, "job-1", "tok", log_path=log))
-            try:
-                await self.until(lambda: sess.status == "crashed")
-            finally:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(sess.status, "crashed")  # the existing abnormal-end status stays
-        self.assertEqual((sess.last_turn_outcome, sess.last_turn_error["kind"]), ("error", "rate_limit"))
-        self.assertEqual(sess.final_response_source, "engine_error")
-        self.assertNotEqual(sess.final_response, "429 Too Many Requests")
-        done = self.events(sess.session_id, "turn_completed")
-        self.assertEqual((len(done), done[0]["data"]["outcome"]), (1, "error"))
-
-    def test_dsh_timeout_that_matches_nothing_is_other(self):
-        info = self.hub._dsh_job_error_info("timeout", "")
-        self.assertEqual((info["kind"], info["retryable"]), ("other", False))
-        self.assertTrue(info["message"].startswith("DSH job timed out:"))
-        matched = self.hub._dsh_job_error_info("timeout", "connection reset by peer")
-        self.assertEqual(matched["kind"], "network")
 
     async def test_group_wait_results_carry_outcome_error_and_engine_errors(self):
         good = self.session("omp", "-group-good")

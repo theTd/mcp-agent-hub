@@ -24,6 +24,15 @@ DISCOVERY = {
             "available_models": ["claude-a"], "default_model": "claude-a",
             "available_thinking_levels": ["low", "high"],
         },
+        "doubao": {
+            "engine": "doubao", "name": "豆包 CLI", "installed": True, "binary": "doubao",
+            "available_models": ["9", "seed-lite-7b"], "default_model": "9",
+            "default_thinking_level": "high", "available_thinking_levels": ["low", "medium", "high"],
+            "model_details": [
+                {"id": "9", "display_name": "Auto", "supported_thinking_levels": ["low", "medium", "high"],
+                 "default_thinking_level": "high"},
+            ],
+        },
     }
 }
 
@@ -62,6 +71,18 @@ class EngineToggleTests(unittest.IsolatedAsyncioTestCase):
 
     def _read_profiles(self):
         return json.loads(self.profiles.read_text(encoding="utf-8"))
+
+    def test_doubao_engine_toggles_and_persists(self):
+        self.assertTrue(self.hub.engine_enabled("doubao"))
+        self.assertIn("doubao", self.hub.get_enabled_profiles())
+        self.hub.set_engine_enabled("doubao", False)
+        self.assertFalse(self.hub.engine_enabled("doubao"))
+        self.assertFalse(self.hub.engines_catalog["doubao"]["enabled"])
+        self.assertNotIn("doubao", self.hub.get_enabled_profiles())
+        self.hub.set_engine_enabled("doubao", True)
+        self.assertTrue(self.hub.engine_enabled("doubao"))
+        launch = self.hub.resolve_launch("doubao", cwd=str(self.root))
+        self.assertEqual(launch["engine"], "doubao")
 
     def test_default_is_enabled_and_catalog_reports_it(self):
         self.assertTrue(self.hub.engine_enabled("codex"))

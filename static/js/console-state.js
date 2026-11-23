@@ -85,7 +85,7 @@ export async function reloadProfiles(refreshDiscovery = false) {
   emit('profiles:changed');
 }
 
-const ENGINE_ORDER = ['omp', 'kimi', 'agy', 'codex', 'claude', 'dsh', 'pwsh'];
+const ENGINE_ORDER = ['omp', 'kimi', 'agy', 'codex', 'claude', 'doubao', 'pwsh'];
 
 export function engineName(engine) {
   return state.enginesCatalog[engine]?.name || engine || '其他';

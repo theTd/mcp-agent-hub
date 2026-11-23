@@ -19,20 +19,20 @@ const FALLBACK_COMMANDS = {
   agy: 'agy.exe',
   codex: 'codex.cmd',
   claude: 'claude.exe',
-  dsh: 'pwsh.exe',
+  doubao: 'doubao.exe',
   pwsh: 'pwsh.exe',
 };
 
-const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'claude', 'dsh', 'pwsh'];
+const ENGINE_IDS = ['omp', 'kimi', 'agy', 'codex', 'claude', 'doubao', 'pwsh'];
 
 // Keys the editor renders itself, so the read-only "高级" box shows only what is left.
 const SHOWN_KEYS = new Set([
   'id', 'name', 'engine', 'kind', 'command', 'config_dir', 'args', 'env', 'default_model', 'default_thinking_level',
-  'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description', 'dsh_tier',
+  'task_mode', 'startup_delay_sec', 'enabled', 'when_to_use', 'description',
   'bypass_approvals',
 ]);
 // Engines whose launch the hub injects approval flags into; bypass_approvals does nothing elsewhere.
-const APPROVAL_ENGINES = new Set(['omp', 'kimi', 'codex', 'claude', 'agy']);
+const APPROVAL_ENGINES = new Set(['omp', 'kimi', 'codex', 'claude', 'agy', 'doubao']);
 const BYPASS_HELP = '打开后递归删除、强推、发布等高风险操作会直接执行，不再交给主 Agent 审批；已归档会话恢复时也按此开关的当前值启动。';
 // Values the hub computes on the way out; they are not stored keys.
 const COMPUTED_KEYS = new Set([
@@ -194,7 +194,7 @@ function profileDraft(id, p) {
     id,
     name: p.name || '',
     engine: p.engine || '',
-    kind: p.kind === 'web_gui' ? 'web_gui' : 'tui',
+    kind: 'tui',
     enabled: p.enabled !== false,
     when_to_use: p.when_to_use || '',
     description: p.description || '',
@@ -208,7 +208,6 @@ function profileDraft(id, p) {
     envText: formatEnvText(p.env),
     task_mode: p.task_mode || '',
     delayText: p.startup_delay_sec ?? '',
-    dsh_tier: p.dsh_tier === 'pro' ? 'pro' : 'flash',
     bypass_approvals: p.bypass_approvals === true,
     extra: p,
   };
@@ -216,7 +215,6 @@ function profileDraft(id, p) {
 
 function readDraft() {
   const engine = $('#editEngine').value;
-  const isDsh = engine === 'dsh';
   const modelChoice = $('#editModelSelect').value;
   const thinkingChoice = $('#editThinking').value;
   return {
@@ -224,7 +222,7 @@ function readDraft() {
     id: $('#editId').value.trim(),
     name: $('#editName').value.trim(),
     engine,
-    kind: isDsh && $('#editKind').value === 'web_gui' ? 'web_gui' : 'tui',
+    kind: 'tui',
     enabled: $('#editEnabled').checked,
     when_to_use: $('#editWhenToUse').value.trim(),
     description: $('#editDesc').value.trim(),
@@ -238,7 +236,6 @@ function readDraft() {
     envText: $('#editEnv') ? $('#editEnv').value : '',
     task_mode: $('#editTaskMode').value,
     delayText: $('#editDelay').value,
-    dsh_tier: $('#editDshTier').value,
     bypass_approvals: $('#editBypassApprovals').checked,
     extra: selectedId ? state.profiles[selectedId] : null,
   };
@@ -262,7 +259,6 @@ function writeDraft(d) {
   showFieldError('editId', '');
 
   setEngineSelect(d.engine);
-  $('#editKind').value = d.kind === 'web_gui' ? 'web_gui' : 'tui';
   $('#editCommand').value = d.command;
   if ($('#editConfigDir')) $('#editConfigDir').value = d.config_dir || '';
   $('#editArgs').value = d.argsText;
@@ -270,7 +266,6 @@ function writeDraft(d) {
   ensureOption($('#editTaskMode'), d.task_mode);
   $('#editTaskMode').value = d.task_mode || '';
   $('#editDelay').value = d.delayText;
-  $('#editDshTier').value = d.dsh_tier;
   $('#editBypassApprovals').checked = d.bypass_approvals === true;
 
   renderEngineGroups(d.engine);
@@ -305,9 +300,6 @@ function setEngineSelect(engine) {
 }
 
 function renderEngineGroups(engine) {
-  const isDsh = engine === 'dsh';
-  $('#groupLaunch').hidden = isDsh;
-  $('#groupDsh').hidden = !isDsh;
   if ($('#fieldConfigDir')) $('#fieldConfigDir').hidden = engine !== 'claude';
   // V-7: pwsh (and any engine the catalog knows no models for) has no model / thinking defaults.
   const hasModels = !!engine && engineModels(engine).length > 0;
@@ -315,7 +307,7 @@ function renderEngineGroups(engine) {
   renderBypassSwitch(engine);
 }
 
-/** bypass_approvals applies to omp / kimi / codex / agy only; dsh and pwsh show it disabled (不适用). */
+/** bypass_approvals applies to omp / kimi / codex / agy only; pwsh shows it disabled (不适用). */
 function renderBypassSwitch(engine) {
   const applies = !engine || APPROVAL_ENGINES.has(engine);
   const box = $('#editBypassApprovals');
@@ -435,7 +427,7 @@ function renderEngineInfo(engine) {
       <dt>可执行文件</dt><dd><code>${escapeHtml(activeBin)}</code></dd>
       ${cfgRow}
       <dt>模型参数</dt><dd><code>${escapeHtml(flags.model || '自动')}</code></dd>
-      <dt>思考等级参数</dt><dd><code>${escapeHtml(flags.thinking_level || '自动')}</code></dd>
+      <dt>思考等级参数</dt><dd><code>${escapeHtml(flags.thinking_level || flags.thinking || '自动')}</code></dd>
       <dt>已启用模型</dt><dd>${enabled.length} / ${all.length}<a href="#" data-goto-tab="catalog" style="margin-left:8px">管理模型开关</a></dd>
       <dt>思考等级</dt><dd>${levels.length ? levels.map((l) => `<span class="pill pill-muted">${escapeHtml(l)}</span>`).join('') : '无'}</dd>
     </dl>`;
@@ -556,6 +548,12 @@ function injectedFlag(engine, args) {
       if (arg === '--model' || arg === '--effort') return arg;
       if (arg.startsWith('--model=')) return '--model';
       if (arg.startsWith('--effort=')) return '--effort';
+    } else if (engine === 'doubao') {
+      if (arg === '--model' || arg === '--effort') return arg;
+      if (arg.startsWith('--model=')) return '--model';
+      if (arg.startsWith('--effort=')) return '--effort';
+      if (arg === '--permission-mode' || arg.startsWith('--permission-mode=')) return '--permission-mode';
+      if (arg === '--dangerously-bypass-approvals-and-sandbox') return arg;
     } else if (engine === 'codex') {
       if (arg === '-m' || arg === '--model') return arg;
       if (arg.startsWith('--model=')) return '--model';
@@ -572,7 +570,7 @@ function injectedFlag(engine, args) {
 function updateArgsValidation() {
   const engine = $('#editEngine').value;
   const args = parseArgsText($('#editArgs').value);
-  const flag = engine === 'dsh' ? '' : injectedFlag(engine, args);
+  const flag = injectedFlag(engine, args);
   argsError = flag
     ? `参数里不要写模型或思考等级（${flag}）：Hub 会按启动时的选择自动注入。`
     : '';
@@ -676,7 +674,6 @@ async function startNewProfile() {
     envText: '',
     task_mode: '',
     delayText: 2.5,
-    dsh_tier: 'flash',
     bypass_approvals: false,
     extra: null,
   });
@@ -723,7 +720,7 @@ async function saveProfile() {
     return;
   }
   const args = parseArgsText(d.argsText);
-  const flag = d.engine === 'dsh' ? '' : injectedFlag(d.engine, args);
+  const flag = injectedFlag(d.engine, args);
   if (flag) {
     updateArgsValidation();
     $('#editArgs').focus();
@@ -735,8 +732,7 @@ async function saveProfile() {
     if ($('#editEnv')) $('#editEnv').focus();
     return;
   }
-  const isDsh = d.engine === 'dsh';
-  const command = isDsh ? (d.command || 'pwsh.exe') : d.command;
+  const command = d.command;
   if (!command) {
     showEditorError('请填写命令');
     $('#editCommand').focus();
@@ -747,7 +743,7 @@ async function saveProfile() {
     id: d.id,
     name: d.name || d.id,
     engine: d.engine,
-    kind: isDsh ? d.kind : 'tui',
+    kind: 'tui',
     enabled: d.enabled,
     when_to_use: d.when_to_use || null,
     description: d.description || null,
@@ -756,13 +752,10 @@ async function saveProfile() {
     command,
     config_dir: d.engine === 'claude' ? (d.config_dir || null) : null,
     args,
-    env: !isDsh && Object.keys(env).length ? env : null,
+    env: Object.keys(env).length ? env : null,
     task_mode: d.task_mode || null,
     startup_delay_sec: Number.isFinite(delay) ? delay : null,
-    // The DSH web page is no longer embedded; saving drops the old address from the profile.
-    gui_url: null,
-    dsh_tier: isDsh ? d.dsh_tier : null,
-    // Round 2: always a bool (false clears the key). For dsh / pwsh the box is disabled and keeps
+    // Round 2: always a bool (false clears the key). For pwsh the box is disabled and keeps
     // the stored value, so a save there never changes it.
     bypass_approvals: d.bypass_approvals === true,
   };

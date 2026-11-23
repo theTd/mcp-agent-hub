@@ -44,15 +44,14 @@ class RequestTests(unittest.TestCase):
         self.assertTrue(request.wants("anything"))
         self.assertEqual(request.text_for("a", "codex", "running"), CONTINUE_TEXT)
         self.assertEqual(request.text_for("a", "claude", "waiting_parent"), CONTINUE_TEXT)
+        self.assertEqual(request.text_for("a", "doubao", "running"), CONTINUE_TEXT)
         self.assertIsNone(request.text_for("a", "codex", "completed"))
-        self.assertIsNone(request.text_for("a", "dsh", "running"))
         (self.dir / REQUEST_NAME).write_text(json.dumps({"continue_unfinished_turns": False}), encoding="utf-8")
         self.assertIsNone(RestartResumeRequest.take(self.dir).text_for("a", "codex", "running"))
         (self.dir / REQUEST_NAME).write_text(json.dumps({"continue_session_ids": ["a", "d"]}), encoding="utf-8")
         request = RestartResumeRequest.take(self.dir)
         self.assertEqual(request.text_for("a", "codex", "interrupted"), CONTINUE_TEXT)
         self.assertIsNone(request.text_for("b", "codex", "running"))
-        self.assertIsNone(request.text_for("d", "dsh", "interrupted"))
 
 
 class GateTests(unittest.IsolatedAsyncioTestCase):
@@ -133,20 +132,28 @@ class HubStartTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         with patch.object(hub, "resume_subagent", side_effect=resume), \
-                patch("session_manager.wait_for_port", side_effect=wait_port):
-            await hub.start()
-            self.assertFalse(hub.restart_resume_gate.is_open)
-            await asyncio.sleep(0.05)
-            self.assertEqual(calls, [], "nothing is resumed before the port is open")
-            port_open.set()
-            await asyncio.wait_for(hub.restart_resume_gate._open.wait(), 5)
-        self.assertEqual([c[0] for c in calls], ["dsh-run", "claude-idle", "codex-run"])
+                patch("session_manager.wait_for_port", side_effect=wait_port), \
+                patch("session_manager.purge_retired_engine_data", new=lambda *a, **k: {
+                    "database": {"sessions": 0, "rows": 0, "backup": None},
+                    "profiles": {"removed": 0, "backup": None},
+                }):
+            # The purge is a no-op here on purpose: this test keeps a DSH row across the start to
+            # pin the guard that covers a start whose purge was skipped (a failed backup).
+            with self.assertLogs("mcp-agent-hub.session_manager", level="INFO") as logs:
+                await hub.start()
+                self.assertFalse(hub.restart_resume_gate.is_open)
+                await asyncio.sleep(0.05)
+                self.assertEqual(calls, [], "nothing is resumed before the port is open")
+                port_open.set()
+                await asyncio.wait_for(hub.restart_resume_gate._open.wait(), 5)
+        self.assertTrue(any("skipped 1 DSH session(s)" in line for line in logs.output), logs.output)
+        self.assertEqual([c[0] for c in calls], ["claude-idle", "codex-run"])
         self.assertEqual(dict((c[0], c[1]) for c in calls),
-                         {"dsh-run": None, "claude-idle": None, "codex-run": CONTINUE_TEXT})
+                         {"claude-idle": None, "codex-run": CONTINUE_TEXT})
         self.assertTrue(all(c[2] == "console" and not c[3] for c in calls))
         await asyncio.sleep(0.05)
         result = json.loads((self.root / RESULT_NAME).read_text(encoding="utf-8"))["sessions"]
-        self.assertEqual(set(result), {"dsh-run", "claude-idle", "codex-run"})
+        self.assertEqual(set(result), {"claude-idle", "codex-run"})
         self.assertFalse(result["claude-idle"]["ok"])
         self.assertTrue(result["codex-run"]["continued"])
         self.assertEqual(result["codex-run"]["status_at_stop"], "running")

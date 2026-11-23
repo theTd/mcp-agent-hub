@@ -666,11 +666,12 @@ fn a_socket_that_takes_nothing_is_closed_with_1000() {
     core.shutdown();
 }
 
-/// §8/§6.4 (gap 9): a socket's input to a **text-only** session is an ordered drain request — the hub
-/// owns that echo and its line callback, so the core stores it and writes it nowhere. Every frame form
-/// is covered: bare text, JSON input, an OSC-only reply, an unknown type, and a `{` that is not JSON.
+/// §6.4 "Input": a socket's input to a **text-only** session is accepted and discarded. No hub
+/// session is a text one since DSH was dropped (2026-11-15), and the core never echoes, so every
+/// frame form must be consumed without reaching the screen or a drain record: bare text, JSON input,
+/// an OSC-only reply, an unknown type, and a `{` that is not JSON.
 #[test]
-fn text_session_input_becomes_an_ordered_drain_request() {
+fn text_session_input_is_discarded_not_echoed_or_recorded() {
     let core = core();
     core.attach_text(text_request("virtual", 40, 8)).expect("attach_text");
     let mut ws = connect(&core, "virtual");
@@ -686,35 +687,20 @@ fn text_session_input_becomes_an_ordered_drain_request() {
         .expect("unknown type");
     ws.send(Message::text("{\"type\":\"input\",\"data\":\"x\""))
         .expect("truncated json");
+    ws.send(Message::text(r#"{"type":"input","data":7}"#)).expect("numeric data");
 
-    let mut seen: Vec<String> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && seen.len() < 3 {
-        for record in core.drain() {
-            seen.extend(record.input_requests);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(
-        seen,
-        vec![
-            "hello ".to_string(),
-            "world".to_string(),
-            "{\"type\":\"input\",\"data\":\"x\"".to_string(),
-        ],
-        "input must arrive in order, OSC-stripped, and only once"
-    );
-    assert!(
-        core.drain().iter().all(|record| record.input_requests.is_empty()),
-        "a drain reported an input request twice"
-    );
-    // Nothing was written into the screen: the core does not echo for a text session.
+    // The core has nothing to deliver: no screen echo, no pending record, and the socket is still
+    // attached (the frames were consumed, not refused).
+    thread::sleep(Duration::from_millis(150));
     let screen = core.screen("virtual", 10, Duration::from_millis(100)).expect("screen");
-    assert!(
-        !screen.text.contains("hello"),
-        "the core echoed input it does not own: {:?}",
-        screen.text
-    );
+    for typed in ["hello", "world", "ignored"] {
+        assert!(
+            !screen.text.contains(typed),
+            "the core echoed input it does not own ({typed}): {:?}",
+            screen.text
+        );
+    }
+    assert_eq!(core.socket_count(), 1, "a text-session input frame closed its socket");
     core.shutdown();
 }
 
@@ -1325,13 +1311,6 @@ fn a_non_string_data_frame_is_ignored_and_logged_once() {
     ws.send(Message::text(r#"{"type":"input","data":[]}"#)).expect("array data");
     ws.send(Message::text(r#"{"type":"input","data":"kept"}"#)).expect("string data");
 
-    let record = drain_until(&core, |record| !record.input_requests.is_empty())
-        .expect("the string frame never reached a drain record");
-    assert_eq!(record.input_requests, vec!["kept".to_string()], "{record:?}");
-    assert!(
-        core.drain().iter().all(|record| record.input_requests.is_empty()),
-        "the non-string frames were delivered as input"
-    );
     wait_for_log(&lines, "was not a string", Duration::from_secs(2));
     let logged = lines.lock().unwrap_or_else(|error| error.into_inner()).join("\n");
     assert_eq!(

@@ -8,6 +8,7 @@ parent_waiting.py
 session_manager.py
 hub_database.py
 hub_persistence.py
+retired_engine_purge.py
 transcript_tail.py
 transcript_feed.py
 native_session_launch.py
@@ -15,10 +16,7 @@ compaction_threshold.py
 context_window_usage.py
 session_mcp_config.py
 model_discovery.py
-dsh_endpoint.py
-dsh_workspace_permissions.py
-dsh_session_record.py
-dsh_mailbox_replay.py
+doubao_session_record.py
 windows_accept_guard.py
 restart_resume_request.py
 transcript_summarizer.py

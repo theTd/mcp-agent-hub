@@ -111,8 +111,7 @@ Kept in Python: env assembly and policy (`TERM`, `COLORTERM`, `PYTHONHOME` remov
 the 20/5 col/row clamp and viewport propagation (`resize_session_from_client`,
 `session_manager.py:4301`), TuiWriterQueue ordering policy (`:2098`), approval/dialog detection and
 every parser of screen text (`parse_codex_approval_prompt`, `:1774`; `_tui_input_line`, `:11386`;
-`sanitize_tui_screen_text`), the DSH virtual session's echo emulation (`start_virtual`, `:2368`, and
-`write_input`, `:2694`; the byte path into the core is `emit_virtual_ansi`'s `feed`, `:2397`),
+`sanitize_tui_screen_text`), the hub's own text path into the core (`emit_virtual_ansi`'s `feed`, `:2397`),
 persistence, ticket issuing and the console-facing HTTP API.
 
 ## 4. Consumer map
@@ -147,7 +146,7 @@ one through `AgentSession`'s seam methods, one per core call: §4.1 is that map 
 | `to_dict["pid"]` | `:2709` | pid | `spawn` reply |
 | `resize` | `:2486` | PTY + screen resize | `resize` |
 | `write_input`, live message injection | `:2463`, call sites `:6718-10759` | ordered keystrokes | `write` |
-| DSH virtual session | `:2188`, `:2213` | screen fed from text, no PTY | `attach_text` + `feed` |
+| text session (core tests, corpus recorder) | — | screen fed from text, no PTY | `attach_text` + `feed` |
 | archived screen / scrollback reads | `server.py:669`, `server.py:1032` | the DB row only | unchanged; its input is `raw`/`screen` at persist time |
 
 ### 4.1 After step 3a: the seam and its callers, by name
@@ -182,7 +181,7 @@ The seam (design §5.2) lives on `AgentSession`; each body is now one core call,
 | consumer | needs | now calls |
 |---|---|---|
 | `read_subagent_screen` (MCP tool) | exact screen, `max_lines` (default 80), plus the composer line and K1 banner state from the same text | `read_screen(max_lines).text` (`server.py:644`) |
-| `_session_can_receive` | live process, else a warm DSH job | `is_process_alive()` (`server.py:122`) |
+| `_session_can_receive` | live process | `is_process_alive()` (`server.py:122`) |
 | `api_terminal_ticket` (console ticket) | a one-use ticket URL, minted by the core | `core.ws_ticket` off the loop (`server.py:1343`); the socket itself is the core's (§6.4) |
 
 `ws_pty_endpoint` is gone (step 4): the console fetches the ticket and connects to the core's listener, so
@@ -204,7 +203,7 @@ Allowed direct readers/writers after 3b-hub:
 
 - `start_pty` (`:2454`) — the spawn path: `env` assembly, `unwrap_windows_cmd_shim` and one
   `core.spawn(…, seed_history, ws_prefix)`. This is a producer, not a reader: it holds no terminal state.
-- `emit_virtual_ansi` (`:2397`) — DSH virtual sessions feed text through the core's `feed`.
+- `emit_virtual_ansi` (`:2397`) — hub-written lines (resume banner, exit note) go through the core's `feed`.
 - `_pid_alive` (module level, `:936`) — `os.kill(pid, 0)` on a *pid number* for the hub's single-instance
   lock, not on `AgentSession.pty`.
 
@@ -244,8 +243,8 @@ Liveness, 21 `is_process_alive()` at manager level plus the seam's own `terminat
 `_shutdown`, `_scrollback_flush_loop`, `_submit_queued_live_text` (2), `_deliver_deny_feedback`,
 `_clear_tui_draft` (2), `_transcript_watch_alive`, `_agy_new_conversation_dir`, `deliver_parent_message`,
 `get_subagent_status_and_trace`, `resize_session_from_client` and the resume/predecessor waits. Each reads the
-drain record's `alive`, never the status string; a DSH text session keeps its own status/job branch because
-the core has no process for it.
+drain record's `alive`, never the status string; a window-only session (desktop GUI) keeps the status check
+because the core has no entry for it.
 
 Process presence, 3 `has_process` at manager level plus 8 inside `AgentSession` (the seam, `terminate`,
 `classify_end_reason`, `to_dict`): `_end_predecessor`, the close path, and the Codex live-write check.
@@ -331,8 +330,8 @@ exceeds 2 s, a spawn over the bound is logged with its measured time, and the re
 | call | arguments | reply | deadline | replaces |
 |---|---|---|---|---|
 | `spawn` | session_id, argv, cwd, env, cols, rows, flags, seed_history, ws_prefix | pid, cols, rows, elapsed_ms | 2 s, measured by the selftest (not interruptible) | `PtyProcess.spawn`, `push_ws_frame` of the resume banner |
-| `attach_text` | session_id, cols, rows, flags, seed_history, seed | pid (0), cols, rows | 50 ms | `HubTerminalScreen` for DSH virtual sessions (`seed_history` is A1's archived scrollback, `seed` the separator frame) |
-| `feed` | session_id, text | rev | 50 ms | `_on_pty_output` for virtual sessions |
+| `attach_text` | session_id, cols, rows, flags, seed_history, seed | pid (0), cols, rows | 50 ms | `HubTerminalScreen` for text sessions (`seed_history` is A1's archived scrollback, `seed` the separator frame; no hub caller since DSH was dropped, kept by the A1 contract) |
+| `feed` | session_id, text | rev | 50 ms | `emit_virtual_ansi`: hub-written lines (resume failure, exit note) into a session's screen and ring |
 | `write` | session_id, text | bytes queued: the whole text or nothing; `0` for empty text; `TimeoutError` when the queue is still full at the deadline | 50 ms | `pty.write` |
 | `resize` | session_id, cols, rows | cols, rows; `ValueError` when the pseudoconsole is already closing/closed, `TimeoutError` when the console is busy past the deadline | 50 ms | `pty.setwinsize` + `screen.resize` |
 | `kill` | session_id, grace_ms | exit_code (None when the process outlived the budget) | 2 s for the whole call: the exit wait, then the same teardown the reaper runs (console close, wait for the reader's last bytes), which publishes on its deadline at the latest | `taskkill /T /F` |
@@ -414,9 +413,9 @@ interval, however much output arrived:
 - `hub._on_core_tick` (`session_manager.py:3677`) runs on the loop and makes a single `core.drain()`
   call, which returns only the sessions whose flags were set and clears them. A record carries
   `session_id`, `alive`, `exit_code`, `crashed`, `degraded`, `pid`, `bytes_total`, `chunks_total`,
-  `last_output_at`, `dropped_bytes`, `screen_rev`, `raw_rev`, `screen_text`, and three hub-facing lists:
-  `resize_requests` (`{cols, rows, propagate}` in arrival order), `input_requests` (`str`, a session with
-  no PTY) and `socket_drops` (`(handle, bytes)` per console socket).
+  `last_output_at`, `dropped_bytes`, `screen_rev`, `raw_rev`, `screen_text`, and two hub-facing lists:
+  `resize_requests` (`{cols, rows, propagate}` in arrival order) and `socket_drops` (`(handle, bytes)` per
+  console socket). Socket input on a text session (no PTY) is discarded: its only consumer was DSH.
   - `raw_rev` is the ring's revision: `raw`'s reply carries the same number, and `_scrollback_blob`'s
     change gate reads it without joining the ring. The mirror is initialised from the stream in
     `new_state` (a seeded attach's ring is already at 1) and advanced with `fetch_max` under the text
@@ -457,7 +456,7 @@ interval, however much output arrived:
 
 **A resume's kill is a supersede, not a death.** Before a successor's `spawn`/`attach_text` replaces an
 id's entry, the hub ends the entry the predecessor owns. The death record that kill publishes is a
-hand-over: a predecessor that had already ended (a completed DSH job, a user termination) keeps that end
+hand-over: a predecessor that had already ended (an ended session, a user termination) keeps that end
 state and emits no lifecycle event for the kill, so a parent is never told that a session it is resuming
 crashed. A text entry has no process and the core's text kill answers `exit_code=None, crashed=false`, so
 "a death without a code is a crash" applies only to a session that had a process; a text entry keeps the
@@ -469,12 +468,10 @@ permanent close keeps the closed object as the id's tombstone until `retire` suc
 publishes after the close still reaches the row it belongs to; a resume of the id drops the tombstone and a
 late record is never routed to a successor.
 
-**The console's requests.** The drain record's `resize_requests` and `input_requests` are applied by one
-consumer per session id, never by the drain itself: the tick only enqueues them, each kind in its own
-arrival order (the core keeps two lists, so a record's resizes are applied before its inputs and the
-record carries no interleaving between the kinds), and the consumer awaits each blocking core call
-(`resize`, `write`, `feed`, and the F12 `watch_screen` re-watch) in a worker thread while the 20/5 clamp,
-the single-window propagation, the session dict and the virtual line callbacks stay on the loop. A
+**The console's requests.** The drain record's `resize_requests` are applied by one consumer per session
+id, never by the drain itself: the tick only enqueues them in arrival order, and the consumer awaits each
+blocking core call (`resize` and the F12 `watch_screen` re-watch) in a worker thread while the 20/5 clamp,
+the single-window propagation and the session dict stay on the loop. A
 request whose id left the hub's list before it is applied does nothing: the pane is gone, so its intent
 must not resize the panes that are still there, and a worker that has not entered the core yet refuses
 for the same reason (`CoreCallRefused`). One bad request costs that request only. Each application runs
@@ -726,7 +723,7 @@ The hub 404s before minting for an id it does not list and for a listed id whose
 start `/health` keeps). A listed session that has already ended but whose core entry still exists **does**
 get a ticket: the pane attaches an ended session's terminal and shows the final replay, which `/ws/pty`
 always allowed, so the ended state alone is not the 404 test. A starting session (no first alive record
-yet) and a DSH text session get one as well. `expires_in` is the whole seconds left of that mint, and each
+yet) and a text session get one as well. `expires_in` is the whole seconds left of that mint, and each
 call mints a new ticket because a ticket is single use and a suspended tab's has expired. The mint reads
 the core's session table, so a missed 50 ms deadline answers a retryable 503 in a worker rather than
 blocking the route. The token is a bearer credential: it appears only in the response body — never in a
@@ -768,7 +765,8 @@ a busy table is a retry, not a fault; 500 only for a genuine core fault; otherwi
   one `Arc`-shared structure that each new incarnation of an id takes over from its predecessor, so
   attached sinks and their handles survive the swap and `detach_sink(id, handle)` still finds them. The
   resume banner travels as `spawn(ws_prefix=…)` and is written to every attached socket before the reader
-  thread starts; the DSH virtual resume passes it as `attach_text(seed=…)` (`:5317`). The handover runs
+  thread starts; a text-session resume passes it as `attach_text(seed=…)` (no hub caller since DSH was dropped;
+  the A1 handover still tests it). The handover runs
   under the delivery lock: the predecessor's pending batch is delivered to the sinks, the predecessor is
   marked `superseded` (anything its reader still files is dropped and counted, never written after the
   banner), the successor becomes the id's replay source, and then the banner goes out. A sink attached
@@ -1050,7 +1048,7 @@ async runtime in the core), `unicode-width` (the parser's grid owns cell widths)
 | scrollback is written at most every 60 s, only when changed | `_scrollback_blob` `:4443` | `raw.rev` replaces `raw_history_rev`; `_scrollback_written_at`/`_scrollback_rev_written` logic unchanged |
 | `last_screen` = last 20 non-empty screen lines | `_last_screen_text` `:4379` | `screen` reply, same trimming in Python (policy stays there) |
 | viewport clamp (cols ≥ 20, rows ≥ 5) and single-window propagation | `:2487`, `:3161` | a console `resize` arrives as a dirty flag on the drain record; Python applies the clamp and propagation, then calls `resize` per session. The core refuses cols < 20 / rows < 5 defensively and never propagates |
-| DSH virtual sessions have a screen without a PTY | `start_virtual` `:2188`, `emit_virtual_ansi` `:2213` | `attach_text` + `feed`; the echo emulation stays in Python |
+| text sessions have a screen without a PTY (core tests, corpus recorder) | `emit_virtual_ansi` `:2213` | `attach_text` + `feed` |
 
 No recorded decision is reversed. Two are touched: `shutdown-ends-cli` is preserved because the core's
 threads die with the interpreter plus `kill_all` on the recorded shutdown path, and `retention`'s 512 KB
@@ -1160,7 +1158,7 @@ New tests, none run by this unit:
   `profile.release.panic` check for the core crate), because a stray `panic = "abort"` silently turns
   every caught panic back into a hub kill.
 - `test_terminal_ticket_endpoint.py`: the ticket route and `/health` on the fake core — 404 for an unknown id, a listed id with no core entry and a hub with no core; 200 for a starting, an ended-but-listed and a text session; the `{"url","expires_in"}` shape and one new URL per call; the token absent from every log record and from uvicorn's access log; `terminal_ws` for a live listener, a stopped one and no core (which is never built).
-- `test_terminal_core_contracts.py` (`DrainRequestTests`): the hub's application of a drain record — resize requests in arrival order with `propagate` false/true, the 20x5 clamp, taken once; text `input_requests` echoed and delivered once, with backspace editing; a bad request costs itself only; `socket_drops` per `(id, handle)` and apart from the ring; a close asks the core once and forgets the id.
+- `test_terminal_core_contracts.py` (`DrainRequestTests`): the hub's application of a drain record — resize requests in arrival order with `propagate` false/true, the 20x5 clamp, taken once; a bad request costs itself only; `socket_drops` per `(id, handle)` and apart from the ring; a close asks the core once and forgets the id.
 - Python and Rust, oracle cases ported at step 6: `test_terminal_core_screen_cases.py` drives the core
   with the exact inputs of the deleted oracle tests (`test_terminal_screen_zero_width.py`,
   `test_terminal_stream_csi.py`) — zero-width draws and splits, combining, marker CSIs whole and split,

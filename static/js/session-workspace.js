@@ -229,10 +229,6 @@ function renderAll() {
 }
 
 // ---------------------------------------------------------- session shapes
-// A DSH session started through the Harness job/message API has no terminal of its own: the Hub
-// reads its native session record, so the console shows the transcript only. (A legacy `web_gui`
-// DSH profile runs `dsh headless` in a real terminal and keeps the 记录 / TUI switch.)
-const isTranscriptOnly = (s) => String(s?.engine || '').toLowerCase() === 'dsh' && s?.kind !== 'web_gui';
 
 function tickSessionDurations() {
   if (sessionsMode !== 'live' || document.hidden) return;
@@ -650,7 +646,6 @@ function createPane(s) {
 function paneHeadHtml(s) {
   const live = isLive(s);
   const wsOpen = !!terminals.get(s.session_id)?.wsOpen;
-  const transcriptOnly = isTranscriptOnly(s);
   const view = transcriptViews.get(s.session_id)?.mode || 'transcript';
   const keys = Object.entries(QUICK_KEYS).map(([key, k]) => {
     const enabled = live && wsOpen;
@@ -665,12 +660,11 @@ function paneHeadHtml(s) {
       ${pillsHtml(s)}
     </div>
     <div class="pane-actions">
-      ${transcriptOnly ? '' : `
-        <div class="view-switch" role="group" aria-label="会话视图">
-          <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化记录：消息、工具调用与审批（默认）">记录</button>
-          <button type="button" data-action="view" data-view="tui" aria-pressed="${view === 'tui'}" title="原始 TUI 终端画面">TUI</button>
-        </div>
-        ${view === 'tui' ? `<div class="key-group" role="group" aria-label="快捷按键">${keys}</div>` : ''}`}
+      <div class="view-switch" role="group" aria-label="会话视图">
+        <button type="button" data-action="view" data-view="transcript" aria-pressed="${view === 'transcript'}" title="结构化记录：消息、工具调用与审批（默认）">记录</button>
+        <button type="button" data-action="view" data-view="tui" aria-pressed="${view === 'tui'}" title="原始 TUI 终端画面">TUI</button>
+      </div>
+      ${view === 'tui' ? `<div class="key-group" role="group" aria-label="快捷按键">${keys}</div>` : ''}
       ${state.layoutMode === 'matrix'
         ? `<button type="button" class="icon-btn sm" data-action="focus-single" title="在单窗口视图中打开（或双击标题栏）" aria-label="在单窗口视图中打开">${icon('maximize')}</button>`
         : ''}
@@ -750,7 +744,7 @@ function transcriptState(sessionId) {
 function setPaneView(sessionId, mode) {
   const view = transcriptState(sessionId);
   const session = state.sessions.find((item) => item.session_id === sessionId);
-  view.mode = mode === 'tui' && !isTranscriptOnly(session) ? 'tui' : 'transcript';
+  view.mode = mode === 'tui' ? 'tui' : 'transcript';
   const pane = panes.get(sessionId);
   if (pane) {
     pane.headSig = '';
@@ -879,14 +873,10 @@ async function respondFromTranscript(id, body, trigger) {
 }
 
 function mountPaneBody(pane, s) {
-  if (isTranscriptOnly(s)) {
-    pane.body.innerHTML = '<div class="transcript-slot" data-ref="transcript"></div>';
-  } else {
-    pane.body.innerHTML = `
-      <div class="transcript-slot" data-ref="transcript"></div>
-      <div class="term-slot" data-ref="alternate"></div>`;
-    attachTerminal(s.session_id, pane.body.querySelector('[data-ref="alternate"]'));
-  }
+  pane.body.innerHTML = `
+    <div class="transcript-slot" data-ref="transcript"></div>
+    <div class="term-slot" data-ref="alternate"></div>`;
+  attachTerminal(s.session_id, pane.body.querySelector('[data-ref="alternate"]'));
   mountTranscript(pane, s);
   applyPaneView(pane, s.session_id);
 }

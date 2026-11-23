@@ -77,7 +77,7 @@ def logical_write(function):
 class HubPersistence:
     READS = frozenset({
         "get_max_seq", "get_session_record", "get_recent_tool_calls",
-        "get_recent_intermediate_messages", "get_recent_worker_events", "get_mailbox_history",
+        "get_recent_intermediate_messages", "get_recent_worker_events",
         "list_persisted_sessions",
         "list_archived", "count_archived", "get_scrollback_blob", "list_session_ids",
     })

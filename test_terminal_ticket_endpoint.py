@@ -62,12 +62,12 @@ class TicketEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.sessions = {}
         for session_id, kind, command in (("starting", "tui", "cmd.exe"),
                                           ("ended", "tui", "cmd.exe"),
-                                          ("text", "virtual", "")):
+                                          ("text", "tui", "")):
             sess = session_manager.AgentSession(
                 session_id, "pwsh", "Probe", kind, "Probe", str(self.root), command, [],
                 core=self.hub.core,
             )
-            sess.engine = "dsh" if kind == "virtual" else "pwsh"
+            sess.engine = "pwsh"
             sess._loop = asyncio.get_running_loop()
             sess.status = "starting"
             self.hub.sessions[session_id] = sess

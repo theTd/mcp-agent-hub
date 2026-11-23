@@ -6,7 +6,7 @@ master `c527749`/`6276c63`) arrived with their tests passing a screen in as a st
 a recorded stream through a screen model.  The recorded decision `live-capture-new-consumers` closes
 that: two live cases were recorded with `tools/record_terminal_corpus.py`, each stopping at the
 screen its consumer reads (`meta.json`'s `consumer.reads_at_chunk`).  This file replays those chunks
-through the core (`attach_text` + `feed`, as a DSH virtual session does) and compares the screen with
+through the core (`attach_text` + `feed`, a session with a screen but no process) and compares the screen with
 `screen-at-consumer-read.txt`, which was frozen from the pyte oracle at 83fdaae, before step 6
 deleted it: the file is that oracle's last answer, and the core must still draw it.  The real
 consumers then run on both screens and must agree.

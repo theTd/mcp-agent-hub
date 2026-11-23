@@ -78,8 +78,8 @@ class NormalizeExtraRootsTests(unittest.TestCase):
     def test_engine_flags(self):
         for engine in ("claude", "codex", "omp", "kimi", "agy"):
             self.assertEqual(extra_root_args(engine, "tui", ["E:\\a", "E:\\b"]), ["--add-dir=E:\\a", "--add-dir=E:\\b"])
-        self.assertEqual(extra_root_args("dsh", "web_gui", []), [])
-        for engine, kind in (("dsh", "tui"), ("dsh", "web_gui"), ("pwsh", "tui")):
+        self.assertEqual(extra_root_args("pwsh", "tui", []), [])
+        for engine, kind in (("pwsh", "tui"), ("omp", "web_gui"), ("doubao", "tui")):
             with self.subTest(engine=engine), self.assertRaises(ValueError) as caught:
                 extra_root_args(engine, kind, ["E:\\a"])
             self.assertIn("put the files under cwd", str(caught.exception))

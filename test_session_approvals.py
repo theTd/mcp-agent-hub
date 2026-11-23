@@ -89,7 +89,7 @@ class ApprovalParserTests(unittest.TestCase):
         self.assertEqual(mode("codex", {"bypass_approvals": True}, requested="ask"), "ask")
         self.assertEqual(mode("claude", bypass=True), "bypass")
         self.assertEqual(mode("claude", requested=" Bypass "), "bypass")
-        self.assertIsNone(mode("dsh", requested="ask"))
+        self.assertIsNone(mode("no-such-engine", requested="ask"))
         policy = resolve_session_approval("codex", {}, None, "ask")
         self.assertEqual((policy["approval_source"], policy["bypass_approvals"]), ("session", False))
         for bypass, requested in ((True, "ask"), (True, "auto"), (False, "bypass")):
@@ -114,7 +114,7 @@ class ApprovalParserTests(unittest.TestCase):
     def test_d13_legacy_fields_report_the_mode_they_ran(self):
         self.assertEqual(resolve_session_approval_fields({"engine": "codex"})["approval_mode"], "ask")
         self.assertEqual(resolve_session_approval_fields({"engine": "codex", "bypass_approvals": True})["approval_mode"], "bypass")
-        self.assertIsNone(resolve_session_approval_fields({"engine": "dsh"})["approval_mode"])
+        self.assertIsNone(resolve_session_approval_fields({"engine": "pwsh"})["approval_mode"])
         self.assertEqual(resolve_session_approval_fields({"engine": "claude", "approval_mode": "auto"})["approval_mode"], "auto")
 
 

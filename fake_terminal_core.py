@@ -19,16 +19,15 @@ What it keeps faithful, because the hub's behaviour depends on it:
 - `drain` returns queued records and clears them, so `_on_core_tick` sees exactly what the core would
   publish, and only the current incarnation's records can mark its death drained; it can withhold a
   death record for N drains (`withhold_death_records`), which the fixed core may do for one;
-- a record carries the console's `resize_requests` and `input_requests` in arrival order and its
-  `socket_drops`, taken once by the drain that reports them (§5.2), and the core never applies a
-  resize or writes a text session's input;
+- a record carries the console's `resize_requests` in arrival order and its `socket_drops`, taken once
+  by the drain that reports them (§5.2), and the core never applies a resize;
 - `retire` refuses a live id, one whose death record has not been drained (`rtc-retire`) and one
   whose resume is in flight (the coming core contract), and it can be made busy (`TimeoutError`);
 - the listener surface: `ws_port`, `ws_listening()`, a one-use `ws_ticket(...)` URL per call and
   `close_sockets(session_id)`, which counts the sockets the test opened (`open_socket`).
 
 Test-only knobs: `set_exit`, `die`, `late_code`, `set_last_output_at`, `set_write_timeouts`,
-`request_resize`, `request_input`, `note_socket_drops`, `open_socket`, `block_retire`,
+`request_resize`, `note_socket_drops`, `open_socket`, `block_retire`,
 `resume_in_flight`, `read_timeouts`, `snapshot_delay`, `shutdown_delay`, `withhold_death_records`,
 `calls` (with `snapshot_budgets`, `kill_graces`, `close_socket_calls`, `retire_calls`).
 """
@@ -73,9 +72,8 @@ class FakeTerminalSession:
         self.flags: Dict[str, Any] = {}
         self.seed_history: Optional[str] = None
         self.ws_prefix: Optional[str] = None
-        # The console's requests, in arrival order, taken once by the next drain record (§5.2).
+        # The console's size requests, in arrival order, taken once by the next drain record (§5.2).
         self.resize_requests: List[Dict[str, Any]] = []
-        self.input_requests: List[str] = []
         self.socket_drops: List[Tuple[int, int]] = []
         # Console sockets of this id: `close_sockets` asks them to close and reports how many.
         self.open_sockets = 0
@@ -167,12 +165,6 @@ class FakeTerminal:
         """
         state = self.sessions[session_id]
         state.resize_requests.append({"cols": cols, "rows": rows, "propagate": bool(propagate)})
-        self.records.append((state.generation, self._record(state)))
-
-    def request_input(self, session_id: str, text: str) -> None:
-        """Typed text for a session with no PTY: queued for the hub's echo, never written anywhere."""
-        state = self.sessions[session_id]
-        state.input_requests.append(str(text))
         self.records.append((state.generation, self._record(state)))
 
     def note_socket_drops(self, session_id: str, handle: int, dropped: int) -> None:
@@ -309,9 +301,8 @@ class FakeTerminal:
             if record.get("alive") is False:
                 state.death_drained = True
             # §5.2: the record carries what the console asked for since the last drain, in order,
-            # taken once; the core itself never applies a resize or writes a text session's input.
+            # taken once; the core itself never applies a resize.
             record["resize_requests"], state.resize_requests = state.resize_requests, []
-            record["input_requests"], state.input_requests = state.input_requests, []
             record["socket_drops"], state.socket_drops = state.socket_drops, []
             out.append(record)
         if held:

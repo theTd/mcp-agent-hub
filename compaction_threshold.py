@@ -9,7 +9,7 @@ The caller passes either a percentage of the context window ("70%") or a token c
   min(window * pct, its default threshold), so the value can only make compaction earlier.
 - codex: tokens, through ``-c model_auto_compact_token_limit=<n>``.
 
-Every other engine has no per-session setting (Kimi and DSH read a host-wide file, AGY's switch
+Every other engine has no per-session setting (Kimi reads a host-wide file, AGY's switch
 is undocumented) and rejects the parameter instead of ignoring it.
 """
 import json

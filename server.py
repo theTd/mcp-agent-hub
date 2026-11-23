@@ -48,7 +48,7 @@ DATA_DIR = Path(os.environ.get("HUB_DATA_DIR") or BASE_DIR).resolve()
 hub = HubSessionManager(PROFILES_PATH, base_dir=BASE_DIR, data_dir=DATA_DIR)
 
 
-# B11: discovery shells out to five CLIs and talks to the DSH host over HTTP, so it never runs on
+# B11: discovery shells out to six CLIs, so it never runs on
 # the event loop. Concurrent refreshes share one in-flight task, and a route that only needs the
 # current data answers from the cache at once.
 _refresh_task: Optional[asyncio.Task] = None
@@ -121,10 +121,8 @@ def not_found(detail: str):
 
 
 def _session_can_receive(session) -> bool:
-    """A live process, or a warm DSH job that its continue API can still take."""
-    if session.is_process_alive():
-        return True
-    return session.status == "completed" and str(session.engine or "").lower() == "dsh"
+    """A live process can take the message; an ended one is resumed instead."""
+    return session.is_process_alive()
 
 
 INJECTION_PENDING_HINT = (
@@ -413,7 +411,8 @@ async def spawn_subagent(
     ``approval_mode`` decides who approves the worker's risky actions:
     - omitted (the default): the engine's own auto-approval reviewer where it has one (Codex
       ``--approve-for-me``, Claude auto mode); only what the reviewer escalates comes to you. Other
-      engines run ``"ask"``. Leave it omitted, even to be explicit or careful: auto is the safe choice.
+      engines run ``"ask"`` (Doubao CLI with ``--permission-mode ask_risky``). Leave it omitted,
+      even to be explicit or careful: auto is the safe choice.
     - ``"ask"``: high-risk actions stop and come to you (respond_to_subagent); only when you or the
       user want to approve every one yourselves.
     - ``"bypass"``: no checks at all; only when the user asked for it or the task needs it.
@@ -422,9 +421,8 @@ async def spawn_subagent(
 
     For every engine, create the task's own worktree, scratch, logs and results under ``cwd``:
     sandboxes and auto-accept cover only ``cwd`` (Codex workspace-write, Claude acceptEdits in ask
-    mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in
-    auto mode, yours in ask mode and for DSH); for DSH every call, reads included, and the hub
-    cannot add roots. Only what the task creates belongs there: leave files it did not create
+    mode), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in
+    ask mode). Only what the task creates belongs there: leave files it did not create
     (sources, shared or others' data, credentials) in place, and never widen ``cwd`` to a parent,
     home or drive root to cover them.
     ``extra_roots`` (claude, codex, omp, kimi, agy) names up to 8 absolute folders beyond ``cwd``
@@ -432,7 +430,7 @@ async def spawn_subagent(
     offers a read-only folder). List each folder the task must use there, such as a shared lock
     folder, never a parent that holds them (it grants everything inside). Refused: a drive root,
     the user's home or a folder holding it, credential and engine settings folders, system and
-    application folders, the hub's data; DSH takes none.
+    application folders, the hub's data.
     ``compaction_threshold`` sets this session's auto-compaction point: ``"70%"`` of the context
     window or a token count (``200000``, ``"200k"``). omp takes both, claude only a percent (it can
     only compact earlier than its default), codex only tokens; other engines reject it.
@@ -530,7 +528,7 @@ async def set_subagent_approval_rules(
     A rule answers approve_once only for an approval request that reports a structured argv
     matching ``match.command_argv`` inside the session cwd, without shell composition, network,
     write, delete, credential, upload, process-control or escalation. No engine reports a
-    structured argv yet (DSH approvals are free text), so stored rules currently match nothing
+    structured argv yet, so stored rules currently match nothing
     and ``rules_applied`` confirms storage only. For approvals outside cwd, fix the cwd layout.
 
     Rule shape: {"id": "read-logs", "match": {"tool": ["Bash"], "command_argv": [["cat", "logs/*.log"]]},
@@ -1539,8 +1537,6 @@ async def api_launch_preview(req: Request):
             strict_mcp_config=body.get("strict_mcp_config", False),
             extra_roots=body.get("extra_roots"),
         )
-        if preview.get("engine") == "dsh":
-            preview["sandbox_preparation"] = await hub._prepare_dsh_workspace(preview["cwd"], repair=False)
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
     payload = {"ok": True}
@@ -1629,7 +1625,7 @@ async def api_send_input(session_id: str, req: Request):
 async def api_send_message(session_id: str, req: Request):
     """The transcript view's message box: what send_to_subagent does, sent by the console user.
 
-    A live session gets the checked delivery with Enter (TUI submit / DSH steer or continue); an
+    A live session gets the checked delivery with Enter (TUI submit); an
     ended or archived one is resumed with the text.  Parent wait handles are left alone, as for
     text typed into the TUI.
     """
@@ -1697,8 +1693,8 @@ async def api_terminal_ticket(session_id: str):
     A session the hub no longer lists, or one whose core entry is gone (retired, closed for good),
     is a 404 before anything is minted. A listed session that already ended but whose core entry
     still exists does get a ticket: its pane attaches the terminal and shows the final replay, as
-    the socket always allowed (`mountPaneBody`). A starting session (no first alive record yet) and
-    a DSH text session do too.
+    the socket always allowed (`mountPaneBody`). A starting session (no first alive record yet)
+    does too.
 
     r4b #2/kimi 4b #3: the mint reads the core's session table, which can miss its 50 ms deadline
     while a spawn, a retire or a snapshot holds it; the call and its ticket store run in a worker so

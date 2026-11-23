@@ -1,6 +1,6 @@
 # Hub 重启与会话恢复
 
-Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并归档，可以在「归档」里恢复（同一个会话 id）。终端类 Agent（Codex、Claude、Kimi 等）随 Hub 一起结束，恢复时用各自的原生记录重新打开；DSH 任务在 DSH Host 里继续运行，恢复时重新接上同一个任务（见 [记录视图](transcript-view.md) 的 DSH 一节）。
+Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并归档，可以在「归档」里恢复（同一个会话 id）。终端类 Agent（Codex、Claude、Kimi 等）随 Hub 一起结束，恢复时用各自的原生记录重新打开。
 
 ## 有意重启时一并恢复（resume_on_start.json）
 
@@ -15,9 +15,9 @@ Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并�
 下次启动时 Hub：
 
 1. 取走这个文件（改名为 `resume_on_start.taken.json`，只用一次），记下停止时仍在运行的会话和它们当时的状态，再照常归档。
-2. 端口打开后逐个恢复这些会话：先 DSH（只是重新接上任务），后终端类 Agent。终端类 Agent 启动时会连 Hub 自己的 MCP 端点，所以要等端口打开后再启动它们。
+2. 端口打开后逐个恢复这些会话。终端类 Agent 启动时会连 Hub 自己的 MCP 端点，所以要等端口打开后再启动它们。
 3. 恢复期间，除了 `/health`、`/api/hub/info`、`/api/hub/shutdown`，所有请求都先等着，最多 30 秒，恢复完立即放行。所以主 Agent 看到的会话已经在运行，它发起的恢复也不会和启动时的恢复抢着做。桌面端检查 Hub 是否就绪不受影响。
-4. 停止时一个回合还没做完的终端类 Agent（状态为运行中、等主 Agent 回复或启动中），恢复时附带一条消息：说明 Hub 重启打断了上一回合、正在运行的命令或审批提示都已停止，请它从中断处继续，原来在等的审批要重新申请。这条消息在记录视图里以「你」显示。空闲的会话和 DSH 会话不带消息。
+4. 停止时一个回合还没做完的终端类 Agent（状态为运行中、等主 Agent 回复或启动中），恢复时附带一条消息：说明 Hub 重启打断了上一回合、正在运行的命令或审批提示都已停止，请它从中断处继续，原来在等的审批要重新申请。这条消息在记录视图里以「你」显示。空闲的会话不带消息。
 5. 把每个会话的结果写到 `resume_on_start.result.json`（`ok`、`continued`、`status_at_stop`，失败时有 `error`）。恢复不了的会话照常留在「归档」里，原因写在记录上。
 
 ## Host / Origin 校验
@@ -34,7 +34,7 @@ Hub 只服务本机页面和本机客户端：`Host` 必须是 `127.0.0.1`、`lo
 
 只在 owner 明确要求时做。流程：写恢复请求 → 结束桌面 App → 备份 → 换 EXE → 用 explorer 启动 → 核对。依赖没变时停机约 30 秒；`desktop/portable/requirements.lock` 变了时，首次启动要新建 Python 环境，约 2–3 分钟。
 
-**停止用强制结束，不用托盘「退出」。** 托盘「退出」和「重启 Hub」是正常停止：结束每个终端 Agent，**取消正在运行的 DSH 任务**，把所有会话归档为「已中断」。之后这些会话已不算「停止时仍在运行」，`resume_on_start.json` 默认一个也不恢复。强制结束桌面 App 时，它的 Job 对象一并结束 Hub 和终端 Agent；DSH 任务在 DSH Host 里继续跑，数据库里这些会话仍是运行中。这正是恢复请求设计和测试的情形（`test_restart_resume_on_start.py` 的 `stopped_hard`）。代价是后台写队列里最后几条未提交的记录可能丢失（DECISIONS.md 的 buffered-durability）。停止令牌只在 App 和 Hub 进程的内存里，不要去找它。
+**停止用强制结束，不用托盘「退出」。** 托盘「退出」和「重启 Hub」是正常停止：结束每个终端 Agent，把所有会话归档为「已中断」。之后这些会话已不算「停止时仍在运行」，`resume_on_start.json` 默认一个也不恢复。强制结束桌面 App 时，它的 Job 对象一并结束 Hub 和终端 Agent，数据库里这些会话仍是运行中。这正是恢复请求设计和测试的情形（`test_restart_resume_on_start.py` 的 `stopped_hard`）。代价是后台写队列里最后几条未提交的记录可能丢失（DECISIONS.md 的 buffered-durability）。停止令牌只在 App 和 Hub 进程的内存里，不要去找它。
 
 命令在 PowerShell 7 里运行（Claude Code 的 PowerShell 工具就是），工作目录为仓库根目录。每个代码块自成一体：工具调用之间变量不保留。
 
@@ -127,7 +127,7 @@ Get-Content $log | Select-Object -Skip ($n - 1) | Select-String "Traceback|ERROR
 成功的样子：
 - 第 1 步里在运行的会话都在 result 里，`ok=True`；当时回合没做完的终端 Agent `continued=True`。
 - `/api/hub/info` 的 `started_at` 是刚才，`repo` 指向新的 `portable\resources\<hash>`。要确认改动已部署，就在那个目录里搜一个这次改动的函数名。
-- 会话列表里它们在运行，DSH 会话的步数在增加。
+- 会话列表里它们在运行，步数在增加。
 - 这次启动之后的 hub.log 没有 Traceback 或 ERROR。
 
 出现下面任何一种情况，就停下来把日志末尾报告给 owner，不要反复重启，也不要再启动一份 EXE：

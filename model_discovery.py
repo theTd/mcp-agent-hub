@@ -9,9 +9,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from dsh_endpoint import dsh_url
+from doubao_session_record import NO_UPDATE_CHECK_ENV, resolve_doubao_binary
 
 
 _TOKEN_COUNT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(KI|K|MI|M|GI|G)?\s*$", re.IGNORECASE)
@@ -228,7 +226,7 @@ def parse_omp_models_yml(path: Path) -> Dict[str, Dict[str, Any]]:
 class AgentModelDiscovery:
     """
     Automatically discovers available LLM models and supported thinking/effort levels
-    across all locally installed Agent CLIs (omp, kimi, agy, codex, dsh).
+    across all locally installed Agent CLIs (omp, kimi, agy, codex, claude, doubao).
     """
 
     # A forced refresh younger than this is answered from cache, so parallel
@@ -266,7 +264,7 @@ class AgentModelDiscovery:
                 "agy": self._discover_agy(),
                 "codex": self._discover_codex(),
                 "claude": self._discover_claude(),
-                "dsh": self._discover_dsh(),
+                "doubao": self._discover_doubao(),
             }
             self._cache = {
                 "discovered_at": round(now, 3),
@@ -541,6 +539,118 @@ class AgentModelDiscovery:
                 "thinking_level": "模型名后缀 -{thinking_level}",
             },
         }
+
+    def _discover_doubao(self) -> Dict[str, Any]:
+        """`doubao model list --json`: the account's models, each with its own effort list."""
+        binary = resolve_doubao_binary()
+        binary_path = Path(binary)
+        installed = binary_path.is_file() if binary_path.is_absolute() else bool(shutil.which(binary))
+        thinking_levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        models: List[Dict[str, Any]] = []
+        discovery_error = ""
+        if not installed:
+            discovery_error = "doubao binary not found"
+        else:
+            env = dict(os.environ)
+            env.setdefault(NO_UPDATE_CHECK_ENV, "1")
+            try:
+                result = subprocess.run(
+                    [binary, "model", "list", "--json"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=12.0,
+                    env=env,
+                )
+                payload = None
+                for line in reversed(str(result.stdout or "").splitlines()):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        candidate = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(candidate, dict):
+                        payload = candidate
+                        break
+                if payload is None:
+                    text = str(result.stdout or "").strip()
+                    if text:
+                        try:
+                            candidate = json.loads(text)
+                            payload = candidate if isinstance(candidate, dict) else None
+                        except Exception:
+                            payload = None
+                if payload is not None:
+                    if payload.get("is_error") is True:
+                        discovery_error = str(payload.get("result") or payload.get("subtype") or "doubao model list failed")
+                    else:
+                        body = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+                        raw_models = body.get("models") if isinstance(body, dict) else None
+                        for raw in raw_models if isinstance(raw_models, list) else []:
+                            if not isinstance(raw, dict):
+                                continue
+                            model_id = str(raw.get("id") or "").strip()
+                            if not model_id:
+                                continue
+                            efforts = [str(level) for level in (raw.get("efforts") or []) if str(level).strip()]
+                            efforts = [level for level in thinking_levels if level in efforts] + [
+                                level for level in efforts if level not in thinking_levels
+                            ]
+                            default_effort = str(raw.get("default_effort") or "").strip()
+                            models.append(
+                                {
+                                    "id": model_id,
+                                    "display_name": str(raw.get("name") or model_id),
+                                    "supported_thinking_levels": efforts,
+                                    "default_thinking_level": default_effort if default_effort in efforts else None,
+                                    "is_default": raw.get("is_default") is True,
+                                }
+                            )
+                        if not models and not discovery_error:
+                            discovery_error = "doubao model list returned no models"
+                elif not discovery_error:
+                    discovery_error = "doubao model list returned no JSON"
+            except subprocess.TimeoutExpired:
+                discovery_error = "doubao model list timed out"
+            except Exception as exc:
+                discovery_error = f"doubao model list failed: {exc}"
+
+        default_model = next((m["id"] for m in models if m["is_default"]), models[0]["id"] if models else None)
+        default_detail = next((m for m in models if m["id"] == default_model), None)
+        available_levels = [
+            level for level in thinking_levels
+            if any(level in (m.get("supported_thinking_levels") or []) for m in models)
+        ]
+        for detail in models:
+            for level in detail.get("supported_thinking_levels") or []:
+                if level not in available_levels:
+                    available_levels.append(level)
+        available_levels = available_levels or thinking_levels
+        default_level = (default_detail or {}).get("default_thinking_level")
+        if default_level not in available_levels:
+            default_level = (default_detail or {}).get("supported_thinking_levels") or []
+            default_level = default_level[0] if default_level else None
+
+        entry: Dict[str, Any] = {
+            "engine": "doubao",
+            "name": "豆包 CLI",
+            "binary": binary,
+            "installed": installed,
+            "default_model": default_model,
+            "default_thinking_level": default_level,
+            "available_models": [m["id"] for m in models],
+            "model_details": [
+                {key: value for key, value in m.items() if key != "is_default"} for m in models
+            ],
+            "available_thinking_levels": available_levels,
+            "cli_flags_template": {"model": "--model", "thinking": "--effort"},
+        }
+        if discovery_error:
+            entry["discovery_error"] = discovery_error
+        return entry
 
     def _discover_codex(self) -> Dict[str, Any]:
         codex_cmd = Path(
@@ -1333,75 +1443,3 @@ class AgentModelDiscovery:
                 "thinking_level": "--effort {thinking_level}",
             },
         }
-
-    def _discover_dsh(self) -> Dict[str, Any]:
-        dsh_cfg_path = self.home / ".config" / "dsh-crew" / "config.json"
-        thinking_levels = ["high", "max"]
-        default_model = "clay/deepseek-flash"
-        default_effort = "high"
-        providers_list: List[Dict[str, Any]] = []
-        bindings: Dict[str, Any] = {}
-
-        if dsh_cfg_path.exists():
-            try:
-                cfg = json.loads(dsh_cfg_path.read_text(encoding="utf-8", errors="replace"))
-                fp = cfg.get("flash_provider", "clay")
-                fm = cfg.get("flash_model", "deepseek-flash")
-                default_model = f"{fp}/{fm}"
-                default_effort = cfg.get("default_effort", "high")
-            except Exception:
-                pass
-
-        try:
-            r = httpx.get(dsh_url("/_dsh/dsh-crew/providers", dsh_cfg_path), timeout=2.0)
-            if r.is_success:
-                data = r.json()
-                providers_list = data.get("providers") or []
-                bindings = data.get("bindings") or {}
-        except Exception:
-            pass
-
-        available_models = [
-            "clay/deepseek-flash",
-            "deepseek-official/deepseek-v4-flash",
-            "deepseek-official/deepseek-v4-pro",
-            "clay/minimax-m3.1-flash",
-        ]
-        for _tier_name, b in bindings.items():
-            if isinstance(b, dict) and b.get("provider") and b.get("model"):
-                cand = f"{b['provider']}/{b['model']}"
-                if cand not in available_models:
-                    available_models.insert(0, cand)
-        if default_model and default_model not in available_models:
-            available_models.insert(0, default_model)
-        elif default_model in available_models:
-            available_models.remove(default_model)
-            available_models.insert(0, default_model)
-
-        models = [
-            {
-                "id": m_id,
-                "provider": m_id.split("/")[0] if "/" in m_id else "clay",
-                "model": m_id.split("/", 1)[1] if "/" in m_id else m_id,
-                "supported_thinking_levels": thinking_levels,
-            }
-            for m_id in available_models
-        ]
-
-        return {
-            "engine": "dsh",
-            "name": "DeepSeek Harness (In-Host Web / Crew)",
-            "binary": dsh_url("/_dsh/dsh-crew/jobs", dsh_cfg_path),
-            "installed": True,
-            "default_model": default_model,
-            "default_thinking_level": default_effort,
-            "available_models": available_models,
-            "model_details": models,
-            "available_thinking_levels": thinking_levels,
-            "providers": providers_list,
-            "cli_flags_template": {
-                "model": "JSON payload {provider, model}",
-                "thinking_level": "JSON payload {effort: thinking_level}",
-            },
-        }
-

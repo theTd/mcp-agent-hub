@@ -21,6 +21,9 @@ ENGINE_BUSY_PHRASES = {
     "codex": ("Starting MCP servers", "esc to interrupt"),
     "claude": ("esc to interrupt", "Thinking…", "Thinking...", "Starting MCP servers"),
     "agy": ("Signing in", "Generating", "Accessing workspace:"),
+    # Doubao pauses input while it loads, then reports each turn; "Worked for" is deliberately
+    # absent, because it can be drawn mid-turn (see TUI_BUSY_PHRASES).
+    "doubao": ("Loading…", "Loading...", "sending is paused", "Responding…", "Responding...", "Processing"),
 }
 # K1/F3: a spinner glyph at the START of a status line is a busy indicator for the engines whose
 # captures show one, plus codex's bare "loading" line. A braille glyph anywhere else (a box border,
@@ -32,6 +35,9 @@ ENGINE_BUSY_LINE_RES = {
     "agy": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
     "codex": re.compile(r"^\s*loading\s*$", re.IGNORECASE),
     "claude": re.compile(r"^\s*[\u2800-\u28FF✻✽✶✢]\s+\S.*(?:…|\.\.\.)"),
+    # Braille spinner at the start of a status row ("⠙ Loading…", "⠋ Responding…"). The message
+    # glyphs ◆/◇ are not spinners: a tool row must not look like a working engine.
+    "doubao": re.compile(r"^\s*[\u2800-\u28FF]\s+\S"),
 }
 TUI_NOISE_PATTERNS = [
     re.compile(r"Welcome to Kimi Code!", re.IGNORECASE),
@@ -61,6 +67,11 @@ TUI_NOISE_PATTERNS = [
     re.compile(r"\bis ready\s*-\s*use the model\b", re.IGNORECASE),
     re.compile(r"^Standard: .*Plus/Moderato", re.IGNORECASE),
     re.compile(r"^No session yet\b", re.IGNORECASE),
+    # Doubao CLI chrome: its banner, its exit hint and the model/effort/cwd status row.
+    re.compile(r"^\s*DOUBAO CLI\b"),
+    re.compile(r"^\s*Resume this session with:"),
+    # `<model> · <effort> · <cwd>` under the composer.
+    re.compile(r"^\s*\S[^·]{0,80}\s·\s\S[^·]{0,40}\s·\s"),
     re.compile(r"^\s*[>❯›»]\s"),
 ]
 
@@ -733,87 +744,7 @@ class AGYTranscriptSummarizer(BaseTranscriptSummarizer):
         }
 
 
-class DSHTranscriptSummarizer(BaseTranscriptSummarizer):
-    """
-    Summarizer for DeepSeek Harness (`dsh-flash-high`, `dsh-flash-max`, `dsh-minimax-flash`, `dsh-tui`, `dsh-gui`).
-    Parses `~/.config/dsh-crew/logs/<job_id>.log`.
-    """
 
-    cli_type = "dsh"
-
-    def summarize(
-        self,
-        transcript_path: Optional[Path],
-        session_meta: Dict[str, Any],
-        db_tools: List[Dict[str, Any]],
-        db_messages: List[Dict[str, Any]],
-        raw_screen_fallback: str = "",
-    ) -> Dict[str, Any]:
-        thoughts: List[str] = []
-        tool_actions: List[str] = []
-        errors: List[str] = []
-        max_step = session_meta.get("step_count", 0)
-
-        if transcript_path and transcript_path.exists():
-            try:
-                for raw in transcript_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        ev = json.loads(raw)
-                    except Exception:
-                        continue
-                    kind = ev.get("kind")
-                    summary = (ev.get("summary") or "").strip()
-                    if kind == "step":
-                        max_step = max(max_step, int(ev.get("step") or 0))
-                    elif kind == "text" and summary:
-                        thoughts.append(summary)
-                    elif kind == "tool_call":
-                        tname = ev.get("tool") or summary or "dsh_tool"
-                        tool_actions.append(f"`{tname}`({_compact_str(summary, 120)})")
-                    elif kind == "tool_result" and summary and tool_actions:
-                        tool_actions[-1] = f"{tool_actions[-1]} -> {_compact_str(summary, 100)}"
-                    elif kind == "error" and summary:
-                        errors.append(summary)
-            except Exception:
-                pass
-
-        if not tool_actions and db_tools:
-            tool_actions = [f"`{t['tool_name']}`({_compact_str(t.get('input_summary'), 120)})" for t in db_tools]
-
-        thoughts = _dedup_preserve_order(thoughts)
-        latest_conclusion = (
-            (
-                session_meta.get("final_response")
-                if session_meta.get("final_response_source") != "terminal_turn_snapshot"
-                else None
-            )
-            or (thoughts[-1] if thoughts else None)
-            or (db_messages[-1]["content"] if db_messages else None)
-        )
-        digest = self.build_digest_markdown(
-            cli_type=f"dsh ({session_meta.get('profile_id', 'dsh')})",
-            status=session_meta.get("status", "unknown"),
-            step_count=max_step,
-            task=session_meta.get("last_task", ""),
-            recent_actions=tool_actions,
-            key_thoughts=thoughts,
-            latest_conclusion=latest_conclusion,
-        )
-        return {
-            "cli_type": "dsh",
-            "dsh_job_id": session_meta.get("dsh_job_id"),
-            "dsh_session_id": session_meta.get("dsh_session_id"),
-            "transcript_file": str(transcript_path) if transcript_path else None,
-            "step_count": max_step,
-            "recent_actions": tool_actions[-10:],
-            "key_thoughts": [_compact_str(t, 300) for t in thoughts[-5:]],
-            "errors": errors[-3:],
-            "latest_conclusion": latest_conclusion,
-            "digest_markdown": digest,
-        }
 
 
 class ClaudeTranscriptSummarizer(BaseTranscriptSummarizer):
@@ -1112,7 +1043,6 @@ class TranscriptSummarizerRegistry:
         self._codex = CodexTranscriptSummarizer()
         self._claude = ClaudeTranscriptSummarizer()
         self._agy = AGYTranscriptSummarizer()
-        self._dsh = DSHTranscriptSummarizer()
         self._generic = GenericTelemetrySummarizer()
 
     def get_summarizer(self, profile_id: str, engine: str = "") -> BaseTranscriptSummarizer:
@@ -1128,8 +1058,6 @@ class TranscriptSummarizerRegistry:
             return self._claude
         if pid.startswith("agy") or eng == "agy":
             return self._agy
-        if pid.startswith("dsh") or eng == "dsh":
-            return self._dsh
         return self._generic
 
     def summarize_session(

@@ -88,7 +88,7 @@ class TerminalSeamScanTests(unittest.TestCase):
             self.assertFalse(hasattr(session_manager.AgentSession, name), name)
         for name in ("read_screen", "read_scrollback", "read_raw", "read_raw_tail", "seed_history",
                      "write_input", "resize", "kill", "is_process_alive", "last_output_time",
-                     "apply_core_record", "start_pty", "start_virtual"):
+                     "apply_core_record", "start_pty"):
             self.assertTrue(callable(getattr(session_manager.AgentSession, name, None)), name)
         for name in ("has_process", "pid", "raw_revision"):
             self.assertIsInstance(getattr(session_manager.AgentSession, name, None), property, name)

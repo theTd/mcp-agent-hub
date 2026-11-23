@@ -205,7 +205,7 @@ class MessageTests(unittest.TestCase):
     def test_long_message_and_its_shorter_stored_copy_are_one_entry(self):
         text = "长" * 4507
         result = feed([event(1, "progress", text)],
-                      messages=[{"timestamp": 1001.0, "content": text[:4000], "source": "dsh_job_log"}])
+                      messages=[{"timestamp": 1001.0, "content": text[:4000], "source": "agent_log"}])
         self.assertEqual(kinds(result), ["task", "assistant"])
 
     def test_older_joined_thinking_and_reply_split_into_thinking_and_final(self):
@@ -254,7 +254,7 @@ class MessageTests(unittest.TestCase):
 
     def test_stored_copy_after_the_final_is_dropped_but_a_later_turn_keeps_it(self):
         reply = "Report: the probe moved, the card fades, and the strict wire check passes. " * 4
-        later = [{"timestamp": 1003.0, "content": reply[:200] + "…", "source": "dsh_job_log"}]
+        later = [{"timestamp": 1003.0, "content": reply[:200] + "…", "source": "agent_log"}]
         result = feed([event(1, "turn_completed", reply)], messages=later)
         self.assertEqual(kinds(result), ["task", "final"])
         result = feed([event(1, "turn_completed", reply)], messages=later,

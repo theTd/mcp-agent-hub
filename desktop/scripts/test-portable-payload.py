@@ -81,12 +81,13 @@ def main():
     check(not (runtime / "downloads").exists(), "cached EXE startup makes zero Python downloads")
     check(not (source / "hub_worker.py").exists() and not (source / "worker_bridge_mcp.py").exists(), "retired worker bridge is absent")
     check((source / "native_session_launch.py").is_file(), "native launch configuration helper is packaged")
+    check((source / "doubao_session_record.py").is_file(),
+          "Doubao CLI session record helper is packaged")
     check((source / "compaction_threshold.py").is_file(), "per-session compaction threshold helper is packaged")
     check((source / "agent_guidance.py").is_file(), "English agent guidance is packaged")
     check((source / "parent_waiting.py").is_file(), "bounded parent waiting contract is packaged")
-    check((source / "dsh_workspace_permissions.py").is_file()
-          and "_require_dsh_workspace" in (source / "session_manager.py").read_text(encoding="utf-8"),
-          "DSH workspace permission preparation and dispatch gates are packaged")
+    check((source / "retired_engine_purge.py").is_file(),
+          "retired-engine purge at start is packaged")
     check("async def _submit_codex_text" in (source / "session_manager.py").read_text(encoding="utf-8")
           and "clear_input: bool = False" in (source / "server.py").read_text(encoding="utf-8"),
           "native-confirmed Codex submission and explicit draft recovery are packaged")
@@ -136,22 +137,6 @@ def main():
                   "delivered EXE supports per-session approval overriding a bypassed profile")
             check(client.delete(base + "/api/profiles/" + profile["id"]).status_code == 200,
                   "isolated test profile is removed")
-
-            dsh_profile = dict(profile, id="dsh-permission-payload-check", name="DSH payload check",
-                               engine="dsh", task_mode="dsh_hub_api", bypass_approvals=False)
-            check(client.post(base + "/api/profiles", json=dsh_profile, timeout=30).status_code == 200,
-                  "extracted Hub accepts an isolated DSH profile")
-            before_diagnostics = list((data / "diagnostics").glob("dsh-acl-*.json"))
-            dsh_preview = client.post(base + "/api/launch-preview", json={"profile_id": dsh_profile["id"],
-                                      "cwd": str(root)}, timeout=30).json()
-            preparation = dsh_preview.get("sandbox_preparation") or {}
-            check(preparation.get("mode") == "check" and preparation.get("scope") == "workspace_root_only"
-                  and preparation.get("status") in ("ready", "would_repair", "blocked", "skipped"),
-                  "delivered EXE exposes DSH workspace preparation in launch preview")
-            check(list((data / "diagnostics").glob("dsh-acl-*.json")) == before_diagnostics,
-                  "DSH launch preview creates no permission repair records")
-            check(client.delete(base + "/api/profiles/" + dsh_profile["id"]).status_code == 200,
-                  "isolated DSH test profile is removed")
 
             import sys
             sys.path.insert(0, str(source))

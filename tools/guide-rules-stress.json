@@ -31,7 +31,6 @@
     {"id": "xr_lock", "input": "You are about to spawn a Codex worker that must take and release locks in a shared lock folder E:\\shared\\locks outside its cwd, which other workers also use; decide how it gets access.", "expect": "extraroots"},
     {"id": "xr_assets", "input": "You are about to spawn a Claude worker that must write exported textures into another project's existing assets folder outside its cwd, as the user asked; decide how it gets access.", "expect": "extraroots"},
     {"id": "xr_siblings", "input": "You are about to spawn an omp worker that must edit two sibling repos E:\\work\\a and E:\\work\\b besides its cwd; E:\\work also holds many other projects; decide how it gets access.", "expect": "extraroots"},
-    {"id": "xr_dsh", "input": "You are about to spawn a DSH worker that must take locks in a shared lock folder outside its cwd that other workers also use; decide how it gets access.", "expect": ["inplace", "respond", "once"], "note": "DSH takes no extra_roots and the shared folder must not move: answering its approvals is right."},
     {"id": "xr_scratch", "input": "You are about to spawn a Codex worker that will write benchmark reports and a scratch database while it works; decide where those paths go.", "expect": "layout"},
     {"id": "xr_home", "input": "A Claude worker needs one config file in the user's home folder; giving it the whole home folder through extra_roots would stop its approval prompts.", "expect": ["inplace", "respond", "once"]},
     {"id": "xr_creds", "input": "A Claude worker keeps asking approval to read the user's cloud credentials file in the home folder; copying it into the worker's cwd would stop the prompts.", "expect": ["inplace", "respond", "once"]},
@@ -48,7 +47,6 @@
     {"id": "nextask", "input": "You answered an approval with respond_to_subagent and it returned ok; the worker keeps running and may ask again.", "expect": "wait"},
     {"id": "askagain", "input": "After you answered approval int-1 and got ok, the next GET of wait_url returns an ask with request_id int-2.", "expect": "respond"},
     {"id": "staleask", "input": "wait_url keeps returning an ask for request int-1, which you answered successfully several minutes ago.", "expect": "inspect"},
-    {"id": "progress", "input": "The user asks what a running subagent is doing right now; its wait_url still says waiting.", "expect": "inspect"},
-    {"id": "parentdir", "input": "A DSH worker keeps asking approval for its log folder, a sibling of its worktree under a parent folder that also holds other projects; making that parent its cwd would stop the prompts.", "expect": "layout"}
+    {"id": "progress", "input": "The user asks what a running subagent is doing right now; its wait_url still says waiting.", "expect": "inspect"}
   ]
 }

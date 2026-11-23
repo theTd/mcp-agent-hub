@@ -90,10 +90,11 @@ pub struct TextRequest {
     pub cols: u16,
     pub rows: u16,
     pub flags: SessionFlags,
-    /// A virtual resume's archived scrollback: the ring's first entry, exactly as `spawn.seed_history`
-    /// (A1, `_make_resumed_session` seeds it for every engine, dsh included).
+    /// A text-session resume's archived scrollback: the ring's first entry, exactly as
+    /// `spawn.seed_history` (A1, the hub seeds a resume for every engine).
     pub seed_history: Option<String>,
-    /// The DSH virtual resume's separator frame (`attach_text(seed=…)`), the `spawn.ws_prefix` twin.
+    /// The resume separator frame (`attach_text(seed=…)`), the `spawn.ws_prefix` twin. No hub caller
+    /// since DSH was dropped (2026-11-15); kept because the A1 handover contract names the frame.
     pub seed: Option<String>,
 }
 
@@ -637,7 +638,7 @@ impl Core {
             .ok_or_else(|| CoreError::Deadline(format!("session {id}: replay missed its deadline")))
     }
 
-    /// §5.2's `attach_text`: a session with a screen but no process (DSH virtual sessions).
+    /// §5.2's `attach_text`: a session with a screen but no process (the corpus and the core's tests).
     pub fn attach_text(&self, request: TextRequest) -> Result<SpawnReply, CoreError> {
         let TextRequest {
             session_id,
@@ -666,7 +667,7 @@ impl Core {
                 )));
             }
         }
-        // The seed (the DSH resume separator) and the handover happen inside `start_text`, under the
+        // The seed (the resume separator) and the handover happen inside `start_text`, under the
         // id's delivery lock and before the session is reachable: a sink attached to the id gets the old
         // session's pending bytes, then the seed, exactly once (§6.4 A1).
         let session = Session::start_text(
@@ -767,9 +768,9 @@ impl Core {
     }
 
     /// Console input from a socket (§6.4 "Input"). A session with a PTY gets the bytes written; a
-    /// text-only session has nothing to write to, so the input becomes an ordered drain-record request
-    /// that the hub feeds to its own echo and line callback (§8: for a text session the core never owns
-    /// the echo). Either way a failure is logged by the caller and costs only that frame.
+    /// text-only session has no PTY and no echo owner since DSH was dropped (2026-11-15), so its input
+    /// is accepted and discarded. Either way a failure is logged by the caller and costs only that
+    /// frame.
     pub fn socket_input(
         &self,
         id: &str,
@@ -778,7 +779,6 @@ impl Core {
     ) -> Result<(), CoreError> {
         let session = self.session(id)?;
         if session.is_text_only() {
-            session.request_input(text.to_string());
             return Ok(());
         }
         session

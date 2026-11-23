@@ -55,6 +55,7 @@ class LaunchTests(unittest.TestCase):
         root = Path(__file__).parent
         payload = (root / "desktop/portable/payload.txt").read_text(encoding="utf-8").splitlines()
         self.assertIn("native_session_launch.py", payload)
+        self.assertIn("doubao_session_record.py", payload)
         for name in ("hub_worker.py", "worker_bridge_mcp.py"):
             self.assertNotIn(name, payload)
             self.assertFalse((root / name).exists())
@@ -114,16 +115,13 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(AgentSession, "start_pty"), patch.object(self.hub, "_schedule", lambda coro: coro.close()):
             return await self.hub.create_session("pwsh", cwd=str(self.root), **kwargs)
 
-    def session(self, engine, suffix="", virtual=False):
+    def session(self, engine, suffix=""):
         sid = f"{engine}-native{suffix}"
         sess = AgentSession(sid, engine, engine, "tui", "Native fixture", str(self.root), "unused", [],
                             core=self.fake)
         sess.engine = engine
         sess.status = "running"
-        if virtual:
-            self.fake.attach_text(sid, cols=120, rows=36)
-        else:
-            self.fake.spawn(sid, ["fixture"])
+        self.fake.spawn(sid, ["fixture"])
         sess._loop = asyncio.get_running_loop()
         self.hub.sessions[sid] = sess
         # The spawn's first record is what makes the session live for the seam (`alive`, `pid`).
@@ -688,40 +686,6 @@ class NativeRecordTests(unittest.IsolatedAsyncioTestCase):
         import sqlite3
         with closing(sqlite3.connect(self.root / "hub_state.db")) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM worker_events").fetchone()[0], 3)
-
-    async def test_dsh_native_message_question_and_result(self):
-        import httpx
-        sess = self.session("dsh", virtual=True)
-        sess.dsh_spec = {"tier": "flash"}
-        sess.dsh_job_id = "native-job"
-        log = self.root / "dsh.jsonl"
-        log.touch()
-        answered = False
-        delivered = []
-        class NativeClient:
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *args):
-                pass
-            async def get(self, url, **kwargs):
-                await asyncio.sleep(0.01)
-                if url.endswith("/messages"):
-                    messages = [] if answered else [{"kind": "message", "sequence": 1, "message_id": "dsh-q", "text": "Which branch?", "expects_reply": True}]
-                    return httpx.Response(200, json={"result": {"messages": messages}})
-                return httpx.Response(200, json={"job": {"status": "done" if answered else "running", "result": "DSH native result" if answered else ""}})
-        def reply(url, **kwargs):
-            nonlocal answered
-            answered = True
-            delivered.append(kwargs["json"])
-            return httpx.Response(200, json={"ok": True})
-        with patch("session_manager.httpx.AsyncClient", return_value=NativeClient()), patch("session_manager.httpx.post", side_effect=reply):
-            task = self.hub._schedule(self.hub._watch_dsh_hub_job(sess, sess.dsh_job_id, "fixture-token", log_path=log))
-            await self.until(lambda: sess.pending_interaction is not None)
-            await self.hub.deliver_parent_message(sess.session_id, "main")
-            await asyncio.wait_for(task, timeout=5)
-        self.assertEqual(delivered, [{"message": "main", "reply_to": "dsh-q"}])
-        self.assertEqual(sess.final_response, "DSH native result")
-        self.assertEqual(sum(e["type"] == "turn_completed" for e in self.hub.worker_events), 1)
 
     async def test_resume_skips_existing_transcript_rows(self):
         sess = self.session("claude")

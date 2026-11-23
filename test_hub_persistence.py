@@ -54,6 +54,17 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 return tuple(conn.execute("PRAGMA journal_mode").fetchone()), tuple(conn.execute("PRAGMA synchronous").fetchone())
         self.assertEqual(await asyncio.to_thread(inspect), (("wal",), (2,)))
 
+    async def test_max_seq_keeps_autoincrement_high_water_mark_after_delete(self):
+        async with self.store.unit(4096):
+            first = await self.store.insert_worker_event(event("first"))
+            second = await self.store.insert_worker_event(event("second"))
+        await self.store.flush()
+        self.assertEqual(second, first + 1)
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("DELETE FROM worker_events WHERE seq=?", (second,))
+            conn.commit()
+        self.assertEqual(await self.store.get_max_seq(), second)
+
     async def test_snapshots_and_aborted_units(self):
         lock = self.lock()
         original = event("original")
@@ -384,58 +395,6 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         tools = await self.module.hub.db.get_recent_tool_calls("test-tui")
         self.assertEqual([row["tool_name"] for row in tools], ["test_tool"])
 
-    async def test_dsh_thousand_line_backlog_remains_interactive(self):
-        import session_manager
-        job_id = "synthetic-job"
-        @self.module.app.get(f"/_test_dsh/jobs/{job_id}/messages")
-        async def messages():
-            return {"result": {"messages": [], "next_cursor": 0}}
-        @self.module.app.get(f"/_test_dsh/jobs/{job_id}")
-        async def job():
-            return {"job": {"status": "done", "result": "synthetic final", "toolCalls": 1000}}
-        log = self.directory / "synthetic-job.jsonl"
-        log.write_text("".join(json.dumps({"kind": "tool_call", "tool": f"tool_{i}", "summary": "test"}) + "\n" for i in range(1000)), encoding="utf-8")
-        session = session_manager.AgentSession(
-            session_id="test-dsh", profile_id="dsh", profile_name="Test DSH", kind="virtual",
-            title="Synthetic backlog", cwd=str(self.directory), command="", args=[],
-        )
-        session.engine = "dsh"
-        session.status = "running"
-        session.dsh_job_id = job_id
-        session._loop = asyncio.get_running_loop()
-        session.core = self.module.hub._ensure_core()
-        self.module.hub.core.attach_text(session.session_id, cols=120, rows=36)
-        self.module.hub.sessions[session.session_id] = session
-        websocket = await self.connect_terminal()
-        with patch.object(session_manager, "dsh_url", lambda path: f"http://127.0.0.1:{self.port}" + path.replace("/_dsh/dsh-crew", "/_test_dsh")):
-            worker = self.module.hub._schedule(self.module.hub._watch_dsh_hub_job(session, job_id, "synthetic-token", log_path=log))
-            start = time.monotonic()
-            worst = 0
-            rounds = 0
-            try:
-                while not worker.done():
-                    self.assertLess(time.monotonic() - start, 60, "backlog failed to drain")
-                    before = time.monotonic()
-                    response = await self.client.get("/api/sessions")
-                    pong = await websocket.ping()
-                    await asyncio.wait_for(pong, timeout=0.5)
-                    self.assertEqual(response.status_code, 200)
-                    worst = max(worst, time.monotonic() - before)
-                    rounds += 1
-                    await asyncio.sleep(0.01)
-                await worker
-            finally:
-                await websocket.close()
-        await self.module.hub.db.flush(timeout=3)
-        self.assertEqual(session.step_count, 1000)
-        self.assertEqual(session.final_response, "synthetic final")
-        self.assertLess(worst, 0.5)
-        with closing(sqlite3.connect(self.directory / "hub_state.db")) as conn:
-            self.assertEqual(conn.execute("SELECT count(*) FROM tool_calls WHERE session_id='test-dsh'").fetchone()[0], 1000)
-        events = [row for row in self.module.hub.worker_events if row["session_id"] == "test-dsh" and row["type"] == "turn_completed"]
-        self.assertEqual(len(events), 1)
-        print(f"\n1000 DSH log lines: {rounds} HTTP/WebSocket rounds, worst={worst*1000:.1f} ms", flush=True)
-
     async def test_scrollback_marks_commit_not_admission(self):
         # The shell's own prompt must already be in the ring: after this, only this test's bytes
         # move the revision, which is what the two assertions compare.
@@ -486,46 +445,6 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         await store.flush()
         self.assertEqual([row["content"] for row in self.module.hub.parent_messages["test-tui"]], ["recovered"])
-
-    async def test_dsh_backpressure_keeps_unaccepted_offset(self):
-        import session_manager
-        job_id = "backpressure-job"
-        @self.module.app.get(f"/_test_dsh/jobs/{job_id}/messages")
-        async def messages():
-            return {"result": {"messages": []}}
-        @self.module.app.get(f"/_test_dsh/jobs/{job_id}")
-        async def job():
-            return {"job": {"status": "done", "result": "accepted after capacity"}}
-        log = self.directory / "backpressure.jsonl"
-        log.write_text('{"kind":"tool_call","tool":"retained"}\n', encoding="utf-8")
-        observed = []
-        read = asyncio.Event()
-        class ObservedTail(TranscriptTail):
-            async def read_batch(tail):
-                observed.append(tail)
-                result = await super().read_batch()
-                read.set()
-                return result
-        store = self.module.hub.db
-        store.max_units = 1
-        lock = sqlite3.connect(self.directory / "hub_state.db", timeout=0.1)
-        lock.execute("BEGIN IMMEDIATE")
-        self.session.dsh_job_id = job_id
-        with patch.object(session_manager, "TranscriptTail", ObservedTail), patch.object(session_manager, "dsh_url", lambda path: f"http://127.0.0.1:{self.port}" + path.replace("/_dsh/dsh-crew", "/_test_dsh")):
-            worker = self.module.hub._schedule(self.module.hub._watch_dsh_hub_job(self.session, job_id, "fake", log_path=log))
-            try:
-                await asyncio.wait_for(read.wait(), timeout=2)
-                await asyncio.sleep(0.05)
-                self.assertFalse(worker.done())
-                self.assertEqual(observed[0].offset, 0)
-                self.assertEqual(self.session.step_count, 0)
-                lock.rollback()
-                await asyncio.wait_for(worker, timeout=5)
-            finally:
-                lock.close()
-        await store.flush()
-        self.assertEqual(observed[0].offset, log.stat().st_size)
-        self.assertEqual(self.session.step_count, 1)
 
     async def test_failed_database_keeps_health_responsive(self):
         def fail(*args):
@@ -681,72 +600,6 @@ class HubIntegrationTests(unittest.IsolatedAsyncioTestCase):
                              "the core never applied the hub's size")
         finally:
             await websocket.close()
-
-    async def test_dsh_socket_input_is_echoed_and_delivered_once(self):
-        # gaps 9: a session with no PTY gets its socket input back as an ordered drain request; the
-        # hub's own echo and line callback do the work, and the core writes nothing anywhere.
-        import session_manager
-        lines = []
-        session = session_manager.AgentSession(
-            session_id="test-dsh-input", profile_id="dsh", profile_name="DSH", kind="virtual",
-            title="Text input", cwd=str(self.directory), command="", args=[],
-        )
-        session.engine = "dsh"
-        session.status = "running"
-        session.core = self.module.hub._ensure_core()
-        session.start_virtual(asyncio.get_running_loop(),
-                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
-        self.module.hub.sessions[session.session_id] = session
-        websocket, _replay = await self.open_terminal("test-dsh-input")
-        try:
-            await websocket.send(json.dumps({"type": "input", "data": "hello hub\r"}))
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and not lines:
-                self.module.hub._on_core_tick()
-                await asyncio.sleep(0.02)
-            self.assertEqual(lines, [("test-dsh-input", "hello hub")])
-            self.assertIn("hello hub", session.read_raw().text, "the DSH echo never reached the screen")
-            self.module.hub._on_core_tick()
-            await asyncio.sleep(0.15)
-            self.module.hub._on_core_tick()
-            self.assertEqual(lines, [("test-dsh-input", "hello hub")],
-                             "the same input was delivered twice")
-        finally:
-            await websocket.close()
-            self.module.hub.sessions.pop("test-dsh-input", None)
-
-    async def test_a_browser_osc_reply_never_reaches_a_text_session(self):
-        # §8/gaps 3+16: the core strips OSC terminal replies from socket input before it records it.
-        # A text session makes that observable: the hub echoes every character it lets through into
-        # the ring, so a reply that survived the strip would be visible there and in the echo.
-        import session_manager
-        lines = []
-        session = session_manager.AgentSession(
-            session_id="test-dsh-osc", profile_id="dsh", profile_name="DSH", kind="virtual",
-            title="OSC strip", cwd=str(self.directory), command="", args=[],
-        )
-        session.engine = "dsh"
-        session.status = "running"
-        session.core = self.module.hub._ensure_core()
-        session.start_virtual(asyncio.get_running_loop(),
-                              on_virtual_line_cb=lambda sid, line: lines.append((sid, line)))
-        self.module.hub.sessions[session.session_id] = session
-        websocket, _replay = await self.open_terminal("test-dsh-osc")
-        try:
-            await websocket.send(json.dumps({"type": "input",
-                                             "data": "\x1b]11;rgb:0000/0000/0000\x07"}))
-            await websocket.send(json.dumps({"type": "input", "data": "hi\r"}))
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and not lines:
-                self.module.hub._on_core_tick()
-                await asyncio.sleep(0.02)
-            self.assertEqual(lines, [("test-dsh-osc", "hi")])
-            ring = session.read_raw().text
-            self.assertNotIn("rgb:0000", ring, "a browser OSC reply reached the session's screen")
-            self.assertNotIn("\x1b]11", ring, "a browser OSC reply was echoed into the session")
-        finally:
-            await websocket.close()
-            self.module.hub.sessions.pop("test-dsh-osc", None)
 
     async def test_a_permanent_close_closes_the_socket_normally(self):
         # W7: a close ends the pane's socket with 1000 through the core, not by silence.

@@ -60,7 +60,7 @@ function modelsCardHtml(engine, info) {
       ${cardHeadHtml(engine, info, enabledCount, models.length, '只保留各 Profile 的默认模型', !models.length)}
       <div class="ec-meta">
         <span>模型参数 <code>${escapeHtml(flags.model || 'N/A')}</code></span>
-        <span>思考等级参数 <code>${escapeHtml(flags.thinking_level || 'N/A')}</code></span>
+        <span>思考等级参数 <code>${escapeHtml(flags.thinking_level || flags.thinking || 'N/A')}</code></span>
         <span class="ec-count">${enabledCount} / ${models.length} 已启用</span>
       </div>
       <div class="model-rows">${rows}</div>
@@ -112,7 +112,7 @@ function legacyCardHtml(engine, info) {
       ${cardHeadHtml(engine, info, enabledCount, all.length, '仅保留默认', !info.default_model)}
       <div class="ec-meta">
         <span>模型参数 <code>${escapeHtml(flags.model || 'N/A')}</code></span>
-        <span>思考等级参数 <code>${escapeHtml(flags.thinking_level || 'N/A')}</code></span>
+        <span>思考等级参数 <code>${escapeHtml(flags.thinking_level || flags.thinking || 'N/A')}</code></span>
       </div>
       <div>
         <div class="ec-label">模型 <span class="ec-count">${enabledCount} / ${all.length} 已启用</span></div>

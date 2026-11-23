@@ -7,7 +7,7 @@
 //! sockets that existed before it registers).
 //!
 //! A text-only session (`attach_text`) has no pipes, no job and no threads: the same state, fed by
-//! `feed` instead of a reader, which is what the DSH virtual sessions need.
+//! `feed` instead of a reader, which is what the corpus and the core's tests use.
 //!
 //! Exit detection is the reaper's job. The reader's `ReadFile` cannot signal a natural exit: the write
 //! end of the output pipe belongs to conhost, which stays alive while we hold the HPCON, so the read
@@ -139,11 +139,6 @@ pub struct DrainRecord {
     /// travels with each one: dropping it would resize every background session in matrix mode. A
     /// backlog over the cap has had its oldest removed.
     pub resize_requests: Vec<ResizeRequest>,
-    /// Console input for a session with no PTY, in arrival order, already OSC-stripped and taken once
-    /// (`attach_text` sessions: the hub owns their echo and line callback, so the core never writes
-    /// them anywhere — §8, `session_manager.py`'s virtual branch). Empty for a process session, whose
-    /// input goes to its PTY directly.
-    pub input_requests: Vec<String>,
     /// Per console socket of this id, its sink handle and the cumulative bytes it dropped (§5.4, §9
     /// step 4). A slow pane's loss stays its own and is never added to `dropped_bytes`; only handles
     /// with a drop are listed, and a socket that detached since the last drain reports its final count
@@ -641,10 +636,6 @@ pub struct Session {
     /// `propagate` is part of the request and an earlier single-window resize still moves the other
     /// sessions' screens even if a later request only resizes this one.
     resize_requests: Mutex<Vec<ResizeRequest>>,
-    /// Console input for a text-only session, in arrival order, already OSC-stripped (`attach_text`:
-    /// the hub owns the echo and the line callback, so nothing may write it into a PTY). Bounded by
-    /// `MAX_PENDING_REQUESTS`; a process session never fills it.
-    input_requests: Mutex<Vec<String>>,
     /// `true` once the input backlog overflowed, so the loss is logged once per incarnation, not per
     /// keystroke.
     request_backlog_logged: AtomicBool,
@@ -732,7 +723,6 @@ impl Session {
             rows: AtomicU32::new(rows as u32),
             tick,
             resize_requests: Mutex::new(Vec::new()),
-            input_requests: Mutex::new(Vec::new()),
             request_backlog_logged: AtomicBool::new(false),
             panics,
             log,
@@ -867,11 +857,11 @@ impl Session {
         Ok((session, spawn_log))
     }
 
-    /// A session with no process (`attach_text`, §5.2): the DSH virtual sessions' screen and raw history,
+    /// A session with no process (`attach_text`, §5.2): a text session's screen and raw history,
     /// fed through `feed`, alive for as long as the hub keeps it. `kill`/`resize` never touch a console
     /// that does not exist.
     ///
-    /// `seed` is the DSH resume's separator (§6.4 A1) and goes out under the same handover `spawn`'s
+    /// `seed` is the resume's separator (§6.4 A1) and goes out under the same handover `spawn`'s
     /// `ws_prefix` uses, so it follows the predecessor's pending batch to the same carried-over sinks.
     pub fn start_text(
         id: String,
@@ -1416,22 +1406,8 @@ impl Session {
         self.tick.pending.store(true, Ordering::Release);
     }
 
-    /// Console input that reached this session through its socket and has no PTY to go to
-    /// (`attach_text`: the hub's virtual sessions). It is stored, never written: the hub owns that echo
-    /// and its line callback (§8, `session_manager.py`'s `emit_virtual_ansi` path). Already stripped by
-    /// `strip_terminal_replies` on the socket (`ws/connection.rs`), the same pattern the hub's reply
-    /// strip uses — not the colour-query strip.
-    pub(crate) fn request_input(&self, text: String) {
-        if text.is_empty() {
-            return;
-        }
-        self.push_bounded(&self.input_requests, text);
-        self.dirty.store(true, Ordering::Release);
-        self.tick.pending.store(true, Ordering::Release);
-    }
-
-    /// Whether this session has no PTY at all, which is what sends console input to `request_input`
-    /// instead of `write`.
+    /// Whether this session has no PTY at all: console input has nowhere to go and is dropped, since
+    /// no hub session is a text one (only the corpus and the core's tests attach text sessions).
     pub(crate) fn is_text_only(&self) -> bool {
         self.resources.is_none()
     }
@@ -1459,14 +1435,10 @@ impl Session {
         }
     }
 
-    /// Takes both pending request lists, in one call so a drain that goes out carries a consistent pair.
-    /// Called by `drain_record` only once it is sure the record goes out, so a request is never dropped
-    /// with a record that was withheld.
-    fn take_requests(&self) -> (Vec<ResizeRequest>, Vec<String>) {
-        (
-            std::mem::take(&mut *self.resize_requests.lock().unwrap_or_else(|e| e.into_inner())),
-            std::mem::take(&mut *self.input_requests.lock().unwrap_or_else(|e| e.into_inner())),
-        )
+    /// Takes the pending resize requests. Called by `drain_record` only once it is sure the record
+    /// goes out, so a request is never dropped with a record that was withheld.
+    fn take_requests(&self) -> Vec<ResizeRequest> {
+        std::mem::take(&mut *self.resize_requests.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// A console socket dropped bytes for itself (§5.4): the drain record reports the count per handle,
@@ -1791,7 +1763,7 @@ impl Session {
         lock_deadline(&self.text, deadline).map(|text| text.stream.replay_text())
     }
 
-    /// `feed` (§5.2): text into a session with no process (the DSH virtual sessions). Returns the new
+    /// `feed` (§5.2): text into a session with no process (a text session's screen). Returns the new
     /// screen revision, or `None` when the deadline passed with nothing done.
     pub fn feed(&self, text: &str, deadline: Duration) -> Option<u64> {
         self.ingest(Ingest::Text(text), Some(deadline))
@@ -2071,10 +2043,9 @@ impl Session {
             screen_rev: self.screen_rev.load(Ordering::Relaxed),
             raw_rev: self.raw_rev.load(Ordering::Relaxed),
             screen_text: self.watched_screen(Instant::now()),
-            // Filled in by the caller: the request lists below (only once the record goes out) and the
-            // per-socket drop counts, which belong to the core's socket registry.
+            // Filled in by the caller: the resize requests below (only once the record goes out) and
+            // the per-socket drop counts, which belong to the core's socket registry.
             resize_requests: Vec::new(),
-            input_requests: Vec::new(),
             socket_drops: Vec::new(),
         };
         if !alive && !self.death_flushed.load(Ordering::Acquire) {
@@ -2086,9 +2057,8 @@ impl Session {
         }
         // Only now, when the record is sure to go out, are the requests taken: one that arrived during
         // a withheld record must survive to the next one.
-        let (resize_requests, input_requests) = self.take_requests();
+        let resize_requests = self.take_requests();
         record.resize_requests = resize_requests;
-        record.input_requests = input_requests;
         #[cfg(test)]
         death_record_tests::drain_snapshot_gate(&self.id);
         // This record is the report `retire` waits for: the death (code, crashed) is in it, and a code

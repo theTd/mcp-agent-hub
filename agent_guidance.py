@@ -67,20 +67,19 @@ ROUTING_RULES = (
     "dispatch others, sends the task unchanged. The note is advice, not a block: Codex/Claude also take "
     'disabled_mcp_servers=["agent-hub"] to remove the tools.',
     'env={"KEY":"VALUE"} overrides profile env across resume; extra_args=["--flag","value"] '
-    "are literal per-session TUI argv (DSH/GUI reject them).",
+    "are literal per-session TUI argv (non-TUI launches reject them).",
     'Codex/Claude mcp_servers use HTTP {"url","headers"} or stdio {"command","args","env"}; '
     "disabled_mcp_servers and Claude strict_mcp_config are session-only. Do not mix these with native overrides; config does not prove connection/authentication.",
     "Approvals: leave approval_mode unset, even to be explicit or careful: the default, auto, is the safe choice. Codex and Claude then run their own auto-approval reviewer (Codex --approve-for-me, Claude auto mode) and only what it escalates comes to you; other engines bring you their high-risk actions. "
     'Set approval_mode="ask" only when you or the user want to approve every high-risk action yourselves, "bypass" (no checks) only when the user asked for it or the task needs it. '
     "bypass_approvals is the legacy switch (true = bypass, false = the default); never pass both.",
-    "A blocked Windows DSH sandbox_preparation prevents dispatch; skipped is unverified. Permission readiness does not prove access; inspect the reason.",
     WAIT_HANDLE_HINT,
     SESSION_LIST_HINT,
-    "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode, DSH workspace root), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode); for DSH every call, reads included, and the hub cannot add roots. "
+    "For every engine, create the task's own worktree, scratch, logs and results under cwd before spawning: sandboxes and auto-accept cover only cwd (Codex workspace-write, Claude acceptEdits in ask mode), so work outside it turns into approvals (the engine reviewer's in auto mode, yours in ask mode). "
     "Only what the task creates belongs there: leave files it did not create (sources, shared or others' data, credentials) in place, and never widen cwd to a parent, home or drive root to cover them. "
     "When the task must use a folder outside cwd (a shared lock folder, say), pass extra_roots=[absolute folders] (claude, codex, omp, kimi, agy): "
     "the worker may then read AND write there as in cwd, so list each folder the task needs, never a parent that holds them (it grants everything inside); "
-    "drive roots, home, credential, system and hub-data folders are refused. DSH takes no extra_roots: leave such a folder in place and answer its approvals.",
+    "drive roots, home, credential, system and hub-data folders are refused.",
     "Repeated approvals outside cwd mean a wrong layout: answer the pending one, then move only files the task created under cwd, or respawn from a task folder holding them. "
     "Never set auto_approval_rules to stop them: rules match only structured-argv approvals inside cwd, which no engine reports yet; to reduce approvals, spawn omp or agy with auto_approve_once_prefixes.",
     "auto_approve_once_prefixes (omp and agy only): the hub answers approve once, never for the session, when a high-risk command starts with one of these prefixes, each starting with the program's absolute path. "
@@ -92,7 +91,6 @@ ROUTING_RULES = (
     "A live measurement brief (numbers read from a running game, device or service under the worker's conditions) must make the worker "
     "read back every controlled variable it set (setting, mode, build, scene, load) on every recorded row, write those values into the row, "
     "and mark a row whose readback differs from the intended value invalid, not keep it.",
-    "On a DSH full-access request never pick Allow for this session (approve_session) unless the user said so, even when more will follow: it grants full shell access, deletes included, until the session ends. Pick Allow once (approve).",
     "delivered=true means sent, not accepted. Native records are authoritative; intermediate text is not completion—wait for done.",
 )
 
@@ -116,6 +114,6 @@ PROFILE_DESCRIPTIONS = {
     "agy": "Antigravity CLI; the Hub appends the selected thinking level to the model name.",
     "codex": "Codex CLI; model uses -m and thinking uses -c model_reasoning_effort.",
     "claude": "Claude Code CLI; model and thinking use --model / --effort. Runs in Claude's auto mode by default: its classifier approves or blocks each tool call.",
-    "dsh": "Native session created through the DSH Hub API, with live events in the console.",
+    "doubao": "Doubao CLI; model and effort use --model / --effort, and the working directory leads as -C <cwd>. High-risk work uses --permission-mode ask_risky.",
     "pwsh": "Interactive PowerShell 7 terminal.",
 }

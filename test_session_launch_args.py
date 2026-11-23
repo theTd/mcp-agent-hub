@@ -42,7 +42,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
             self.server = importlib.import_module("server")
         self.hub_patch = patch.object(self.server, "hub", self.hub)
         self.hub_patch.start()
-        for engine in ("codex", "claude", "agy", "kimi", "omp", "pwsh", "dsh"):
+        for engine in ("codex", "claude", "agy", "kimi", "omp", "doubao", "pwsh"):
             self.hub.profiles[engine] = {
                 "name": engine, "engine": engine, "enabled": True, "kind": "tui",
                 "command": "unused", "args": ["--profile-arg"],
@@ -69,7 +69,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_creation_persistence_and_resume_do_not_duplicate_tokens(self):
         extra = ["--custom-option", r"E:\配置 with spaces\mcp.json", '{"mcpServers":{}}']
-        for engine in ("codex", "claude", "agy", "kimi", "omp"):
+        for engine in ("codex", "claude", "agy", "kimi", "omp", "doubao"):
             with self.subTest(engine=engine):
                 # Suppress native processes/watchers, retaining the real creation and persistence path.
                 with patch.object(AgentSession, "start_pty"), patch.object(self.hub, "_schedule", lambda coro: coro.close()):
@@ -104,10 +104,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
         resumed = self.hub.build_resume_launch(record)
         self.assertEqual(sum(a.startswith("--extension=") for a in resumed["args"]), 1)
 
-    async def test_non_cli_and_invalid_input_rejected_before_spawn(self):
-        for profile, kwargs in (("dsh", {}),):
-            with self.subTest(profile=profile), self.assertRaises(ValueError):
-                await self.hub.create_session(profile, extra_args=["--flag"], **kwargs)
+    async def test_invalid_input_rejected_before_spawn(self):
         with self.assertRaises(ValueError):
             await self.hub.create_session("codex", extra_args="--flag value")
         self.assertEqual(self.hub.sessions, {})
@@ -123,7 +120,7 @@ class SessionLaunchArgsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(preview.json()["args"][-2:], extra)
             bad = await client.post("/api/sessions", json={"profile_id": "codex", "extra_args": [1]})
             self.assertEqual(bad.status_code, 400)
-            bad_preview = await client.post("/api/launch-preview", json={"profile_id": "dsh", "extra_args": extra})
+            bad_preview = await client.post("/api/launch-preview", json={"profile_id": "no-such-profile", "extra_args": extra})
             self.assertFalse(bad_preview.json()["ok"])
             def no_watchers(coro):
                 coro.close()

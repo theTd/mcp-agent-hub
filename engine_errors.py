@@ -1,9 +1,9 @@
 """Classify an engine's own failure text into one parent-facing error kind.
 
-Endpoint-agnostic on purpose: the callers are the transcript watchers, the screen poll and the
-DSH job watcher, and none of an engine's API objects belongs here.  The text is whatever the
-engine wrote (a Codex ``error.message``, a Claude ``API Error: 429 ...`` line, a Kimi
-``error.message``, an omp ``errorMessage``, a DSH job error), plus its optional status hints.
+Endpoint-agnostic on purpose: the callers are the transcript watchers and the screen poll, and
+none of an engine's API objects belongs here.  The text is whatever the engine wrote (a Codex
+``error.message``, a Claude ``API Error: 429 ...`` line, a Kimi ``error.message``, an omp
+``errorMessage``), plus its optional status hints.
 
 The order is the decision table, first match wins.  It is what makes a real record classify as
 written in the spec: ``usage limit`` with status 429 is quota, while ``exceeded retry limit, last

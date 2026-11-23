@@ -101,6 +101,6 @@ def extra_root_args(engine: str, kind: str, roots: List[str]) -> List[str]:
     if kind != "tui" or engine not in EXTRA_ROOT_ENGINES:
         raise ValueError(
             f"extra_roots works on {', '.join(EXTRA_ROOT_ENGINES)} only, not {engine or kind}: "
-            "it has no flag that adds a folder (DSH's workspace is its cwd alone); put the files under cwd"
+            "it has no flag that adds a folder; put the files under cwd"
         )
     return [f"--add-dir={root}" for root in roots]

@@ -61,13 +61,12 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
             self.server = importlib.import_module("server")
         self.hub_patch = patch.object(self.server, "hub", self.hub)
         self.hub_patch.start()
-        for engine in ("codex", "claude", "agy", "kimi", "omp", "pwsh", "dsh"):
+        for engine in ("codex", "claude", "agy", "kimi", "omp", "pwsh"):
             self.hub.profiles[engine] = {
                 "name": engine, "engine": engine, "enabled": True, "kind": "tui",
                 "command": "unused", "args": ["--profile-arg"],
                 "task_mode": {"codex": "codex_positional", "claude": "claude_positional",
-                              "agy": "agy_interactive_flag", "omp": "omp_positional",
-                              "dsh": "dsh_hub_api"}.get(engine, "pty_input"),
+                              "agy": "agy_interactive_flag", "omp": "omp_positional"}.get(engine, "pty_input"),
             }
 
     async def asyncTearDown(self):
@@ -92,7 +91,7 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", self.hub.resolve_launch("codex", cwd=str(self.root))["env"])
 
     def test_unsupported_engines_units_and_conflicts_rejected(self):
-        for engine in ("kimi", "agy", "dsh", "pwsh"):
+        for engine in ("kimi", "agy", "pwsh", "doubao"):
             with self.subTest(engine=engine), self.assertRaises(ValueError):
                 self.hub.resolve_launch(engine, cwd=str(self.root), compaction_threshold="70%")
         with self.assertRaises(ValueError):
@@ -109,7 +108,7 @@ class CompactionLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.hub.resolve_launch("kimi", cwd=str(self.root), compaction_threshold=None)["compaction_threshold"])
 
     async def test_rejections_leave_no_session(self):
-        for engine, kwargs in (("kimi", {}), ("dsh", {})):
+        for engine, kwargs in (("kimi", {}), ("pwsh", {})):
             with self.subTest(engine=engine), self.assertRaises(ValueError):
                 await self.hub.create_session(engine, compaction_threshold="70%", **kwargs)
         self.assertEqual(self.hub.sessions, {})

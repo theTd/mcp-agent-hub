@@ -111,14 +111,14 @@ function currentProfile() {
 
 function renderProfileDetails({ reset }) {
   const p = currentProfile();
-  $('#extraArgsField').hidden = p.engine === 'dsh' || (p.kind || 'tui') !== 'tui';
+  $('#extraArgsField').hidden = (p.kind || 'tui') !== 'tui';
   if (reset || $('#extraArgsField').hidden) $('#extraArgsInput').value = '';
   $('#mcpConfigField').hidden = !['codex', 'claude'].includes(p.engine) || (p.kind || 'tui') !== 'tui';
   $('#strictMcpField').hidden = $('#mcpConfigField').hidden || p.engine !== 'claude';
   $('#codexMcpHint').hidden = $('#mcpConfigField').hidden || p.engine !== 'codex';
   if (reset || $('#mcpConfigField').hidden) resetMcpConfig();
   if ($('#strictMcpField').hidden) $('#strictMcpInput').checked = false;
-  $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy'].includes(p.engine);
+  $('#approvalField').hidden = !['codex', 'omp', 'kimi', 'claude', 'agy', 'doubao'].includes(p.engine);
   if (reset || $('#approvalField').hidden) $('#approvalSelect').value = '';
   const models = engineModels(p.engine || '');
   // Engines without a model list (pwsh) get no model / thinking rows at all.
@@ -342,11 +342,6 @@ function renderPreview() {
     : '';
   const args = Array.isArray(d.args) ? d.args : [];
   const commandLine = [d.command || '', ...args].map(quoteArg).join(' ').trim();
-  // V-3b: dsh is launched through the hub API, so the pwsh wrapper says nothing about what runs.
-  const spec = d.dsh_spec;
-  const dshLine = spec && (spec.provider || spec.model)
-    ? `DSH Hub API：${spec.tier || ''} · ${spec.provider || ''}/${spec.model || ''} · 思考 ${spec.effort || ''}`
-    : '';
   const env = Object.entries(d.env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
   box.innerHTML = `
     <div class="preview-head">${head}</div>
@@ -354,7 +349,7 @@ function renderPreview() {
     ${mcpSummary}
     <details class="run-command">
       <summary>完整命令</summary>
-      <pre class="run-pre">${escapeHtml(dshLine || commandLine)}</pre>
+      <pre class="run-pre">${escapeHtml(commandLine)}</pre>
       ${env ? `<pre class="run-pre run-env">${escapeHtml(env)}</pre>` : ''}
       ${d.cwd ? `<div class="run-cwd">工作目录：<code>${escapeHtml(d.cwd)}</code></div>` : ''}
     </details>`;

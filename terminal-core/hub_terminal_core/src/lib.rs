@@ -375,8 +375,7 @@ impl Core {
                 dict.set_item("raw_rev", record.raw_rev)?;
                 dict.set_item("screen_text", record.screen_text)?;
                 // §6.4: the console's pending size requests, in arrival order (the hub applies its
-                // clamp and its propagation to each), the input a text-only session must feed to its
-                // own echo, and each socket's own drop count, per handle.
+                // clamp and its propagation to each), and each socket's own drop count, per handle.
                 let resize_requests = PyList::empty(py);
                 for request in record.resize_requests {
                     let item = PyDict::new(py);
@@ -386,11 +385,6 @@ impl Core {
                     resize_requests.append(item)?;
                 }
                 dict.set_item("resize_requests", resize_requests)?;
-                let input_requests = PyList::empty(py);
-                for text in record.input_requests {
-                    input_requests.append(text)?;
-                }
-                dict.set_item("input_requests", input_requests)?;
                 let socket_drops = PyList::empty(py);
                 for (handle, dropped) in record.socket_drops {
                     socket_drops.append((handle, dropped))?;
@@ -522,7 +516,7 @@ impl Core {
     }
 
     /// `attach_text` (§5.2): a session with a screen and a raw ring but no process. `seed_history` is a
-    /// virtual resume's archived scrollback (A1); `seed` is its separator frame.
+    /// resume's archived scrollback (A1); `seed` is its separator frame.
     #[pyo3(signature = (session_id, cols=80, rows=24, flags=None, seed_history=None, seed=None))]
     fn attach_text<'py>(
         &self,

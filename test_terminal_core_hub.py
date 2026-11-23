@@ -9,6 +9,7 @@ Run: python -m unittest -v test_terminal_core_hub
 """
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
@@ -82,16 +83,16 @@ class TerminalDrainTests(_ManagerCase):
         self.assertEqual(broken.raw_revision, 0, "the broken session's record was never applied")
         self.assertEqual(healthy.read_raw().text, "第二行\r\n")
 
-    async def test_a_virtual_session_is_ended_in_the_core_and_retired(self):
+    async def test_a_text_session_is_ended_in_the_core_and_retired(self):
         # `attach_text` has no process, but the core owns the id: closing the session must end it
         # there too, or `retire` could never accept the id and the ring would live for the hub's life.
-        sess = _session(self.hub, "virtual-probe", command="", args=[])
-        sess.start_virtual(asyncio.get_running_loop())
+        sess = _session(self.hub, "text-probe", command="", args=[])
+        self.hub.core.attach_text(sess.session_id, cols=120, rows=36)
         sess.emit_virtual_ansi("第一行\r\n")
         self.hub._on_core_tick()
         self.assertEqual(sess.read_raw().text, "第一行\r\n")
 
-        closed = await self.hub.close_session("virtual-probe", source="mcp")
+        closed = await self.hub.close_session("text-probe", source="mcp")
         self.assertTrue(closed["found"])
         self.hub._on_core_tick()  # the death record schedules the retried retire
         for _ in range(100):
@@ -186,6 +187,72 @@ class HubOnCoreTests(_ManagerCase):
         self.assertEqual(self.hub.core.stats()["sessions"], 0, "retire left the id in the core's table")
         self.assertNotIn("hub-core-probe", self.hub.sessions)
         self.assertEqual(self.hub.core.socket_count(), 0, "a console socket outlived its session")
+
+
+class RetiredEngineDataTests(unittest.IsolatedAsyncioTestCase):
+    """DSH was dropped on 2026-11-15; its old data is purged at start, and these guards cover a skip.
+
+    The owner decided on page `hub-dsh-removal-1115` that the rows and a saved profile go at the
+    next start (after a backup, `test_retired_engine_purge`). The guards below still matter for a
+    start whose purge was skipped because its backup failed: nothing revives the leftovers.
+    """
+
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().set_debug(False)
+        self.temporary = tempfile.TemporaryDirectory(prefix="hub-retired-")
+        self.root = Path(self.temporary.name)
+        self.profiles = self.root / "agent_profiles.json"
+        self.profiles.write_text(json.dumps({"profiles": {
+            "dsh": {"name": "DSH", "engine": "dsh", "kind": "tui", "command": "dsh"},
+            "plain": {"name": "Plain", "engine": "pwsh", "kind": "tui", "command": "pwsh.exe"},
+        }}), encoding="utf-8")
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            self.hub = HubSessionManager(self.profiles, base_dir=Path(session_manager.__file__).parent,
+                                         data_dir=self.root)
+        self.hub.core = FakeTerminal()
+        await self.hub.start()
+
+    async def asyncTearDown(self):
+        if self.hub.core is not None:
+            self.hub.core.kill_all(500)
+            self.hub._on_core_tick()
+        await self.hub.archive_all_sessions_on_shutdown()
+        self.temporary.cleanup()
+
+    async def test_a_saved_dsh_profile_left_by_a_skipped_purge_is_skipped_by_the_loader(self):
+        # The start-up purge removed the entry (`test_retired_engine_purge` proves that); put it
+        # back to stand for a start whose backup failed and whose purge was therefore skipped.
+        self.profiles.write_text(json.dumps({"profiles": {
+            "dsh": {"name": "DSH", "engine": "dsh", "kind": "tui", "command": "dsh"},
+            "plain": {"name": "Plain", "engine": "pwsh", "kind": "tui", "command": "pwsh.exe"},
+        }}), encoding="utf-8")
+        before = self.profiles.read_bytes()
+        with self.assertLogs("mcp-agent-hub.session_manager", level="INFO") as logs:
+            self.hub.load_profiles(discovery={"engines": {}})
+        self.assertNotIn("dsh", self.hub.profiles, "the dropped engine's profile is still served")
+        self.assertIn("plain", self.hub.profiles, "the ordinary profile was dropped with it")
+        self.assertTrue(any("skipped 1 DSH profile(s)" in line for line in logs.output), logs.output)
+        self.assertEqual(self.profiles.read_bytes(), before, "the loader rewrote the profile file")
+
+    async def test_a_dsh_row_left_by_a_skipped_purge_refuses_with_a_reason(self):
+        sess = _session(self.hub, "dsh-old", command="", args=[])
+        sess.engine = "dsh"
+        sess.profile_snapshot = {"profile_id": "dsh", "engine": "dsh", "kind": "tui",
+                                 "cwd": str(self.root), "args": []}
+        sess.conversation_ref = {"dsh_job_id": "job-1"}
+        sess.status = "completed"
+        sess.end_reason = "exited"
+        await self.hub.persist_session(sess)
+        await self.hub._archive_session(sess, end_reason="exited")
+        page = await self.hub.list_archive()
+        self.assertIn("dsh-old", [row["session_id"] for row in page["sessions"]],
+                      "the DSH row disappeared from the archive")
+        record = await self.hub.db.get_session_record("dsh-old")
+        self.assertEqual(self.hub.compute_resumable(record),
+                         (False, "DSH 已不再支持，无法恢复此会话。"))
+        with self.assertRaises(ValueError) as caught:
+            await self.hub.resume_subagent("dsh-old")
+        self.assertEqual(str(caught.exception), "DSH 已不再支持，无法恢复此会话。")
 
 
 class FakeCoreFidelityTests(unittest.TestCase):

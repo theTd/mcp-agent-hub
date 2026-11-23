@@ -727,15 +727,14 @@ class TerminalSocketTests(unittest.TestCase):
         return client
 
     def drain_requests(self, timeout=5.0):
-        """Every `resize_requests`/`input_requests` entry the drains carry within `timeout`."""
-        resizes, typed = [], []
+        """Every `resize_requests` entry the drains carry within `timeout`."""
+        resizes = []
         end = time.time() + timeout
-        while time.time() < end and (not resizes or not typed):
+        while time.time() < end and not resizes:
             for record in self.core.drain():
                 resizes.extend(record["resize_requests"])
-                typed.extend(record["input_requests"])
             time.sleep(0.02)
-        return resizes, typed
+        return resizes
 
     @live_core
     def test_a_real_socket_serves_a_session_end_to_end(self):
@@ -749,12 +748,12 @@ class TerminalSocketTests(unittest.TestCase):
         self.core.feed("live", "hello socket\r\n")
         self.assertIn("hello socket", client.read_text_until("hello socket"))
 
-        # Both request kinds travel on the drain record; the hub applies them (4b).
+        # The resize travels on the drain record; the input frame on a text session is consumed and
+        # discarded (DSH, its only owner, was dropped).
         client.send_text('{"type":"resize","cols":100,"rows":40,"propagate":true}')
         client.send_text('{"type":"input","data":"typed"}')
-        resizes, typed = self.drain_requests()
+        resizes = self.drain_requests()
         self.assertEqual(resizes, [{"cols": 100, "rows": 40, "propagate": True}])
-        self.assertEqual(typed, ["typed"], "a text session's input must come back on the record")
 
         self.assertEqual(self.core.close_sockets("live"), 1)
         self.assertEqual(client.read_close(), 1000, "the hub's close is 1000")
