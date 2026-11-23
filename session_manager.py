@@ -12046,7 +12046,11 @@ class HubSessionManager:
         turn_busy = False
         turn_text: Optional[str] = None
         turn_evidence = False
-        baseline_reply: Optional[str] = None
+        baseline_reply: Optional[str] = (
+            str(session.final_response or "").strip() or None
+            if session.resume_attach and session.final_response_from_previous_turn
+            else None
+        )
         seen_turn_id = session.turn_id
 
         while self._transcript_watch_alive(session):
@@ -12176,6 +12180,15 @@ class HubSessionManager:
                 )
                 clean_rows = sanitize_tui_screen_text(screen_text, max_lines=20, engine="doubao")
                 screen_reply = extract_doubao_screen_reply(clean_rows)
+                if getattr(session, "_startup_inject_pending", False):
+                    # While the startup/resume task is still booting and typing, any `◆` block
+                    # drawn on screen is replayed history (never the new turn's answer). Keep
+                    # refreshing the baseline as replay arrives and hold the idle settle timer.
+                    if screen_reply:
+                        baseline_reply = screen_reply
+                    idle_since = 0.0
+                    await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
+                    continue
                 if busy:
                     idle_since = 0.0
                     if baseline_reply is None:
@@ -12197,41 +12210,34 @@ class HubSessionManager:
                         idle_since = now
                     if baseline_reply is None:
                         baseline_reply = screen_reply
-                    injection_pending = bool(getattr(session, "_startup_inject_pending", False))
                     if session.status in ("starting", "running") and session.pending_interaction is None:
-                        if injection_pending:
-                            # The prompt/resume text has not been submitted yet: the screen still
-                            # shows the previous turn and its export rows predate this one, so
-                            # nothing here can end the turn. Keep the baseline untouched.
-                            pass
-                        else:
-                            # Only an answer that DIFFERS from the pre-turn `◆` block is fresh.
-                            # The resume replay draws the previous turn's `▍` + `◆` again, so
-                            # "drawn after a user prompt" alone would accept that old answer.
-                            screen_fresh = bool(screen_reply) and screen_reply != str(baseline_reply or "")
-                            export_due = now - last_export_probe >= DOUBAO_EXPORT_PROBE_SEC
-                            if now - idle_since >= DOUBAO_IDLE_SETTLE_SEC and (
-                                turn_busy or turn_evidence or screen_fresh or export_due
-                            ):
-                                if export_due:
-                                    last_export_probe = now
-                                ended = await self._finish_doubao_turn(
-                                    session,
-                                    conversation_id,
-                                    turn_text,
-                                    screen_text,
-                                    baseline_reply=str(baseline_reply or ""),
-                                    allow_export=export_due or turn_evidence or screen_fresh,
-                                    turn_busy_seen=turn_busy,
-                                )
-                                if ended:
-                                    # A card the parent has not answered yet keeps the turn open:
-                                    # its "Reject and stop" also ends the turn without another
-                                    # busy phase.
-                                    turn_busy = False
-                                    turn_text = None
-                                    turn_evidence = False
-                                    baseline_reply = screen_reply
+                        # Only an answer that DIFFERS from the pre-turn `◆` block is fresh.
+                        # The resume replay draws the previous turn's `▍` + `◆` again, so
+                        # "drawn after a user prompt" alone would accept that old answer.
+                        screen_fresh = bool(screen_reply) and screen_reply != str(baseline_reply or "")
+                        export_due = now - last_export_probe >= DOUBAO_EXPORT_PROBE_SEC
+                        if now - idle_since >= DOUBAO_IDLE_SETTLE_SEC and (
+                            turn_busy or turn_evidence or screen_fresh or export_due
+                        ):
+                            if export_due:
+                                last_export_probe = now
+                            ended = await self._finish_doubao_turn(
+                                session,
+                                conversation_id,
+                                turn_text,
+                                screen_text,
+                                baseline_reply=str(baseline_reply or ""),
+                                allow_export=export_due or turn_evidence or screen_fresh,
+                                turn_busy_seen=turn_busy,
+                            )
+                            if ended:
+                                # A card the parent has not answered yet keeps the turn open:
+                                # its "Reject and stop" also ends the turn without another
+                                # busy phase.
+                                turn_busy = False
+                                turn_text = None
+                                turn_evidence = False
+                                baseline_reply = screen_reply
                     else:
                         # No live turn: this answer is the baseline the next turn must differ from.
                         baseline_reply = screen_reply
