@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use conpty_session::conpty::{spawn, ConPtyProcess, SpawnSpec};
 use conpty_session::handles::OwnedPseudoConsole;
 use conpty_session::job_tree;
-use conpty_session::session::IO_CHUNK;
+use conpty_session::session::{SessionFlags, IO_CHUNK};
 
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
@@ -219,6 +219,7 @@ fn run() -> i32 {
         env: &env,
         cols: args.cols,
         rows: args.rows,
+        flags: SessionFlags::default(),
     };
     let process = match spawn(&spec) {
         Ok(process) => process,

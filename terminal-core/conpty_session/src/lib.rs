@@ -28,6 +28,7 @@ pub use core::{
     Core, CoreError, CoreOptions, SocketAttach, SpawnReply, SpawnRequest, Stats, TextRequest,
 };
 pub use frame_queue::{FrameQueue, Frames};
+pub use job::JobPolicy;
 pub use session::{
     DrainRecord, RawReply, ResizeRequest, ScreenReply, SessionFlags, SessionSnapshot, TextReply,
 };

@@ -35,7 +35,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE,
+    PROCESS_TERMINATE,
+};
 
 use terminal_stream::{
     trim_history_text, Coalescer, FrameSink, StreamOptions, TerminalStream,
@@ -43,7 +46,7 @@ use terminal_stream::{
 
 use crate::conpty::ConPtyProcess;
 use crate::handles::{OwnedHandle, OwnedPseudoConsole};
-use crate::job::JobObject;
+use crate::job::{JobObject, JobPolicy};
 use crate::job_tree;
 use crate::sink_fanout::{Delivery, SinkFanout};
 
@@ -71,6 +74,11 @@ pub struct SessionFlags {
     pub history_rows: usize,
     pub raw_cap_bytes: usize,
     pub raw_slack_bytes: usize,
+    /// What the session's job owns (`job.rs`): the whole tree (the default, and the behaviour every
+    /// session had before) or the client alone. A client that starts a machine-wide singleton — a shared
+    /// `--type=service` process other sessions also use — needs `ClientOnly`, or closing this session
+    /// terminates that singleton and every other session dies with it.
+    pub job_policy: JobPolicy,
 }
 
 impl Default for SessionFlags {
@@ -81,6 +89,7 @@ impl Default for SessionFlags {
             history_rows: 3000,
             raw_cap_bytes: 512 * 1024,
             raw_slack_bytes: 64 * 1024,
+            job_policy: JobPolicy::default(),
         }
     }
 }
@@ -280,6 +289,33 @@ impl Drop for Resources {
         if let Some(console) = console {
             let _ = close_console_off_thread(console, CONSOLE_CLOSE_DEADLINE, &self.console);
         }
+    }
+}
+
+/// Terminates the one process a `ClientOnly` session owns: the client itself, through its handle, and
+/// through a reopen by pid when that handle cannot terminate it.
+///
+/// This is deliberately *not* `job_tree::terminate_tree`: the walk selects descendants by parent pid
+/// whatever their job membership is, so it would reach a child the client created outside the job — the
+/// machine-wide service singleton the whole `ClientOnly` policy exists to protect.
+fn terminate_client(process: &OwnedHandle, pid: u32) -> std::io::Result<()> {
+    // SAFETY: the process handle is owned by the session and was created with PROCESS_TERMINATE.
+    if unsafe { TerminateProcess(process.get(), 1) }.is_ok() {
+        return Ok(());
+    }
+    // SAFETY: no inheritance; the returned handle is owned by the wrapper for the duration of the call.
+    let reopened = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) };
+    match reopened {
+        Ok(handle) => {
+            let handle = OwnedHandle::new(handle);
+            // SAFETY: the handle was opened with PROCESS_TERMINATE and is closed by the wrapper.
+            unsafe { TerminateProcess(handle.get(), 1) }
+                .map_err(|error| std::io::Error::other(error.message()))
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "TerminateProcess failed and OpenProcess({pid}) failed: {}",
+            error.message()
+        ))),
     }
 }
 
@@ -761,8 +797,14 @@ impl Session {
         } = process;
         let mut spawn_log = Vec::new();
         if let Some(error) = job_error {
+            // What a refused assignment means for the cleanup depends on the policy: the tree walk is
+            // only ever a `KillTree` fallback (`terminate_processes`).
+            let fallback = match job.policy() {
+                JobPolicy::ClientOnly => "kill will terminate the client process only",
+                JobPolicy::KillTree => "kill will walk the tree with ToolHelp",
+            };
             spawn_log.push(format!(
-                "session {id}: job assignment failed, kill will walk the tree with ToolHelp: {error}"
+                "session {id}: job assignment failed, {fallback}: {error}"
             ));
         }
         spawn_log.push(format!(
@@ -835,17 +877,14 @@ impl Session {
                 }
             }
             let resources = session.resources.clone().expect("a spawned session has resources");
-            let terminated = if resources.job_assigned {
-                resources.job.terminate(1)
-            } else {
-                job_tree::terminate_tree(session.pid);
-                Ok(())
-            };
+            // The same policy-aware termination `kill` runs: under `ClientOnly` a failed thread start
+            // must not walk the tree either, or it would take the client's shared children with it.
+            let (_method, terminated) = session.terminate_processes(&resources);
             // Close on a helper so a reader that did start leaves its `ReadFile`; no session-level wait,
             // because the node is not in the table and nobody drains it.
             let _ = session.close_console(CONSOLE_CLOSE_DEADLINE);
             return Err(format!(
-                "session {}: could not start its threads ({error}); the tree was terminated{}",
+                "session {}: could not start its threads ({error}); the session's processes were terminated{}",
                 session.id,
                 match terminated {
                     Ok(()) => String::new(),
@@ -1544,6 +1583,56 @@ impl Session {
         }
     }
 
+    /// Ends this incarnation's processes according to the job's policy, returning the method name for the
+    /// log and the call's result.
+    ///
+    /// `KillTree` keeps the original two-step: `TerminateJobObject` when the client is in the job, the
+    /// ToolHelp walk when the assignment was refused, and the walk again when the job call fails.
+    ///
+    /// `ClientOnly` never walks the tree. Its descendants are outside the job by design
+    /// (`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` in `job.rs`), and `job_tree::terminate_tree` selects by
+    /// parent pid regardless of job membership, so the walk would still terminate the client's children —
+    /// the shared `doubao.exe --type=service` among them, which is the crash this policy removes. The
+    /// client is terminated through its own handle (or a reopen by pid) instead, and that is the only
+    /// fallback: not even "`job_assigned == false`" or "`TerminateJobObject` failed" is a reason to walk.
+    fn terminate_processes(&self, resources: &Resources) -> (&'static str, std::io::Result<()>) {
+        if resources.job.policy() == JobPolicy::ClientOnly {
+            if resources.job_assigned {
+                // Only the client is in the job (its children broke away when they were created), so
+                // terminating the job cannot reach a grandchild.
+                match resources.job.terminate(1) {
+                    Ok(()) => return ("TerminateJobObject", Ok(())),
+                    Err(error) => self.log(&format!(
+                        "session {}: TerminateJobObject failed ({}), terminating the client process \
+                         only (the job's children break away)",
+                        self.id, error
+                    )),
+                }
+            }
+            return (
+                "client-only TerminateProcess",
+                terminate_client(&resources.process, self.pid),
+            );
+        }
+
+        if resources.job_assigned {
+            match resources.job.terminate(1) {
+                Ok(()) => ("TerminateJobObject", Ok(())),
+                Err(error) => {
+                    self.log(&format!(
+                        "session {}: TerminateJobObject failed ({}), falling back to the tree walk",
+                        self.id, error
+                    ));
+                    job_tree::terminate_tree(self.pid);
+                    ("TerminateJobObject", Ok(()))
+                }
+            }
+        } else {
+            job_tree::terminate_tree(self.pid);
+            ("ToolHelp tree kill", Ok(()))
+        }
+    }
+
     /// Terminates the session's tree and waits up to `budget` for the exit, then runs the one exit
     /// teardown (`finish_exit`): the tree is always terminated, even when the session is already marked
     /// dead, because a reader panic leaves the CLI running (should-fix 2) and `TerminateJobObject` is
@@ -1559,20 +1648,16 @@ impl Session {
         // The code of a process that has already exited must be read before the job is terminated, or
         // the termination can overwrite it (see `record_exit_code_if_exited`).
         self.record_exit_code_if_exited();
-        let mut method = "TerminateJobObject";
-        let result = if resources.job_assigned {
-            resources.job.terminate(1)
-        } else {
-            method = "ToolHelp tree kill";
-            job_tree::terminate_tree(self.pid);
-            Ok(())
-        };
+        // The policy lives on the job, so `kill` cannot walk a tree that belongs to someone else by
+        // accident: only `KillTree` reaches `job_tree::terminate_tree` (see `terminate_processes`).
+        let (method, result) = self.terminate_processes(&resources);
         if let Err(error) = &result {
+            // Only a `ClientOnly` session can reach this line: its fallback is the client itself, and a
+            // tree walk here is exactly what the policy forbids.
             self.log(&format!(
-                "session {}: {} failed ({}), falling back to the tree walk",
+                "session {}: {} failed ({}), the client process is still running",
                 self.id, method, error
             ));
-            job_tree::terminate_tree(self.pid);
         }
 
         let mut announcement = None;

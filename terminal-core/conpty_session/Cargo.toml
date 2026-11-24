@@ -45,6 +45,13 @@ test-hooks = []
 name = "selftest"
 path = "src/bin/selftest.rs"
 
+# Test support for `tests/session_lifecycle.rs`: a client that starts one child with `DETACHED_PROCESS`,
+# which is the shape of `doubao.exe` starting `doubao.exe --type=service`. The child must outlive the
+# session's pseudoconsole for `JobPolicy::ClientOnly` to be what the case measures.
+[[bin]]
+name = "detached_client"
+path = "src/bin/detached_client.rs"
+
 # §9 step 4's measurement, not part of the gate: `cargo run --release --bin replay_bench` reports the
 # cost of `attach_sink`'s replay render (the delivery lock is held across it).
 [[bin]]

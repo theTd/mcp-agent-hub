@@ -87,6 +87,15 @@ pub fn count_processes_named_by_parent(parent: u32, name: &str) -> usize {
         .count()
 }
 
+/// The executable name of `pid` from a process snapshot: how a test tells the child it expected from any
+/// other process that appeared at the same moment.
+pub fn process_name(pid: u32) -> Option<String> {
+    process_snapshot_entries()
+        .into_iter()
+        .find(|(entry_pid, _, _)| *entry_pid == pid)
+        .map(|(_, _, exe)| exe)
+}
+
 /// `(pid, parent pid, executable name)` for every process in one snapshot.
 fn process_snapshot_entries() -> Vec<(u32, u32, String)> {
     // SAFETY: a system-wide process snapshot; the handle is closed by the wrapper.

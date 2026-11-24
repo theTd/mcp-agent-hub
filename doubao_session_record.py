@@ -28,6 +28,12 @@ from engine_errors import classify_engine_error
 DOUBAO_APP_DIR_NAME = "doubao_cli"
 DOUBAO_NATIVE_RELATIVE = Path("app") / "current" / "doubao.exe"
 NO_UPDATE_CHECK_ENV = "DOUBAO_CLI_NO_UPDATE_CHECK"
+# The CLI's own code for a shared-service disconnect. It is deliberately NOT in `_ERROR_CODES` and
+# NOT in `_ERROR_CODE_LINE_RE`: such a row is recoverable, so `detect_doubao_error` must never turn
+# it into an `engine_error` turn (7 in `FINAL_SOURCE_PRIORITY`, which would outrank the recovered
+# answer forever), and it must never become a 401 `auth` failure (`auth_failed` /
+# `session_expired` stay non-retryable). See `detect_doubao_service_link_loss`.
+DOUBAO_SERVICE_LINK_LOSS_CODE = "auth_unavailable"
 # `assignment.md` is written when a turn starts; its mtime is the only cheap ordering signal.
 ASSIGNMENT_FRESH_SLACK_SEC = 5.0
 MAX_ASSIGNMENT_BYTES = 1024 * 1024
@@ -72,9 +78,28 @@ _ERROR_CODES = {
 # The CLI's own failure formats, and nothing else: a line that starts with an error code and a
 # colon, a known CLI banner, or a JSON error envelope. Ordinary prose that merely mentions one of
 # these words (an answer explaining `internal_error`, a task titled "auth_failed") never matches.
+# The Ink cursor (`❯` / `›` / `>`) may lead the CLI's own error row; it is stripped before the code
+# is matched, so `❯ network_offline: …` reads as a failure while `❯ Ask Doubao …` does not.
 _ERROR_CODE_LINE_RE = re.compile(
-    r"^\s*(?:Error:\s*)?(invalid_arguments|auth_failed|session_expired|network_offline|"
+    r"^\s*(?:[❯›>]\s*)?(?:Error:\s*)?(invalid_arguments|auth_failed|session_expired|network_offline|"
     r"server_error|permission_denied|internal_error)\s*:\s*\S"
+)
+# The shared-service disconnect row, in its own detector: it is retryable recovery material, not an
+# engine error (see `DOUBAO_SERVICE_LINK_LOSS_CODE`).
+_SERVICE_LINK_LINE_RE = re.compile(
+    r"^\s*(?:❯|›|>|Error:)\s*auth_unavailable\s*:\s*\S"
+)
+# The same disconnect row after a wide terminal's status-bar redraw overlaid it: Ink repaints
+# `model · effort · cwd` and pushes the failure text into that row, so the leading `❯ ` frame is
+# gone and it clips even the row's first characters (`… uth_unavailable: …`). Both forms stay
+# strict because `_service_link_candidate_rows` drops every `◆`/`▍` row before they run.
+_SERVICE_LINK_INLINE_RE = re.compile(
+    r"(?<![\w])(?:auth_unavailable|uth_unavailable)\s*:\s*\S"
+)
+# The CLI's own Chinese banner for the same drop: the only part an overlay cannot swallow, since
+# it is the message body itself. `，`/`,` is the renderer's; the punctuation after is not owned.
+_SERVICE_LINK_BANNER_RE = re.compile(
+    r"运行时与共享服务断开连接[，,]?\s*任务已停止"
 )
 _ERROR_BANNERS = (
     (re.compile(r"^\s*Your session has expired\b", re.IGNORECASE), "session_expired"),
@@ -497,6 +522,72 @@ def _doubao_error_info(line: str, code: str) -> Dict[str, Any]:
     info = classify_engine_error(line or code, code=_ERROR_CODES.get(code) or None)
     info["code"] = code
     return info
+
+
+def _service_link_candidate_rows(text: str) -> List[str]:
+    """Rows of a screen that can carry the CLI's own `auth_unavailable` row.
+
+    The Doubao TUI draws a submitted text with the `❯` composer glyph and keeps drawing it while the
+    answer streams in, so a `❯` row is not by itself the CLI talking: it may be the echoed task, the
+    user's own follow-up, or a line inside an answer. Both blocks therefore continue across `❯`
+    rows:
+
+    - a `◆` assistant block runs until a blank row, a rule row (`───`), a `◇` tool row or a `▍`
+      user row -- so an answer quoting `❯ auth_unavailable: …` stays prose;
+    - a `▍` user block runs the same way until a blank row, a rule row, a `◆` or a `◇` row -- so a
+      user echo spanning several lines (a `❯` continuation among them) stays an echo.
+
+    Outside both blocks (at the top of the screen, after a blank row, after a rule row, or below a
+    tool row) a `❯ auth_unavailable: …` row is the CLI's own failure frame and is kept: the real
+    layout is a rule row, the row, and another rule row.
+    """
+    rows: List[str] = []
+    in_assistant = False
+    in_user = False
+    for raw in str(text or "").splitlines():
+        row = raw.strip()
+        if not row or _RULE_ROW_RE.match(row):
+            # A blank row or a rule row closes whichever block was open.
+            in_assistant = False
+            in_user = False
+            continue
+        if row.startswith(ASSISTANT_GLYPH):
+            in_assistant, in_user = True, False
+            continue
+        if row.startswith(TOOL_GLYPH):
+            in_assistant = in_user = False
+            continue
+        if row.startswith(USER_GLYPH):
+            in_assistant, in_user = False, True
+            continue
+        if in_assistant or in_user:
+            # The block is still open: this row is its continuation, never the CLI's own frame.
+            continue
+        rows.append(row)
+    return rows
+
+
+def detect_doubao_service_link_loss(text: Any) -> Optional[Dict[str, Any]]:
+    """The CLI's `auth_unavailable: …` shared-service disconnect row, or None.
+
+    It is a RETRYABLE `network` failure the hub can recover from by itself, so it is read by its
+    own detector and never by `detect_doubao_error` (which would end the turn with an engine error
+    that outranks the recovered answer). Only the CLI's own row counts: a `◆` assistant answer
+    quoting `auth_unavailable` and a `▍` user echo of it are prose, and never match (see
+    `_service_link_candidate_rows`). The CLI's row also counts once Ink's status-bar redraw has
+    overlaid or clipped it (see `_SERVICE_LINK_INLINE_RE` / `_SERVICE_LINK_BANNER_RE`).
+    """
+    for row in _service_link_candidate_rows(_ANSI_RE.sub("", str(text or ""))):
+        if (_SERVICE_LINK_LINE_RE.match(row)
+                or _SERVICE_LINK_INLINE_RE.search(row)
+                or _SERVICE_LINK_BANNER_RE.search(row)):
+            return {
+                "kind": "network",
+                "retryable": True,
+                "code": DOUBAO_SERVICE_LINK_LOSS_CODE,
+                "message": row,
+            }
+    return None
 
 
 def _doubao_clean_label(label: str) -> str:

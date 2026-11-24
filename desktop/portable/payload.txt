@@ -19,6 +19,7 @@ session_mcp_bridge.py
 mcp_session_pool.py
 model_discovery.py
 doubao_session_record.py
+doubao_recovery.py
 windows_accept_guard.py
 restart_resume_request.py
 transcript_summarizer.py

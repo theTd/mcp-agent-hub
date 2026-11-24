@@ -245,13 +245,27 @@ def _spawned_by_view(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"process": caller.get("process"), "pid": caller.get("pid")}
 
 
+def _live_wait_handle(session) -> Optional[str]:
+    """The wait handle the LIVE object of a session id carries.
+
+    A Doubao auto-recovery replaces the session object under the same id, so the one a start/spawn
+    tool still holds may be the abandoned predecessor (whose handle is already None). Reading the
+    successor's handle -- with the prior one as the fallback -- keeps the URL a parent polls
+    pointed at the turn it is really waiting on.
+    """
+    sid = str(getattr(session, "session_id", "") or "")
+    live = hub.sessions.get(sid) if sid else None
+    return getattr(live, "wait_handle", None) or getattr(session, "wait_handle", None)
+
+
 def _control_status(session, *, accepted=True):
-    return {
+    wait_handle = _live_wait_handle(session)
+    payload = {
         "accepted": bool(accepted),
         "session_id": session.session_id,
         "turn_id": session.turn_id,
-        "wait_handle": session.wait_handle,
-        "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}" if session.wait_handle else None,
+        "wait_handle": wait_handle,
+        "wait_url": f"{hub_api_base_url()}/api/wait/{wait_handle}" if wait_handle else None,
         "status": session.status,
         "approval": {
             "approval_mode": resolve_session_approval_fields(session.profile_snapshot)["approval_mode"],
@@ -259,6 +273,11 @@ def _control_status(session, *, accepted=True):
             "approval_source": (session.profile_snapshot or {}).get("approval_source"),
         },
     }
+    if str(getattr(session, "status", "") or "") == "recovering":
+        # The Doubao auto-recovery's own counters, so a poll can tell "coming back" from "stuck"
+        # without reading the crash or the launch snapshot.
+        payload["auto_recovery"] = hub.doubao_recovery_view(session.session_id)
+    return payload
 
 # ============================================================================
 # 1. 北向 MCP Server (/mcp) —— 暴露给【主 Agent / Parent Agent】的调度、遥测与双向通信接口
@@ -474,11 +493,15 @@ async def spawn_subagent(
         env=env,
     )
     wait = await _wait_contract([session.session_id], turn_ids={session.session_id: session.turn_id})
-    session.wait_handle = wait["wait_handle"]
-    await hub.persist_session(session)
-    return {**_control_status(session), **wait, "title": session.title, "agent_type": session.profile_id,
-            "engine": session.engine, "effective_model": session.effective_model,
-            "effective_thinking_level": session.effective_thinking_level,
+    # A Doubao recovery may have replaced the object while the contract was being read; the handle
+    # belongs to whoever owns the id now, never to the corpse the spawn returned.
+    current = hub.sessions.get(session.session_id) or session
+    current.wait_handle = wait["wait_handle"]
+    await hub.persist_session(current)
+    return {**_control_status(current), **wait, "title": current.title,
+            "agent_type": current.profile_id,
+            "engine": current.engine, "effective_model": current.effective_model,
+            "effective_thinking_level": current.effective_thinking_level,
             "delivery": {"accepted": True, "state": "queued"}}
 
 
@@ -514,13 +537,14 @@ async def spawn_subagents(specs: List[Dict[str, Any]], all_settled: bool = True)
     wait = await _wait_contract([s.session_id for s in sessions],
                                 turn_ids={s.session_id: s.turn_id for s in sessions},
                                 mode="all_settled" if all_settled else "any_settled")
-    for session in sessions:
+    live = [hub.sessions.get(s.session_id) or s for s in sessions]
+    for session in live:
         session.wait_handle = wait["wait_handle"]
         await hub.persist_session(session)
     return {
         "accepted": True,
         "mode": "all_settled" if all_settled else "any_settled",
-        "sessions": [{"session_id": s.session_id, "turn_id": s.turn_id, "status": s.status} for s in sessions],
+        "sessions": [{"session_id": s.session_id, "turn_id": s.turn_id, "status": s.status} for s in live],
         **wait,
     }
 
@@ -573,6 +597,10 @@ async def get_subagent_status_and_trace(
         "status": session.status,
         "current_activity": session.current_activity,
         "pending_interaction": parent_interaction_view(session.pending_interaction),
+        # Present only while a Doubao auto-recovery is bringing the turn back (a poll that sees
+        # `recovering` is not a failed turn: the same handle settles when it finishes or gives up).
+        **({"auto_recovery": hub.doubao_recovery_view(session.session_id)}
+           if str(session.status or "") == "recovering" else {}),
     }
 
 
@@ -648,8 +676,9 @@ async def send_to_subagent(
     else:
         # A follow-up message starts a fresh turn on the same session.  Re-arm the
         # durable handle so a previous done result cannot be returned immediately.
-        await hub.wait_inbox.update_turn(session.wait_handle, session.session_id, session.turn_id)
-        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+        handle = _live_wait_handle(session) or session.wait_handle
+        await hub.wait_inbox.update_turn(handle, session.session_id, session.turn_id)
+        wait = {"wait_handle": handle, "wait_url": f"{hub_api_base_url()}/api/wait/{handle}"}
     return {**_control_status(session), **wait, "resumed": resumed, "delivery": delivery}
 
 
@@ -684,8 +713,9 @@ async def resume_subagent(
         wait = await _wait_contract([session.session_id], turn_ids={session.session_id: session.turn_id})
         session.wait_handle = wait["wait_handle"]
     else:
-        await hub.wait_inbox.update_turn(session.wait_handle, session.session_id, session.turn_id)
-        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+        handle = _live_wait_handle(session) or session.wait_handle
+        await hub.wait_inbox.update_turn(handle, session.session_id, session.turn_id)
+        wait = {"wait_handle": handle, "wait_url": f"{hub_api_base_url()}/api/wait/{handle}"}
     return {**_control_status(session), **wait, "resumed": bool(result.get("resumed")),
             "already_live": bool(result.get("already_live")), "delivery": delivery}
 
@@ -768,7 +798,8 @@ async def _respond_to_subagent_impl(
         wait = await _wait_contract([session_id], turn_ids={session_id: session.turn_id})
         session.wait_handle = wait["wait_handle"]
     else:
-        wait = {"wait_handle": session.wait_handle, "wait_url": f"{hub_api_base_url()}/api/wait/{session.wait_handle}"}
+        handle = _live_wait_handle(session) or session.wait_handle
+        wait = {"wait_handle": handle, "wait_url": f"{hub_api_base_url()}/api/wait/{handle}"}
     return {**_control_status(session, accepted=bool(action_result.get("ok", True))), **wait,
             "response": {key: action_result.get(key) for key in RESPOND_REPLY_KEYS if key in action_result}}
 
@@ -1064,7 +1095,9 @@ async def collect_and_terminate(
 
 
 # A session in one of these is in the middle of a turn: its newest text is progress, not an answer.
-MID_TURN_STATUSES = ("starting", "running", "waiting_parent")
+# `recovering` is the Doubao auto-recovery state: the turn a parent is awaiting is still open (its
+# process is coming back), so a poll here must not read the crash as the turn's answer either.
+MID_TURN_STATUSES = ("starting", "running", "waiting_parent", "recovering")
 
 
 def _this_turns_answer(session) -> Optional[str]:

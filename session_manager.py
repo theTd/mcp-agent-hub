@@ -57,6 +57,7 @@ from doubao_session_record import (
     DOUBAO_COMPOSER_PLACEHOLDER,
     classify_doubao_option,
     detect_doubao_error,
+    detect_doubao_service_link_loss,
     doubao_card_submitting,
     doubao_data_root,
     doubao_has_idle_composer,
@@ -68,6 +69,20 @@ from doubao_session_record import (
     parse_doubao_status_session_id,
     parse_doubao_trajectory_record,
     resolve_doubao_binary,
+)
+from doubao_recovery import (
+    DOUBAO_LINK_LOSS_CODE,
+    RECOVERING_STATUS,
+    DoubaoServiceGate,
+    RecoveryBudget,
+    attempt_activity,
+    continuation_prompt,
+    doubao_auto_recovery_enabled,
+    exhaustion_event_data,
+    exhaustion_message,
+    link_loss_detail,
+    recovery_event_data,
+    sleep_with_abort,
 )
 
 from model_discovery import AgentModelDiscovery
@@ -902,6 +917,27 @@ DOUBAO_ARROW_STEP_DELAY_SEC = 0.08
 # this long with the same card still drawn (and no busy footer) the interaction is dropped and the
 # live card is registered again under a brand-new request id, never the old one.
 DOUBAO_UNCONFIRMED_TIMEOUT_SEC = 15.0
+# Auto-recovery (`doubao_recovery`): after a `auth_unavailable` row is recorded the CLI usually dies
+# at once. One that keeps running only draws the row again, so the watcher kills that session
+# object (never the job tree: `job_policy=client_only` is what leaves the shared service alive)
+# this long after the row, and the ordinary exit path then starts the recovery.
+DOUBAO_LINK_LOSS_KILL_AFTER_SEC = 3.0
+# How often a waiting recovery re-reads the terminal name of a recovering session; a cheap loop
+# guard for the backoff wait, which is abandoned the moment a terminate/shutdown asks it to stop.
+DOUBAO_RECOVERY_ABORT_POLL_SEC = 0.2
+# P0-1: `last_injection.mode` values that mean a text of THIS turn was submitted (or a follow-up
+# continuing a turn whose own text already landed). Only `startup_task` starts a turn's first text;
+# the others are proof the turn is not a brand-new turn 1 and must never replay its initial prompt.
+DOUBAO_SUBMITTING_INJECTION_MODES = frozenset({
+    "parent_message", "resume_task", "resume_prompt", "recovery_prompt",
+})
+# P0-2: how long `close_session` waits for a cancelled recovery to unwind out of the resume lock.
+# A cancelled task releases it at its next await, so this is a backstop, never a normal wait.
+CLOSE_RESUME_LOCK_WAIT_SEC = 5.0
+
+
+class DoubaoRecoveryAborted(Exception):
+    """The recovery loop must stop without spawning (terminate, close, shutdown, planned restart)."""
 # The states in which a prompt already has an answer in flight: a second respond call must not
 # write another keystroke, and the parent must not be asked again.
 APPROVAL_ANSWERED_STATES = ("sending", "sent", "unconfirmed", "confirmed")
@@ -2606,6 +2642,18 @@ class AgentSession:
         # R2: set by a resume's `_end_predecessor`. The death it causes is a hand-over, so an
         # object that already ended keeps that end state and is not announced as crashed.
         self.superseded: bool = False
+        # Doubao auto-recovery: the death record already read, so `_finish_read` knows which status
+        # (starting / running / waiting_parent) the session really had before it died; the recovery
+        # eligibility check reads this, never the end state `_finish_read` writes afterwards.
+        self._status_before_death: Optional[str] = None
+        # Doubao auto-recovery: this object's turn was handed to a recovered successor, so a late
+        # death record must not mutate its status or schedule a second recovery.
+        self._recovery_abandoned: bool = False
+        # Doubao auto-recovery: the `auth_unavailable` row the watcher read off this session's screen
+        # (and when), which the exit path uses as its link-loss evidence.
+        self._doubao_link_loss: Optional[Dict[str, Any]] = None
+        self._doubao_link_loss_at: Optional[float] = None
+        self._doubao_link_loss_killed: bool = False
         # B9: the initial task, never overwritten by follow-up messages or by status text.
         self.last_task: str = ""
 
@@ -2674,6 +2722,11 @@ class AgentSession:
         # K8 (fix 9d): every record set here is also kept in recent_injections (see the property).
         self._recent_injections: List[Dict[str, Any]] = []
         self.last_injection = None
+        # Doubao auto-recovery (P0-1): the id of the turn whose own first text was really submitted
+        # (its Enter proved). Submission state is per TURN, not read off the latest injection record:
+        # a `send_to_subagent` follow-up later turns `last_injection.mode` into "parent_message", and
+        # a recovery of that turn must continue it, never replay turn 1's `initial_prompt`.
+        self._turn_submitted_for_turn_id: Optional[str] = None
         # K6 (fix 9c): the startup text and the live messages type into the TUI one at a time.
         self.tui_writer = TuiWriterQueue()
         # A failed/unchecked draft must be explicitly cleared before another message is typed.
@@ -2812,6 +2865,13 @@ class AgentSession:
             "history_rows": TERMINAL_HISTORY_ROWS,
             "raw_cap_bytes": RESUME_SCROLLBACK_MAX_BYTES,
             "raw_slack_bytes": HISTORY_TRIM_SLACK_BYTES,
+            # The core's job policy: a Doubao CLI keeps supervising a shared service the whole hub
+            # uses, so killing it (`kill_tree`) would take that service down with one session; it
+            # is killed as a client only. Every other engine kills its whole tree (D: a child
+            # `npx` an agent started must not outlive it). The old core ignores this unknown key,
+            # so a hub seamed to an older core keeps its previous behaviour.
+            "job_policy": "client_only" if (self.engine or "").strip().lower() == "doubao"
+            else "kill_tree",
         }
 
     def _wants_tool_line_scan(self) -> bool:
@@ -2909,6 +2969,14 @@ class AgentSession:
             # already earned (a user termination) stays, and the parent is not
             # told a session it is resuming crashed.
             return
+        if getattr(self, "_recovery_abandoned", False):
+            # Doubao auto-recovery: this object's turn already moved to a recovered successor. A
+            # death record arriving now (a second drain of the same dead id) must not rewrite the
+            # status the successor owns, and must not queue another exit callback.
+            return
+        # Doubao auto-recovery: what the session really was before this death decides whether the
+        # turn may be recovered; the end reason below is written afterwards and can no longer say.
+        self._status_before_death = str(getattr(self, "_status", "") or self.status)
         self.ended_at = time.time()
         self.exit_code = exit_code
         self._died_crashed = bool(crashed)
@@ -3207,7 +3275,12 @@ class AgentSession:
         return self._pid or None
 
     def kill(self, grace_ms: int = KILL_GRACE_MS) -> Optional[int]:
-        """`kill` (§5.2): the job object ends the tree and the reply carries the code, if any.
+        """`kill` (§5.2): the core writes the code it read, and the death record carries the rest.
+
+        What "ends" means is the session's `JobPolicy`: the default `KillTree` ends the job object,
+        so the whole tree goes. Under `JobPolicy::ClientOnly` (the Doubao CLI) only the client
+        process is terminated and detached children are spared -- which is exactly why
+        `doubao.exe --type=service` survives a recovery's kill and the shared service stays up.
 
         The core reads `GetExitCodeProcess` before `TerminateJobObject`, so `cmd /c "exit 3"`
         reports 3; a process that outlived the budget answers None and the death record that
@@ -3359,7 +3432,7 @@ class AgentSession:
     def to_dict(self) -> Dict[str, Any]:
         alive = self.is_process_alive()
         if not alive and self.has_process and self.status not in (
-            "completed", "exited", "crashed", "terminated", "interrupted"
+            "completed", "exited", "crashed", "terminated", "interrupted", RECOVERING_STATUS
         ):
             self.status = "exited"
         return {
@@ -3468,6 +3541,18 @@ class HubSessionManager:
         # The scheduled ordinary-exit finalizations, by session id, so the shutdown can wait for
         # the ones a death started before it instead of cancelling them away (kimi 4).
         self._exit_tasks: Dict[str, asyncio.Task] = {}
+        # Doubao auto-recovery: the recovery task each session id has in flight (never awaited from
+        # `_on_session_exit`, which `_end_predecessor` waits on while holding the resume lock), and
+        # the per-session policy state (its budget, its last crash context). `_recovery_frozen` is
+        # set by a graceful restart or a stop: nothing may spawn a recovered CLI after that.
+        self._recovery_tasks: Dict[str, asyncio.Task] = {}
+        self._doubao_recovery: Dict[str, Dict[str, Any]] = {}
+        self._recovery_frozen: bool = False
+        # One hub-wide gate: N Doubao sessions that lost the shared service at once must not start
+        # N CLIs against it; the gate serializes them and lets the followers wait for it.
+        self.doubao_service_gate = DoubaoServiceGate.from_env()
+        # Injectable for tests: the backoff sleep (None = asyncio.sleep).
+        self._recovery_sleep: Optional[Callable[[float], Any]] = None
         # Set for the exit task a death record started before `_shutting_down`; the shutdown drains
         # them first, so a natural exit keeps its native final answer and its one lifecycle event.
         self._pre_shutdown_exits: Set[str] = set()
@@ -6795,8 +6880,20 @@ class HubSessionManager:
         if not sid:
             raise ValueError("找不到会话 ")
         normalized_rules = None if auto_approval_rules is None else normalize_auto_approval_rules(auto_approval_rules)
+        # Doubao auto-recovery: a manual resume overrides it, so the recovery task is cancelled
+        # BEFORE this takes the resume lock -- a recovery holding that lock (or waiting for the
+        # service gate) would otherwise deadlock the caller against itself.
+        await self._cancel_doubao_recovery(sid, wait=True)
         lock = self._resume_lock(sid)
         async with lock:
+            existing = self.sessions.get(sid)
+            if existing is not None and str(existing.status or "") == RECOVERING_STATUS:
+                # The cancelled recovery left the object abandoned mid-turn with no process: this
+                # resume revives it now, so the abandoned predecessor must finalize like any ended
+                # session instead of holding the row at `recovering` forever.
+                existing.status = "interrupted"
+                existing.end_reason = existing.end_reason or "interrupted"
+                existing.ended_at = existing.ended_at or time.time()
             try:
                 result = await self._resume_locked(sid, text, normalized_rules, source)
                 if result.get("resumed") and text and str(text).strip():
@@ -7144,8 +7241,26 @@ class HubSessionManager:
         return self._task_with_session_marker(session_id, clean)
 
     async def _resume_process_session(
-        self, session_id: str, record: Dict[str, Any], text: Optional[str]
+        self,
+        session_id: str,
+        record: Dict[str, Any],
+        text: Optional[str],
+        *,
+        same_turn: bool = False,
+        source: str = "parent",
+        reuse_bridge: bool = False,
+        raw_text: bool = False,
     ) -> AgentSession:
+        """Spawn the revived process for `session_id` and install it as the live session.
+
+        `same_turn` is the Doubao auto-recovery path: the turn is *continued*, not restarted, so the
+        `turn_id`, the `wait_handle` and the parent's awaited completion survive the respawn.
+        `source` only labels the lifecycle event (a recovery is not a user resume). `reuse_bridge`
+        keeps the session's existing MCP pool and bridge file instead of rebuilding them (the pool
+        belongs to this hub process and the crashed CLI never released it). `raw_text` says the
+        message already carries its `[Hub Session: ...]` marker (a replayed `initial_prompt`), so no
+        second marker is appended.
+        """
         loop = asyncio.get_running_loop()
         snapshot = record.get("profile_snapshot") or {}
         ref = record.get("conversation_ref") or {}
@@ -7153,19 +7268,27 @@ class HubSessionManager:
         built = self.build_resume_launch(record)
         built["attach_offset"] = self._resume_attach_offset(engine, ref)
         message = str(text) if text is not None and str(text).strip() else None
+
+        def marked(value: str) -> str:
+            return str(value) if raw_text else self._resume_task_text(session_id, str(value), engine)
+
         prompt_for_tui: Optional[str] = None
+        first_text: Optional[str] = None
         # A10: how the text really travels. "argv" is handed over at spawn, "pending" is typed after
         # the TUI is ready and only then has an outcome (last_injection); pty_written is never faked.
         injection = "none"
         if message:
             if built["message_mode"] == "positional":
-                built["args"].append(self._resume_task_text(session_id, message, engine))
+                first_text = marked(message)
+                built["args"].append(first_text)
                 injection = "argv"
             elif built["message_mode"] == "agy_interactive_flag":
-                built["args"].extend(["-i", self._resume_task_text(session_id, message, engine)])
+                first_text = marked(message)
+                built["args"].extend(["-i", first_text])
                 injection = "argv"
             elif built["message_mode"] == "pty_input":
-                prompt_for_tui = self._resume_task_text(session_id, message, engine)
+                first_text = marked(message)
+                prompt_for_tui = first_text
                 injection = "pending"
 
         # Scheme B: a resumed bridged session re-writes bridge.json against the Hub's current URL
@@ -7181,6 +7304,9 @@ class HubSessionManager:
         sess: Optional[AgentSession] = None
         old: Optional[AgentSession] = None
         bridge_created = False
+        # A recovery reuses the pool the crashed CLI was already wired to: rebuilding it would close
+        # the connections a concurrent bridge call may be using, and its bridge.json is still valid.
+        reuse_existing_bridge = bool(reuse_bridge and self.mcp_pool_registry.get(session_id) is not None)
         # r4 #3: the bump below drops the closed id's tombstone, which is where a code the core still
         # owes would be rewritten; a resume that fails puts both back for the old generation.
         previous_incarnation = self._incarnations.get(session_id, 0)
@@ -7189,7 +7315,7 @@ class HubSessionManager:
             # Scheme B: the bridge is built first so its settings ride in the startup text; from
             # here to the end of the spawn anything may fail, and a failure must not leave the pool,
             # its bridge folder or a spawned child behind.
-            if uses_mcp_bridge(engine, session_kind, mcp_config):
+            if uses_mcp_bridge(engine, session_kind, mcp_config) and not reuse_existing_bridge:
                 bridge_created = True
                 # A resumed session already carries a continue message into the same composer, so
                 # its note is the compact one: both texts must still fit one prompt.
@@ -7203,6 +7329,12 @@ class HubSessionManager:
             # A DB/scrollback read with its own awaits: a slow or broken store fails here, and the
             # bridge above must already be undoable.
             sess = await self._make_resumed_session(session_id, record, snapshot, ref, built)
+            if first_text:
+                # Doubao auto-recovery reads this to replay the text a crash happened before; it is
+                # therefore THIS incarnation's first text (the note included), never the archived
+                # spawn's, so a second crash before submission cannot type the old task twice.
+                sess.profile_snapshot = dict(sess.profile_snapshot)
+                sess.profile_snapshot["initial_prompt"] = prompt_for_tui or first_text
             if mcp_note and not prompt_for_tui:
                 sess._pending_mcp_bridge_note = mcp_note
             if message and injection == "argv":
@@ -7295,9 +7427,23 @@ class HubSessionManager:
         if old is not None:
             self._release_transcripts(session_id)
         await self.db.reset_session_after_resume(session_id)
-        # D2: the same shared helper the live follow-up uses marks the archived answer as the
-        # previous turn's; it stays readable until the resumed turn writes its own.
-        self.begin_new_turn(sess)
+        if same_turn:
+            # Doubao auto-recovery: the SAME turn continues in the revived process. `begin_new_turn`
+            # would mint a new turn id and re-arm the parent's wait handles, which would settle the
+            # awaited turn as a stale one; only the per-turn flags are reset here.
+            if old is not None:
+                sess.turn_id = old.turn_id or sess.turn_id
+                sess.wait_handle = old.wait_handle
+                sess.created_at = old.created_at or sess.created_at
+                sess.step_count = max(int(sess.step_count or 0), int(old.step_count or 0))
+                # P0-1: this turn's own text already landed before the crash, so the successor
+                # carries that per-turn fact too: a second crash continues, never replays turn 1.
+                sess._turn_submitted_for_turn_id = getattr(old, "_turn_submitted_for_turn_id", None)
+            self._begin_recovered_turn(sess)
+        else:
+            # D2: the same shared helper the live follow-up uses marks the archived answer as the
+            # previous turn's; it stays readable until the resumed turn writes its own.
+            self.begin_new_turn(sess)
         await self.persist_session(sess)
 
         if engine == "codex":
@@ -7334,7 +7480,11 @@ class HubSessionManager:
                 "type": "resumed",
                 "category": "lifecycle",
                 "status": "resumed",
-                "content": f"会话已恢复（第 {sess.resume_count} 次）",
+                "content": (
+                    f"会话已恢复（第 {sess.resume_count} 次）" if source == "parent"
+                    else f"会话已自动恢复（第 {sess.resume_count} 次续接）"
+                ),
+                **({"data": {"source": source}} if source != "parent" else {}),
             },
         )
         delivery = {
@@ -7439,7 +7589,8 @@ class HubSessionManager:
         status = rec.get("status")
         end_reason = rec.get("end_reason")
         # V5: an archived record must never report a live status; its end state is what happened.
-        if (rec.get("archived_at") or end_reason) and str(status or "") in LIVE_STATUSES:
+        if (rec.get("archived_at") or end_reason) and (
+                str(status or "") in LIVE_STATUSES or str(status or "") == RECOVERING_STATUS):
             status = end_reason or status
         return {
             "session_id": rec.get("session_id"),
@@ -7537,7 +7688,7 @@ class HubSessionManager:
             if not rec.get("archived_at"):
                 fields["archived_at"] = now
                 fields["ended_at"] = rec.get("ended_at") or now
-                if status in LIVE_STATUSES:
+                if status in LIVE_STATUSES or status == RECOVERING_STATUS:
                     live_at_stop[sid] = {"engine": str(rec.get("engine") or "").strip().lower(), "status": status}
                     fields["status"] = "interrupted"
                     fields["end_reason"] = "interrupted"
@@ -7556,8 +7707,34 @@ class HubSessionManager:
         return live_at_stop
 
     async def close_session(self, session_id: str, source: str = "console") -> Dict[str, Any]:
-        async with self._resume_lock(session_id):
+        """Close a session, never hanging behind a Doubao recovery that holds the resume lock.
+
+        P0-2: `_recover_doubao_once` holds `_resume_lock(session_id)` across its spawn, which may
+        block for as long as the CLI takes to start. Taking that lock first (as the close used to)
+        made a terminate/close wait behind the very task it is meant to cancel -- forever, when the
+        spawn blocks. The recovery is therefore cancelled and awaited OUTSIDE the lock: it unwinds
+        at its next await, and its `async with` releases the lock. Only then is the lock taken (bounded,
+        a backstop only) and `_close_session` run against whatever live object the id now lists.
+        """
+        await self._cancel_doubao_recovery(session_id)
+        lock = self._resume_lock(session_id)
+        acquired = False
+        try:
+            await asyncio.wait_for(lock.acquire(), CLOSE_RESUME_LOCK_WAIT_SEC)
+            acquired = True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] close: the resume lock was still held %.1f s after cancelling the recovery; "
+                "closing anyway", session_id, CLOSE_RESUME_LOCK_WAIT_SEC,
+            )
+        try:
+            # A death that landed while the close was cancelling may have scheduled the recovery
+            # again; it is stopped here too, before the object is closed.
+            await self._cancel_doubao_recovery(session_id)
             return await self._close_session(session_id, source)
+        finally:
+            if acquired:
+                lock.release()
 
     async def _close_session(self, session_id: str, source: str) -> Dict[str, Any]:
         """B9: removes a session from the live list without rewriting the status an ended process already earned.
@@ -7570,6 +7747,14 @@ class HubSessionManager:
         had. "auto_cleanup" identifies the Hub's completed-session timeout.
         Returns {"found": bool, "was_alive": bool, "status": str}.
         """
+        # Doubao auto-recovery runs in its own task; a close must end it first, or the recovery would
+        # spawn a CLI for a session the user is closing. Not a terminate message: the close writes
+        # its own one lifecycle event below.
+        was_recovering = False
+        current = self.sessions.get(session_id)
+        if current is not None:
+            was_recovering = str(current.status or "") == RECOVERING_STATUS
+        await self._cancel_doubao_recovery(session_id)
         sess = self.sessions.get(session_id)
         if not sess:
             return {"found": False, "was_alive": False, "status": None}
@@ -7581,6 +7766,14 @@ class HubSessionManager:
         terminated = await sess.terminate()
         if terminated:
             sess.end_reason = "terminated"
+        if was_recovering and not terminated:
+            # The session being recovered has no process any more; the user still ended it, so its
+            # row says terminated and the parent gets the one terminated event a terminate owes it
+            # (the exit callback cannot: the death it would announce was already consumed).
+            sess.status = "terminated"
+            sess.end_reason = "terminated"
+            sess.terminated_by_user = True
+            sess.current_activity = "Terminated by parent/user"
         if source == "auto_cleanup":
             sess.current_activity = TERMINATED_MESSAGES["auto_cleanup"]
         await self._archive_session(sess, snapshot=archive_snapshot)
@@ -7616,19 +7809,23 @@ class HubSessionManager:
         self._release_transcripts(session_id)
         # The bridge goes with the session: its pool, its MCP child processes and its folder.
         await self._release_mcp_bridge(session_id)
-        if terminated or (was_alive and sess.status == "terminated") or source == "auto_cleanup":
+        if terminated or (was_alive and sess.status == "terminated") or source == "auto_cleanup" \
+                or was_recovering:
             await self.record_worker_event(
                 session_id,
                 {
-                    "type": "terminated" if was_alive else "closed",
+                    "type": "terminated" if (was_alive or was_recovering) else "closed",
                     "category": "lifecycle",
                     "status": sess.status,
-                    "content": TERMINATED_MESSAGES.get(
-                        str(source or "").lower(),
-                        TERMINATED_MESSAGES["console"],
+                    "content": (
+                        "豆包自动恢复进行中，被用户终止" if was_recovering
+                        else TERMINATED_MESSAGES.get(str(source or "").lower(),
+                                                     TERMINATED_MESSAGES["console"])
                     ),
                 },
             )
+        # The id is closed for good: its recovery policy state (budget, crash context) has no reader.
+        self._doubao_recovery.pop(session_id, None)
         return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
 
     def _restart_live_snapshot(self) -> Dict[str, Dict[str, str]]:
@@ -7641,6 +7838,7 @@ class HubSessionManager:
             sid: {"engine": str(sess.engine or "").strip().lower(), "status": str(sess.status or "")}
             for sid, sess in self.sessions.items()
             if sess.is_process_alive() or str(sess.status or "") in LIVE_STATUSES
+            or str(sess.status or "") == RECOVERING_STATUS
         }
 
     @property
@@ -7666,6 +7864,16 @@ class HubSessionManager:
         """
         if self.restart_in_progress:
             raise RuntimeError("Hub 已在关闭或重启中")
+        # Doubao auto-recovery: nothing may spawn a Doubao CLI after a restart was accepted. The
+        # freeze goes first, then the pending recovery tasks are cancelled -- a session that is
+        # `recovering` right now is part of the snapshot below and is archived as interrupted, not
+        # left to a recovery that would fight the stop.
+        self._recovery_frozen = True
+        for sid in list(self._recovery_tasks):
+            try:
+                self._cancel_recovery_now(sid)
+            except Exception:
+                logger.exception("[%s] could not cancel its recovery before the restart", sid)
         restart_id = str(restart_id or "").strip() or uuid.uuid4().hex
         requested_at = time.time()
         sessions = self._restart_live_snapshot()
@@ -7706,8 +7914,10 @@ class HubSessionManager:
             self._restart_mode = None
             self._restart_requested_at = None
             # No request on disk means no restart: the snapshot taken above must not outlive it,
-            # or a death after the failed write would be fenced as if a resume awaited it.
+            # or a death after the failed write would be fenced as if a resume awaited it. Recovery
+            # goes back on too: the stop this freeze belonged to never happened.
             self._stop_live_at = {}
+            self._recovery_frozen = False
             raise
         return {
             "restart_id": restart_id,
@@ -7780,6 +7990,16 @@ class HubSessionManager:
             # was started: an API call or a plain signal.
             planned = RestartResumeRequest.peek(self.data_dir) is not None
         self._planned_restart = bool(planned)
+        # Doubao auto-recovery: a stop is not a turn failure, and a recovery that spawned a CLI
+        # mid-stop would fight the kill and the archive. Freeze first (the flag is read before every
+        # spawn), then cancel the pending backoffs -- what is still `recovering` is cut off, and the
+        # archive below records it as interrupted, resumable, and resumed by the next start.
+        self._recovery_frozen = True
+        for sid in list(self._recovery_tasks):
+            try:
+                self._cancel_recovery_now(sid)
+            except Exception:
+                logger.exception("[%s] could not cancel its recovery during the stop", sid)
         stop_id = uuid.uuid4().hex[:8]
         # Before any drain, kill or archive: the sessions that were alive when the stop began, and
         # the status each really had (`completed` idle vs `running` mid-turn). A planned restart
@@ -7789,6 +8009,7 @@ class HubSessionManager:
             sid: {"engine": str(sess.engine or "").strip().lower(), "status": str(sess.status or "")}
             for sid, sess in self.sessions.items()
             if sess.is_process_alive() or str(sess.status or "") in LIVE_STATUSES
+            or str(sess.status or "") == RECOVERING_STATUS
         }
         if self._planned_restart and self._stop_live_at:
             # `prepare_graceful_restart` already fenced this restart and recorded what was live
@@ -7879,7 +8100,9 @@ class HubSessionManager:
                 reasons[sess.session_id] = "interrupted"
                 sess.status = "interrupted"
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
-            elif sess.is_process_alive():
+            elif sess.is_process_alive() or str(sess.status or "") == RECOVERING_STATUS:
+                # Doubao auto-recovery: a session cut off while `recovering` has no process, but it
+                # is still mid-turn; the stop ends it as an interruption the next start resumes.
                 reasons[sess.session_id] = "interrupted"
                 sess.status = "interrupted"
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
@@ -10273,7 +10496,15 @@ class HubSessionManager:
         """
         session._turn_completion_emitted = False
         session.turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+        # P0-1: a new turn has submitted nothing yet; its own submit proves it again.
+        session._turn_submitted_for_turn_id = None
         session.final_response_from_previous_turn = bool(session.final_response)
+        # Doubao auto-recovery: a turn that really completed earns the next one a fresh per-turn
+        # attempt counter. The rolling window across turns is kept, which is what caps a service
+        # that keeps dropping; only a clean turn says the service is well again.
+        budget = (self._doubao_recovery.get(session.session_id) or {}).get("budget")
+        if budget is not None:
+            budget.note_turn_end(completion_reported=bool(session.completion_reported))
         session.completion_reported = False
         session.last_turn_outcome = None
         session.last_turn_error = None
@@ -10300,6 +10531,30 @@ class HubSessionManager:
                 pass
         if status is not None:
             session.status = status
+
+    def _begin_recovered_turn(self, session: AgentSession, attempt: int = 1,
+                              max_attempts: int = 1) -> None:
+        """Doubao auto-recovery: continue the SAME turn in the revived process.
+
+        `begin_new_turn` would mint a new `turn_id` and re-arm the parent's wait handles, so a
+        recovery that followed it would settle the turn the parent is still awaiting as a stale one.
+        Everything a turn needs to restart safely is reset here instead, and the identity is kept:
+        the same `turn_id`, the same `wait_handle`, the same `created_at` and the same step count.
+        `final_response_from_previous_turn` is forced on: whatever answer the row still holds is an
+        earlier turn's, and the recovered turn's first answer replaces it whatever its source
+        priority, exactly as `begin_new_turn` decides for a resume.
+        """
+        session._turn_completion_emitted = False
+        session.final_response_from_previous_turn = True
+        session.completion_reported = False
+        session.last_turn_outcome = ""
+        session.last_turn_error = None
+        session.undelivered_messages = []
+        session._pending_engine_error = None
+        session._omp_error_busy_at = None
+        session._codex_reconnect = None
+        session._seen_tui_prompt_signatures.clear()
+        session.current_activity = attempt_activity(attempt, max_attempts)
 
     @staticmethod
     def _tui_writer_queue(session: Any) -> TuiWriterQueue:
@@ -13204,6 +13459,43 @@ class HubSessionManager:
                 pass
             await asyncio.sleep(TRANSCRIPT_TAIL_INTERVAL_SEC)
 
+    async def _observe_doubao_service_state(self, session: AgentSession, screen_text: str) -> None:
+        """Notice a shared-service disconnect, and prove the service ready again.
+
+        A `auth_unavailable` row is recorded on the session (never published: it is not a turn end,
+        not an approval and not a wake) as the evidence the exit path needs, because the CLI's exit
+        alone (`exit_code=3`) says nothing about the shared service. The row is usually followed by
+        an immediate exit; a CLI that keeps drawing it is killed as a client after
+        `DOUBAO_LINK_LOSS_KILL_AFTER_SEC` -- the kill only ends this session's client (its
+        `job_policy` is `client_only`), and `_on_session_exit` then starts the recovery.
+
+        A screen that draws the idle composer proves the shared service is answering, which is
+        what releases the recoveries waiting at the hub-wide gate.
+        """
+        info = detect_doubao_service_link_loss(screen_text)
+        if info is not None:
+            if getattr(session, "_doubao_link_loss", None) is None:
+                session._doubao_link_loss = info
+                session._doubao_link_loss_at = time.time()
+                logger.info("[%s] Doubao shared service disconnected (%s): %s",
+                            session.session_id, info.get("code"), link_loss_detail(info))
+                return
+            seen_at = float(getattr(session, "_doubao_link_loss_at", None) or 0.0)
+            if (not getattr(session, "_doubao_link_loss_killed", False)
+                    and (time.time() - seen_at) >= DOUBAO_LINK_LOSS_KILL_AFTER_SEC
+                    and session.is_process_alive()):
+                session._doubao_link_loss_killed = True
+                logger.info("[%s] Doubao CLI still alive %.0f s after its link loss; ending that client",
+                            session.session_id, time.time() - seen_at)
+                try:
+                    await asyncio.to_thread(session.kill, KILL_GRACE_MS)
+                except Exception:
+                    logger.exception("[%s] could not end the Doubao client after its link loss",
+                                     session.session_id)
+            return
+        if doubao_has_idle_composer(screen_text):
+            self.doubao_service_gate.note_service_ready()
+
     async def _watch_doubao_session(self, session: AgentSession, root: Optional[Path] = None):
         """Follows one Doubao CLI conversation: `assignment.md` marker, trajectory, screen turn ends.
 
@@ -13390,6 +13682,7 @@ class HubSessionManager:
             if now - last_screen_at >= DOUBAO_SCREEN_POLL_SEC:
                 last_screen_at = now
                 screen_text = session.read_screen(max_lines=max(40, int(getattr(session, "rows", 38) or 38))).text
+                await self._observe_doubao_service_state(session, screen_text)
                 # A busy marker is only drawn near the composer, and `Processing` only as a
                 # status row with a leading glyph; a transcript row that merely quotes it must
                 # not hold the turn open.
@@ -14194,6 +14487,9 @@ class HubSessionManager:
 
     async def _submit_codex_text(self, session: AgentSession, text: str, submit_key: str) -> Dict[str, Any]:
         """One paste, at most one Enter, and exact native user-message proof. Never retry Enter."""
+        # P1-4: the paste and the Enter are PTY writes; a replaced/abandoned object types nothing.
+        if not self._tui_startup_session_current(session):
+            return self._tui_submit_superseded_result()
         if getattr(session, "_tui_draft_pending", None) and not self._reconcile_codex_submit(session):
             return {"ok": False, "reason": "input_recovery_required", "attempts": 0, "label": "失败"}
         clean = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -14232,6 +14528,10 @@ class HubSessionManager:
                  "pty_written": True, "extra_press": False}
         reason = "typed_text_not_settled"
         if settled and not self._tui_blocking_dialog(screen, session) and not session.pending_interaction:
+            # P1-4: re-check after the settle await: the Enter must never reach a successor's PTY.
+            if not self._tui_startup_session_current(session):
+                session._tui_draft_pending = None
+                return self._tui_submit_superseded_result()
             if session.write_input(submit_key):
                 draft["attempts"] = 1
                 deadline = time.monotonic() + TUI_SUBMIT_EVIDENCE_SEC
@@ -14478,6 +14778,10 @@ class HubSessionManager:
         clean = str(text).replace("\r", " ").replace("\n", " ").strip()
         if not clean:
             return {"ok": False, "reason": "empty_text", "attempts": 0, "label": "失败"}
+        # P1-4: the text is typed into a PTY. A Doubao recovery that installed a successor under
+        # this id while the caller waited must never receive this dead object's keystrokes.
+        if not self._tui_startup_session_current(session):
+            return self._tui_submit_superseded_result()
         size_before = 0
         if session.transcript_path:
             try:
@@ -14516,6 +14820,10 @@ class HubSessionManager:
         marks: Dict[str, Any] = {"screen": screen, "expected_text": clean}
         while attempts < TUI_SUBMIT_MAX_TRIES:
             attempts += 1
+            # P1-4: the await above (settle / evidence) may have straddled a recovery; the Enter
+            # would land in the successor's composer, so it is never pressed on a replaced object.
+            if not self._tui_startup_session_current(session):
+                return self._tui_submit_superseded_result()
             marks.update(self._tui_submit_marks(session, marks.get("screen") or "", engine, probe))
             session.write_input(submit_key)
             state, reason = await self._confirm_tui_submit(
@@ -14592,6 +14900,12 @@ class HubSessionManager:
         an unchecked one (an unknown composer) gets no grey line, as nothing was checked.
         """
         session.last_injection = result
+        if result.get("ok") is True:
+            # P0-1: a submit this turn's own text is proved -- a startup task, a checked parent
+            # follow-up, or a resume text. The turn id is recorded, so a later crash continues this
+            # turn instead of replaying turn 1's initial prompt (the mode alone stops saying so once
+            # a follow-up rewrites it).
+            session._turn_submitted_for_turn_id = session.turn_id
         what = "消息提交" if result.get("mode") == "parent_message" else "启动文本注入"
         delivery_status = "confirmed" if result.get("ok") is True else (
             "failed" if result.get("ok") is False else "unconfirmed"
@@ -14626,6 +14940,14 @@ class HubSessionManager:
         if (result.get("mode") == "parent_message" and not feedback_hold
                 and self._live_message_undelivered(result)):
             await self._publish_undelivered(session, result)
+        if (getattr(session, "_recovery_abandoned", False) or session.superseded
+                or (session.session_id in self.sessions
+                    and self.sessions[session.session_id] is not session)):
+            # P1-4: the object was abandoned or replaced while this text was being typed. Its row
+            # belongs to the successor now, so persisting this stale state would overwrite it.
+            logger.info("[%s] input delivery not persisted: the session was replaced",
+                        session.session_id)
+            return
         try:
             await self.persist_session(session)
         except PersistenceUnavailable:
@@ -14713,6 +15035,33 @@ class HubSessionManager:
                 logger.info("[%s] %d unconfirmed message(s) reached the transcript later", session.session_id, len(pending))
         return [dict(item) for item in items]
 
+    def _tui_startup_session_current(self, session: AgentSession) -> bool:
+        """P1-4: True while this object still owns its id and its own process is alive.
+
+        The startup watcher awaits (a writer turn, a settle, an evidence window), and a Doubao
+        recovery can install a successor under the SAME id while it waits. A keystroke or a
+        persisted row from the dead object would then land in the successor's PTY or overwrite the
+        successor's row. Every PTY write, every Enter and the persist of the startup submission
+        therefore asks this first: the object must not be abandoned, not superseded, still be the
+        one `self.sessions` lists for the id, and its process alive.
+        """
+        if getattr(session, "_recovery_abandoned", False):
+            return False
+        if bool(getattr(session, "superseded", False)):
+            return False
+        session_id = str(getattr(session, "session_id", "") or "")
+        if session_id in self.sessions and self.sessions[session_id] is not session:
+            return False
+        try:
+            return bool(session.is_process_alive())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _tui_submit_superseded_result() -> Dict[str, Any]:
+        """The submit result for a session a recovery replaced: nothing was written, nothing proved."""
+        return {"ok": False, "reason": "session_superseded", "attempts": 0, "label": "失败"}
+
     async def _auto_handle_tui_startup_and_trust(
         self,
         session: AgentSession,
@@ -14746,7 +15095,18 @@ class HubSessionManager:
         try:
             if claim is not None:
                 await claim.wait_turn()
+                # P1-4: the turn this claim waited for may have taken a while; a recovery that
+                # replaced the object meanwhile means this text must never be typed at all.
+                if not self._tui_startup_session_current(session):
+                    logger.info("[%s] startup text not typed: the session was replaced or ended",
+                                session.session_id)
+                    return
             await self._watch_tui_startup_and_type(session, task_to_inject, startup_delay, submit_key)
+            # P1-4: and never report anything on the successor's behalf after that await either.
+            if not self._tui_startup_session_current(session):
+                logger.info("[%s] startup watcher finished on a replaced/ended object",
+                            session.session_id)
+                return
         finally:
             session._startup_watch_active = False
             session._startup_inject_pending = False
@@ -14794,6 +15154,12 @@ class HubSessionManager:
         retypes = 0
 
         while session.status in ("starting", "running"):
+            if getattr(session, "_recovery_abandoned", False) or not session.is_process_alive():
+                # Doubao auto-recovery (and any other death): an abandoned object or one whose
+                # process is already gone must stop typing at once. A recovery that replaced the
+                # session owns the new object and its own startup watcher; keystrokes typed into
+                # this dead screen would be lost (or land in the successor's PTY).
+                return
             await asyncio.sleep(TUI_DIALOG_POLL_SEC)
             if session.status not in ("starting", "running"):
                 return
@@ -14808,9 +15174,13 @@ class HubSessionManager:
                     await asyncio.sleep(TUI_TRUST_OPEN_GUARD_SEC)
                     if session.status not in ("starting", "running"):
                         return
+                    if not self._tui_startup_session_current(session):
+                        return
                     session.write_input("\x1b[B")
                     await asyncio.sleep(0.25)
                     if session.status not in ("starting", "running"):
+                        return
+                    if not self._tui_startup_session_current(session):
                         return
                     screen_txt = session.read_screen(max_lines=40).text
                     trust_screen = None
@@ -14826,6 +15196,10 @@ class HubSessionManager:
                     if (stable_for_trust and retry_due
                             and trust_presses < TUI_TRUST_MAX_ATTEMPTS
                             and not TUI_TRUST_NO_FOCUSED_RE.search(screen_txt)):
+                        # P1-4: the trust Enter is a PTY write too: only this object's own live
+                        # process may be pressed, never a successor installed under the same id.
+                        if not self._tui_startup_session_current(session):
+                            return
                         session.write_input("\r")
                         trust_presses += 1
                         trust_last_press = time.time()
@@ -14901,8 +15275,13 @@ class HubSessionManager:
                     ready["banner_fallback"] = True
 
             if not typed and ready["ready"] and (now - start) >= startup_delay:
+                if not self._tui_startup_session_current(session):
+                    return
                 prior = None if rejected is None else dict(rejected, retyped=retypes)
                 result = await self._submit_text_to_tui(session, task_to_inject, submit_key, prior=prior)
+                if not self._tui_startup_session_current(session) and result.get("reason") != "session_superseded":
+                    # P1-4: the submit's own await may have straddled a recovery; never record it.
+                    return
                 result["ready"] = ready
                 result["trust_dismissed"] = trust_dismissed
                 result["at"] = round(time.time(), 3)
@@ -15049,35 +15428,676 @@ class HubSessionManager:
                 self._release_transcripts(session_id)
                 self._user_terminated.discard(session_id)
                 return
+        if sess is not None and getattr(sess, "_recovery_abandoned", False):
+            # Doubao auto-recovery: this object was already superseded by a recovered successor (or
+            # its turn belongs to one). Its death must neither rewrite a row nor start a second
+            # attempt; the successor owns the id, its row and its own lifecycle event.
+            return
+        link_loss = detect_doubao_service_link_loss(final_snapshot.get("screen_text") or "") or (
+            getattr(sess, "_doubao_link_loss", None) if sess is not None else None
+        )
+        if sess is not None and link_loss is not None and self._doubao_recovery_eligible(
+                session_id, sess, exit_code, link_loss):
+            await self._start_doubao_recovery(session_id, sess, exit_code, link_loss, final_snapshot)
+            return
+        exhausted = None
+        if sess is not None and link_loss is not None:
+            # The link loss is real but the budget is spent (or the hub may not recover now): the
+            # ordinary finalization path carries the exhausted sentence and data, so the parent's
+            # wait handle settles as failed on facts instead of on a bare "crashed".
+            exhausted = await self._doubao_recovery_exhausted_state(session_id, sess, link_loss)
+        await self._finalize_session_exit(session_id, sess, exit_code, final_snapshot,
+                                          exhausted=exhausted)
+
+    async def _finalize_session_exit(self, session_id: str, sess: Optional[AgentSession],
+                                     exit_code: Optional[int],
+                                     snapshot: Optional[Dict[str, Any]] = None,
+                                     *, exhausted: Optional[Dict[str, Any]] = None) -> str:
+        """The one ordinary exit finalization: final row, one lifecycle event, transcript release.
+
+        Both a natural exit and a Doubao recovery that ran out of attempts end here, so an exhausted
+        recovery's row, event and reclaim behave exactly like any other crashed session; `exhausted`
+        only replaces the event's text/data with the recovery-specific failure facts.
+        """
         end_reason = "exited"
         if sess is not None:
             if exit_code is not None:
                 # F1/F2: a death the core gave no code for stays None; a code the death record
                 # lacked was already written by the late record, and never becomes a clean 0 here.
                 sess.exit_code = exit_code
-            self._finalize_session(sess, snapshot=final_snapshot)
+            self._finalize_session(sess, snapshot=snapshot)
             # A7: the object is the live one, so its status follows its own end state (the PTY reader
             # normally did this already; doing it here keeps the callback self-contained).
             if sess.end_reason:
                 sess.status = sess.end_reason
             # The final record writes the scrollback and the mailbox thread once, here (spec §3, A11).
-            await self.persist_session(sess, force_scrollback=True, final=True,
-                                       snapshot=final_snapshot)
+            await self.persist_session(sess, force_scrollback=True, final=True, snapshot=snapshot)
             end_reason = sess.end_reason or "exited"
         ev_type = "crashed" if end_reason == "crashed" else "exited"
-        await self.record_worker_event(
-            session_id,
-            {
-                "type": ev_type,
-                "category": "lifecycle",
-                "status": end_reason,
-                "content": self._exit_event_content(session_id, exit_code, sess, final_snapshot),
-            },
-        )
+        payload: Dict[str, Any] = {
+            "type": ev_type,
+            "category": "lifecycle",
+            "status": end_reason,
+            "content": self._exit_event_content(session_id, exit_code, sess, snapshot),
+        }
+        if exhausted:
+            # Doubao auto-recovery spent its budget: the parent-visible failure names the CLI's own
+            # code, how many attempts were really made, the last error and the standard two-step
+            # hint (`get_subagent_final_response`, plus `resume_subagent` when it is still resumable).
+            resumable = bool(getattr(sess, "resumable", False)) if sess is not None else False
+            payload["content"] = exhaustion_message(
+                session_id,
+                exit_code=exhausted.get("exit_code", exit_code),
+                attempts=int(exhausted.get("attempts") or 0),
+                max_attempts=int(exhausted.get("max_attempts") or 0),
+                error_detail=exhausted.get("detail") or "",
+                resumable=resumable,
+                reason=str(exhausted.get("reason") or ""),
+                code=str(exhausted.get("code") or DOUBAO_LINK_LOSS_CODE),
+            )
+            payload["data"] = exhaustion_event_data(
+                int(exhausted.get("attempts") or 0),
+                int(exhausted.get("max_attempts") or 0),
+                code=str(exhausted.get("code") or DOUBAO_LINK_LOSS_CODE),
+                exit_code=exhausted.get("exit_code", exit_code),
+            )
+        await self.record_worker_event(session_id, payload)
         # Q12: the exit event is out. The process ended on its own, so its conversation is nobody's
         # live transcript any more and the one-lifecycle-event marker must not outlive it.
         self._release_transcripts(session_id)
         self._user_terminated.discard(session_id)
+        return end_reason
+
+    # ---------------------------------------------------------------------------------------------
+    # Doubao auto-recovery: `auth_unavailable` (the shared service dropped mid-turn)
+    # ---------------------------------------------------------------------------------------------
+
+    def _doubao_state(self, session_id: str) -> Dict[str, Any]:
+        """The per-session recovery policy state (its budget, its last crash context)."""
+        state = self._doubao_recovery.get(session_id)
+        if state is None:
+            state = {"budget": RecoveryBudget.from_env(), "crash": {}, "last_error": ""}
+            self._doubao_recovery[session_id] = state
+        return state
+
+    def _doubao_budget(self, session_id: str) -> RecoveryBudget:
+        return self._doubao_state(session_id)["budget"]
+
+    def doubao_recovery_view(self, session_id: str) -> Dict[str, Any]:
+        """The public counters a status view may show (never the crash object or the snapshot)."""
+        budget = (self._doubao_recovery.get(session_id) or {}).get("budget")
+        if budget is None:
+            return {}
+        return {
+            "attempts": int(budget.attempts),
+            "max_attempts": int(budget.max_attempts),
+            "rolling_attempts": budget.rolling_attempts(),
+            "rolling_max": int(budget.rolling_max),
+        }
+
+    def _doubao_recovery_interrupted(self, session_id: str) -> bool:
+        """True when nothing may spawn for this id any more (or the session is now owned elsewhere)."""
+        if self._recovery_frozen or self._shutting_down or self._planned_restart:
+            return True
+        if session_id in self._user_terminated:
+            return True
+        sess = self.sessions.get(session_id)
+        if sess is not None and (sess.terminated_by_user or sess.superseded):
+            return True
+        return False
+
+    def _doubao_recovery_eligible(self, session_id: str, sess: AgentSession,
+                                  exit_code: Optional[int],
+                                  link_loss: Optional[Dict[str, Any]]) -> bool:
+        """Whether this death is a recoverable shared-service disconnect.
+
+        Only a `auth_unavailable` row plus a doubao TUI that was really mid-work qualifies: the
+        status before the death must be starting/running/waiting_parent (never completed), the turn
+        must not have reported completion, the user must not have ended it, and the hub must not be
+        stopping or restarting. A spent budget also refuses here; the caller then finalizes with the
+        exhausted sentence instead of a bare `crashed`.
+        """
+        if link_loss is None or sess is None:
+            return False
+        if str(getattr(sess, "engine", "") or "").strip().lower() != "doubao":
+            return False
+        if str(getattr(sess, "kind", "") or "") != "tui":
+            return False
+        if sess.terminated_by_user or sess.superseded:
+            return False
+        if getattr(sess, "_recovery_abandoned", False):
+            return False
+        status_before = str(getattr(sess, "_status_before_death", None) or sess.status or "")
+        if status_before not in ("starting", "running", "waiting_parent"):
+            return False
+        if bool(getattr(sess, "completion_reported", False)):
+            return False
+        if not doubao_auto_recovery_enabled():
+            return False
+        if self._recovery_frozen or self._shutting_down or self._planned_restart:
+            return False
+        return self._doubao_budget(session_id).can_attempt()
+
+    async def _doubao_recovery_exhausted_state(self, session_id: str, sess: AgentSession,
+                                               link_loss: Optional[Dict[str, Any]]
+                                               ) -> Optional[Dict[str, Any]]:
+        """The failure facts when the link loss is real but no attempt is left (None otherwise)."""
+        if link_loss is None or sess is None or not doubao_auto_recovery_enabled():
+            return None
+        budget = self._doubao_budget(session_id)
+        if int(budget.attempts) <= 0:
+            return None
+        reason = budget.exhausted_reason()
+        if not reason:
+            return None
+        state = self._doubao_state(session_id)
+        return {
+            "attempts": int(budget.attempts),
+            "max_attempts": int(budget.max_attempts),
+            "reason": reason,
+            "detail": state.get("last_error") or link_loss_detail(link_loss),
+            "code": str(link_loss.get("code") or DOUBAO_LINK_LOSS_CODE),
+        }
+
+    async def _start_doubao_recovery(self, session_id: str, sess: AgentSession,
+                                     exit_code: Optional[int],
+                                     link_loss: Dict[str, Any],
+                                     final_snapshot: Optional[Dict[str, Any]]) -> None:
+        """Abandon the dead object and queue the recovery in its own task.
+
+        The exit callback itself must never await the recovery: `_end_predecessor` waits on this
+        exit task while holding the resume lock, and a recovery holding that lock would deadlock.
+        The dead object is *abandoned* rather than finalized: its row keeps `recovering` (so a
+        planned restart still archives it as interrupted), and every late record for it is ignored.
+        """
+        budget = self._doubao_budget(session_id)
+        attempt = int(budget.attempts) + 1
+        max_attempts = int(budget.max_attempts)
+        state = self._doubao_state(session_id)
+        state["crash"] = {
+            "exit_code": exit_code,
+            "ended_at": float(sess.ended_at or time.time()),
+            "link_loss": dict(link_loss),
+            "final_snapshot": dict(final_snapshot or EMPTY_SNAPSHOT),
+            "detail": link_loss_detail(link_loss),
+        }
+        state["last_error"] = link_loss_detail(link_loss)
+        try:
+            # An approval/question card drawn before the crash belongs to a process that is gone; the
+            # re-run raises a fresh one. Left in place, it would linger on the card and could be auto
+            # approved against a call that no longer exists.
+            await self.clear_pending_interaction(sess)
+        except PersistenceUnavailable:
+            raise
+        except Exception:
+            logger.exception("[%s] could not clear the pending interaction before recovery", session_id)
+        sess.status = RECOVERING_STATUS
+        sess.end_reason = None
+        sess.ended_at = None
+        sess.exit_code = None
+        sess.current_activity = attempt_activity(attempt, max_attempts)
+        # D2: whatever answer the row still holds belongs to an earlier turn; the recovered turn's
+        # first source replaces it whatever its rank.
+        sess.final_response_from_previous_turn = True
+        sess._recovery_abandoned = True
+        try:
+            await self.record_worker_event(
+                session_id,
+                {
+                    # Not a wake type: the parent is still awaiting this turn, and a recovery progress
+                    # row must never settle or interrupt it.
+                    "type": "auto_recovery",
+                    "category": "lifecycle",
+                    "status": RECOVERING_STATUS,
+                    "content": (
+                        f"豆包共享服务断开（{str(link_loss.get('code') or DOUBAO_LINK_LOSS_CODE)}），"
+                        f"正在自动恢复（第 {attempt}/{max_attempts} 次）"
+                    ),
+                    "data": recovery_event_data(
+                        attempt, max_attempts,
+                        code=str(link_loss.get("code") or DOUBAO_LINK_LOSS_CODE),
+                        detail=link_loss_detail(link_loss),
+                        exit_code=exit_code,
+                    ),
+                },
+            )
+        except PersistenceUnavailable:
+            raise
+        await self.persist_session(sess)
+        task = asyncio.create_task(self._run_doubao_recovery(session_id))
+        self._recovery_tasks[session_id] = task
+        self._background_tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._background_tasks.discard(finished)
+            if self._recovery_tasks.get(session_id) is finished:
+                self._recovery_tasks.pop(session_id, None)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error is not None:
+                # Never leak: the recovery task's failure is logged here, and the session keeps the
+                # status it had; the next poll shows a session that never came back.
+                logger.error("[%s] the Doubao recovery task failed: %s", session_id, error)
+
+        task.add_done_callback(_done)
+
+    async def _run_doubao_recovery(self, session_id: str) -> None:
+        """Backoff → spawn → verify, bounded by the session's budget; never holds the resume lock."""
+        state = self._doubao_state(session_id)
+        budget: RecoveryBudget = state["budget"]
+        succeeded = False
+        try:
+            while True:
+                if self._doubao_recovery_interrupted(session_id):
+                    return
+                try:
+                    attempt = budget.begin_attempt()
+                except RuntimeError:
+                    await self._fail_doubao_recovery(session_id)
+                    return
+                delay = budget.delay_for(attempt)
+                proceeded = await sleep_with_abort(
+                    delay,
+                    sleep=self._recovery_sleep,
+                    abort=lambda: self._doubao_recovery_interrupted(session_id),
+                    poll_sec=DOUBAO_RECOVERY_ABORT_POLL_SEC,
+                )
+                if not proceeded or self._doubao_recovery_interrupted(session_id):
+                    return
+                try:
+                    await self._recover_doubao_once(session_id, attempt)
+                    succeeded = True
+                    return
+                except DoubaoRecoveryAborted:
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    state["last_error"] = str(error) or error.__class__.__name__
+                    logger.warning("[%s] Doubao recovery attempt %s failed: %s",
+                                   session_id, attempt, state["last_error"])
+                    if self._recovery_frozen or self._shutting_down or self._planned_restart:
+                        return
+                    if not budget.can_attempt():
+                        await self._fail_doubao_recovery(session_id)
+                        return
+        finally:
+            if not succeeded:
+                # A lead attempt that never proved the service ready must release the sessions waiting
+                # at the gate; a successful one releases them when its composer draws (or on timeout).
+                # The token scopes that release to the lead THIS recovery really took: a sibling whose
+                # attempt failed before acquiring the gate (or that was cancelled there) settles
+                # nothing, so another session's active lead keeps its waiters held.
+                self.doubao_service_gate.note_attempt_settled(state.get("lead_token"))
+
+    async def _fail_doubao_recovery(self, session_id: str) -> None:
+        """The budget is spent: finalize the row as crashed with the recovery's own failure facts."""
+        state = self._doubao_state(session_id)
+        crash = state.get("crash") or {}
+        sess = self.sessions.get(session_id)
+        budget: RecoveryBudget = state["budget"]
+        detail = state.get("last_error") or crash.get("detail") or ""
+        logger.warning("[%s] Doubao auto-recovery gave up after %s attempt(s): %s",
+                       session_id, budget.attempts, detail)
+        if sess is not None:
+            # The abandoned object becomes the row's owner again for this one finalization; its
+            # status returns to an end state and `crashed` is what the parent already awaits.
+            sess.current_activity = "豆包自动恢复失败（auth_unavailable）"
+            sess._recovery_abandoned = False
+            await self._finalize_session_exit(
+                session_id, sess, crash.get("exit_code"), crash.get("final_snapshot"),
+                exhausted={
+                    "attempts": int(budget.attempts),
+                    "max_attempts": int(budget.max_attempts),
+                    "reason": budget.exhausted_reason() or "自动恢复次数已用尽",
+                    "detail": detail,
+                    "code": str((crash.get("link_loss") or {}).get("code") or DOUBAO_LINK_LOSS_CODE),
+                    "exit_code": crash.get("exit_code"),
+                },
+            )
+            return
+        # The row is already final (a shutdown archived it, or a close won): nothing left to write.
+        logger.info("[%s] no live object to finalize after the exhausted recovery", session_id)
+
+    async def _recover_doubao_once(self, session_id: str, attempt: int) -> None:
+        """One attempt: resume the same conversation, or respawn and replay the exact first text."""
+        old = self.sessions.get(session_id)
+        record = self._record_from_session(old) if old is not None else (
+            await self._load_record_for_resume(session_id) or {}
+        )
+        if not record:
+            raise ValueError(f"找不到会话 {session_id} 的记录，无法自动恢复")
+        snapshot = dict(record.get("profile_snapshot") or {})
+        record["profile_snapshot"] = snapshot
+        if not snapshot:
+            raise ValueError("会话缺少启动快照（profile_snapshot），无法自动恢复")
+
+        submitted = self._doubao_turn_was_submitted(old)
+        if submitted:
+            # A real mid-turn interruption: the revived process reads the same conversation, so one
+            # short continuation is all it needs. Never the original task again.
+            message: Optional[str] = continuation_prompt()
+            raw_text = False
+        else:
+            message = self._doubao_initial_prompt(session_id, record)
+            raw_text = True
+        if message is None and submitted is False and not str(snapshot.get("initial_prompt") or "").strip():
+            # An interactive Doubao session with no task to submit: there is nothing to replay and
+            # nothing to continue, so the attempt only has to bring the CLI back.
+            logger.info("[%s] Doubao recovery: no task text to submit; respawning the CLI only", session_id)
+
+        # Same conversation when the CLI recorded it (or its marker is on disk); otherwise a fresh
+        # launch that replays the archived first text. Never a guess: an unusable ref is checked.
+        ok, reason = self.compute_resumable(record)
+        if not ok:
+            finder = None
+            try:
+                finder = await asyncio.to_thread(
+                    find_doubao_session_by_marker, session_id,
+                    created_at=getattr(old, "created_at", None),
+                )
+            except Exception as error:  # a scan failure must not lose an otherwise valid recovery
+                logger.warning("[%s] Doubao recovery could not scan the CLI store: %s", session_id, error)
+            if isinstance(finder, tuple) and len(finder) == 2 and str(finder[0] or "").strip():
+                conversation_id, found_paths = finder
+                ref = dict(record.get("conversation_ref") or {})
+                ref["session_id"] = str(conversation_id)
+                ref.setdefault("cwd", str(snapshot.get("cwd") or record.get("cwd") or ""))
+                paths = [Path(p) for p in (found_paths or [])]
+                if paths:
+                    ref["transcript_path"] = str(paths[-1])
+                record["conversation_ref"] = ref
+                ok, reason = self.compute_resumable(record)
+        if ok:
+            logger.info("[%s] Doubao recovery attempt %s: resuming conversation %s",
+                        session_id, attempt, (record.get("conversation_ref") or {}).get("session_id"))
+        else:
+            logger.info("[%s] Doubao recovery attempt %s: fresh spawn (resume refused: %s)",
+                        session_id, attempt, reason)
+
+        gate = self.doubao_service_gate
+        # The slot serializes spawns across the hub, honours the min gap, and lets this session wait
+        # for a lead recovery that is still bringing the shared service up (bounded, never forever).
+        # Its `lead_token` is what scopes this attempt's release: only the spawn that really became
+        # the lead may settle it, never a sibling that failed or was cancelled before getting the slot.
+        slot = await gate.acquire_spawn_slot()
+        lead_token = slot.get("lead_token")
+        state = self._doubao_state(session_id)
+        state["lead_token"] = lead_token
+        try:
+            lock = self._resume_lock(session_id)
+            async with lock:
+                if self._doubao_recovery_interrupted(session_id):
+                    raise DoubaoRecoveryAborted()
+                if ok:
+                    new = await self._resume_process_session(
+                        session_id, record, message,
+                        same_turn=True, source="auto_recovery", reuse_bridge=True, raw_text=raw_text,
+                    )
+                else:
+                    new = await self._respawn_doubao_session(session_id, record, message)
+        except BaseException:
+            gate.abort_spawn_slot(lead_token)
+            raise
+        gate.finish_spawn_slot()
+        new = self.sessions.get(session_id)
+        if new is not None and old is not None:
+            # The identity the parent is waiting on survives the respawn: the same turn id, the same
+            # wait handle, the same creation time and the widest step count (the recovered process
+            # continues the turn the parent already has a handle for).
+            new.turn_id = old.turn_id or new.turn_id
+            new.wait_handle = old.wait_handle
+            new.created_at = old.created_at or new.created_at
+            new.step_count = max(int(new.step_count or 0), int(old.step_count or 0))
+            new._doubao_budget = self._doubao_budget(session_id)
+            new.current_activity = attempt_activity(
+                attempt, int(self._doubao_budget(session_id).max_attempts))
+            await self.persist_session(new)
+
+    def _doubao_turn_was_submitted(self, session: Optional[AgentSession]) -> bool:
+        """Whether this turn's own first text really landed in the composer (its Enter succeeded).
+
+        P0-1: the answer may not be read off the latest injection record's mode alone. A follow-up
+        (`send_to_subagent`) rewrites `last_injection` to `parent_message`, and only `startup_task`
+        used to count, so a crash on turn 2+ replayed turn 1's `initial_prompt`. Submission is
+        therefore tracked per turn:
+        - `_turn_submitted_for_turn_id` names the turn whose text was proved (it survives the
+          recovery that hands the turn to a successor);
+        - any successful injection of a submitting mode (`startup_task`, `parent_message`,
+          `resume_task`/`resume_prompt`) is the same proof; a follow-up mode means the turn it
+          continues already got its own text, so it never makes a brand-new turn 1 replay;
+        - a session that already resumed the same conversation once has a turn 1 whose text landed.
+        `final_response_from_previous_turn` is NOT used as evidence: `_start_doubao_recovery` sets
+        it on every mid-turn death, so it says nothing about this turn's submission.
+        Only a brand-new turn 1 whose startup task was never submitted may replay it.
+        """
+        if session is None:
+            return False
+        turn_id = str(getattr(session, "turn_id", "") or "")
+        if turn_id and str(getattr(session, "_turn_submitted_for_turn_id", "") or "") == turn_id:
+            return True
+        injection = getattr(session, "last_injection", None)
+        if isinstance(injection, dict):
+            mode = str(injection.get("mode") or "")
+            if mode == "startup_task" and injection.get("ok") is True:
+                return True
+            if mode in DOUBAO_SUBMITTING_INJECTION_MODES:
+                # A follow-up or a resume text is never turn 1's startup task: the turn it carries
+                # already had its own submitted text.
+                return True
+        ref = getattr(session, "conversation_ref", None)
+        if int(getattr(session, "resume_count", 0) or 0) > 0 and isinstance(ref, dict) \
+                and str(ref.get("session_id") or "").strip():
+            return True
+        return False
+
+    def _doubao_initial_prompt(self, session_id: str, record: Dict[str, Any]) -> Optional[str]:
+        """The exact archived first text, marker included; None only when this spawn had no task.
+
+        A record from before the snapshot kept `initial_prompt` can still be replayed from its own
+        task text, but a brief where that text was truncated is no basis for a blind replay: the
+        recovery refuses instead of typing half a task.
+        """
+        snapshot = record.get("profile_snapshot") or {}
+        prompt = str(snapshot.get("initial_prompt") or "").strip()
+        if prompt:
+            return prompt
+        task = str(record.get("last_task") or "").strip()
+        brief = str(snapshot.get("brief_path") or "").strip()
+        if brief and (not task or task.rstrip().endswith(("…", "..."))):
+            raise ValueError("无法安全重放初始任务：记录缺少 initial_prompt，且 brief 只存了截断的任务文本")
+        if not task:
+            return None
+        return self._task_with_session_marker(session_id, task)
+
+    async def _respawn_doubao_session(self, session_id: str, record: Dict[str, Any],
+                                      prompt: Optional[str]) -> AgentSession:
+        """A fresh `doubao` launch under the SAME session id, replaying `prompt` verbatim.
+
+        Used when the crash happened before the CLI owned a conversation (the welcome banner has no
+        marker yet), so there is nothing to resume. The spawn keeps the archived identity: the same
+        id and turn id, the same wait handle, the same profile/model/env/cwd/extra args, the same
+        approval policy and the same MCP wiring -- and the bridge it was already wired to is REUSED
+        (the crashed client never released it, and the pool belongs to this hub process), so the
+        replayed text goes through the same `HUB_MCP_BRIDGE` file.
+        """
+        loop = asyncio.get_running_loop()
+        snapshot = dict(record.get("profile_snapshot") or {})
+        profile_id = str(snapshot.get("profile_id") or record.get("profile_id") or "")
+        if not profile_id:
+            raise ValueError("会话记录缺少 profile_id，无法自动恢复")
+        launch = self.resolve_launch(
+            profile_id,
+            model=snapshot.get("model"),
+            thinking_level=snapshot.get("thinking_level"),
+            cwd=str(snapshot.get("cwd") or record.get("cwd") or "") or None,
+            env=dict(snapshot.get("env") or {}),
+            bypass_approvals=snapshot.get("bypass_approvals"),
+            extra_args=list(snapshot.get("extra_args") or []),
+            mcp_servers=snapshot.get("mcp_servers") or {},
+            disabled_mcp_servers=snapshot.get("disabled_mcp_servers") or [],
+            strict_mcp_config=bool(snapshot.get("strict_mcp_config")),
+            approval_mode=snapshot.get("approval_mode_override"),
+            compaction_threshold=snapshot.get("compaction_threshold"),
+            extra_roots=list(snapshot.get("extra_roots") or []),
+        )
+        engine = str(launch.get("engine") or "").strip().lower()
+        if engine != "doubao":
+            raise ValueError(f"Profile「{profile_id}」已不是豆包引擎，无法自动恢复")
+        task_mode = str(snapshot.get("task_mode") or "pty_input")
+        if task_mode != "pty_input":
+            raise ValueError(f"豆包会话的 task_mode 应为 pty_input，记录中却是「{task_mode}」")
+        startup_delay = 2.5
+        try:
+            startup_delay = float(snapshot.get("startup_delay_sec") or 2.5)
+        except (TypeError, ValueError):
+            startup_delay = 2.5
+        submit_key = str(snapshot.get("submit_key") or "\r")
+        prof_name = str(snapshot.get("profile_name") or (self.profiles.get(profile_id) or {}).get("name")
+                        or profile_id)
+        sess = AgentSession(
+            session_id=session_id,
+            profile_id=profile_id,
+            profile_name=prof_name,
+            kind="tui",
+            title=str(record.get("title") or derive_readable_session_title(
+                record.get("title"), record.get("last_task"), prof_name, session_id)),
+            cwd=str(launch.get("cwd") or ""),
+            command=str(launch.get("command") or ""),
+            args=[str(a) for a in (launch.get("args") or [])],
+            cols=int(record.get("cols") or self.default_cols),
+            rows=int(record.get("rows") or self.default_rows),
+            core=self._ensure_core(),
+            on_exit_cb=self._exit_callback,
+            on_tui_tool_cb=self._tool_callback,
+        )
+        sess.engine = "doubao"
+        sess.turn_id = str(record.get("turn_id") or sess.turn_id)
+        sess.wait_handle = record.get("wait_handle")
+        sess.effective_model = launch.get("model")
+        sess.effective_thinking_level = launch.get("thinking_level")
+        sess.last_task = str(record.get("last_task") or "")
+        sess.created_at = float(record.get("created_at") or time.time())
+        sess.step_count = int(record.get("step_count") or 0)
+        sess.resume_count = int(record.get("resume_count") or 0)
+        sess.status = RECOVERING_STATUS
+        snapshot.update({
+            "command": launch.get("command"),
+            "args": [str(a) for a in (launch.get("args") or [])],
+            "env": dict(launch.get("env") or {}),
+            "model": launch.get("model"),
+            "thinking_level": launch.get("thinking_level"),
+            "cli_model": launch.get("cli_model"),
+            "cwd": str(launch.get("cwd") or ""),
+            "task_mode": task_mode,
+            "startup_delay_sec": startup_delay,
+            "submit_key": submit_key,
+            # What THIS incarnation's first text is; a crash before its Enter replays exactly it.
+            "initial_prompt": prompt,
+            BYPASS_APPROVALS_KEY: bool(launch.get("bypass_approvals")),
+            **resolve_session_approval_fields(launch),
+        })
+        sess.profile_snapshot = snapshot
+        sess.launch_notes = list(launch.get("notes") or [])
+        # A fresh conversation: the marker inside `prompt` is how the watcher finds its id again.
+        sess.conversation_ref = {}
+        sess._doubao_export_rows = 0
+        self._ensure_session_context_tracker(sess)
+        old = self.sessions.get(session_id)
+        if old is not None:
+            # The handoff keeps what only the dead object knew.
+            # P0-1: whether this turn's own text already landed, so the next crash continues it.
+            sess._turn_submitted_for_turn_id = getattr(old, "_turn_submitted_for_turn_id", None)
+            # P1-3: a bridged session created without an initial task still owes its first live
+            # message the [Hub MCP] block; dropping it here would leave the revived CLI blind to it.
+            sess._pending_mcp_bridge_note = getattr(old, "_pending_mcp_bridge_note", None)
+            # P1-3: the answer the row holds belongs to an earlier turn. Losing that fact let the
+            # live API report that old answer as THIS recovered turn's answer.
+            if getattr(old, "final_response", None) \
+                    or getattr(old, "final_response_from_previous_turn", False):
+                sess.final_response = getattr(old, "final_response", None)
+                sess.final_response_source = getattr(old, "final_response_source", None)
+                sess.final_response_from_previous_turn = True
+        installed = False
+        try:
+            # The identity is bumped BEFORE the spawn so a retire still pending for the dead entry
+            # cannot take the id away from the new incarnation.
+            self._next_incarnation(session_id)
+            self.sessions[session_id] = sess
+            installed = True
+            await self._start_with_claim_retry(
+                sess.start_pty, loop, env_overrides=dict(launch.get("env") or {}) or None,
+            )
+        except BaseException:
+            if installed and old is not None:
+                self.sessions[session_id] = old
+            elif installed and self.sessions.get(session_id) is sess:
+                self.sessions.pop(session_id, None)
+            if sess.has_process:
+                await asyncio.to_thread(sess.kill, KILL_GRACE_MS)
+            raise
+        await self.persist_session(sess)
+        self._schedule(self._watch_doubao_session(sess))
+        self._schedule(self._watch_tui_interactive_prompts(sess))
+        sess._startup_watch_active = True
+        sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
+        sess._startup_inject_pending = True
+        self._schedule(
+            self._auto_handle_tui_startup_and_trust(
+                sess,
+                task_to_inject=prompt,
+                startup_delay=startup_delay,
+                submit_key=submit_key,
+            )
+        )
+        return sess
+
+    def _cancel_recovery_now(self, session_id: str) -> bool:
+        """Synchronous cancel: a stop or a restart must not await a task it is about to abandon."""
+        task = self._recovery_tasks.pop(session_id, None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    async def _cancel_doubao_recovery(self, session_id: str, *, emit_terminated: bool = False,
+                                      wait: bool = True, timeout: float = 5.0) -> bool:
+        """Stop a session's recovery task, so a terminate/close/restart or a manual resume wins.
+
+        `emit_terminated` publishes the `terminated` lifecycle event a user's terminate owes the
+        parent (the exit callback will not: the process is already gone). The recovery task is
+        cancelled at its next await, and the wait is bounded, so a task that is mid-spawn cannot
+        hold the caller hostage.
+        """
+        task = self._recovery_tasks.pop(session_id, None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        if wait:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                logger.exception("[%s] the cancelled Doubao recovery task ended with an error", session_id)
+        if emit_terminated:
+            try:
+                await self.record_worker_event(
+                    session_id,
+                    {
+                        "type": "terminated",
+                        "category": "lifecycle",
+                        "status": "terminated",
+                        "content": "豆包自动恢复进行中，被用户终止",
+                        "data": {"reason": "terminated_during_auto_recovery"},
+                    },
+                )
+            except PersistenceUnavailable:
+                raise
+            except Exception:
+                logger.exception("[%s] could not record the termination of its recovery", session_id)
+        return True
 
     
 
@@ -16614,6 +17634,13 @@ class HubSessionManager:
                     args.append(self._task_with_session_marker(session_id, delivered_task))
 
             prof_name = str(prof.get("name", profile_id))
+            # Archive spec §3 + Doubao auto-recovery: the EXACT first text is computed and stored
+            # BEFORE the PTY starts (and before the first persist), so a Doubao CLI that dies while
+            # its welcome banner is still drawing can replay the original task verbatim -- marker
+            # included, and no second marker later. A resume adds its own message and never this.
+            prompt_to_send: Optional[str] = None
+            if delivered_task and task_mode == "pty_input":
+                prompt_to_send = self._task_with_session_marker(session_id, delivered_task)
             sess = AgentSession(
                 session_id=session_id,
                 profile_id=profile_id,
@@ -16662,6 +17689,9 @@ class HubSessionManager:
                 "auto_approve_once_uses": 0,
                 # Where the brief file lives, so a close/archive deletes the right one.
                 "brief_path": str(brief_path) if brief_path is not None else None,
+                # The exact first text, marker and notes included (Doubao auto-recovery replays it
+                # raw after an early crash; a resume never reuses it as its own message).
+                "initial_prompt": prompt_to_send,
                 # Whether the first task carried the leaf-worker note (a resume adds no note of its own).
                 "leaf_worker": leaf_worker,
                 # Who spawned it: {"pid", "process", "hub_session_id", "hub_session_title"} or None.
@@ -16733,9 +17763,6 @@ class HubSessionManager:
 
         if kind == "tui":
             self._schedule(self._watch_tui_interactive_prompts(sess))
-            prompt_to_send: Optional[str] = None
-            if delivered_task and task_mode == "pty_input":
-                prompt_to_send = self._task_with_session_marker(sess.session_id, delivered_task)
             sess._startup_watch_active = True
             sess._startup_watch_until = time.time() + TUI_STARTUP_WINDOW_SEC
             sess._startup_inject_pending = True

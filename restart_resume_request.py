@@ -50,7 +50,9 @@ REQUEST_NAME = "resume_on_start.json"
 TAKEN_NAME = "resume_on_start.taken.json"
 RESULT_NAME = "resume_on_start.result.json"
 # A turn the stop cut off. "completed" is live but idle, so it comes back without a message.
-UNFINISHED_TURN_STATUSES = frozenset({"starting", "running", "waiting_parent"})
+# "recovering" is a Doubao session the hub was bringing back after a shared-service drop when the
+# stop cut it off: its turn was unfinished too, so it comes back with the continuation message.
+UNFINISHED_TURN_STATUSES = frozenset({"starting", "running", "waiting_parent", "recovering"})
 CONTINUE_TEXT = (
     "[Hub] The agent hub was restarted while you were working, so your previous turn was cut off: "
     "any command, script or approval prompt that was running has stopped. Check where you left off "
