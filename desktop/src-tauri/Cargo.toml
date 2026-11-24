@@ -26,6 +26,10 @@ windows = { version = "0.62", features = [
     "Foundation",
     "UI_Notifications",
 ] }
+# Same WebView2 COM bindings wry/tauri already use, for the ProcessFailed hook and the surface
+# resync (toggle visibility + re-apply the host rect). 0.39.1 sits in Cargo.lock with the same
+# `windows 0.62` underneath, so this adds no downloaded crate.
+webview2-com = "0.39"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",

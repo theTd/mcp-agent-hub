@@ -16,6 +16,7 @@ mod portable_runtime;
 mod tray_menu;
 mod update_helper;
 mod waiting_notifier;
+mod webview_recovery;
 mod windows_process;
 
 use std::sync::Arc;
@@ -147,6 +148,11 @@ fn main() {
                 if let Ok(url) = window.url() {
                     setup_shell.set_splash_url(url);
                 }
+                // Same hook every rebuilt window gets (see webview_recovery): one code path for the
+                // startup window and the ones the tray / a pending recovery recreate. The startup
+                // window is the first instance, so it takes the first generation.
+                let generation = webview_recovery::begin_window_generation();
+                webview_recovery::attach_process_failed_hook(&handle, &window, generation);
                 if !start_hidden {
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -167,6 +173,11 @@ fn main() {
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
+                    // A rebuild destroys this window on purpose: never swallow that close, or the
+                    // label stays registered and the replacement can never be created.
+                    if webview_recovery::is_rebuilding() {
+                        return;
+                    }
                     // Closing the window is not quitting: the hub keeps running (tray 退出 quits).
                     api.prevent_close();
                     let _ = window.hide();

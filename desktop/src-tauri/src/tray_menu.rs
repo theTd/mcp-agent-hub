@@ -220,6 +220,16 @@ fn build_menu(app: &AppHandle, mode: HubMode) -> tauri::Result<Menu<Wry>> {
         true,
         None::<&str>,
     )?)?;
+    // Escape hatch for a blank / wedged window (WebView2 GPU or renderer crash): rebuild the window
+    // itself, which never touches the hub, its sessions or the owned process. Always enabled: it
+    // also works while the hub is still starting or failed (the splash / error view is rebuilt).
+    menu.append(&MenuItem::with_id(
+        app,
+        "rebuild_window",
+        "重建控制台窗口",
+        true,
+        None::<&str>,
+    )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "restart",
@@ -347,6 +357,7 @@ fn on_menu(app: &AppHandle, id: &str) {
     };
     match id {
         "open" => shell.open_console(app, None),
+        "rebuild_window" => shell.rebuild_console_window(app, "tray_menu"),
         "restart" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move { shell.restart(&app).await });
