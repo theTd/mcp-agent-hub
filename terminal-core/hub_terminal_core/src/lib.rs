@@ -21,7 +21,7 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTimeoutError, PyValueError}
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 
-use conpty_session::{CoreError, CoreOptions, SessionFlags, SpawnRequest, TextRequest};
+use conpty_session::{CoreError, CoreOptions, JobPolicy, SessionFlags, SpawnRequest, TextRequest};
 use terminal_stream::strip_terminal_replies;
 
 const DEFAULT_WRITE_DEADLINE_MS: u64 = 50;
@@ -126,6 +126,22 @@ fn flags_from_dict<'py>(
     }
     if let Some(value) = flags.get_item("raw_slack_bytes")? {
         out.raw_slack_bytes = value.extract()?;
+    }
+    // `job_policy` names what the session's job owns: `"kill_tree"` (the default, the client and every
+    // descendant) or `"client_only"` (the client alone, so a service singleton it starts survives the
+    // session). A missing key keeps the default; anything else is refused rather than guessed, because
+    // the two policies differ in what they kill and a typo must not silently pick one.
+    if let Some(value) = flags.get_item("job_policy")? {
+        let name: Option<String> = value.extract().ok();
+        out.job_policy = match name.as_deref() {
+            Some("kill_tree") => JobPolicy::KillTree,
+            Some("client_only") => JobPolicy::ClientOnly,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "flags[\"job_policy\"] must be \"kill_tree\" or \"client_only\", not {value}"
+                )));
+            }
+        };
     }
     Ok(out)
 }

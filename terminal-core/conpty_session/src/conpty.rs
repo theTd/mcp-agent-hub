@@ -10,15 +10,17 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{CreatePseudoConsole, HPCON, COORD};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, ResumeThread,
-    TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, OpenProcess,
+    ResumeThread, TerminateProcess, UpdateProcThreadAttribute, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROCESS_TERMINATE, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 use crate::command_line::build_command_line;
 use crate::handles::{OwnedHandle, OwnedPseudoConsole};
-use crate::job::JobObject;
+use crate::job::{JobObject, JobPolicy};
+use crate::session::SessionFlags;
 
 /// What to start. `argv[0]` is resolved like pywinpty does before the command line is built.
 pub struct SpawnSpec<'a> {
@@ -27,6 +29,9 @@ pub struct SpawnSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+    /// The session's flags: `spawn` reads `job_policy` here, because the job has to exist with the right
+    /// limit flags before the child is assigned to it.
+    pub flags: SessionFlags,
 }
 
 /// A started console session: the process, its two usable pipe ends, the pseudoconsole and its job.
@@ -38,8 +43,11 @@ pub struct ConPtyProcess {
     pub output: OwnedHandle,
     pub console: OwnedPseudoConsole,
     pub job: Arc<JobObject>,
-    /// False when `AssignProcessToJobObject` was refused (nested jobs, §12.8); `kill` then walks the
-    /// tree with ToolHelp instead of `TerminateJobObject`.
+    /// False when `AssignProcessToJobObject` was refused (nested jobs, §12.8). What `kill` then does
+    /// depends on the policy the job was created with: under `JobPolicy::KillTree` it falls back to the
+    /// ToolHelp tree walk, while under `JobPolicy::ClientOnly` it terminates the client process only (it
+    /// reopens the single pid with `PROCESS_TERMINATE`) and never walks descendants, because a walk would
+    /// reach the client's children that deliberately live outside the job.
     pub job_assigned: bool,
     /// Set when the assignment failed, for the spawn log line.
     pub job_error: Option<String>,
@@ -47,14 +55,36 @@ pub struct ConPtyProcess {
 
 /// Terminates a child that `CreateProcessW` created suspended and that must not run: the spawn path
 /// failed after the process existed (should-fix 1). The caller's handle closes with `OwnedHandle`.
-fn terminate_suspended(process: &OwnedHandle, pid: u32) {
+///
+/// The fallback honours the session's `JobPolicy`: `KillTree` may walk the tree with ToolHelp, while
+/// `ClientOnly` must never walk it — the walk selects descendants by parent pid regardless of job
+/// membership, so it would terminate a child the client started outside the job (the machine-wide
+/// service singleton the policy exists to protect). `ClientOnly` therefore reopens the single client pid
+/// at most, a zero-tree-walk kill that reaches nothing but the client itself.
+fn terminate_suspended(process: &OwnedHandle, pid: u32, policy: JobPolicy) {
     // SAFETY: the process handle is owned by the caller and has PROCESS_TERMINATE.
     if unsafe { TerminateProcess(process.get(), 1) }.is_ok() {
         return;
     }
-    // The handle can lack PROCESS_TERMINATE if the security policy narrowed it; the tree walk with
-    // PROCESS_TERMINATE is the fallback `kill` uses as well.
-    crate::job_tree::terminate_tree(pid);
+    match policy {
+        // The handle can lack PROCESS_TERMINATE if the security policy narrowed it; the tree walk with
+        // PROCESS_TERMINATE is the fallback `kill` uses as well.
+        JobPolicy::KillTree => {
+            crate::job_tree::terminate_tree(pid);
+        }
+        // Client-only: reopen this one pid and terminate it; never enumerate, never recurse.
+        JobPolicy::ClientOnly => {
+            if pid == 0 {
+                return;
+            }
+            // SAFETY: no inheritance; the handle is closed by `OwnedHandle` at the end of the block.
+            if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
+                let handle = OwnedHandle::new(handle);
+                // SAFETY: the handle was opened with PROCESS_TERMINATE and is closed by the wrapper.
+                let _ = unsafe { TerminateProcess(handle.get(), 1) };
+            }
+        }
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -126,8 +156,14 @@ pub fn spawn(spec: &SpawnSpec<'_>) -> Result<ConPtyProcess, String> {
     // failure must terminate it. Dropping its handle alone leaves a permanently suspended process, and
     // `console` (an `OwnedPseudoConsole`) closes the HPCON on the same path (should-fix 1).
     let started = (|| -> Result<(Arc<JobObject>, bool, Option<String>), String> {
-        let job =
-            Arc::new(JobObject::new_kill_on_close().map_err(|e| format!("CreateJobObject: {e}"))?);
+        // The limit flags come from the session's policy: `ClientOnly` sets SILENT_BREAKAWAY_OK, so a
+        // child the client starts later (a machine-wide service singleton) is created outside this job
+        // instead of inside it. The child is still suspended here and assigned below, before
+        // `ResumeThread`, so nothing it spawns can predate the assignment.
+        let job = Arc::new(
+            JobObject::new_kill_on_close_with(spec.flags.job_policy)
+                .map_err(|e| format!("CreateJobObject: {e}"))?,
+        );
         let (job_assigned, job_error) = match job.assign(process.get()) {
             Ok(()) => (true, None),
             Err(error) => (false, Some(error.to_string())),
@@ -146,7 +182,7 @@ pub fn spawn(spec: &SpawnSpec<'_>) -> Result<ConPtyProcess, String> {
     let (job, job_assigned, job_error) = match started {
         Ok(started) => started,
         Err(error) => {
-            terminate_suspended(&process, pid);
+            terminate_suspended(&process, pid, spec.flags.job_policy);
             return Err(error);
         }
     };

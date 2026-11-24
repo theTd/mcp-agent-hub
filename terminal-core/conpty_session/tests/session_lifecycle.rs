@@ -1,14 +1,17 @@
 //! Session mechanics that the gates in step 1 do not otherwise reach, each pinned to one review finding.
 //!
-//! Every case starts `cmd.exe` (or a loop of them) headless through the system ConPTY: no window is
-//! opened and nothing is typed that a person would see.
+//! Every case runs a console client headless through the system ConPTY — `cmd.exe`, or the crate's own
+//! `detached_client` for the cases about a client that starts a console-less child: no window is opened
+//! that a person would see.
 
 use std::collections::HashMap;
 use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use conpty_session::job_tree::{count_processes_named_by_parent, current_handle_count};
-use conpty_session::{Core, CoreError, CoreOptions, SpawnRequest};
+use conpty_session::job_tree::{
+    children_of, count_processes_named_by_parent, current_handle_count, process_name,
+};
+use conpty_session::{Core, CoreError, CoreOptions, JobPolicy, SessionFlags, SpawnRequest};
 
 /// The handle and conhost counts are process-wide, so the cases in this file run one at a time: a
 /// parallel spawn would otherwise look exactly like the leak these tests exist to catch.
@@ -517,6 +520,198 @@ fn a_late_exit_code_reaches_the_next_drain() {
 
 fn job_tree_alive(pid: u32) -> bool {
     conpty_session::job_tree::process_alive(pid)
+}
+
+/// The same request with a job policy: `SessionFlags` carries it, and `conpty::spawn` reads it before the
+/// child is assigned, so the job exists with the policy's limit flags.
+fn request_with_policy(id: &str, argv: &[&str], job_policy: JobPolicy) -> SpawnRequest {
+    SpawnRequest {
+        flags: SessionFlags {
+            job_policy,
+            ..SessionFlags::default()
+        },
+        ..request(id, argv)
+    }
+}
+
+/// The crate's test client (`src/bin/detached_client.rs`): a session client that starts one child with
+/// `DETACHED_PROCESS` and waits for it.
+const DETACHED_CLIENT: &str = env!("CARGO_BIN_EXE_detached_client");
+
+/// That client, asked for a long-lived child in its own service mode: `[client, program, args...]` — the
+/// same executable started again with no console, which is the shape of `doubao.exe` starting
+/// `doubao.exe --type=service`, the process `AttachConsole` finds console-less (`ERROR_INVALID_HANDLE`)
+/// and which therefore outlives the session's pseudoconsole by itself. Only a job object can reach such a
+/// child, which is exactly what these two cases measure.
+const DETACHED_CLIENT_WITH_A_SERVICE: [&str; 4] = [DETACHED_CLIENT, DETACHED_CLIENT, "--sleep", "30"];
+
+/// The pid the client announced on the session's console (`detached-pid <pid>`): the exact child under
+/// test, read out of the session's own output instead of guessed from a snapshot.
+///
+/// Matched as a substring, not token by token: ConPTY prepends its own escape sequences
+/// (`ESC[?25l ESC[2J ESC[m ESC[H` and the like) straight onto the first character of the tail, so the
+/// marker can arrive glued to `\x1b[...` on its left, and trailing escapes can touch the digits on the
+/// right. The digits are therefore the run of ASCII digits that follows the marker, and nothing after
+/// them is parsed.
+fn announced_pid(tail: &str) -> Option<u32> {
+    let digits: String = tail
+        .split("detached-pid ")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// The client's detached child, once the client has announced it, with the model's facts checked: the
+/// process runs, its image is the client's own executable (the service mode of the same binary), and it is
+/// a child of the session's client — so a job that owned the client would own it too, which is the premise
+/// both cases measure.
+fn detached_child_of(core: &Core, id: &str, client: u32) -> u32 {
+    let exe = std::path::Path::new(DETACHED_CLIENT)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let end = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < end {
+        let tail = core
+            .raw_tail(id, 4096, Duration::from_millis(20))
+            .unwrap_or_default();
+        if let Some(child) = announced_pid(&tail) {
+            assert!(
+                job_tree_alive(child),
+                "the child {child} the client announced is not running"
+            );
+            assert!(
+                process_name(child).is_some_and(|name| name.eq_ignore_ascii_case(&exe)),
+                "the announced pid {child} is not {exe:?}"
+            );
+            assert!(
+                child != client && children_of(client).contains(&child),
+                "the announced pid {child} is not a child of the client {client}: the case would not model \
+                 a process the client starts"
+            );
+            return child;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("session {id}: client {client} never announced the detached child it started");
+}
+
+/// The announcement survives the escape sequences ConPTY writes around it: the init sequence is glued to
+/// the first character of the tail (`\x1b[?25l\x1b[2J\x1b[m\x1b[Hdetached-pid …`), and a cursor or colour
+/// escape can follow the digits. Needs no console, so it runs everywhere, including hosts where ConPTY
+/// itself is unavailable.
+#[test]
+fn the_announced_pid_survives_conpty_escapes() {
+    assert_eq!(
+        announced_pid("\x1b[?25l\x1b[2J\x1b[m\x1b[Hdetached-pid 4242\x1b[m"),
+        Some(4242u32)
+    );
+    assert_eq!(announced_pid("C:\\> detached-pid 77\r\n"), Some(77u32));
+    assert_eq!(announced_pid("\x1b[mdetached-pid 9\x1b[?25h"), Some(9u32));
+    // Only the leading digits count, and a marker without digits is not an announcement.
+    assert_eq!(announced_pid("detached-pid 1x2"), Some(1u32));
+    assert_eq!(announced_pid("detached-pid \x1b[m"), None);
+    assert_eq!(announced_pid("no announcement here"), None);
+}
+
+/// Ends the test's child on every path, so a failed assertion cannot leave a sleeping process behind.
+struct KillChild(u32);
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            conpty_session::job_tree::terminate_tree(self.0);
+        }
+    }
+}
+
+/// Ends the core's sessions and stops its ticker on every path, panicking included.
+///
+/// A case that panics between `spawn` and `kill` would otherwise leave its client, its job and its
+/// conhost alive for the rest of the run — and the counts these cases compare (`conhost.exe` by parent,
+/// open handles) are process-wide, so one leaked console makes the *next* case fail. `kill_all` is what
+/// terminates the clients (the job's kill-on-close only follows the last job handle, which the session's
+/// own threads hold), and `shutdown` stops the ticker; the core is then dropped with the guard.
+struct ShutdownOnDrop(std::sync::Arc<Core>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill_all(Duration::from_millis(2000));
+        self.0.shutdown();
+    }
+}
+
+/// `JobPolicy::ClientOnly`: `kill` ends the client and only the client. The child the client started is
+/// outside the session's job — the policy sets `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`, so a child of a job
+/// member is created outside it — and it is console-detached on top of that, so neither
+/// `TerminateJobObject` nor `ClosePseudoConsole` can reach it. Surviving a `TerminateJobObject` is exactly
+/// what "not a member of the job" means: that call ends every member synchronously.
+#[test]
+fn client_only_kills_the_client_and_spares_its_grandchild() {
+    let _serial = serialized();
+    let core = core();
+    let _shutdown = ShutdownOnDrop(std::sync::Arc::clone(&core));
+    let reply = core
+        .spawn(request_with_policy(
+            "client-only",
+            &DETACHED_CLIENT_WITH_A_SERVICE,
+            JobPolicy::ClientOnly,
+        ))
+        .expect("spawn");
+    let client = reply.pid;
+    let grandchild = detached_child_of(&core, "client-only", client);
+    let _guard = KillChild(grandchild);
+
+    core.kill("client-only", Duration::from_millis(2000))
+        .expect("kill");
+    let end = Instant::now() + Duration::from_secs(2);
+    while job_tree_alive(client) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !job_tree_alive(client),
+        "the client {client} survived kill under ClientOnly"
+    );
+
+    // A member of the job would already be gone; the settle window only keeps a dying process from being
+    // read as alive.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        job_tree_alive(grandchild),
+        "the grandchild {grandchild} died with the client: ClientOnly's job still owned it, or the \
+         pseudo console still owned its console"
+    );
+}
+
+/// `JobPolicy::KillTree` (the default): the same detached child is inside the session's job, so `kill`
+/// takes it down with the client. Paired with the case above, the two runs differ in nothing but the
+/// policy, which is what pins that the policy — not the console — decides what a kill reaches.
+#[test]
+fn kill_tree_still_terminates_the_clients_descendants() {
+    let _serial = serialized();
+    let core = core();
+    let _shutdown = ShutdownOnDrop(std::sync::Arc::clone(&core));
+    let reply = core
+        .spawn(request("kill-tree-policy", &DETACHED_CLIENT_WITH_A_SERVICE))
+        .expect("spawn");
+    let client = reply.pid;
+    let grandchild = detached_child_of(&core, "kill-tree-policy", client);
+    let _guard = KillChild(grandchild);
+
+    core.kill("kill-tree-policy", Duration::from_millis(2000))
+        .expect("kill");
+    let end = Instant::now() + Duration::from_secs(3);
+    while job_tree_alive(grandchild) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!job_tree_alive(client), "the client {client} survived kill");
+    assert!(
+        !job_tree_alive(grandchild),
+        "the grandchild {grandchild} outlived kill under KillTree: the job no longer owns the tree"
+    );
 }
 
 /// The session behind an id, for the tests that must put it in a state a real thread panic would. A

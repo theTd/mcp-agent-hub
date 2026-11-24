@@ -401,6 +401,7 @@ impl Core {
             env: &env,
             cols,
             rows,
+            flags,
         };
         let process = conpty::spawn(&spec).map_err(CoreError::Spawn)?;
         let (session, log_lines) = Session::start(

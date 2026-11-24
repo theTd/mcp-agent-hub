@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import restart_resume_request as rrr
 from restart_resume_request import (CONTINUE_TEXT, REQUEST_NAME, RESULT_NAME, TAKEN_NAME,
+                                    UNFINISHED_TURN_STATUSES,
                                     RestartResumeGate, RestartResumeRequest)
 from session_manager import AgentSession, HubSessionManager
 
@@ -78,6 +79,16 @@ class RequestTests(unittest.TestCase):
         request = RestartResumeRequest.take(self.dir)
         self.assertEqual(request.text_for("a", "codex", "interrupted"), CONTINUE_TEXT)
         self.assertIsNone(request.text_for("b", "codex", "running"))
+
+    def test_a_session_the_stop_cut_off_mid_recovery_gets_the_message_too(self):
+        # P0-3: a Doubao session the hub was bringing back after a shared-service drop was still
+        # mid-turn when the stop cut it off; resuming it without asking it to continue left it idle.
+        (self.dir / REQUEST_NAME).write_text("{}", encoding="utf-8")
+        request = RestartResumeRequest.take(self.dir)
+        self.assertEqual(request.text_for("a", "doubao", "recovering"), CONTINUE_TEXT)
+        self.assertEqual(request.text_for("a", "doubao", "recovering"), CONTINUE_TEXT)
+        self.assertIn("recovering", UNFINISHED_TURN_STATUSES)
+        self.assertIsNone(request.text_for("a", "doubao", "completed"))
 
 
 class GateTests(unittest.IsolatedAsyncioTestCase):
