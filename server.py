@@ -1477,6 +1477,52 @@ async def api_toggle_engine_model(engine: str, req: Request):
         "hub_port": hub_port(),
     }
 
+@app.post("/api/engines/{engine}/models/toggle-batch")
+async def api_toggle_engine_models_batch(engine: str, req: Request):
+    """Enable/disable several models at once (one file write): 「全部启用」 and 「只保留默认」."""
+    try:
+        body = await req.json()
+    except Exception:
+        return bad_request("请求体必须是 JSON 对象。")
+    if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
+        return bad_request("enabled 必须是布尔值 true 或 false。")
+    models_field = body.get("models")
+    if not isinstance(models_field, list) or not all(isinstance(m, str) for m in models_field):
+        return bad_request("models 必须是模型标识的字符串数组。")
+    try:
+        result = await asyncio.to_thread(
+            hub.toggle_engine_models_batch, engine, models_field, body["enabled"]
+        )
+    except ValueError as e:
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload.update(result)
+    return payload
+
+
+@app.post("/api/engines/{engine}/model-groups/toggle")
+async def api_toggle_engine_model_group(engine: str, req: Request):
+    """Enable or disable one aggregator group (`google`, `ollama-cloud`, ...) as a whole."""
+    try:
+        body = await req.json()
+    except Exception:
+        return bad_request("请求体必须是 JSON 对象。")
+    if not isinstance(body, dict) or type(body.get("enabled")) is not bool:
+        return bad_request("enabled 必须是布尔值 true 或 false。")
+    group = body.get("group")
+    if not isinstance(group, str) or not group.strip():
+        return bad_request("group 必须是非空字符串。")
+    try:
+        result = await asyncio.to_thread(
+            hub.toggle_engine_model_group, engine, group, body["enabled"]
+        )
+    except ValueError as e:
+        return bad_request(str(e))
+    payload = await profiles_payload()
+    payload.update(result)
+    return payload
+
+
 @app.post("/api/engines/{engine}/toggle")
 async def api_toggle_engine(engine: str, req: Request):
     """Enable or disable one engine; only model policy stays untouched, live sessions keep running."""

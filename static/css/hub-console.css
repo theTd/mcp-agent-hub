@@ -271,6 +271,18 @@ textarea { resize: vertical; min-height: 64px; line-height: 1.55; }
 }
 .switch input:checked + .switch-track { background: var(--success); }
 .switch input:checked + .switch-track::after { transform: translateX(14px); }
+/* A group that is only partly enabled: neither on nor off, so it gets its own amber dash state. */
+.switch input:indeterminate + .switch-track { background: var(--warning-soft); box-shadow: inset 0 0 0 1px rgba(242, 179, 71, 0.55); }
+.switch input:indeterminate + .switch-track::after {
+  width: 10px;
+  height: 4px;
+  top: 7px;
+  left: 11px;
+  border-radius: 2px;
+  background: var(--warning);
+  box-shadow: none;
+  transform: none;
+}
 .switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 .switch.is-disabled { cursor: not-allowed; opacity: 0.5; }
 /* bypass_approvals: an on switch is a warning, not a success. */
@@ -1314,6 +1326,102 @@ body.is-resizing-sidebar * {
 .mr-note-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .mr-note-text.is-empty { color: var(--line-3); }
 .mr-note-input { height: 28px !important; font-size: 12px !important; }
+
+/* Aggregator model groups (`google/…`, `ollama-cloud/…`): a toolbar, then one collapsible row per channel. */
+.mg-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+.mg-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 180px;
+  max-width: 340px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-0);
+  color: var(--text-3);
+  transition: border-color 0.12s;
+}
+.mg-search:focus-within { border-color: var(--accent-line); }
+.mg-search .icon { width: 14px; height: 14px; flex: none; }
+.mg-search input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12px;
+  outline: none;
+}
+.mg-search input::-webkit-search-cancel-button { filter: invert(0.7); cursor: pointer; }
+.mg-toolbar-actions { display: flex; gap: 6px; }
+
+.model-groups { display: flex; flex-direction: column; gap: 8px; }
+.model-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 8px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+}
+.model-group[hidden] { display: none; }
+.model-group.is-ungrouped { background: transparent; border-style: dashed; }
+.mg-head { display: flex; align-items: center; gap: 8px; }
+.mg-collapse-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  min-height: 26px;
+  padding: 2px 4px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.mg-collapse-btn:hover { background: var(--bg-3); }
+.mg-chevron { display: inline-grid; place-items: center; width: 16px; height: 16px; flex: none; color: var(--text-3); transition: transform 0.15s var(--ease); }
+.mg-chevron .icon { width: 14px; height: 14px; }
+.model-group[data-collapsed="true"] .mg-chevron { transform: rotate(-90deg); }
+.mg-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 7px;
+  border: 1px solid var(--accent-line);
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: 600 11.5px/1.6 var(--font-mono);
+}
+.model-group.is-ungrouped .mg-name { border-color: var(--line-2); background: transparent; color: var(--text-2); font-family: var(--font-ui); font-weight: 600; }
+.mg-count { flex: none; color: var(--text-3); font-size: 11.5px; }
+.mg-stale {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px dashed rgba(242, 179, 71, 0.5);
+  border-radius: 5px;
+  background: var(--warning-soft);
+  color: var(--warning-text);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.mg-switch { flex: none; }
+.mg-body { padding-left: 2px; }
+.model-group[data-collapsed="true"] .mg-body { display: none; }
+.model-row[hidden] { display: none; }
+.mr-prefix { color: var(--text-3); }
 
 /* The session record: a facts strip, then the structured transcript or the terminal replay. */
 .history-body { display: flex; flex-direction: column; }
