@@ -303,6 +303,79 @@ class WaitInboxTests(unittest.IsolatedAsyncioTestCase):
         result = await self.inbox.wait(info["wait_handle"], 0.1)
         self.assertEqual([(x["request_id"], x["result_id"]) for x in result["requests"]], [("q1", "q1"), ("q2", "q2")])
 
+    # -- a planned restart never settles a parent's handle --------------------------------
+
+    def open_types(self, handle: str) -> list:
+        import sqlite3
+        conn = sqlite3.connect(str(self.inbox.db_path))
+        try:
+            rows = conn.execute(
+                "SELECT event_type FROM wait_inbox_events WHERE handle=? AND consumed=0", (handle,)
+            ).fetchall()
+        finally:
+            conn.close()
+        return [row[0] for row in rows]
+
+    async def test_a_planned_stop_writes_no_shutdown_event(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        await self.inbox.publish_shutdown(planned=True, stop_id="r1")
+        self.assertEqual(self.open_types(handle), [])
+        self.assertEqual(self.inbox._row(handle)["state"], "waiting")
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["state"], "waiting")
+
+    async def test_a_planned_close_tells_in_flight_polls_to_keep_waiting(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        waiter = asyncio.create_task(self.inbox.wait(handle, 2))
+        await asyncio.sleep(0.03)
+        await self.inbox.close(planned=True)
+        result = await waiter
+        self.assertEqual(result["state"], "waiting")
+        self.assertTrue(result["hub_restarting"])
+        # The handle is still the parent's after the replacement hub restores the inbox.
+        self.assertEqual(self.inbox._row(handle)["state"], "waiting")
+        self.assertEqual((await self.inbox.wait(handle, 0.1))["state"], "waiting")
+
+    async def test_a_real_stop_keys_each_shutdown_event_by_stop_id(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        await self.inbox.publish_shutdown(planned=False, stop_id="s1")
+        await self.inbox.publish_shutdown(planned=False, stop_id="s2")
+        await self.inbox.publish_shutdown(planned=False, stop_id="s2")  # the same stop repeats
+        self.assertEqual(self.open_types(handle).count("hub_shutdown"), 2,
+                         "two stops land in one inbox; the same stop does not duplicate")
+        events = await self.inbox._take_events(handle, "hub_shutdown")
+        self.assertEqual([e["data"]["stop_id"] for e in events], ["s1", "s2"])
+        self.assertTrue(all(e["data"]["planned"] is False for e in events))
+
+    async def test_repair_planned_restart_clears_only_shutdown_leftovers(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        await self.inbox.publish_shutdown(planned=False, stop_id="old1")
+        await self.inbox.publish_shutdown(planned=False, stop_id="old2")
+        await self.inbox.publish_event({"session_id": "a", "type": "approval_request",
+                                        "request_id": "r1", "content": "allow?"})
+        await self.inbox.publish_event({"session_id": "a", "type": "crashed",
+                                        "seq": 9, "content": "worker died"})
+        self.assertEqual(sorted(self.open_types(handle)),
+                         ["approval_request", "crashed", "hub_shutdown", "hub_shutdown"])
+        self.assertEqual(await self.inbox.repair_planned_restart(), 2)
+        self.assertEqual(sorted(self.open_types(handle)), ["approval_request", "crashed"])
+        result = await self.inbox.wait(handle, 0.1)
+        self.assertEqual((result["state"], result["requests"][0]["request_id"]), ("ask", "r1"))
+
+    async def test_a_resume_failure_is_a_terminal_failure_with_its_own_type(self):
+        handle = (await self.inbox.create(["a"]))["wait_handle"]
+        await self.inbox.publish_event({
+            "type": "restart_resume_failed", "session_id": "a",
+            "result_id": "restart-resume-failed:a",
+            "content": "会话 a 重启后恢复失败：boom",
+            "data": {"reason": "boom", "session_id": "a"},
+        })
+        woke = await self.inbox.wait(handle, 0.1)
+        self.assertEqual(woke["state"], "failed")
+        self.assertEqual(woke["errors"][0]["type"], "restart_resume_failed")
+        self.assertEqual(woke["errors"][0]["session_id"], "a")
+        self.assertEqual(woke["errors"][0]["reason"], "boom")
+        self.assertEqual(self.inbox._row(handle)["state"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1207,8 +1207,16 @@ async def persistence_unavailable_handler(request: Request, exc: PersistenceUnav
 
 @app.middleware("http")
 async def reject_work_during_shutdown(request: Request, call_next):
-    if hub._shutting_down and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
-        return JSONResponse({"detail": "Hub 正在关闭"}, status_code=503)
+    if hub._shutting_down and request.url.path not in {"/health", "/api/hub/info",
+                                                       "/api/hub/shutdown",
+                                                       "/api/hub/graceful-restart",
+                                                       "/api/hub/restart-status"}:
+        if getattr(hub, "_planned_restart", False):
+            # A restart, not a stop: the caller should retry, not treat the hub as gone for good.
+            return JSONResponse({"detail": "Hub 正在重启", "restarting": True},
+                                status_code=503, headers={"Retry-After": "1"})
+        return JSONResponse({"detail": "Hub 正在关闭"}, status_code=503,
+                            headers={"Retry-After": "1"})
     return await call_next(request)
 
 
@@ -1217,8 +1225,19 @@ async def hold_requests_during_restart_resume(request: Request, call_next):
     # After a deliberate restart (resume_on_start.json) the hub resumes the interrupted sessions
     # once its port is open. Until that is done (at most 30 s) callers wait here instead of
     # seeing those sessions interrupted or racing the resume; the desktop app's probes do not.
-    if not hub.restart_resume_gate.is_open and request.url.path not in {"/health", "/api/hub/info", "/api/hub/shutdown"}:
-        await hub.restart_resume_gate.wait()
+    if hub.restart_resume_gate.is_open or request.url.path in {"/health", "/api/hub/info",
+                                                              "/api/hub/shutdown",
+                                                              "/api/hub/graceful-restart",
+                                                              "/api/hub/restart-status"}:
+        return await call_next(request)
+    if request.url.path.startswith("/api/wait/"):
+        # A long poll is the one request that must not hang for the whole resume: answer 503 with
+        # Retry-After, and the waiter (tools/hub_wait.py) retries until the resume is done.
+        if await hub.restart_resume_gate.wait_bounded(5.0):
+            return await call_next(request)
+        return JSONResponse({"detail": "Hub 正在恢复会话", "restarting": True},
+                            status_code=503, headers={"Retry-After": "1"})
+    await hub.restart_resume_gate.wait()
     return await call_next(request)
 
 
@@ -1807,24 +1826,142 @@ async def api_hub_info():
     }
 
 
-async def _stop_hub_like_ctrl_c() -> None:
+async def _stop_hub_like_ctrl_c(planned: Optional[bool] = None) -> None:
     # Persist/archive every live session and unblock long-pollers before uvicorn begins tearing
     # down HTTP/MCP streams, so even if an open stream hits timeout_graceful_shutdown no session
-    # record is ever lost.
+    # record is ever lost. `planned` says this stop is a restart; None lets the hub decide from a
+    # pending resume_on_start.json, which is what a stop triggered by a signal does.
     try:
-        await hub.archive_all_sessions_on_shutdown()
+        await hub.archive_all_sessions_on_shutdown(planned=planned)
     except Exception:
         logging.getLogger(__name__).exception("Hub shutdown failed before SIGINT")
     signal.raise_signal(signal.SIGINT)
 
 
-@app.post("/api/hub/shutdown")
-async def api_hub_shutdown(req: Request):
+def _shutdown_token_error(req: Request):
+    """None when the caller may stop or restart this hub, else the answer to send it."""
     if not _HUB_SHUTDOWN_TOKEN:
         return not_found("此 Hub 未启用远程停止")
     given = req.headers.get("x-hub-shutdown-token", "")
     if not hmac.compare_digest(given.encode("utf-8"), _HUB_SHUTDOWN_TOKEN.encode("utf-8")):
         return JSONResponse({"detail": "停止令牌无效"}, status_code=403)
+    return None
+
+
+async def _json_object_body(req: Request) -> Optional[Dict[str, Any]]:
+    """The request body as a JSON object, or None when it is not one (an empty body is {})."""
+    raw = await req.body()
+    if not raw or not raw.strip():
+        return {}
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+RESTART_MODES = ("hub", "replace-exe")
+
+
+def _restart_fields(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The restart request's fields, validated; ValueError says what is wrong."""
+    mode = str(body.get("mode") or "hub").strip().lower() or "hub"
+    if mode not in RESTART_MODES:
+        raise ValueError("mode 只能是 hub 或 replace-exe")
+    for name in ("session_ids", "continue_session_ids"):
+        value = body.get(name)
+        if value is not None and (not isinstance(value, list)
+                                  or not all(isinstance(i, str) for i in value)):
+            raise ValueError(f"{name} 必须是字符串列表")
+    text = body.get("continue_text")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("continue_text 必须是字符串")
+    return {
+        "mode": mode,
+        "restart_id": str(body.get("restart_id") or "").strip() or None,
+        "continue_unfinished_turns": body.get("continue_unfinished_turns", True) is not False,
+        "resume_crashed": body.get("resume_crashed") is True,
+        "session_ids": body.get("session_ids"),
+        "continue_session_ids": body.get("continue_session_ids"),
+        "continue_text": text,
+    }
+
+
+def _restart_payload(prepared: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "restart_id": prepared["restart_id"],
+        "mode": prepared["mode"],
+        "pid": os.getpid(),
+        "port": hub_port(),
+        "started_at": HUB_STARTED_AT,
+        "sessions": prepared["sessions"],
+        "session_count": prepared["session_count"],
+    }
+
+
+async def _prepare_restart_or_error(fields: Dict[str, Any]):
+    """(payload, None) once the request is on disk and this stop is a restart, else (None, answer)."""
+    if hub.restart_in_progress:
+        return None, JSONResponse({"detail": "Hub 已在关闭或重启中"}, status_code=409)
+    try:
+        prepared = await hub.prepare_graceful_restart(**fields)
+    except RuntimeError:
+        return None, JSONResponse({"detail": "Hub 已在关闭或重启中"}, status_code=409)
+    return _restart_payload(prepared), None
+
+
+@app.post("/api/hub/graceful-restart")
+async def api_hub_graceful_restart(req: Request):
+    """The one restart entry: snapshot the live sessions, write the resume request, stop gracefully."""
+    denied = _shutdown_token_error(req)
+    if denied is not None:
+        return denied
+    body = await _json_object_body(req)
+    if body is None:
+        return JSONResponse({"detail": "请求体必须是 JSON 对象"}, status_code=400)
+    try:
+        fields = _restart_fields(body)
+    except ValueError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=400)
+    payload, error = await _prepare_restart_or_error(fields)
+    if error is not None:
+        return error
+    return JSONResponse(payload, status_code=202,
+                        background=BackgroundTask(_stop_hub_like_ctrl_c, planned=True))
+
+
+@app.get("/api/hub/restart-status")
+async def api_hub_restart_status():
+    """Read-only restart progress, answered even while the hub is stopping or resuming.
+
+    Exempt from the shutdown gate and from the resume hold (like `/health` and `/api/hub/info`),
+    and it never carries the shutdown token or any other secret: a shell polls it without one.
+    """
+    status = hub.restart_status()
+    status.update({"started_at": HUB_STARTED_AT, "port": hub_port(), "pid": os.getpid()})
+    return status
+
+
+@app.post("/api/hub/shutdown")
+async def api_hub_shutdown(req: Request):
+    denied = _shutdown_token_error(req)
+    if denied is not None:
+        return denied
+    body = await _json_object_body(req)
+    # Backward compatible with the desktop app's old stop: `{"for_restart": true}` means "restart
+    # me, not stop me", and runs the same prepare + planned stop as /api/hub/graceful-restart.
+    # Every other body (none, empty, or anything without that flag) is the final stop it always was.
+    if body and body.get("for_restart") is True:
+        try:
+            fields = _restart_fields(body)
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        payload, error = await _prepare_restart_or_error(fields)
+        if error is not None:
+            return error
+        return JSONResponse(payload, status_code=200,
+                            background=BackgroundTask(_stop_hub_like_ctrl_c, planned=True))
     # The answer goes out first; the stop runs after the response is sent.
     return JSONResponse({"ok": True}, background=BackgroundTask(_stop_hub_like_ctrl_c))
 

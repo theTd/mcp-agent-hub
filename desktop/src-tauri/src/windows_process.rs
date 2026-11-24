@@ -8,8 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-#[cfg(any(feature = "portable", test))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
@@ -30,11 +29,10 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, OpenThread, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
-    CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+    GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
+    TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
-#[cfg(any(feature = "portable", test))]
-use windows_sys::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
 
 /// A Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the last handle closes (this app
 /// exits, crashes or is killed), Windows kills every process in it.
@@ -346,7 +344,6 @@ pub fn process_command_line(pid: u32) -> Option<String> {
 }
 
 /// The full image path of `pid`, or `None` when the process is gone or inaccessible.
-#[cfg(any(feature = "portable", test))]
 pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     // SAFETY: query-only handle; the wide buffer is sized by the API's required-length protocol.
     unsafe {
@@ -374,6 +371,34 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
             size *= 2;
         }
     }
+}
+
+/// Case-insensitive, verbatim-prefix-free form of an image path, so a path from `current_exe()`
+/// and one from `QueryFullProcessImageNameW` compare equal.
+fn normalize_image(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    text.strip_prefix("\\\\?\\")
+        .map(str::to_string)
+        .unwrap_or(text)
+}
+
+/// The first running process whose image path is exactly `exe`. Used by the upgrade helper to tell
+/// whether the app it just launched is alive; the desktop shell's own process therefore never
+/// matches an app it did not start.
+pub fn find_process_by_image(exe: &Path) -> Option<u32> {
+    let wanted = normalize_image(exe);
+    let name = exe.file_name()?.to_string_lossy().to_lowercase();
+    for entry in list_processes().ok()? {
+        if entry.exe.to_lowercase() != name {
+            continue;
+        }
+        if let Some(image) = process_image_path(entry.pid) {
+            if normalize_image(&image) == wanted {
+                return Some(entry.pid);
+            }
+        }
+    }
+    None
 }
 
 /// `root` and every descendant, root first. A process only counts as a child if it was created

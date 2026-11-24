@@ -13,16 +13,21 @@ import json
 import secrets
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 
 WAKE_EVENT_TYPES = frozenset({
     "approval_request", "question", "delivery_failed", "turn_completed",
-    "session_exited", "exited", "crashed", "hub_shutdown",
+    "session_exited", "exited", "crashed", "hub_shutdown", "restart_resume_failed",
 })
 ASK_EVENT_TYPES = frozenset({"approval_request", "question"})
 TERMINAL_FAILURE_TYPES = frozenset({"crashed", "session_exited", "exited"})
+# A session a deliberate restart could not bring back: the parent's handle must not wait forever
+# for a worker the hub already gave up on, so this is a terminal failure with its own type.
+RESTART_FAILED_EVENT_TYPE = "restart_resume_failed"
+SHUTDOWN_EVENT_TYPE = "hub_shutdown"
 # A parent's live message the hub could not submit, or could not prove submitted: the worker has not
 # read it. Owner decision `hub-friction-1116` (undelivered-wake, 2026-11-16): it wakes the handle with
 # state=undelivered and leaves it waiting (the worker is still alive), never failed.
@@ -253,7 +258,7 @@ class WaitInbox:
             if waiter and not waiter[1].done():
                 waiter[1].set_result(True)
 
-    async def publish_event(self, event: Dict[str, Any]) -> None:
+    async def publish_event(self, event: Dict[str, Any], *, event_key: Optional[str] = None) -> None:
         """Add one audit event to each matching parent inbox, with stable dedup keys."""
         event_type = str(event.get("type") or "")
         if event_type not in WAKE_EVENT_TYPES:
@@ -263,7 +268,8 @@ class WaitInbox:
         result_id = event.get("result_id")
         if event_type == "turn_completed":
             result_id = result_id or f"result:{sid}:{event.get('turn_id') or event.get('seq') or 'current'}"
-        key = str(request_id or result_id or f"event:{sid}:{event_type}:{event.get('seq') or event.get('timestamp')}")
+        key = str(event_key or request_id or result_id
+                  or f"event:{sid}:{event_type}:{event.get('seq') or event.get('timestamp')}")
         payload = dict(event)
         payload["result_id"] = result_id
         handles: List[str] = []
@@ -285,7 +291,8 @@ class WaitInbox:
                     and len(session_ids) > 1
                 )
                 state = "ask" if event_type in ("approval_request", "question") else (
-                    "failed" if event_type in TERMINAL_FAILURE_TYPES else "waiting"
+                    "failed" if event_type in TERMINAL_FAILURE_TYPES
+                    or event_type == RESTART_FAILED_EVENT_TYPE else "waiting"
                     if group_waiting else "done" if event_type == "turn_completed" else "waiting"
                 )
                 conn.execute(
@@ -298,8 +305,46 @@ class WaitInbox:
         for handle in handles:
             await self._notify(handle)
 
-    async def publish_shutdown(self) -> None:
-        await self.publish_event({"type": "hub_shutdown", "session_id": "", "content": "Hub shutdown"})
+    async def publish_shutdown(self, *, planned: bool = False,
+                               stop_id: Optional[str] = None) -> None:
+        """Tell parents the hub is stopping -- unless this stop is a planned restart.
+
+        A planned restart resumes its sessions behind the gate, so a settlement event here would
+        make every parent read "failed" for a worker that is about to be alive again.  A real
+        stop keeps one durable signal, keyed by ``stop_id`` so two stops never collide in one
+        handle's inbox (the old fixed key made the second one a silent no-op).
+        """
+        if planned:
+            return
+        stop = str(stop_id or uuid.uuid4().hex[:8])
+        await self.publish_event(
+            {"type": SHUTDOWN_EVENT_TYPE, "session_id": "", "content": "Hub shutdown",
+             "data": {"planned": False, "stop_id": stop}},
+            event_key=f"event:shutdown:{stop}",
+        )
+
+    async def repair_planned_restart(self) -> int:
+        """Drop leftover shutdown events a planned restart wrote before this fix, or by a real stop.
+
+        Only ``hub_shutdown`` rows are touched: every real business event (crashed, session_exited,
+        turn_completed, approval_request, ...) stays exactly as it was, so a restart can never hide
+        a worker's death or an open approval. Returns how many rows were consumed.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,payload_json FROM wait_inbox_events"
+                " WHERE consumed=0 AND event_type=?", (SHUTDOWN_EVENT_TYPE,)
+            ).fetchall()
+            cleared = 0
+            for row in rows:
+                payload = self._load(row["payload_json"], {})
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                # A planned-restart event is pure noise; a real stop's event is stale the moment a
+                # fresh hub took over the inbox (its sessions were resumed or are archived).
+                if data.get("planned") is False or not data:
+                    conn.execute("UPDATE wait_inbox_events SET consumed=1 WHERE id=?", (row["id"],))
+                    cleared += 1
+        return cleared
 
     def _request_open(self, event: Dict[str, Any], request_id: Optional[str]) -> bool:
         if self._request_check is None:
@@ -461,7 +506,28 @@ class WaitInbox:
                 events = [event] + await self._take_events(handle, UNDELIVERED_EVENT_TYPE)
                 return {"state": "undelivered", "result_id": event.get("result_id"),
                         "messages": [undelivered_entry(item) for item in events]}
-            if kind in TERMINAL_FAILURE_TYPES or kind == "hub_shutdown":
+            if kind == RESTART_FAILED_EVENT_TYPE:
+                # A worker the restart could not bring back: the parent must wake now instead of
+                # waiting for a session that will never report a turn.
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                reason = str(data.get("reason") or event.get("content") or "restart resume failed")
+                return {
+                    "state": "failed",
+                    "result_id": event.get("result_id") or event.get("request_id"),
+                    "errors": [{
+                        "type": RESTART_FAILED_EVENT_TYPE,
+                        "message": reason,
+                        "session_id": event.get("session_id") or data.get("session_id"),
+                        "reason": reason,
+                        "event": event,
+                    }],
+                }
+            if kind == SHUTDOWN_EVENT_TYPE:
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if data.get("planned") is True:
+                    # A planned restart turns long polls into "keep waiting", never into failure.
+                    continue
+            if kind in TERMINAL_FAILURE_TYPES or kind == SHUTDOWN_EVENT_TYPE:
                 message = event.get("content") or kind
                 return {
                     "state": "failed",
@@ -592,8 +658,18 @@ class WaitInbox:
             if current and current[0] == token:
                 self._waiters.pop(handle, None)
 
-    async def close(self) -> None:
+    async def close(self, *, planned: bool = False) -> None:
+        """Release every in-flight long poll.
+
+        A planned restart answers "the hub is restarting, keep waiting" instead of `superseded`
+        (or `failed`): the handle is still valid after the replacement hub restores the inbox,
+        and a parent that settles now would give up on a worker that is coming back.
+        """
         for handle, waiter in list(self._waiters.items()):
-            if not waiter[1].done():
+            if waiter[1].done():
+                continue
+            if planned:
+                waiter[1].set_result({"state": "waiting", "wait_handle": handle, "hub_restarting": True})
+            else:
                 waiter[1].set_result({"state": "superseded", "wait_handle": handle})
         self._waiters.clear()

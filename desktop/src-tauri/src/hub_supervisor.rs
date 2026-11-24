@@ -5,13 +5,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Url};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-use crate::hub_api::{count_sessions, HubApi, SessionCounts};
+use crate::desktop_toast::{self, ToastClick};
+use crate::hub_api::{count_sessions, HubApi, RestartStatus, SessionCounts};
 #[cfg(not(feature = "portable"))]
 use crate::hub_api::HubInfo;
 use crate::hub_config::{self, HubConfig};
@@ -20,12 +21,17 @@ use crate::owned_hub::{self, OwnedHub, ReadyError, PORT_RELEASE_WAIT};
 #[cfg(not(feature = "portable"))]
 use crate::owned_hub::PortProbe;
 use crate::tray_menu;
+use crate::update_helper::{self, RestartPlan};
 use crate::windows_process;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const EXTERNAL_MISSES_BEFORE_ERROR: u32 = 3;
 /// Checks in a row an owned hub may run without listening on its port before the error view.
 const NOT_LISTENING_BEFORE_ERROR: u32 = 3;
+/// How long the shell waits for the restarted hub to report `ready` / `failed`.
+const RESTART_STATUS_TIMEOUT: Duration = Duration::from_secs(45);
+/// A brand-new hub may report `idle` before it begins resuming; it has to stay idle this long.
+const RESTART_IDLE_POLLS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubMode {
@@ -34,6 +40,102 @@ pub enum HubMode {
     External,
     Failed,
     Stopping,
+    /// 优雅重启 / 重启并升级: a planned stop is in flight and the hub is expected to go away. A child
+    /// exit here is never an error, and the splash / tray say so instead of "Hub 未运行".
+    Restarting,
+}
+
+/// What an owned hub's exit means, decided from `restart_plan.json`. A stop this app (or an external
+/// CLI hitting the same hub) asked for must never surface as "Hub 进程意外退出".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannedExit {
+    /// mode `hub`: restart the hub here and let it resume the archived sessions.
+    Restart,
+    /// mode `replace-exe`: exit so the detached helper can swap the EXE.
+    ExitForUpgrade,
+    /// No plan, an expired plan, a plan for another app instance, or an unknown mode.
+    UnexpectedFailure,
+}
+
+pub fn classify_owned_exit(
+    plan: Option<&RestartPlan>,
+    app_pid: u32,
+    app_creation_time: Option<u64>,
+    now: f64,
+) -> PlannedExit {
+    let Some(plan) = plan else {
+        return PlannedExit::UnexpectedFailure;
+    };
+    if plan.is_expired(now) || plan.app_pid == 0 || plan.app_pid != app_pid {
+        return PlannedExit::UnexpectedFailure;
+    }
+    // Windows reuses PIDs within minutes. A plan left behind by an older app instance whose PID
+    // this app happens to own must never excuse a real crash of this app's hub — and must never
+    // make this app exit "for an upgrade" it never staged.
+    if plan.app_creation_time != 0 {
+        match app_creation_time {
+            Some(current) if current == plan.app_creation_time => {}
+            _ => return PlannedExit::UnexpectedFailure,
+        }
+    }
+    match plan.mode.as_str() {
+        "hub" => PlannedExit::Restart,
+        "replace-exe" => PlannedExit::ExitForUpgrade,
+        _ => PlannedExit::UnexpectedFailure,
+    }
+}
+
+fn new_restart_id() -> String {
+    windows_process::random_token()
+        .map(|token| token.chars().take(16).collect())
+        .unwrap_or_else(|_| format!("restart-{}", std::process::id()))
+}
+
+/// A `replace-exe` hand-off is only safe when the build the helper is going to swap in really
+/// exists: either the staged copy with its planned hash, or a target that already carries the new
+/// bytes (the helper finished the swap while this app was still running).
+fn upgrade_handoff_is_ready(plan: &RestartPlan) -> bool {
+    let expected = plan
+        .new_exe_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|sha| sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+    let Some(expected) = expected else {
+        return false;
+    };
+    if let Some(target) = plan.target_exe.as_deref() {
+        if update_helper::sha256_file(target).is_ok_and(|sha| sha.eq_ignore_ascii_case(expected)) {
+            return true;
+        }
+    }
+    match plan.staged_exe.as_deref() {
+        Some(staged) if staged.is_file() => {
+            update_helper::sha256_file(staged).is_ok_and(|sha| sha.eq_ignore_ascii_case(expected))
+        }
+        _ => false,
+    }
+}
+
+/// The files an EXE swap needs, prepared before anything is stopped.
+#[cfg(feature = "portable")]
+struct PreparedUpgrade {
+    plan_path: PathBuf,
+    helper_exe: PathBuf,
+    staged_exe: PathBuf,
+    target_exe: PathBuf,
+}
+
+/// Two paths naming the same file (`current_exe()` and a user-picked path can differ in case, `/`
+/// vs `\\` or a `\\\\?\\` prefix).
+#[cfg(feature = "portable")]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a
+            .to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&b.to_string_lossy().replace('/', "\\")),
+    }
 }
 
 /// What the bundled splash page shows (it polls this through the `splash_state` command).
@@ -309,16 +411,28 @@ impl HubShell {
         tray_menu::refresh(app);
     }
 
-    fn set_starting_state(&self, message: &str, detail: &str) {
+    /// 优雅重启 / 重启并升级: the splash keeps its "starting" phase (the page knows how to render a
+    /// spinner) while the message, the tray tooltip and the tray menu say restart.
+    fn set_restarting(&self, app: &AppHandle, message: &str, detail: &str) {
+        self.set_phase_state(HubMode::Restarting, "starting", message, detail);
+        self.navigate_splash(app);
+        tray_menu::refresh(app);
+    }
+
+    fn set_phase_state(&self, mode: HubMode, phase: &str, message: &str, detail: &str) {
         let mut st = self.st();
-        st.mode = HubMode::Starting;
-        st.splash.phase = "starting".into();
+        st.mode = mode;
+        st.splash.phase = phase.into();
         st.splash.message = message.into();
         st.splash.detail = detail.into();
         st.splash.log_tail.clear();
         st.splash.can_recover = false;
         st.splash.recovery_detail.clear();
         st.splash.console_url = None;
+    }
+
+    fn set_starting_state(&self, message: &str, detail: &str) {
+        self.set_phase_state(HubMode::Starting, "starting", message, detail);
     }
 
     /// The hub answers: switch the mode and the splash view in one step, so the splash page can
@@ -586,30 +700,455 @@ impl HubShell {
         app.exit(0);
     }
 
-    /// Tray 重启 Hub: the same confirm and stop as 退出, then start again.
+    /// Tray 优雅重启 Hub（保留会话）: write `restart_plan.json`, ask the hub to stop with
+    /// `/api/hub/graceful-restart` (it archives the live sessions and plans to resume them), start a
+    /// new hub, then wait until it reports how many sessions it resumed.
     pub async fn restart(self: &Arc<Self>, app: &AppHandle) {
-        if self.mode() == HubMode::External {
+        if !matches!(self.mode(), HubMode::Owned | HubMode::Failed) {
             return;
         }
         let n = self.live_session_count().await;
         if n > 0
             && !confirm(
                 app,
-                "重启 Hub",
-                &format!("有 {n} 个会话正在运行。重启会停止 Hub 和这些会话。确定重启？"),
-                "重启",
+                "优雅重启 Hub",
+                &format!("当前有 {n} 个活跃会话。优雅重启会重启 Hub 并自动恢复这些会话，是否继续？"),
+                "优雅重启",
             )
             .await
         {
             self.log(&format!("restart cancelled ({n} live sessions)"));
             return;
         }
-        self.cancel_start.store(true, Ordering::SeqCst);
         let _guard = self.ops.lock().await;
-        self.log("restart");
-        self.set_starting(app, "正在重启 Hub…", "");
-        self.stop_owned_locked(app).await;
+        // The confirmation dialog may have run while a start was finishing.
+        if !matches!(self.mode(), HubMode::Owned | HubMode::Failed) {
+            return;
+        }
+        self.log("graceful restart requested");
+        self.set_restarting(app, "正在优雅重启并恢复会话…", "");
+        let restart_id = new_restart_id();
+        let port = self.write_restart_plan(&restart_id, "hub");
+        // Fail-closed: without a confirmed graceful stop the hub has not archived the sessions in
+        // `resume_on_start.json`, so starting a new one would silently drop every live session.
+        // Keep the running hub, its sessions and the shell exactly as they are.
+        if let Err(reason) = self.stop_owned_for_restart("hub", Some(&restart_id)).await {
+            update_helper::remove_restart_plan(&update_helper::restart_plan_path());
+            self.abort_planned_stop(app, "优雅重启已中止", &reason);
+            return;
+        }
         self.start_locked(app).await;
+        self.settle_restart(app, &restart_id, port).await;
+        update_helper::remove_restart_plan(&update_helper::restart_plan_path());
+        tray_menu::refresh(app);
+    }
+
+    /// `restart_plan.json` for an in-place restart. Returns the port the new hub will listen on.
+    fn write_restart_plan(&self, restart_id: &str, mode: &str) -> u16 {
+        let (port, hub) = {
+            let st = self.st();
+            (
+                st.config.as_ref().map(|c| c.port).unwrap_or(0),
+                st.owned.as_ref().and_then(|owned| owned.hub_identity()),
+            )
+        };
+        let app_pid = std::process::id();
+        let now = update_helper::now_secs();
+        let plan = RestartPlan {
+            version: update_helper::PLAN_VERSION,
+            restart_id: restart_id.to_string(),
+            mode: mode.to_string(),
+            requested_at: now,
+            expires_at: now + update_helper::RESTART_PLAN_TTL_SECS,
+            port,
+            app_pid,
+            app_creation_time: windows_process::creation_time(app_pid).unwrap_or(0),
+            hub_pid: hub.map(|identity| identity.pid).unwrap_or(0),
+            hub_creation_time: hub.map(|identity| identity.creation_time).unwrap_or(0),
+            data_dir: self.data_dir_for_plan(),
+            target_exe: None,
+            old_exe_sha256: None,
+            new_exe: None,
+            new_exe_sha256: None,
+            staged_exe: None,
+            backup_exe: None,
+        };
+        let path = update_helper::restart_plan_path();
+        match update_helper::write_restart_plan(&path, &plan) {
+            Ok(()) => self.log(&format!(
+                "restart plan written: {} (mode {mode}, restart_id {restart_id}, port {port})",
+                path.display()
+            )),
+            Err(error) => self.log(&format!("restart plan write failed: {error}")),
+        }
+        port
+    }
+
+    fn data_dir_for_plan(&self) -> Option<PathBuf> {
+        #[cfg(feature = "portable")]
+        {
+            Some(hub_config::portable_root().join("data"))
+        }
+        #[cfg(not(feature = "portable"))]
+        {
+            None
+        }
+    }
+
+    /// Stop an owned hub as part of a planned restart: the same wait / terminate / port release as
+    /// 退出, but the request goes to the graceful-restart endpoint so sessions are archived first.
+    ///
+    /// **Fail-closed**: when the hub does not confirm the graceful restart, this puts the untouched
+    /// hub back into the shell state (mode `Owned`, so this app keeps supervising it) and returns
+    /// the reason. The caller must then abort the restart / upgrade and leave the live hub alone.
+    async fn stop_owned_for_restart(
+        &self,
+        mode: &str,
+        restart_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(owned) = self.st().owned.take() else {
+            self.log("planned restart: there is no owned hub to stop");
+            return Ok(());
+        };
+        {
+            let mut st = self.st();
+            st.mode = HubMode::Restarting;
+            st.counts = SessionCounts::default();
+        }
+        // Ends the notifier's long-poll, so the hub has no open request holding up its shutdown.
+        self.bump_generation();
+        let log = |line: &str| self.log(line);
+        match owned.stop_for_graceful_restart(mode, restart_id, &log).await {
+            Ok(report) => {
+                self.log(&format!(
+                    "planned stop finished: graceful={}, restart_endpoint={}, exit={}",
+                    report.graceful,
+                    report.graceful_restart_supported,
+                    report
+                        .exit
+                        .as_deref()
+                        .unwrap_or("terminated by the job")
+                ));
+                Ok(())
+            }
+            Err((owned, reason)) => {
+                // Not a single file was touched and the hub never got a stop request: keep owning it.
+                {
+                    let mut st = self.st();
+                    st.owned = Some(owned);
+                    st.mode = HubMode::Owned;
+                }
+                Err(reason)
+            }
+        }
+    }
+
+    /// A planned stop was refused: restore the shell to a normal owned-hub state (splash, console,
+    /// notifier), then tell the user why nothing happened. The live hub keeps serving its sessions.
+    fn abort_planned_stop(&self, app: &AppHandle, title: &str, reason: &str) {
+        self.log(&format!("{title}: {reason}"));
+        self.bump_generation();
+        if let Some(cfg) = self.st().config.clone() {
+            self.mark_ready_state(HubMode::Owned, &cfg);
+            self.open_console_quietly(app, &cfg);
+        } else {
+            self.set_starting_state("正在启动 Hub…", "");
+        }
+        tray_menu::refresh(app);
+        app.dialog()
+            .message(reason)
+            .title(title)
+            .kind(MessageDialogKind::Error)
+            .buttons(MessageDialogButtons::Ok)
+            .show(|_| {});
+    }
+
+    /// Poll `/api/hub/restart-status` until the restarted hub says the resume finished, then log it,
+    /// toast the counts and refresh the tray. `idle` only counts after a few polls, because a
+    /// brand-new hub answers `idle` before it starts resuming.
+    async fn settle_restart(&self, app: &AppHandle, restart_id: &str, port: u16) {
+        if port == 0 {
+            self.log("restart: no port to probe for restart status");
+            return;
+        }
+        let api = HubApi::new(port);
+        let deadline = Instant::now() + RESTART_STATUS_TIMEOUT;
+        let mut last: Option<RestartStatus> = None;
+        let mut idle_polls = 0u32;
+        loop {
+            match api.restart_status(Duration::from_secs(2)).await {
+                Ok(status) => {
+                    self.log(&format!("restart {restart_id} status: {status:?}"));
+                    idle_polls = if status.phase == "idle" { idle_polls + 1 } else { 0 };
+                    let finished = status.is_terminal()
+                        && (status.phase != "idle" || idle_polls >= RESTART_IDLE_POLLS);
+                    last = Some(status);
+                    if finished {
+                        break;
+                    }
+                }
+                Err(error) => self.log(&format!("restart status unavailable: {error}")),
+            }
+            if Instant::now() >= deadline {
+                self.log(&format!(
+                    "restart status still not final after {} s",
+                    RESTART_STATUS_TIMEOUT.as_secs()
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+        self.report_restart_result(app, restart_id, last.as_ref());
+        self.refresh_counts_and_tray(app).await;
+    }
+
+    fn report_restart_result(&self, app: &AppHandle, restart_id: &str, status: Option<&RestartStatus>) {
+        let Some(status) = status else {
+            self.log(&format!(
+                "restart {restart_id}: the new hub never reported a restart status"
+            ));
+            desktop_toast::show(
+                app,
+                desktop_toast::APP_DISPLAY_NAME,
+                "Hub 已重启",
+                Some("会话恢复状态未知，可在总控台查看"),
+                ToastClick::ShowWindow,
+            );
+            return;
+        };
+        match status.phase.as_str() {
+            "ready" => {
+                self.log(&format!(
+                    "restart {restart_id} ready: {}/{} resumed, {} skipped, {} failed",
+                    status.resumed_count,
+                    status.target_count,
+                    status.skipped_count,
+                    status.failed_count
+                ));
+                let line1 = format!(
+                    "已恢复 {} / {} 个会话",
+                    status.resumed_count, status.target_count
+                );
+                let line2 = (status.skipped_count > 0 || status.failed_count > 0).then(|| {
+                    format!(
+                        "{} 个未能恢复（见「归档」）",
+                        status.skipped_count + status.failed_count
+                    )
+                });
+                desktop_toast::show(
+                    app,
+                    desktop_toast::APP_DISPLAY_NAME,
+                    &line1,
+                    line2.as_deref(),
+                    ToastClick::ShowWindow,
+                );
+            }
+            "failed" => {
+                self.log(&format!(
+                    "restart {restart_id} failed: {}/{} resumed, {} failed",
+                    status.resumed_count, status.target_count, status.failed_count
+                ));
+                desktop_toast::show(
+                    app,
+                    desktop_toast::APP_DISPLAY_NAME,
+                    "Hub 已重启，但会话恢复失败",
+                    Some("可在「归档」里手动恢复"),
+                    ToastClick::ShowWindow,
+                );
+            }
+            other => {
+                self.log(&format!("restart {restart_id} ended in phase {other}"));
+            }
+        }
+    }
+
+    /// 重启并升级…: validate and stage the chosen EXE, stop the hub gracefully, hand the swap to a
+    /// detached helper, then exit so the helper is the only thing touching the file.
+    #[cfg(feature = "portable")]
+    pub async fn restart_and_upgrade(self: &Arc<Self>, app: &AppHandle, new_exe: PathBuf) {
+        if self.mode() != HubMode::Owned {
+            self.log("upgrade ignored: this app does not own the hub");
+            return;
+        }
+        let name = new_exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| new_exe.display().to_string());
+        if !confirm(
+            app,
+            "重启并升级",
+            &format!(
+                "将用 {name} 替换当前程序。Hub 会先优雅停止，随后由新版本恢复会话，应用会自动退出。确定继续？"
+            ),
+            "升级",
+        )
+        .await
+        {
+            self.log("upgrade cancelled");
+            return;
+        }
+        let _guard = self.ops.lock().await;
+        if self.mode() != HubMode::Owned {
+            return;
+        }
+        let restart_id = new_restart_id();
+        let prepared = match self.prepare_upgrade(&new_exe, &restart_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Nothing was stopped and no file was touched.
+                self.log(&format!("upgrade aborted before any change: {error}"));
+                app.dialog()
+                    .message(&error)
+                    .title("无法升级")
+                    .kind(MessageDialogKind::Error)
+                    .buttons(MessageDialogButtons::Ok)
+                    .show(|_| {});
+                return;
+            }
+        };
+        self.log(&format!(
+            "upgrade staged: target {}, staged {}, helper {}, plan {}",
+            prepared.target_exe.display(),
+            prepared.staged_exe.display(),
+            prepared.helper_exe.display(),
+            prepared.plan_path.display()
+        ));
+        self.set_restarting(app, "正在重启并升级…", &format!("新版本：{name}"));
+        // Fail-closed: when the hub does not confirm the graceful restart, the sessions were never
+        // archived. Handing the EXE to the helper here would lose them, so drop every staged
+        // artefact of this attempt and keep the current build running.
+        if let Err(reason) = self
+            .stop_owned_for_restart("replace-exe", Some(&restart_id))
+            .await
+        {
+            update_helper::remove_restart_plan(&prepared.plan_path);
+            let _ = std::fs::remove_file(&prepared.staged_exe);
+            let _ = std::fs::remove_file(&prepared.helper_exe);
+            self.abort_planned_stop(app, "升级已中止", &reason);
+            return;
+        }
+        if let Err(error) = update_helper::launch_detached_helper(&prepared.helper_exe, &prepared.plan_path) {
+            self.log(&format!("upgrade helper did not start: {error}"));
+            let _ = std::fs::remove_file(&prepared.plan_path);
+            let _ = std::fs::remove_file(&prepared.staged_exe);
+            app.dialog()
+                .message(&format!(
+                    "无法启动升级助手：{error}\n\n当前版本会重新启动。"
+                ))
+                .title("升级中止")
+                .kind(MessageDialogKind::Warning)
+                .show(|_| {});
+            self.start_locked(app).await;
+            return;
+        }
+        self.log("upgrade helper launched; exiting so the EXE is no longer locked");
+        app.exit(0);
+    }
+
+    #[cfg(not(feature = "portable"))]
+    pub async fn restart_and_upgrade(self: &Arc<Self>, app: &AppHandle, new_exe: PathBuf) {
+        let _ = new_exe;
+        self.log("upgrade ignored: the installed build does not replace its EXE");
+        app.dialog()
+            .message("只有便携版（单个 EXE）支持“重启并升级…”。安装版请用新的安装包升级。")
+            .title("重启并升级")
+            .kind(MessageDialogKind::Info)
+            .show(|_| {});
+    }
+
+    /// Precheck + staging for an EXE swap. Every step fails closed: a rejected file leaves the hub
+    /// running and no file touched.
+    #[cfg(feature = "portable")]
+    fn prepare_upgrade(&self, new_exe: &Path, restart_id: &str) -> Result<PreparedUpgrade, String> {
+        if !new_exe.is_file() {
+            return Err(format!("找不到所选文件：{}", new_exe.display()));
+        }
+        let current = std::env::current_exe().map_err(|e| format!("无法定位当前程序：{e}"))?;
+        if same_file(&current, new_exe) {
+            return Err("所选文件就是当前正在运行的程序".to_string());
+        }
+        let new_sha = update_helper::sha256_file(new_exe)?;
+        let current_sha = update_helper::sha256_file(&current)?;
+        let (port, hub) = {
+            let st = self.st();
+            (
+                st.config.as_ref().map(|c| c.port).unwrap_or(0),
+                st.owned.as_ref().and_then(|owned| owned.hub_identity()),
+            )
+        };
+        if port == 0 {
+            // The helper verifies the upgrade through `/api/hub/info`; without a port it must not
+            // swap anything, so refuse here rather than stage a plan it will reject.
+            return Err("Hub 端口未知，无法校验升级结果".to_string());
+        }
+        let sidecar = PathBuf::from(format!("{}.sha256", new_exe.display()));
+        if sidecar.is_file() {
+            let text = std::fs::read_to_string(&sidecar)
+                .map_err(|e| format!("无法读取 {}：{e}", sidecar.display()))?;
+            let expected = text
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("{} 不是有效的 SHA-256 清单", sidecar.display()));
+            }
+            if expected != new_sha.to_lowercase() {
+                return Err(format!(
+                    "新程序的 SHA-256（{new_sha}）与 {} 不一致",
+                    sidecar.display()
+                ));
+            }
+            self.log(&format!("upgrade: sha256 sidecar verified ({new_sha})"));
+        }
+        let nonce = update_helper::random_nonce()?;
+        let staged = update_helper::staged_exe_path(&current, &nonce);
+        let helper = update_helper::helper_exe_path(&nonce);
+        let backup = update_helper::backup_exe_path(&current);
+        std::fs::copy(new_exe, &staged)
+            .map_err(|e| format!("无法暂存到 {}：{e}", staged.display()))?;
+        let staged_sha = update_helper::sha256_file(&staged)?;
+        if !staged_sha.eq_ignore_ascii_case(&new_sha) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("暂存副本校验失败：{staged_sha} != {new_sha}"));
+        }
+        std::fs::copy(&current, &helper)
+            .map_err(|e| format!("无法复制升级助手到 {}：{e}", helper.display()))?;
+        let helper_sha = update_helper::sha256_file(&helper)?;
+        if helper_sha != current_sha {
+            let _ = std::fs::remove_file(&helper);
+            let _ = std::fs::remove_file(&staged);
+            return Err("复制到临时目录的升级助手与当前程序不一致".to_string());
+        }
+        let app_pid = std::process::id();
+        let now = update_helper::now_secs();
+        let plan = RestartPlan {
+            version: update_helper::PLAN_VERSION,
+            restart_id: restart_id.to_string(),
+            mode: "replace-exe".to_string(),
+            requested_at: now,
+            expires_at: now + update_helper::RESTART_PLAN_TTL_SECS,
+            port,
+            app_pid,
+            app_creation_time: windows_process::creation_time(app_pid).unwrap_or(0),
+            hub_pid: hub.map(|identity| identity.pid).unwrap_or(0),
+            hub_creation_time: hub.map(|identity| identity.creation_time).unwrap_or(0),
+            data_dir: self.data_dir_for_plan(),
+            target_exe: Some(current.clone()),
+            old_exe_sha256: Some(current_sha),
+            new_exe: Some(new_exe.to_path_buf()),
+            new_exe_sha256: Some(new_sha),
+            staged_exe: Some(staged.clone()),
+            backup_exe: Some(backup),
+        };
+        let plan_path = update_helper::restart_plan_path();
+        update_helper::write_restart_plan(&plan_path, &plan)?;
+        Ok(PreparedUpgrade {
+            plan_path,
+            helper_exe: helper,
+            staged_exe: staged,
+            target_exe: current,
+        })
     }
 
     /// Tray 接管 Hub: stop the external hub (its pid from /api/hub/info and its process tree) and
@@ -682,25 +1221,120 @@ impl HubShell {
     /// Every 5 s: session counts for the tray, a crashed owned hub → error view, an owned hub that
     /// runs but no longer listens on its port → error view (its sessions keep running until 重试),
     /// an external hub that stopped answering → error view (重试 then starts an owned one).
+    ///
+    /// A hub that exited because `restart_plan.json` says so was *not* a crash: `mode="hub"` restarts
+    /// it here (the sessions were archived and the new hub resumes them), `mode="replace-exe"` exits
+    /// the shell so the detached helper can swap the EXE.
     pub async fn watch(self: Arc<Self>, app: AppHandle) {
         let mut external_misses = 0u32;
         let mut not_listening = 0u32;
         loop {
             tokio::time::sleep(STATUS_INTERVAL).await;
             match self.mode() {
+                HubMode::Restarting | HubMode::Stopping => {
+                    // A planned stop is in flight: the child is supposed to exit. Whoever started the
+                    // restart owns the transition out of this mode; the watch must not react at all.
+                    external_misses = 0;
+                    not_listening = 0;
+                }
                 HubMode::Owned => {
                     external_misses = 0;
+                    let mut planned = false;
                     if let Ok(_guard) = self.ops.try_lock() {
                         if let Some(code) = self.owned_exit() {
                             not_listening = 0;
-                            if let Some(owned) = self.st().owned.take() {
-                                owned.terminate();
+                            let plan =
+                                update_helper::read_restart_plan(&update_helper::restart_plan_path());
+                            match classify_owned_exit(
+                                plan.as_ref(),
+                                std::process::id(),
+                                // The plan names a process *instance*: a reused PID is another app.
+                                windows_process::process_identity(std::process::id())
+                                    .map(|identity| identity.creation_time),
+                                update_helper::now_secs(),
+                            ) {
+                                PlannedExit::Restart => {
+                                    let restart_id = plan
+                                        .as_ref()
+                                        .map(|p| p.restart_id.clone())
+                                        .unwrap_or_default();
+                                    let port =
+                                        self.st().config.as_ref().map(|c| c.port).unwrap_or(0);
+                                    self.log(&format!(
+                                        "planned restart detected via restart_plan.json (hub exited with {code}); starting a new hub"
+                                    ));
+                                    self.bump_generation();
+                                    if let Some(owned) = self.st().owned.take() {
+                                        owned.terminate();
+                                    }
+                                    #[cfg(feature = "portable")]
+                                    let _ = std::fs::remove_file(
+                                        hub_config::portable_root().join("launch.json"),
+                                    );
+                                    self.set_restarting(
+                                        &app,
+                                        "正在优雅重启并恢复会话…",
+                                        "",
+                                    );
+                                    self.start_locked(&app).await;
+                                    self.settle_restart(&app, &restart_id, port).await;
+                                    update_helper::remove_restart_plan(
+                                        &update_helper::restart_plan_path(),
+                                    );
+                                    tray_menu::refresh(&app);
+                                    planned = true;
+                                }
+                                PlannedExit::ExitForUpgrade => {
+                                    // Only hand the EXE over when the staged build really exists (or
+                                    // the swap already happened). A plan whose staged file is missing
+                                    // or whose hash does not match must not make this app exit and
+                                    // leave the desktop with no shell and no hub.
+                                    let handoff_ready =
+                                        plan.as_ref().is_some_and(upgrade_handoff_is_ready);
+                                    if !handoff_ready {
+                                        self.log("planned EXE upgrade is incomplete: staged build missing or hash mismatch; keeping the shell");
+                                        update_helper::remove_restart_plan(
+                                            &update_helper::restart_plan_path(),
+                                        );
+                                        if let Some(owned) = self.st().owned.take() {
+                                            owned.terminate();
+                                        }
+                                        self.fail(
+                                            &app,
+                                            "升级计划不完整（暂存文件缺失或哈希不一致），已取消升级并保留当前程序。\
+                                             点「重试」可重新启动 Hub。",
+                                            false,
+                                        );
+                                        continue;
+                                    }
+                                    self.log(&format!(
+                                        "planned EXE upgrade detected (hub exited with {code}); exiting shell cleanly so the helper can replace it"
+                                    ));
+                                    if let Some(owned) = self.st().owned.take() {
+                                        owned.terminate();
+                                    }
+                                    #[cfg(feature = "portable")]
+                                    let _ = std::fs::remove_file(
+                                        hub_config::portable_root().join("launch.json"),
+                                    );
+                                    planned = true;
+                                    app.exit(0);
+                                }
+                                PlannedExit::UnexpectedFailure => {
+                                    if let Some(owned) = self.st().owned.take() {
+                                        owned.terminate();
+                                    }
+                                    self.fail(
+                                        &app,
+                                        &format!("Hub 进程意外退出了（退出码 {code}）。"),
+                                        true,
+                                    );
+                                    continue;
+                                }
                             }
-                            self.fail(
-                                &app,
-                                &format!("Hub 进程意外退出了（退出码 {code}）。"),
-                                true,
-                            );
+                        }
+                        if planned {
+                            tray_menu::refresh_tooltip(&app);
                             continue;
                         }
                         // Connections that were already open keep working, so session counts
@@ -724,7 +1358,9 @@ impl HubShell {
                             continue;
                         }
                     }
-                    self.refresh_counts().await;
+                    if self.mode() == HubMode::Owned {
+                        self.refresh_counts().await;
+                    }
                 }
                 HubMode::External => {
                     if self.refresh_counts().await {
@@ -832,5 +1468,143 @@ mod tests {
         assert_eq!(shell.mode(), HubMode::Failed);
         assert_eq!(failed.phase, "error");
         assert_eq!(failed.console_url, None);
+    }
+
+    #[test]
+    fn restarting_is_its_own_mode_with_a_restart_message() {
+        let shell = HubShell::new(std::env::temp_dir());
+        shell.mark_ready_state(HubMode::Owned, &cfg(4444));
+        // A restart is not a failure: the mode, the splash message and the console target all change.
+        let mut st = shell.st();
+        st.mode = HubMode::Restarting;
+        st.splash.phase = "starting".into();
+        st.splash.message = "正在优雅重启并恢复会话…".into();
+        st.splash.console_url = None;
+        drop(st);
+        assert_eq!(shell.mode(), HubMode::Restarting);
+        assert_ne!(shell.mode(), HubMode::Failed);
+        assert!(shell.splash_view().message.contains("优雅重启"));
+        // No ready target while restarting: the notifier and the console must not talk to a hub
+        // that is going away.
+        assert!(shell.ready_target().is_none());
+    }
+
+    fn plan(mode: &str, app_pid: u32, expires_at: f64) -> RestartPlan {
+        RestartPlan {
+            version: update_helper::PLAN_VERSION,
+            restart_id: "r".into(),
+            mode: mode.into(),
+            requested_at: expires_at - 600.0,
+            expires_at,
+            port: 4444,
+            app_pid,
+            app_creation_time: 1,
+            hub_pid: 2,
+            hub_creation_time: 3,
+            data_dir: None,
+            target_exe: None,
+            old_exe_sha256: None,
+            new_exe: None,
+            new_exe_sha256: None,
+            staged_exe: None,
+            backup_exe: None,
+        }
+    }
+
+    #[test]
+    fn a_planned_exit_is_told_apart_from_a_crash() {
+        let me = std::process::id();
+        let now = 1_795_470_500.0;
+
+        // The plan this app wrote for itself: restart the hub, never an error.
+        assert_eq!(
+            classify_owned_exit(Some(&plan("hub", me, 1_795_470_600.0)), me, Some(1), now),
+            PlannedExit::Restart
+        );
+        // The same for an EXE swap: exit so the helper can take over.
+        assert_eq!(
+            classify_owned_exit(
+                Some(&plan("replace-exe", me, 1_795_471_800.0)),
+                me,
+                Some(1),
+                now
+            ),
+            PlannedExit::ExitForUpgrade
+        );
+        // Expired plan, another app instance, no plan, unknown mode: all real failures.
+        assert_eq!(
+            classify_owned_exit(Some(&plan("hub", me, now - 10.0)), me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_owned_exit(Some(&plan("hub", me + 1, 1_795_470_600.0)), me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_owned_exit(Some(&plan("hub", 0, 1_795_470_600.0)), me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_owned_exit(None, me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_owned_exit(Some(&plan("shutdown", me, 1_795_470_600.0)), me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+        // A plan with no deadline at all can never justify skipping the error view.
+        assert_eq!(
+            classify_owned_exit(Some(&plan("hub", me, 0.0)), me, Some(1), now),
+            PlannedExit::UnexpectedFailure
+        );
+    }
+
+    #[test]
+    fn a_reused_app_pid_never_turns_a_crash_into_a_planned_exit() {
+        let me = std::process::id();
+        let now = 1_795_470_500.0;
+        let mut reuse = plan("replace-exe", me, now + 100.0);
+        reuse.app_creation_time = 7;
+        // Same PID, different process instance: the plan belongs to an app that is already gone,
+        // so this app's hub exit is a real crash and this app must not exit "for the upgrade".
+        assert_eq!(
+            classify_owned_exit(Some(&reuse), me, Some(9), now),
+            PlannedExit::UnexpectedFailure
+        );
+        assert_eq!(
+            classify_owned_exit(Some(&reuse), me, Some(7), now),
+            PlannedExit::ExitForUpgrade
+        );
+        // A plan that names an instance can never be honoured without our own creation time.
+        assert_eq!(
+            classify_owned_exit(Some(&reuse), me, None, now),
+            PlannedExit::UnexpectedFailure
+        );
+    }
+
+    #[test]
+    fn an_upgrade_hand_off_needs_the_staged_build_it_promises() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("app.exe");
+        let staged = temp.path().join(".hub-update-x.exe");
+        std::fs::write(&target, b"OLD").unwrap();
+        std::fs::write(&staged, b"NEW").unwrap();
+        let mut handoff = plan("replace-exe", 1, 1_795_471_800.0);
+        handoff.target_exe = Some(target.clone());
+        handoff.staged_exe = Some(staged.clone());
+        handoff.new_exe_sha256 = Some("0".repeat(64));
+        assert!(!upgrade_handoff_is_ready(&handoff), "staged hash mismatch");
+
+        handoff.new_exe_sha256 = Some(update_helper::sha256_file(&staged).unwrap());
+        assert!(upgrade_handoff_is_ready(&handoff));
+
+        std::fs::remove_file(&staged).unwrap();
+        assert!(!upgrade_handoff_is_ready(&handoff), "the staged build is gone");
+        // The helper may have finished the swap already: a target with the new bytes is ready too.
+        std::fs::write(&target, b"NEW").unwrap();
+        assert!(upgrade_handoff_is_ready(&handoff));
+
+        handoff.new_exe_sha256 = Some("zz".into());
+        assert!(!upgrade_handoff_is_ready(&handoff), "a malformed hash never counts");
     }
 }

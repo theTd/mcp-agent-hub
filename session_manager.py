@@ -27,7 +27,8 @@ from transcript_feed import (
     FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT, build_transcript_feed, json_valued_arguments, tool_output_text,
     tool_title, interaction_view as transcript_interaction_view,
 )
-from restart_resume_request import RestartResumeGate, RestartResumeRequest, wait_for_port
+from restart_resume_request import (REQUEST_NAME as RESTART_REQUEST_NAME,
+                                    RestartResumeGate, RestartResumeRequest, wait_for_port)
 from native_session_launch import normalize_extra_args, strip_legacy_worker_bridge_args
 from spawn_extra_roots import extra_root_args, normalize_extra_roots
 from compaction_threshold import (
@@ -38,7 +39,7 @@ from session_mcp_config import (
     normalize_mcp_config, mcp_config_active, validate_mcp_engine, check_mcp_arg_conflicts,
     build_mcp_args, merge_claude_settings, replace_claude_settings,
 )
-from mcp_session_pool import PoolRegistry, error_result
+from mcp_session_pool import PoolRegistry, error_result, spec_secrets, scrub_secrets
 from session_mcp_bridge import (
     build_mcp_bridge_note, derive_mcp_bridge_token, load_or_create_bridge_secret,
     mcp_cli_script_path, prune_stale_bridge_dirs, remove_session_bridge_dir,
@@ -3472,6 +3473,27 @@ class HubSessionManager:
         self._pre_shutdown_exits: Set[str] = set()
         self._background_tasks = set()
         self._shutdown_task = None
+        # Planned-restart state, set at the very top of `_shutdown()`: True when the stop is a
+        # restart (`resume_on_start.json` is waiting to be taken by the next start), and the
+        # live sessions as they were *before* the stop killed them, so the archive can restore
+        # their real status (`completed` idle vs `running` mid-turn) and keep them out of `crashed`.
+        self._planned_restart: bool = False
+        self._stop_live_at: Dict[str, Dict[str, str]] = {}
+        # Names this start for `RestartResumeRequest.take`: a `.taken.json` this start stamped is
+        # never taken twice, while one an earlier, hard-killed start left behind is taken again.
+        self._start_token: str = f"{os.getpid()}:{uuid.uuid4().hex}"
+        # What GET /api/hub/restart-status reports: the request this hub is stopping for, or the
+        # resume pass this hub is carrying out. Counts move while `_resume_on_start` runs, so a
+        # desktop shell or the CLI can tell a resume in progress from a stuck one. Never a secret.
+        self._restart_phase: str = "idle"
+        self._restart_id: Optional[str] = None
+        self._restart_mode: Optional[str] = None
+        self._restart_requested_at: Optional[float] = None
+        self._restart_target_count: int = 0
+        self._restart_resumed_count: int = 0
+        self._restart_skipped_count: int = 0
+        self._restart_failed_count: int = 0
+        self._restart_result: Optional[Dict[str, Any]] = None
         self.summarizer_registry = TranscriptSummarizerRegistry()
         self.model_discovery = AgentModelDiscovery()
         self.context_window_catalog = ContextWindowCatalog(discovery=self.model_discovery)
@@ -3584,22 +3606,51 @@ class HubSessionManager:
                     self.load_profiles(discovery=self._cached_discovery)
             except Exception as exc:
                 logger.warning("Retired-engine purge hook failed; continuing startup: %s", exc)
-            request = RestartResumeRequest.take(self.data_dir)
+            request = RestartResumeRequest.take(self.data_dir, owner=self._start_token)
+            if request is not None:
+                # This start is the second half of a restart: say so before the resume begins, so
+                # /api/hub/restart-status answers "resuming" from the first poll on.
+                self._restart_id = request.restart_id
+                self._restart_mode = request.mode
+                self._restart_requested_at = request.requested_at
+                self._restart_phase = "resuming"
             live_at_stop = await self._normalize_archive_on_startup()
             await self.db.flush()
+            kept = self._peek_kept_at_stop()
+            # The sessions this start means to resume: what a hard kill left live (the store still
+            # says so), what a graceful stop recorded *before* it archived them (with their real
+            # status at the stop), and what the request itself snapshotted when it was written.
+            # Later pools never overwrite an earlier one: the closest to the truth wins.
+            merged_at_stop: Dict[str, Dict[str, str]] = {}
+            for pool in (live_at_stop, kept.get("sessions") or {},
+                         (request.sessions if request is not None else {})):
+                for sid, info in (pool or {}).items():
+                    meta = info if isinstance(info, dict) else {}
+                    merged_at_stop.setdefault(str(sid), {
+                        "engine": str(meta.get("engine") or "").strip().lower(),
+                        "status": str(meta.get("status") or "").strip().lower(),
+                    })
             # Briefs of sessions closed, ended or unknown have no reader. A session the stop cut off
             # keeps its brief: resume-on-start, or the parent's resume_subagent right after,
             # continues it and may read the brief again. A forced stop's sessions are still live in
             # the store (`live_at_stop`); a graceful stop recorded the ids it kept before archiving
             # them. Either way the brief goes at the next start, or when the resumed session closes.
-            keep_briefs = set(live_at_stop) | self._take_briefs_kept_at_stop()
+            keep_briefs = (set(live_at_stop) | set(kept.get("session_ids") or ())
+                           | set(merged_at_stop))
             self._prune_stale_briefs(keep=keep_briefs)
             # Same moment, same rule for the MCP bridge folders: an mcp_<sid>/ tree belongs to a
-            # live or resumable session, and everyone else's is a leftover.
+            # live or resumable session, and everyone else's is a leftover. Every id this start
+            # may resume stays, or the resume would find its folder gone.
             try:
                 prune_stale_bridge_dirs(self.runtime_configs_dir, keep_session_ids=keep_briefs)
             except Exception as exc:  # a locked folder must not cost the Hub its startup
                 logger.warning("MCP bridge: stale folder prune failed; continuing startup: %s", exc)
+            if request is None:
+                # A plain cold start resumes nothing, so the manifest an earlier stop left behind
+                # has no reader here. Leaving it would arm a later restart: a graceful restart
+                # accepted while no session is live would merge history's ids and revive sessions
+                # nobody asked for. The ids were already honoured above by keeping their briefs.
+                self._delete_kept_at_stop()
         except BaseException:
             await self.db.close(timeout=0.5)
             raise
@@ -3609,11 +3660,40 @@ class HubSessionManager:
         # Idle MCP actors are dropped off the loop by the registry's own reaper, not by a session.
         self.mcp_pool_registry.start_reaper()
         if request is not None:
-            targets = {sid: info for sid, info in live_at_stop.items() if request.wants(sid)}
-            for sid in sorted(request.session_ids or ()):
-                rec = None if sid in targets else await self.db.get_session_record(sid)
-                if rec and rec.get("status") == "interrupted" and sid not in self.sessions:
-                    targets[sid] = {"engine": str(rec.get("engine") or "").strip().lower(), "status": "interrupted"}
+            # A restart leaves shutdown events in the inbox that a parent would read as failure.
+            try:
+                repaired = await self.wait_inbox.repair_planned_restart()
+            except Exception:
+                logger.exception("Resume-on-start: could not repair the wait inbox")
+                repaired = 0
+            if repaired:
+                logger.info("Resume-on-start: cleared %d stale hub_shutdown event(s)", repaired)
+            targets = {sid: dict(info) for sid, info in merged_at_stop.items() if request.wants(sid)}
+            # Owner decision `live_only_opt_in_crashed`: history's crashed rows are fetched only
+            # when the caller named them or asked for them with `resume_crashed`; a plain restart
+            # never resurrects a worker that already failed on its own.
+            named = set(request.session_ids or ())
+            if request.resume_crashed and request.session_ids is None:
+                try:
+                    rows = await self.db.list_persisted_sessions(limit=1000)
+                except Exception as exc:
+                    logger.warning("Resume-on-start: could not list crashed sessions: %s", exc)
+                    rows = []
+                named |= {str(row.get("session_id") or "") for row in rows
+                          if str(row.get("status") or "") == "crashed"}
+            for sid in sorted(named):
+                if not sid or sid in targets or sid in self.sessions:
+                    continue
+                rec = await self.db.get_session_record(sid)
+                if not rec:
+                    continue
+                status = str(rec.get("status") or "")
+                # A row an earlier start already archived as interrupted is resumed even without a
+                # live row; a crashed one only when the caller asked for it (by name or flag).
+                if status == "interrupted" or (status == "crashed" and request.allows_crashed()):
+                    targets[sid] = {
+                        "engine": str(rec.get("engine") or "").strip().lower(), "status": status,
+                    }
             # DSH was dropped on 2026-11-15. Its rows are purged at start; a start whose purge was
             # skipped (a failed backup) still finds them, and they are never resumed.
             dropped = [sid for sid, info in targets.items()
@@ -3623,42 +3703,190 @@ class HubSessionManager:
             if dropped:
                 logger.info("Resume-on-start: skipped %d DSH session(s); DSH is no longer supported",
                             len(dropped))
+            # An engine without a revive recipe (pwsh, generic, ...) is left alone on purpose,
+            # and says so as a skip instead of failing the whole restart.
+            skipped = {}
+            for sid, info in list(targets.items()):
+                engine = str(info.get("engine") or "").strip().lower()
+                if engine not in RESUME_ENGINES:
+                    skipped[sid] = (f"引擎「{engine}」不支持自动恢复" if engine
+                                    else "未记录引擎，无法自动恢复")
+                    targets.pop(sid, None)
+            if skipped:
+                logger.info("Resume-on-start: skipped %d session(s) whose engine cannot resume: %s",
+                            len(skipped), ", ".join(sorted(skipped)))
             logger.info("Resume-on-start request: %d of %d sessions live at the stop", len(targets), len(live_at_stop))
+            self._restart_target_count = len(targets) + len(skipped)
+            self._restart_skipped_count = len(skipped)
+            self._restart_resumed_count = 0
+            self._restart_failed_count = 0
             if targets:
                 self.restart_resume_gate.close()
-                self._schedule(self._resume_on_start(request, targets))
+                self._schedule(self._resume_on_start(request, targets, skipped))
             else:
-                request.write_result({}, time.time())
+                results = {sid: {"ok": True, "skipped": True, "reason": reason, "status_at_stop": None}
+                           for sid, reason in skipped.items()}
+                request.write_result(results, time.time(), restart_id=request.restart_id,
+                                     skipped=skipped)
+                self._delete_kept_at_stop()
+                self._finish_restart_phase(request, results, skipped, time.time())
 
-    async def _resume_on_start(self, request: RestartResumeRequest, targets: Dict[str, Dict[str, str]]) -> None:
+    def _resume_secret_values(self, record: Optional[Dict[str, Any]]) -> List[str]:
+        """Every credential a resume error for this session could echo, longest values first.
+
+        A resume failure is published three ways: `resume_on_start.result.json`, the token-free
+        read-only `GET /api/hub/restart-status` and the `restart_resume_failed` wait event. An
+        exception that quotes an upstream MCP `headers` value or an `env` value would therefore
+        hand a credential to any caller that can reach the loopback status endpoint.
+        """
+        secrets: List[str] = []
+        try:
+            snapshot = (record or {}).get("profile_snapshot")
+            if isinstance(snapshot, str):
+                # A record read straight from the store keeps the column as text.
+                snapshot = json.loads(snapshot or "{}")
+            servers = snapshot.get("mcp_servers") if isinstance(snapshot, dict) else None
+            if isinstance(servers, dict):
+                for spec in servers.values():
+                    if isinstance(spec, dict):
+                        secrets.extend(spec_secrets(spec))
+        except Exception:
+            logger.debug("Resume-on-start: could not read the session's MCP spec", exc_info=True)
+        hub_values: List[str] = []
+        bridge = getattr(self, "_mcp_bridge_secret", None)
+        if isinstance(bridge, (bytes, bytearray)):
+            hub_values.append(bytes(bridge).decode("utf-8", "replace"))
+        elif isinstance(bridge, str):
+            hub_values.append(bridge)
+        for name in ("shutdown_token", "_hub_shutdown_token"):
+            value = getattr(self, name, None)
+            if value:
+                hub_values.append(str(value))
+        secrets.extend(value.strip() for value in hub_values if value and len(str(value).strip()) >= 4)
+        return secrets
+
+    async def _scrubbed_resume_error(self, session_id: str, exc: BaseException) -> str:
+        """`str(exc)` with this session's upstream credentials and the Hub's own secrets removed."""
+        record: Optional[Dict[str, Any]] = None
+        try:
+            record = await self.db.get_session_record(session_id)
+        except Exception:
+            logger.debug("Resume-on-start: could not read the record of %s", session_id, exc_info=True)
+        return str(scrub_secrets(str(exc), self._resume_secret_values(record)))
+
+    async def _resume_on_start(self, request: RestartResumeRequest, targets: Dict[str, Dict[str, str]],
+                               skipped: Optional[Dict[str, str]] = None) -> None:
         """Resume the sessions a deliberate restart interrupted, while requests wait at the gate.
 
         It starts once the hub's own port is open: a resumed Codex or Claude connects to the hub's
         MCP endpoint as it starts, and that connection now waits at the gate instead of being
         refused.
+
+        The kept-at-stop manifest is only deleted once every target has an answer in the result
+        file: a hub that dies mid-resume finds the manifest still there and continues the rest on
+        the next start, instead of losing the sessions it had not reached yet.
         """
         started = time.time()
         results: Dict[str, Dict[str, Any]] = {}
+        skipped = dict(skipped or {})
+        for sid, reason in skipped.items():
+            results[sid] = {"ok": True, "skipped": True, "reason": reason, "status_at_stop": None}
+        finished = False
         try:
             if not await wait_for_port(hub_port()):
                 logger.warning("Resume-on-start: port %s did not open; resuming anyway", hub_port())
             for sid in sorted(targets):
                 info = targets[sid]
-                text = request.text_for(sid, info.get("engine", ""), info.get("status", ""))
+                status_at_stop = str(info.get("status") or "")
+                live = self.sessions.get(sid)
+                if live is not None and live.is_process_alive():
+                    # Already back (an earlier start resumed it before it died): never spawn a
+                    # second process or send the continue text a second time.
+                    results[sid] = {"ok": True, "resumed": False, "already_live": True,
+                                    "continued": False, "status_at_stop": status_at_stop}
+                    self._restart_resumed_count += 1
+                    continue
+                text = request.text_for(sid, str(info.get("engine") or ""), status_at_stop)
                 try:
                     res = await self.resume_subagent(sid, text=text, source="console")
                     results[sid] = {"ok": True, "resumed": bool(res.get("resumed")),
                                     "already_live": bool(res.get("already_live")), "continued": bool(text),
-                                    "status_at_stop": info.get("status")}
+                                    "status_at_stop": status_at_stop}
                 except Exception as exc:  # one session's failure must not keep the others down
-                    logger.warning("Resume-on-start of %s failed: %s", sid, exc)
-                    results[sid] = {"ok": False, "error": str(exc), "status_at_stop": info.get("status")}
+                    # Never the raw message: it travels to a token-free status endpoint and to a
+                    # result file a parent reads, and it can quote an upstream MCP credential.
+                    error_text = await self._scrubbed_resume_error(sid, exc)
+                    logger.warning("Resume-on-start of %s failed: %s", sid, error_text)
+                    results[sid] = {"ok": False, "error": error_text, "status_at_stop": status_at_stop}
+                    # The parent's handle must wake now: the worker it waits on will never report.
+                    try:
+                        await self.wait_inbox.publish_event({
+                            "type": "restart_resume_failed",
+                            "session_id": sid,
+                            "result_id": f"restart-resume-failed:{sid}",
+                            "content": f"会话 {sid} 重启后恢复失败：{error_text}",
+                            "data": {"reason": error_text, "session_id": sid,
+                                     "restart_id": request.restart_id},
+                        })
+                    except Exception:
+                        logger.exception("Resume-on-start: could not wake the parent of %s", sid)
+                if results[sid].get("ok"):
+                    self._restart_resumed_count += 1
+                else:
+                    self._restart_failed_count += 1
+            finished = True
         finally:
             self.restart_resume_gate.open()
-            request.write_result(results, started)
-            logger.info("Resume-on-start done in %.1fs: %d resumed, %d failed", time.time() - started,
-                        sum(1 for r in results.values() if r.get("ok")),
-                        sum(1 for r in results.values() if not r.get("ok")))
+            # `completed` is the stamp `RestartResumeRequest.take` reads next start: a finished
+            # pass (even one with nothing to resume) never arms a resume again, while a pass that
+            # died mid-way leaves its answer marked as partial.
+            request.write_result(results, started, restart_id=request.restart_id, skipped=skipped,
+                                 completed=finished)
+            self._finish_restart_phase(request, results, skipped, started, finished=finished)
+            if finished:
+                self._delete_kept_at_stop()
+            else:
+                # A hub that dies mid-resume must not swallow the sessions it never reached: the
+                # request goes back (the next start takes it and continues) and the manifest, which
+                # still names them, stays.
+                request.restore()
+                logger.warning("Resume-on-start did not finish; the request and the kept-at-stop "
+                               "manifest stay for the next start (%d of %d answered)",
+                               len(results), len(targets) + len(skipped))
+            logger.info("Resume-on-start done in %.1fs: %d resumed, %d failed, %d skipped",
+                        time.time() - started,
+                        sum(1 for r in results.values() if r.get("ok") and not r.get("skipped")),
+                        sum(1 for r in results.values() if not r.get("ok")), len(skipped))
+
+    def _finish_restart_phase(self, request: RestartResumeRequest, results: Dict[str, Dict[str, Any]],
+                              skipped: Dict[str, str], started: float, *, finished: bool = True) -> None:
+        """Settle the counts and the phase `/api/hub/restart-status` reports for this restart.
+
+        `failed` is reserved for a resume that failed a session (or never finished): a restart
+        whose sessions all came back is `ready` even when an engine could not be resumed and was
+        counted as a skip, so a shell or the CLI can tell an honest partial from a broken one.
+        """
+        skipped = dict(skipped or {})
+        self._restart_target_count = len(results)
+        self._restart_skipped_count = len(skipped)
+        self._restart_resumed_count = sum(1 for r in results.values()
+                                          if r.get("ok") and not r.get("skipped"))
+        self._restart_failed_count = sum(1 for r in results.values() if not r.get("ok"))
+        self._restart_result = {
+            "restart_id": request.restart_id,
+            "mode": request.mode,
+            "requested_at": request.requested_at,
+            "started_at": started,
+            "finished_at": time.time(),
+            "finished": bool(finished),
+            "target_count": self._restart_target_count,
+            "resumed_count": self._restart_resumed_count,
+            "skipped_count": self._restart_skipped_count,
+            "failed_count": self._restart_failed_count,
+            "sessions": results,
+            "skipped": skipped,
+        }
+        self._restart_phase = "ready" if finished and self._restart_failed_count == 0 else "failed"
 
     def _request_awaits_parent(self, session_id: str, request_id: str) -> bool:
         """True while ``request_id`` is a live request that nobody has answered yet.
@@ -6665,38 +6893,88 @@ class HubSessionManager:
     def _kept_briefs_path(self) -> Path:
         return self.data_dir / "briefs" / BRIEFS_KEPT_AT_STOP_FILE
 
-    def _remember_briefs_kept_at_stop(self, session_ids: Iterable[str]) -> None:
-        """Records the ids whose briefs the stop kept, for the next start's prune."""
+    def _remember_briefs_kept_at_stop(self, session_ids: Iterable[str],
+                                      sessions_meta: Optional[Dict[str, Dict[str, str]]] = None) -> None:
+        """Records the ids whose briefs the stop kept, and how they looked just before it.
+
+        `session_ids` stays the plain list the older readers expect; `sessions` adds the status
+        each session really had at the stop (`completed` idle vs `running` mid-turn), which the
+        archived row no longer carries once the stop calls every survivor `interrupted`.
+        """
         ids = sorted({str(sid) for sid in session_ids if str(sid or "")})
         if not ids:
             return
+        meta: Dict[str, Dict[str, str]] = {}
+        for sid, info in (sessions_meta or {}).items():
+            key = str(sid or "")
+            if not key or key not in ids:
+                continue
+            value = info if isinstance(info, dict) else {}
+            meta[key] = {
+                "engine": str(value.get("engine") or "").strip().lower(),
+                "status": str(value.get("status") or "").strip().lower(),
+            }
         path = self._kept_briefs_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"session_ids": ids}, ensure_ascii=False), encoding="utf-8")
+            body: Dict[str, Any] = {"session_ids": ids}
+            if meta:
+                body["sessions"] = meta
+            path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
         except OSError:
             logger.warning("could not record the briefs kept at stop (%s)", path)
 
-    def _take_briefs_kept_at_stop(self) -> Set[str]:
-        """The ids the last stop kept briefs for, then deletes the record (missing/unreadable = none)."""
+    def _peek_kept_at_stop(self) -> Dict[str, Any]:
+        """The last stop's manifest without deleting it: {"session_ids": set, "sessions": {...}}.
+
+        The start reads it to plan the resume and only deletes it once the resume wrote its
+        result, so a hub that dies mid-resume can continue the remaining sessions next time.
+        """
         path = self._kept_briefs_path()
-        ids: Set[str] = set()
+        result: Dict[str, Any] = {"session_ids": set(), "sessions": {}}
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return ids
+            return result
         except (OSError, ValueError):
             logger.warning("could not read the briefs kept at stop (%s); none are kept", path)
-        else:
-            values = raw.get("session_ids") if isinstance(raw, dict) else raw
-            if isinstance(values, list):
-                ids = {str(v) for v in values if isinstance(v, str) and v}
+            return result
+        if not isinstance(raw, dict):
+            # An older manifest was the bare list of ids.
+            if isinstance(raw, list):
+                result["session_ids"] = {str(v) for v in raw if isinstance(v, str) and v}
+            return result
+        values = raw.get("session_ids")
+        if isinstance(values, list):
+            result["session_ids"] = {str(v) for v in values if isinstance(v, str) and v}
+        sessions = raw.get("sessions")
+        if isinstance(sessions, dict):
+            for sid, info in sessions.items():
+                key = str(sid or "")
+                if not key:
+                    continue
+                meta = info if isinstance(info, dict) else {}
+                result["sessions"][key] = {
+                    "engine": str(meta.get("engine") or "").strip().lower(),
+                    "status": str(meta.get("status") or "").strip().lower(),
+                }
+                result["session_ids"].add(key)
+        return result
+
+    def _delete_kept_at_stop(self) -> None:
+        """Drops the manifest once it has been honoured (a missing file is not an error)."""
         try:
-            path.unlink()
+            self._kept_briefs_path().unlink()
         except FileNotFoundError:
             pass
         except OSError:
-            logger.warning("could not delete the briefs-kept-at-stop record (%s)", path)
+            logger.warning("could not delete the briefs-kept-at-stop record (%s)",
+                           self._kept_briefs_path())
+
+    def _take_briefs_kept_at_stop(self) -> Set[str]:
+        """The ids the last stop kept briefs for, then deletes the record (missing/unreadable = none)."""
+        ids = set(self._peek_kept_at_stop()["session_ids"])
+        self._delete_kept_at_stop()
         return ids
 
     def _prune_stale_briefs(self, keep: Iterable[str] = ()) -> int:
@@ -6782,6 +7060,7 @@ class HubSessionManager:
         mcp_config: Dict[str, Any],
         cwd: str,
         env_overrides: Dict[str, str],
+        compact: bool = False,
     ) -> str:
         """Mount the session's MCP servers in the Hub and return the first-turn note ("" if unused)."""
         if not uses_mcp_bridge(engine, kind, mcp_config):
@@ -6821,7 +7100,7 @@ class HubSessionManager:
             env_overrides.setdefault("HUB_MCP_BRIDGE", str(bridge_file))
         return build_mcp_bridge_note(
             session_id, servers, bridge_file, mcp_cli_script_path(self.base_dir), sys.executable,
-            server_tool_counts=counts, shared_servers=shared_servers,
+            server_tool_counts=counts, shared_servers=shared_servers, compact=compact,
         )
 
     async def _release_mcp_bridge(self, session_id: str) -> None:
@@ -6912,9 +7191,12 @@ class HubSessionManager:
             # its bridge folder or a spawned child behind.
             if uses_mcp_bridge(engine, session_kind, mcp_config):
                 bridge_created = True
+                # A resumed session already carries a continue message into the same composer, so
+                # its note is the compact one: both texts must still fit one prompt.
                 mcp_note = await self._setup_mcp_bridge(
                     session_id, engine, session_kind, mcp_config,
-                    str(built.get("cwd") or ""), built.setdefault("env", {}))
+                    str(built.get("cwd") or ""), built.setdefault("env", {}),
+                    compact=bool(prompt_for_tui and message))
                 if prompt_for_tui:
                     prompt_for_tui = with_mcp_bridge_note(prompt_for_tui, mcp_note)
 
@@ -7349,13 +7631,124 @@ class HubSessionManager:
             )
         return {"found": True, "was_alive": bool(was_alive), "status": sess.status}
 
-    async def archive_all_sessions_on_shutdown(self) -> int:
-        """Share one shutdown operation between the HTTP stop and lifespan exit."""
+    def _restart_live_snapshot(self) -> Dict[str, Dict[str, str]]:
+        """The sessions a stop would cut off right now, with the status each really has.
+
+        The same predicate `_shutdown` uses for `_stop_live_at`: a status may say `completed`
+        while the object still holds a live process (or a text session's core entry).
+        """
+        return {
+            sid: {"engine": str(sess.engine or "").strip().lower(), "status": str(sess.status or "")}
+            for sid, sess in self.sessions.items()
+            if sess.is_process_alive() or str(sess.status or "") in LIVE_STATUSES
+        }
+
+    @property
+    def restart_in_progress(self) -> bool:
+        """True from the moment a graceful restart is accepted until this process is gone."""
+        return bool(self._shutting_down or self._planned_restart
+                    or self._restart_phase in ("stopping", "resuming"))
+
+    async def prepare_graceful_restart(self, *, mode: str = "hub",
+                                       restart_id: Optional[str] = None,
+                                       continue_unfinished_turns: bool = True,
+                                       resume_crashed: bool = False,
+                                       session_ids: Optional[Iterable[str]] = None,
+                                       continue_session_ids: Optional[Iterable[str]] = None,
+                                       continue_text: Optional[str] = None,
+                                       ) -> Dict[str, Any]:
+        """Write the request the next start resumes from, and mark this stop as a restart.
+
+        Runs before the response, so the caller that asked for the restart already knows the
+        session snapshot was taken (and can report it), while the stop itself runs afterwards.
+        `resume_on_start.json` is written whole through a temp file, so a crash during the write
+        never leaves a half request for the next start to consume.
+        """
+        if self.restart_in_progress:
+            raise RuntimeError("Hub 已在关闭或重启中")
+        restart_id = str(restart_id or "").strip() or uuid.uuid4().hex
+        requested_at = time.time()
+        sessions = self._restart_live_snapshot()
+        body: Dict[str, Any] = {
+            "restart_id": restart_id,
+            "requested_at": requested_at,
+            "mode": mode,
+            "sessions": sessions,
+            "continue_unfinished_turns": bool(continue_unfinished_turns),
+            "resume_crashed": bool(resume_crashed),
+        }
+        if session_ids is not None:
+            body["session_ids"] = [str(sid) for sid in session_ids]
+        if continue_session_ids is not None:
+            body["continue_session_ids"] = [str(sid) for sid in continue_session_ids]
+        if continue_text:
+            body["continue_text"] = str(continue_text)
+        # From here on this stop is a restart: the middleware answers 503 "restarting" instead of
+        # "closed", the archive keeps every cut-off session resumable, and a second request is 409.
+        # The flags go first, before the file write yields to the loop, so a concurrent request is
+        # refused instead of overwriting this one's snapshot.
+        self._planned_restart = True
+        self._restart_phase = "stopping"
+        self._restart_id = restart_id
+        self._restart_mode = mode
+        self._restart_requested_at = requested_at
+        # The fence, taken here and not by `_shutdown`: a session that exits while the request
+        # file is being written (a thread doing the I/O, an await before it) is still one of the
+        # sessions this restart means to resume. `_on_session_exit` reads `_stop_live_at`, so this
+        # synchronous assignment closes the window between "restart accepted" and "stop began".
+        self._stop_live_at = dict(sessions)
+        try:
+            await asyncio.to_thread(self._write_resume_request, body)
+        except BaseException:
+            self._planned_restart = False
+            self._restart_phase = "idle"
+            self._restart_id = None
+            self._restart_mode = None
+            self._restart_requested_at = None
+            # No request on disk means no restart: the snapshot taken above must not outlive it,
+            # or a death after the failed write would be fenced as if a resume awaited it.
+            self._stop_live_at = {}
+            raise
+        return {
+            "restart_id": restart_id,
+            "mode": mode,
+            "requested_at": requested_at,
+            "sessions": sessions,
+            "session_count": len(sessions),
+        }
+
+    def _write_resume_request(self, body: Dict[str, Any]) -> None:
+        path = self.data_dir / RESTART_REQUEST_NAME
+        temp = path.with_name(f".{RESTART_REQUEST_NAME}.tmp")
+        temp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+
+    def restart_status(self) -> Dict[str, Any]:
+        """The restart's phase and progress, as GET /api/hub/restart-status reports it."""
+        return {
+            "ok": True,
+            "phase": self._restart_phase,
+            "restart_id": self._restart_id,
+            "mode": self._restart_mode,
+            "requested_at": self._restart_requested_at,
+            "target_count": self._restart_target_count,
+            "resumed_count": self._restart_resumed_count,
+            "skipped_count": self._restart_skipped_count,
+            "failed_count": self._restart_failed_count,
+            "result": self._restart_result,
+        }
+
+    async def archive_all_sessions_on_shutdown(self, *, planned: Optional[bool] = None) -> int:
+        """Share one shutdown operation between the HTTP stop and lifespan exit.
+
+        `planned` says whether this stop is a restart whose sessions the next start will resume;
+        None lets `_shutdown` decide from a pending `resume_on_start.json`.
+        """
         if self._shutdown_task is None:
-            self._shutdown_task = asyncio.create_task(self._shutdown())
+            self._shutdown_task = asyncio.create_task(self._shutdown(planned=planned))
         return await asyncio.shield(self._shutdown_task)
 
-    async def _shutdown(self) -> int:
+    async def _shutdown(self, *, planned: Optional[bool] = None) -> int:
         """graceful-budget, in §6.6's order: snapshot the screens, then kill, then archive and drain.
 
         The snapshot is taken before the kill, so the archived rows carry the last screen and
@@ -7381,6 +7774,31 @@ class HubSessionManager:
         # r4b F5/kimi 4: the budget starts here, so the reconcile drains spend it instead of running
         # before it; a reconciling drain is bounded by what is left, and a second one is skipped
         # when the first already spent its share.
+        if planned is None:
+            # A restart writes `resume_on_start.json` before stopping the hub. Reading it (without
+            # taking it) is what tells this stop apart from the user's final one, however the stop
+            # was started: an API call or a plain signal.
+            planned = RestartResumeRequest.peek(self.data_dir) is not None
+        self._planned_restart = bool(planned)
+        stop_id = uuid.uuid4().hex[:8]
+        # Before any drain, kill or archive: the sessions that were alive when the stop began, and
+        # the status each really had (`completed` idle vs `running` mid-turn). A planned restart
+        # restores them with this status, and a death inside the stop window never downgrades one
+        # of them to `crashed`.
+        snapshot = {
+            sid: {"engine": str(sess.engine or "").strip().lower(), "status": str(sess.status or "")}
+            for sid, sess in self.sessions.items()
+            if sess.is_process_alive() or str(sess.status or "") in LIVE_STATUSES
+        }
+        if self._planned_restart and self._stop_live_at:
+            # `prepare_graceful_restart` already fenced this restart and recorded what was live
+            # *then*, with the status it had at the request; a session that started or finished
+            # since is added, but nothing recorded earlier is overwritten (the later object may
+            # already say `crashed` for a death this stop caused).
+            for sid, info in snapshot.items():
+                self._stop_live_at.setdefault(sid, info)
+        else:
+            self._stop_live_at = snapshot
         deadline = time.monotonic() + SHUTDOWN_MAX_SEC
         for attempt in range(SHUTDOWN_RECONCILE_DRAINS):
             if attempt:
@@ -7455,7 +7873,13 @@ class HubSessionManager:
         sessions = list(self.sessions.values())
         reasons = {}
         for sess in sessions:
-            if sess.is_process_alive():
+            if self._planned_restart and sess.session_id in self._stop_live_at:
+                # A planned restart: whatever happened to the process inside the stop window, this
+                # session was cut off on purpose, so it is interrupted, never crashed.
+                reasons[sess.session_id] = "interrupted"
+                sess.status = "interrupted"
+                sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
+            elif sess.is_process_alive():
                 reasons[sess.session_id] = "interrupted"
                 sess.status = "interrupted"
                 sess.current_activity = "Hub 停止时会话仍在运行（已中断）"
@@ -7463,9 +7887,24 @@ class HubSessionManager:
                 reasons[sess.session_id] = sess.end_reason or sess.classify_end_reason(sess.exit_code)
         # A graceful stop cuts these sessions off: their briefs stay for a resume after the restart,
         # and the record tells the next start's prune to keep them once more (the archive below
-        # would otherwise delete them with the session).
+        # would otherwise delete them with the session). The status recorded here is the one from
+        # before the stop: the archived row calls every survivor `interrupted`.
         interrupted_ids = [sid for sid, reason in reasons.items() if reason == "interrupted"]
-        self._remember_briefs_kept_at_stop(interrupted_ids)
+        kept_meta: Dict[str, Dict[str, str]] = {}
+        for sess in sessions:
+            sid = sess.session_id
+            if reasons.get(sid) != "interrupted":
+                continue
+            before = self._stop_live_at.get(sid) if self._planned_restart else None
+            kept_meta[sid] = {
+                "engine": str((before or {}).get("engine") or sess.engine or "").strip().lower(),
+                "status": str((before or {}).get("status") or "running").strip().lower(),
+            }
+        self._remember_briefs_kept_at_stop(interrupted_ids, kept_meta)
+        if not interrupted_ids:
+            # Nothing was kept for a resume, so no manifest may outlive this stop: a stale one
+            # would let a later start fetch sessions this stop has already settled.
+            self._delete_kept_at_stop()
         snapshots: Dict[str, Dict[str, Any]] = {}
         core = self.core
         if core is not None:
@@ -7585,10 +8024,11 @@ class HubSessionManager:
                 self._claimed_transcripts.clear()
             self._notify_waiters()
             # Parent waiters receive one durable terminal signal and then reconnect to the same
-            # opaque URL after the replacement Hub has restored the inbox.
+            # opaque URL after the replacement Hub has restored the inbox. A planned restart sends
+            # none: its sessions come back, so a settlement here would be a false failure.
             try:
-                await self.wait_inbox.publish_shutdown()
-                await self.wait_inbox.close()
+                await self.wait_inbox.publish_shutdown(planned=self._planned_restart, stop_id=stop_id)
+                await self.wait_inbox.close(planned=self._planned_restart)
             except Exception:
                 logger.exception("Could not publish Hub shutdown to wait inbox")
             for entry in self.pending_questions.values():
@@ -14555,6 +14995,12 @@ class HubSessionManager:
         """
         obj = session if isinstance(session, AgentSession) else None
         session_id = obj.session_id if obj is not None else str(session)
+        if self._planned_restart and session_id in self._stop_live_at:
+            # A planned restart: this session was live when the stop began, so its death belongs to
+            # the stop, which archives it as interrupted and resumes it. Publishing `crashed` (or
+            # `exited`) here would settle the parent's wait handle as a failure for a worker that is
+            # coming back -- and a final row with that status would overwrite the real one.
+            return
         if self._shutting_down and session_id not in self._pre_shutdown_exits:
             # §6.6: the shutdown archives every session itself. The death record of its own kill
             # arrives while it runs, and this callback must not write a competing final status or a

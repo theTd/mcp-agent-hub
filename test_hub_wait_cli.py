@@ -37,6 +37,8 @@ class ScriptedOpener:
         self.urls.append((url, timeout))
         self.clock.now += self.step
         item = self.script.pop(0)
+        if callable(item) and not isinstance(item, BaseException):
+            item = item()  # a factory: a repeated HTTPError must be a fresh one, its body is read once
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, bytes):
@@ -75,6 +77,70 @@ class HubWaitTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(payload["http_status"], 404)
         self.assertIn("unknown handle", payload["detail"])
+
+    def test_a_restarting_hub_503_is_retried_until_the_answer(self):
+        restarting = urllib.error.HTTPError(
+            URL, 503, "Service Unavailable", {"Retry-After": "1"},
+            io.BytesIO('{"detail":"Hub 正在重启"}'.encode("utf-8")))
+        code, payload, opener = self.run_script(
+            [restarting, restarting, {"state": "done", "results": []}], retry_seconds=120, step=1.0)
+        self.assertEqual((code, payload["state"]), (0, "done"), payload)
+        self.assertEqual(len(opener.urls), 3, "each 503 is retried, never settled as a failure")
+
+    def test_the_retry_after_header_is_honoured_but_capped(self):
+        clock = FakeClock()
+        clock.now = 0.0
+        slow = urllib.error.HTTPError(URL, 429, "Too Many Requests", {"Retry-After": "60"},
+                                      io.BytesIO(b"{}"))
+        sleeps = []
+        original = clock.sleep
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            original(seconds)
+
+        opener = ScriptedOpener(clock, [slow, {"state": "done", "results": []}], 0.0)
+        code, payload = hub_wait.wait_until_settled(URL, 1000.0, 120.0, opener=opener,
+                                                    clock=clock, sleep=sleep)
+        self.assertEqual((code, payload["state"]), (0, "done"))
+        self.assertEqual(sleeps, [hub_wait.RETRY_AFTER_CAP_SEC], "a 60 s Retry-After is capped at 5")
+
+    def test_a_503_that_outlasts_the_retry_budget_exits_3(self):
+        def restarting():
+            return urllib.error.HTTPError(URL, 503, "Service Unavailable", {},
+                                          io.BytesIO('{"detail":"Hub 正在恢复会话"}'.encode("utf-8")))
+        code, payload, _ = self.run_script([restarting] * 50, retry_seconds=4, step=1.0)
+        self.assertEqual(code, 3)
+        self.assertEqual(payload["http_status"], 503)
+        self.assertIn("Hub 正在恢复会话", payload["detail"])
+
+    def test_a_superseded_poll_is_retried_until_the_answer(self):
+        code, payload, opener = self.run_script(
+            [{"state": "superseded", "wait_handle": "wh_abc"},
+             {"state": "done", "results": []}], retry_seconds=120, step=1.0)
+        self.assertEqual((code, payload["state"]), (0, "done"), payload)
+        self.assertEqual(len(opener.urls), 2)
+
+    def test_a_superseded_answer_that_never_settles_exits_3(self):
+        code, payload, _ = self.run_script([{"state": "superseded"}] * 50,
+                                           retry_seconds=5, step=1.0)
+        self.assertEqual(code, 3)
+        self.assertIn("superseded", payload["detail"])
+
+    def test_a_hub_restarting_answer_keeps_waiting(self):
+        code, payload, opener = self.run_script(
+            [{"state": "waiting", "wait_handle": "wh_abc", "hub_restarting": True},
+             {"state": "waiting"},
+             {"state": "done", "results": []}])
+        self.assertEqual((code, payload["state"]), (0, "done"))
+        self.assertEqual(len(opener.urls), 3)
+
+    def test_a_real_failure_still_exits_0_at_once(self):
+        code, payload, opener = self.run_script(
+            [{"state": "failed", "errors": [{"type": "restart_resume_failed"}]}])
+        self.assertEqual(code, 0, "a failure the hub decided is the answer, not an error to retry")
+        self.assertEqual(payload["errors"][0]["type"], "restart_resume_failed")
+        self.assertEqual(len(opener.urls), 1)
 
     def test_refused_connection_is_retried_then_succeeds(self):
         refused = urllib.error.URLError(ConnectionRefusedError(10061, "refused"))

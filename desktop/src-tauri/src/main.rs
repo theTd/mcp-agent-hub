@@ -14,6 +14,7 @@ mod owned_hub;
 #[cfg(feature = "portable")]
 mod portable_runtime;
 mod tray_menu;
+mod update_helper;
 mod waiting_notifier;
 mod windows_process;
 
@@ -43,6 +44,20 @@ fn recover_hub(app: AppHandle, shell: State<'_, Arc<HubShell>>) {
 }
 
 fn main() {
+    // Portable self-update runs before anything else: `--apply-update` is started by the exiting
+    // shell, which may still hold the single-instance lock, and `--print-build-info` must only read
+    // the current EXE (no data directory, no single-instance plugin).
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--print-build-info") {
+        std::process::exit(update_helper::print_build_info());
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--apply-update") {
+        let Some(plan) = args.get(index + 1) else {
+            eprintln!("--apply-update 需要一个 restart_plan.json 路径");
+            std::process::exit(2);
+        };
+        std::process::exit(update_helper::apply_update(std::path::Path::new(plan)));
+    }
     #[cfg(feature = "portable")]
     if std::env::args().any(|arg| arg == "--portable-prepare-only") {
         // Non-GUI diagnostics can verify bootstrap without touching a live Hub.
@@ -138,6 +153,10 @@ fn main() {
                 }
             }
             tray_menu::create(&handle)?;
+            // Best effort: a helper copy left behind by an interrupted upgrade is never needed again.
+            let _ = std::thread::Builder::new()
+                .name("hub-update-cleanup".into())
+                .spawn(update_helper::cleanup_stale_helpers);
             let s = setup_shell.clone();
             let h = handle.clone();
             tauri::async_runtime::spawn(async move { s.start(&h).await });

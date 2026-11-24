@@ -1,24 +1,175 @@
 # Hub 重启与会话恢复
 
-Hub 停止时仍在运行的会话，在下次启动时标为「已中断」并归档，可以在「归档」里恢复（同一个会话 id）。终端类 Agent（Codex、Claude、Kimi 等）随 Hub 一起结束，恢复时用各自的原生记录重新打开。
+Hub 停止时仍在运行的会话会被中断。优雅重启把「停 Hub → 拉起新 Hub → 恢复会话」做成一个动作，并保证主 Agent 的等待不会被这次重启判成失败。
 
-## 有意重启时一并恢复（resume_on_start.json）
+## 三个入口
 
-主 Agent 可能一直在等 Hub 回来：如果 Hub 先开端口、再由人逐个恢复，主 Agent 会先看到子 Agent「已中断」（等待接口回答 `failed`），可能当成失败处理，或与人工恢复同时调用恢复。为避免这一点，重启前在 Hub 的数据目录（便携版为 `%LOCALAPPDATA%\mcp-agent-hub-portable\portable\data`）放一个 `resume_on_start.json`：
+- **托盘菜单**（桌面版）：一键「重启 Hub」，桌面壳识别计划内重启，不弹错误页，自动拉起新 Hub。
+- **`tools/hub_graceful_restart.py`**（便携版自带，标准库，Python 3.8+）：`status`、`restart`、`replace-exe` 三个子命令，输出一个 JSON。
+- **HTTP**：`POST /api/hub/graceful-restart` 与 `GET /api/hub/restart-status`。
+
+重启接口与停止接口一样校验 `x-hub-shutdown-token`：没启用 token 返回 404，token 无效 403。**不提供无鉴权的重启入口**，Web 控制台也没有重启按钮。
+
+## 重启做了什么
+
+`POST /api/hub/graceful-restart` 的请求体（字段都可选）：
 
 ```json
-{"session_ids": ["codex-…"], "continue_unfinished_turns": true, "continue_session_ids": ["codex-…"], "continue_text": "…"}
+{
+  "mode": "hub",
+  "restart_id": "可选 uuid，省略时服务端生成",
+  "continue_unfinished_turns": true,
+  "resume_crashed": false,
+  "session_ids": ["可选显式列表"],
+  "continue_session_ids": ["可选显式列表"],
+  "continue_text": "可选覆盖文案"
+}
 ```
 
-各字段都可省略：不写 `session_ids` 表示「停止时仍在运行的全部会话」；`continue_unfinished_turns` 默认开启；`continue_text` 有默认文字。`session_ids` 里列出的会话如果已经被更早的一次启动归档为「已中断」（之后没有恢复过），也会恢复；这时已不知道它停止时的状态，所以只有列在 `continue_session_ids` 里的会话才附带继续消息。写了 `continue_session_ids` 时，附带消息只看这个列表。
+`mode` 只能是 `hub`（默认）或 `replace-exe`，其他值 400。Hub 已经在关闭/重启中时返回 `409 {"detail": "Hub 已在关闭或重启中"}`。
 
-下次启动时 Hub：
+应答是 **202**，且在应答发出之前已经完成快照和落盘：
 
-1. 取走这个文件（改名为 `resume_on_start.taken.json`，只用一次），记下停止时仍在运行的会话和它们当时的状态，再照常归档。
-2. 端口打开后逐个恢复这些会话。终端类 Agent 启动时会连 Hub 自己的 MCP 端点，所以要等端口打开后再启动它们。
-3. 恢复期间，除了 `/health`、`/api/hub/info`、`/api/hub/shutdown`，所有请求都先等着，最多 30 秒，恢复完立即放行。所以主 Agent 看到的会话已经在运行，它发起的恢复也不会和启动时的恢复抢着做。桌面端检查 Hub 是否就绪不受影响。
-4. 停止时一个回合还没做完的终端类 Agent（状态为运行中、等主 Agent 回复或启动中），恢复时附带一条消息：说明 Hub 重启打断了上一回合、正在运行的命令或审批提示都已停止，请它从中断处继续，原来在等的审批要重新申请。这条消息在记录视图里以「你」显示。空闲的会话不带消息。
-5. 把每个会话的结果写到 `resume_on_start.result.json`（`ok`、`continued`、`status_at_stop`，失败时有 `error`）。恢复不了的会话照常留在「归档」里，原因写在记录上。
+1. 同步快照当前存活会话（`{sid: {"engine": …, "status": …}}`，状态是它真实的 `running` / `completed` / `waiting_parent`，不是一律 `interrupted`）；
+2. 原子写入 `<data_dir>/resume_on_start.json`（临时文件 + `os.replace`）；
+3. 标记这次停止是计划内重启；
+4. 后台任务执行优雅关停（和 Ctrl+C 同一条路径），先归档、唤醒长轮询，再结束 HTTP/MCP。
+
+```json
+{
+  "ok": true, "restart_id": "…", "mode": "hub",
+  "pid": 12345, "port": 4444, "started_at": "…",
+  "sessions": {"codex-…": {"engine": "codex", "status": "running"}},
+  "session_count": 1
+}
+```
+
+旧的 `POST /api/hub/shutdown` 保持最终停止的语义；带 JSON body 且 `for_restart` 为 `true` 时，走与上面完全相同的准备路径（200，同样的 payload）。不带这个字段的请求（包括空 body）与以前一样是最终停止。
+
+## 会话怎么恢复
+
+下次启动时 Hub 取走 `resume_on_start.json`（改名为 `resume_on_start.taken.json`，只用一次），等端口打开后逐个恢复：
+
+- **默认只恢复发起重启时存活的会话**。历史 `crashed` 会话不会因为一次重启被拉起来（`live_only_opt_in_crashed`）：只有显式列在 `session_ids` 里，或传 `resume_crashed: true`（扫描库里的 `crashed` 行），才会尝试恢复，并且仍要求引擎有恢复配方。
+- 更早一次启动已归档为「已中断」、之后没人恢复过的会话，被列名时也会恢复。
+- 停止时回合没做完的终端类 Agent（状态 `starting` / `running` / `waiting_parent`）恢复后收到一条继续消息；空闲的（`completed`）不带消息。消息内容可用 `continue_text` 覆盖，`continue_unfinished_turns: false` 则一律不发。
+- 引擎不支持自动恢复（`pwsh`、`generic`）的会话记为一个 **skip**，不算失败。
+- 恢复期间，除 `/health`、`/api/hub/info`、`/api/hub/shutdown`、`/api/hub/graceful-restart`、`/api/hub/restart-status` 以外的请求先等最多 30 秒；`/api/wait/` 长轮询改为返回 503 + `Retry-After` 让调用方重试。
+- 每个会话的结果写进 `<data_dir>/resume_on_start.result.json`（`ok`、`continued`、`status_at_stop`，失败有 `error`）。
+
+### 等待句柄跨重启有效
+
+`wait_handle` 在重启前后始终有效：
+
+- 计划内重启不会把等待结算成失败：Hub 启动时修掉 inbox 里残留的 `hub_shutdown` 事件，句柄保持有效，恢复后的会话照常往里报告。
+- 恢复失败的会话会主动发一个 `restart_resume_failed` 错误事件，父 Agent 立刻被唤醒，而不是一直等一个永远不会回报的 worker。
+- `tools/hub_wait.py` 对 503/`superseded` 等重启期应答本来就会重试，所以父 Agent 的等待命令不需要重跑。
+
+## 状态：`GET /api/hub/restart-status`
+
+只读，不需要 token，**不含任何密钥**；豁免关停 gate 与恢复 gate，Hub 正在停止或恢复时也答得出来。
+
+```json
+{
+  "ok": true,
+  "phase": "idle | stopping | resuming | ready | failed",
+  "restart_id": "…", "mode": "hub", "requested_at": 1795470000.0,
+  "started_at": "…", "port": 4444, "pid": 12345,
+  "target_count": 3, "resumed_count": 3, "skipped_count": 0, "failed_count": 0,
+  "result": null
+}
+```
+
+- `idle`：冷启动，没有 `resume_on_start.json`（即使磁盘上留着上一次的 result 文件也仍是 `idle`）。
+- `stopping`：重启请求已被接受，Hub 正在停。
+- `resuming`：新 Hub 正在执行恢复，四个计数实时更新。
+- `ready`：全部目标都有答案且没有失败（skip 可以大于 0）。
+- `failed`：有会话恢复失败，或这一趟恢复没跑完。`result.sessions` 列出每个会话的明细。
+
+## `tools/hub_graceful_restart.py`
+
+便携版 payload 自带，纯标准库，绕过系统代理，只输出一个 UTF-8 JSON。退出码：`0` 正常（skip 不算失败），`2` 重启完成但有会话没恢复，`1` 拒绝或失败。
+
+### `status`
+
+```powershell
+python tools\hub_graceful_restart.py status [--portable-root PATH] [--port N]
+```
+
+只读，什么都不改。输出 `launch.json`（**脱敏：只报 `shutdown_token_set`，绝不打印 token**）、`/api/hub/info`、`/health`、`/api/hub/restart-status`、`/api/sessions`（会话总数与活跃列表）、仍然有效的 `restart_plan.json`，以及最近一次 `resume_on_start.result.json` / `restart_plan.result.json`。
+
+### `restart`
+
+```powershell
+python tools\hub_graceful_restart.py restart [--no-continue] [--resume-crashed] `
+    [--session-id SID] [--timeout-seconds 300] [--no-wait]
+```
+
+1. 读 `<portable_root>/launch.json`（`port`、`pid`、`creation_time`、`app_pid`、`app_creation_time`、`data_dir`、`shutdown_token`）；
+2. 发现未过期的 `restart_plan.json` 就拒绝，先不动任何东西；
+3. 写 `<portable_root>/restart_plan.json`（`mode="hub"`，有效期 600 秒），桌面壳 `watch()` 据此知道这是计划内重启；
+4. `POST /api/hub/graceful-restart`（带 token）；请求失败就删掉刚写的 plan 并返回 1；
+5. 不传 `--no-wait` 时等旧 Hub 退出、新 Hub 起来（`started_at` 变了），再轮询 `/api/hub/restart-status` 到 `ready`/`failed`（默认超时 300 秒）。完成后删掉自己写的 plan。
+
+### `replace-exe`
+
+```powershell
+python tools\hub_graceful_restart.py replace-exe <new_exe> [--target-exe PATH] `
+    [--sha256 HEX] [--portable-root PATH] [--no-continue] [--resume-crashed] `
+    [--timeout-seconds 600] [--dry-run]
+```
+
+**预检全部在停止任何东西之前完成，任何一项失败都立即退出、绝不停止旧 Hub：**
+
+1. 新 EXE 必须存在；算 SHA-256，与 `--sha256` 比对，没传就找 `<new_exe>.sha256` 自动对账；
+2. 运行 `<new_exe> --print-build-info`，必须是 `portable: true` 且输出的 `exe_sha256` 与文件一致（`--skip-build-probe` 仅测试用）；
+3. 要替换的 EXE 默认按 `app_pid` 用 `QueryFullProcessImageNameW` 查真实路径（可用 `--target-exe` 覆盖）；拒绝新旧同一个文件，拒绝 `desktop\dist\` 里的构建产物；
+4. 没有未过期的 `restart_plan.json`；
+5. `--dry-run` 只打印通过预检的计划并退出 0，不写文件、不碰进程。
+
+**执行阶段：**
+
+1. 算旧 EXE 的 SHA-256；把新 EXE 复制成目标同目录、同卷的 `.hub-update-<nonce>.exe` 并复核 SHA-256；再复制成 `%TEMP%\hub-update-helper-<nonce>.exe`；
+2. 原子写 `<portable_root>/restart_plan.json`（`mode="replace-exe"`）；
+3. `POST /api/hub/graceful-restart`（`mode="replace-exe"`）；失败就清理暂存文件、helper 和 plan 后报错；
+4. 用 `ShellExecuteW` 拉起 helper（脱离 Agent 的 Job Object，父进程结束也不会被带走），参数 `--apply-update "<plan.json>"`；
+5. 轮询 `restart_plan.result.json` + `/api/hub/info` + `/api/hub/restart-status`（默认最多 600 秒，覆盖首次建 venv），核对新 Hub 的 `started_at` 变了、目标 EXE 的 SHA-256 已是新值，输出最终 JSON；通过后删掉自己写的 plan（`restart_plan.result.json` 保留作为记录）。
+
+helper 等待旧 Hub 退出后 `ReplaceFileW`；替换失败会回滚，旧文件保留为 `<target_exe>.bak`。
+
+### `restart_plan.json` 字段
+
+CLI 与桌面壳、升级 helper 共用这一份计划（`<portable_root>/restart_plan.json`）：
+
+| 字段 | 含义 |
+|---|---|
+| `version` | 1 |
+| `restart_id` | 与请求里的 id 一致 |
+| `mode` | `hub` 或 `replace-exe` |
+| `requested_at` / `expires_at` | 写入时间与该计划的有效期（600 秒） |
+| `port` | Hub 端口 |
+| `app_pid` / `app_creation_time` | 桌面 App 进程与它的创建时间 |
+| `hub_pid` / `hub_creation_time` | 旧 Hub 进程与它的创建时间 |
+| `data_dir` | Hub 数据目录 |
+| `target_exe` | 被替换的旧 EXE |
+| `old_exe_sha256` / `new_exe` / `new_exe_sha256` | 换 EXE 的校验信息 |
+| `staged_exe` | 目标同卷的暂存文件 |
+| `backup_exe` | 旧 EXE 的备份路径 |
+
+## 回滚
+
+- 重启（`hub` 模式）不需要回滚：没有文件被改。
+- 换 EXE 失败在预检阶段：什么都没动。
+- 换 EXE 在请求/助手阶段失败：CLI 清理暂存文件、helper 和 plan，旧 EXE 不变。
+- helper 已经替换但新 Hub 起不来：用 `<target_exe>.bak` 换回旧 EXE，再照常启动桌面版。CLI 的最终 JSON 里 `exe_replaced: false` 时也会提示备份位置。
+- 数据库只在 Hub 停止期间才可能需要回滚；那会丢掉备份之后的记录，先问 owner。
+
+## 排查
+
+- `GET /api/hub/restart-status` 停在 `stopping`：旧 Hub 没有安静退出，看 `hub.log` 末尾有没有 Traceback；桌面壳在等 Hub 进程结束。
+- 停在 `resuming` 超过 30 秒：某个会话恢复卡住；`resume_on_start.result.json` 里有每个会话的答案，`failed_count > 0` 时按会话用 `resume_subagent` 单独恢复。
+- 托盘「重启 Hub」报「已在关闭或重启中」：上一次重启还没结束，等它完成或看日志，不要强杀进程再点。
+- 换 EXE 报 `desktop\dist`：从构建目录直接运行的那份 EXE 不升级，先部署到正式位置。
 
 ## Host / Origin 校验
 
@@ -29,143 +180,6 @@ Hub 只服务本机页面和本机客户端：`Host` 必须是 `127.0.0.1`、`lo
 `host[:port]` 均可（端口被忽略），空条目或写错的条目会在启动时打一条警告后被丢弃，不支持 `*`；两个变量都只在第一个
 请求前读取一次。被拒的请求在 `hub.log` 里每个 `(Host, Origin)` 组合每分钟最多一行、全局每分钟最多 20 行，超出的部分在
 下一个时间窗用一行 `N refusals not logged` 汇总；行内只有规范化后的主机/来源和经过 `%r` 转义的路径，没有查询串。
-
-## 重启线上 Hub：给 Agent 的操作步骤
-
-只在 owner 明确要求时做。流程：写恢复请求 → 结束桌面 App → 备份 → 换 EXE → 用 explorer 启动 → 核对。依赖没变时停机约 30 秒；`desktop/portable/requirements.lock` 变了时，首次启动要新建 Python 环境，约 2–3 分钟。
-
-**停止用强制结束，不用托盘「退出」。** 托盘「退出」和「重启 Hub」是正常停止：结束每个终端 Agent，把所有会话归档为「已中断」。之后这些会话已不算「停止时仍在运行」，`resume_on_start.json` 默认一个也不恢复。强制结束桌面 App 时，它的 Job 对象一并结束 Hub 和终端 Agent，数据库里这些会话仍是运行中。这正是恢复请求设计和测试的情形（`test_restart_resume_on_start.py` 的 `stopped_hard`）。代价是后台写队列里最后几条未提交的记录可能丢失（DECISIONS.md 的 buffered-durability）。停止令牌只在 App 和 Hub 进程的内存里，不要去找它。
-
-命令在 PowerShell 7 里运行（Claude Code 的 PowerShell 工具就是），工作目录为仓库根目录。每个代码块自成一体：工具调用之间变量不保留。
-
-### 1. 准备
-
-- 构建新 EXE：`cd desktop; pnpm build:portable`，产物是 `desktop\dist\mcp-agent-hub-0.1.0-windows-x64-portable.exe`。
-- 构建要在正常的交互式 Windows 桌面会话（`WinSta0\Default`）里运行。离屏或无头会话里，`tauri-build` 生成的 `build-script-build` 可能以 `0xc0000142 (STATUS_DLL_INIT_FAILED)` 失败（它静态链接了 `shell32.dll`、`ole32.dll`）。
-- 不要从 `desktop\dist` 直接运行它（WebView2 0x800700AA 崩溃）。也不要在线上 Hub 运行时试启动任何一份 EXE：4444 被占时，它会在 4445 用同一个数据目录再起一个 Hub，把所有会话归档为「已中断」，恢复请求就落空了。
-- 看一眼现状，记下哪些会话在运行：
-
-```powershell
-Get-CimInstance Win32_Process | Where-Object { $_.Name -like "mcp-agent-hub*" } | Select-Object ProcessId, ExecutablePath
-curl.exe -s --noproxy "*" http://127.0.0.1:4444/api/hub/info
-(curl.exe -s --noproxy "*" http://127.0.0.1:4444/api/sessions | ConvertFrom-Json).sessions | Select-Object session_id, status, title
-```
-
-### 2. 停止、备份、换 EXE、启动（一个代码块，一次运行）
-
-先填 `$B`：仓库外的备份目录，遵守你的临时文件规则。代码块在动手前做检查，任何一项不满足就 `throw` 并且什么都不改；这时停下来问 owner。
-
-```powershell
-$B   = "<备份目录>"
-$new = Join-Path (git rev-parse --show-toplevel) "desktop\dist\mcp-agent-hub-0.1.0-windows-x64-portable.exe"
-
-$ErrorActionPreference = "Stop"
-$D   = Join-Path $env:LOCALAPPDATA "mcp-agent-hub-portable\portable\data"
-$app = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "mcp-agent-hub*" })
-if ($app.Count -ne 1) { throw "expected one desktop app, found $($app.Count)" }
-$exe = $app[0].ExecutablePath   # owner 平时运行的位置，新 EXE 放这里
-if ($exe -like "*\desktop\dist\*") { throw "the app runs from desktop\dist; ask the owner" }
-if (-not (Test-Path $new)) { throw "no new build at $new" }
-if (Test-Path "$D\resume_on_start.json") { throw "a resume request is already pending; ask the owner" }
-New-Item -ItemType Directory -Force $B | Out-Null
-Set-Content "$B\exe-path.txt" $exe   # 回滚时用
-
-# 恢复请求：停止时仍在运行的会话全部恢复，被打断回合的终端 Agent 收到继续消息
-Set-Content -Encoding ascii "$D\resume_on_start.json" '{"continue_unfinished_turns": true}'
-
-# 强制结束桌面 App；Job 对象带走 Hub 和终端 Agent
-$hubIds = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*mcp-agent-hub-portable*server.py*" }).ProcessId
-Stop-Process -Id $app[0].ProcessId -Force
-Start-Sleep -Seconds 3
-if ($hubIds) { Get-Process -Id $hubIds -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2 }
-if (Get-NetTCPConnection -LocalPort 4444 -State Listen -ErrorAction SilentlyContinue) { throw "port 4444 still listening" }
-
-# 备份（Hub 已停，文件静止），再换 EXE
-Copy-Item "$D\hub_state.db*", "$D\wait_inbox.db", $exe -Destination $B
-Copy-Item $new $exe -Force
-if ((Get-FileHash $new).Hash -ne (Get-FileHash $exe).Hash) { throw "EXE copy mismatch" }
-
-# 用 explorer 启动，App 不继承 Agent 的环境变量
-explorer.exe $exe
-"started $exe sha256 $((Get-FileHash $exe).Hash)"
-```
-
-`explorer.exe $exe` 要运行在交互式桌面（`WinSta0\Default`）上，并且要等这个短命的 `explorer.exe` 进程退出、把启动交给常驻的桌面 shell 之后再结束命令。Agent 的命令运行器退出时会结束自己的 Job 对象：直接启动 `$exe`，新 App 会在命令返回时一起被杀掉；不等 shim 交接完就结束，则 shim 先被杀，App 根本没起来（`desktop.log` 里不会出现新的 `app start`）。交接成功的标志是 `desktop.log` 出现新的 `app start: pid <pid>` 行，且该 pid 的 `ParentProcessId` 是桌面 shell（`explorer.exe`），不是 Agent 的 shell。
-
-停机期间，你自己和其他父 Agent 的 agent-hub MCP 连接会断开，Hub 回来后自动重连；恢复进行时，除 `/health` 和桌面端探测外的请求都先等着（最多 30 秒）。
-
-### 3. 等恢复完成
-
-每次最多等 160 秒；`done=False` 就再运行一次。新建 Python 环境时 `progress.json` 依次显示 Creating isolated Hub environment、Downloading Hub dependencies、Python environment ready。
-
-```powershell
-$P = Join-Path $env:LOCALAPPDATA "mcp-agent-hub-portable"; $D = "$P\portable\data"
-$end = (Get-Date).AddSeconds(160)
-do {
-  $done = -not (Test-Path "$D\resume_on_start.json") -and (Test-Path "$D\resume_on_start.result.json") -and
-          (Get-Item "$D\resume_on_start.result.json").LastWriteTime -ge (Get-Item "$D\resume_on_start.taken.json").LastWriteTime
-  if (-not $done) { Start-Sleep -Seconds 3 }
-} until ($done -or (Get-Date) -gt $end)
-"done=$done"
-Get-Content "$P\portable\progress.json" -Raw
-Select-String -Path "$P\logs\desktop.log" -Pattern "hub ready on port|error view|port 4445" | Select-Object -Last 2 | ForEach-Object Line
-```
-
-### 4. 核对
-
-```powershell
-$P = Join-Path $env:LOCALAPPDATA "mcp-agent-hub-portable"; $D = "$P\portable\data"
-(Get-Content "$D\resume_on_start.result.json" -Raw | ConvertFrom-Json).sessions.PSObject.Properties |
-  ForEach-Object { "{0} ok={1} continued={2} at_stop={3} {4}" -f $_.Name, $_.Value.ok, $_.Value.continued, $_.Value.status_at_stop, $_.Value.error }
-curl.exe -s --noproxy "*" http://127.0.0.1:4444/api/hub/info
-(curl.exe -s --noproxy "*" http://127.0.0.1:4444/api/sessions | ConvertFrom-Json).sessions | Select-Object session_id, status, current_activity
-$log = "$P\logs\hub.log"
-$n = (Select-String -Path $log -Pattern "desktop shell: starting hub" | Select-Object -Last 1).LineNumber
-Get-Content $log | Select-Object -Skip ($n - 1) | Select-String "Traceback|ERROR"
-```
-
-成功的样子：
-- 第 1 步里在运行的会话都在 result 里，`ok=True`；当时回合没做完的终端 Agent `continued=True`。
-- `/api/hub/info` 的 `started_at` 是刚才，`repo` 指向新的 `portable\resources\<hash>`。要确认改动已部署，就在那个目录里搜一个这次改动的函数名。
-- 会话列表里它们在运行，步数在增加。
-- 这次启动之后的 hub.log 没有 Traceback 或 ERROR。
-
-出现下面任何一种情况，就停下来把日志末尾报告给 owner，不要反复重启，也不要再启动一份 EXE：
-- desktop.log 有 `error view`、`port 4445`；
-- 5 分钟后还没有 `hub ready on port 4444`（另看 `logs\bootstrap.log`）；
-- result 里有 `ok=False`。这样的会话留在「归档」里，原因写在记录上，可以用 `resume_subagent` 单独恢复。
-
-### 5. 回滚
-
-新构建起不来或有问题、owner 同意回滚时，把第 2 步备份的旧 EXE 换回去。不要为回滚改第 2 步的代码块：它的备份行会用新 EXE 覆盖 `$B` 里的旧 EXE。
-
-```powershell
-$B = "<第 2 步用的备份目录>"
-
-$ErrorActionPreference = "Stop"
-$D   = Join-Path $env:LOCALAPPDATA "mcp-agent-hub-portable\portable\data"
-$exe = (Get-Content "$B\exe-path.txt").Trim()
-$old = Join-Path $B (Split-Path $exe -Leaf)
-if (-not (Test-Path $old)) { throw "no backup EXE at $old" }
-$app = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -like "mcp-agent-hub*" })
-if ($app.Count -gt 1) { throw "more than one desktop app; ask the owner" }
-if (-not (Test-Path "$D\resume_on_start.json")) { Set-Content -Encoding ascii "$D\resume_on_start.json" '{"continue_unfinished_turns": true}' }
-$hubIds = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*mcp-agent-hub-portable*server.py*" }).ProcessId
-if ($app) { Stop-Process -Id $app[0].ProcessId -Force; Start-Sleep -Seconds 3 }
-if ($hubIds) { Get-Process -Id $hubIds -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2 }
-if (Get-NetTCPConnection -LocalPort 4444 -State Listen -ErrorAction SilentlyContinue) { throw "port 4444 still listening" }
-Copy-Item $old $exe -Force
-explorer.exe $exe
-"rolled back $exe sha256 $((Get-FileHash $exe).Hash)"
-```
-
-启动方式和第 2 步相同：`explorer.exe $exe` 在交互式桌面上运行，并等它完成交接。然后照第 3、4 步核对。只有数据库损坏时，才在 Hub 停止期间把 `$B` 里的 `hub_state.db*` 和 `wait_inbox.db` 拷回数据目录：那会丢掉备份之后的所有记录，先问 owner。
-
-### 6. 收尾
-
-- **旧 Python 环境**：依赖变了时，`portable\venvs\` 下会多出一个目录。当前用的是 desktop.log 最后一条 `hub launched` 行里的那个；其余的不再使用。确认没有进程从它运行（`Get-CimInstance Win32_Process | Where-Object ExecutablePath -like "*venvs\<旧 hash>*"`），征得 owner 同意后按字面路径删除。
-- **备份目录 `$B`**：留到 owner 确认新 Hub 正常，然后删除。
-- `resume_on_start.taken.json` 和 `resume_on_start.result.json` 留在数据目录里，下次重启时会被覆盖。
 
 ## Hub 不再接受连接时
 

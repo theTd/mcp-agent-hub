@@ -143,6 +143,31 @@ pub mod launch_record {
             validate_launch_record(&self)?;
             Ok(self)
         }
+
+        /// The exact desktop-app process instance this record belongs to, when the record names
+        /// one. `None` for a legacy record (version 0), for a record written before the app pinned
+        /// itself, and for a record that only kept `app_pid`.
+        pub fn owner_app_identity(&self) -> Option<windows_process::ProcessIdentity> {
+            let pid = self.app_pid.filter(|pid| *pid != 0)?;
+            let creation_time = self.app_creation_time.filter(|ticks| *ticks != 0)?;
+            Some(windows_process::ProcessIdentity { pid, creation_time })
+        }
+
+        /// `Some(app_pid)` when the app that wrote this record is still that exact process. A
+        /// reused PID (same number, different creation time) is a different program and reports
+        /// `None`, so it can never keep an orphan hub alive by accident.
+        pub fn owner_app_pid_if_alive(&self) -> Option<u32> {
+            let identity = self.owner_app_identity()?;
+            windows_process::process_is_alive(identity).then_some(identity.pid)
+        }
+
+        /// `Some(app_pid)` for an old record that carries only `app_pid`, with no creation time to
+        /// pin the instance. The PID alone proves nothing, so a caller must verify the image name
+        /// before treating it as a live app. `None` when the record has no usable app PID.
+        pub fn owner_app_pid_without_identity(&self) -> Option<u32> {
+            let pid = self.app_pid.filter(|pid| *pid != 0)?;
+            self.owner_app_identity().is_none().then_some(pid)
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -257,7 +282,10 @@ pub mod launch_record {
         }
         match (record.app_pid, record.app_creation_time) {
             (None, None) | (Some(0), None) => {}
-            (Some(_), None) => return Err("launch.json 有 app_pid 但没有 app_creation_time".into()),
+            // An old record may name only `app_pid`. It stays readable instead of being moved
+            // aside — possibly while the app that wrote it is still running — and its PID is
+            // verified by image name where the record is used.
+            (Some(_), None) => {}
             (Some(_), Some(0)) | (None, Some(_)) => return Err("launch.json 的 app_pid/app_creation_time 不一致".into()),
             (Some(_), Some(_)) => {}
         }
@@ -762,6 +790,59 @@ mod tests {
         assert_eq!(record.pid, 0);
         assert_eq!(record.creation_time, 0);
         assert_eq!(record.shutdown_token, None);
+    }
+
+    #[test]
+    fn launch_record_without_app_fields_has_no_owner_app() {
+        // Both a version 0 record and a version 1 record written before the hub was launched
+        // predate the app fields; they must still parse and simply report no owner app.
+        let legacy =
+            r#"{"python":"C:\\hub\\python.exe","repo_dir":"C:\\hub\\resources","port":4444}"#;
+        let record = parse_launch_record(legacy).unwrap();
+        assert_eq!(record.app_pid, None);
+        assert_eq!(record.app_creation_time, None);
+        assert_eq!(record.owner_app_identity(), None);
+        assert_eq!(record.owner_app_pid_if_alive(), None);
+        assert_eq!(record.owner_app_pid_without_identity(), None);
+
+        let prepared = r#"{"version":1,"python":"C:\\hub\\python.exe","repo_dir":"C:\\hub\\resources","port":4444,"state":"prepared"}"#;
+        let record = parse_launch_record(prepared).unwrap();
+        assert_eq!(record.owner_app_identity(), None);
+    }
+
+    #[test]
+    fn launch_record_reads_an_old_app_pid_without_a_creation_time() {
+        // A record from a build that pinned only the app PID stays readable: moving it aside
+        // could destroy a record a live app is still using.
+        let text = r#"{"version":1,"python":"C:\\hub\\python.exe","repo_dir":"C:\\hub\\resources","port":4500,"pid":0,"creation_time":0,"app_pid":777}"#;
+        let record = parse_launch_record(text).unwrap();
+        assert_eq!(record.app_pid, Some(777));
+        assert_eq!(record.app_creation_time, None);
+        assert_eq!(record.owner_app_identity(), None);
+        assert_eq!(record.owner_app_pid_if_alive(), None);
+        assert_eq!(record.owner_app_pid_without_identity(), Some(777));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launch.json");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(recover_launch_record(&path).unwrap(), Some(record));
+        assert!(path.exists(), "the record is kept, not moved aside");
+    }
+
+    #[test]
+    fn owner_app_identity_distinguishes_this_app_from_a_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = launch_record(dir.path())
+            .with_runtime_metadata(std::process::id(), dir.path().join("data"), "test")
+            .unwrap();
+        let identity = record.owner_app_identity().unwrap();
+        assert_eq!(identity.pid, std::process::id());
+        assert_eq!(record.owner_app_pid_if_alive(), Some(identity.pid));
+        // Same number, different creation time: Windows reused the PID for another program.
+        let mut reused = record.clone();
+        reused.app_creation_time = Some(identity.creation_time + 1);
+        assert_eq!(reused.owner_app_pid_if_alive(), None);
+        assert_eq!(reused.owner_app_pid_without_identity(), None);
     }
 
     #[test]

@@ -94,6 +94,63 @@ pub struct TelemetryEvents {
     pub events: Vec<Value>,
 }
 
+/// The hub's restart progress: `idle` → `stopping` → `resuming` → `ready` (or `failed`).
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct RestartStatus {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub restart_id: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub target_count: u32,
+    #[serde(default)]
+    pub resumed_count: u32,
+    #[serde(default)]
+    pub skipped_count: u32,
+    #[serde(default)]
+    pub failed_count: u32,
+}
+
+impl RestartStatus {
+    /// The shell stops polling here: nothing more will change until the next request.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.phase.as_str(), "ready" | "failed" | "idle")
+    }
+}
+
+/// One `HTTP <code> …` line with the hub's own `detail`, so the error view says why the hub refused
+/// instead of only naming a status code.
+fn http_error_text(what: &str, code: u16, body: &str) -> String {
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("detail")
+                .or_else(|| value.get("error"))
+                .or_else(|| value.get("message"))
+                .map(|d| match d {
+                    Value::String(s) => s.trim().to_string(),
+                    other => other.to_string(),
+                })
+        })
+        .unwrap_or_else(|| body.trim().to_string());
+    let hint = match code {
+        404 => "（Hub 可能是旧版本，不支持优雅重启）",
+        403 => "（Hub 拒绝了关闭令牌）",
+        409 => "（Hub 当前状态不允许重启）",
+        _ => "",
+    };
+    if detail.is_empty() {
+        format!("HTTP {code} {what}{hint}")
+    } else {
+        format!("HTTP {code} {what}: {detail}{hint}")
+    }
+}
+
 #[derive(Clone)]
 pub struct HubApi {
     client: reqwest::Client,
@@ -157,6 +214,59 @@ impl HubApi {
         } else {
             Err(format!("HTTP {}", resp.status()))
         }
+    }
+
+    /// Ask an owned hub to stop *and plan a restart*: it archives the live sessions, remembers them
+    /// in `resume_on_start.json`, and stops. `202 Accepted` (and a plain `200`) both mean accepted;
+    /// a `404` means the running hub predates this endpoint.
+    pub async fn graceful_restart(
+        &self,
+        token: &str,
+        mode: &str,
+        restart_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let body = serde_json::json!({
+            "mode": mode,
+            "restart_id": restart_id,
+            "continue_unfinished_turns": true,
+        });
+        let resp = self
+            .client
+            .post(format!("{}/api/hub/graceful-restart", self.base))
+            .header("X-Hub-Shutdown-Token", token)
+            .json(&body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if (200..300).contains(&code) {
+            if text.trim().is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&text)
+                .map_err(|e| format!("Hub 返回的不是 JSON：{e}（{text}）"));
+        }
+        Err(http_error_text("graceful-restart", code, &text))
+    }
+
+    /// `GET /api/hub/restart-status`: how far the hub got with resuming after a planned restart.
+    pub async fn restart_status(&self, timeout: Duration) -> Result<RestartStatus, String> {
+        let resp = self
+            .client
+            .get(format!("{}/api/hub/restart-status", self.base))
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let code = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&code) {
+            return Err(http_error_text("restart-status", code, &text));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| format!("restart-status 不是 JSON：{e}（{text}）"))
     }
 
     /// Console-only telemetry. This cursor is independent from parent wait handles.
@@ -225,5 +335,53 @@ mod tests {
         );
         let other: HubInfo = serde_json::from_str(r#"{"service":"something-else"}"#).unwrap();
         assert!(!other.is_agent_hub());
+    }
+
+    #[test]
+    fn restart_status_parses_a_full_and_a_sparse_answer() {
+        let full: RestartStatus = serde_json::from_str(
+            r#"{"ok":true,"phase":"resuming","restart_id":"r-1","mode":"hub","target_count":3,"resumed_count":1,"skipped_count":1,"failed_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(full.phase, "resuming");
+        assert_eq!(full.restart_id.as_deref(), Some("r-1"));
+        assert_eq!(
+            (
+                full.target_count,
+                full.resumed_count,
+                full.skipped_count,
+                full.failed_count
+            ),
+            (3, 1, 1, 1)
+        );
+        assert!(!full.is_terminal());
+
+        // A hub that has no restart in mind answers with idle and nulls instead of omitting keys.
+        let idle: RestartStatus = serde_json::from_str(
+            r#"{"ok":true,"phase":"idle","restart_id":null,"mode":null,"target_count":0,"resumed_count":0,"skipped_count":0,"failed_count":0}"#,
+        )
+        .unwrap();
+        assert!(idle.is_terminal());
+        assert_eq!(idle.restart_id, None);
+    }
+
+    #[test]
+    fn error_text_keeps_the_hub_detail_and_names_the_code() {
+        assert_eq!(
+            http_error_text(
+                "graceful-restart",
+                404,
+                r#"{"detail":"Not Found"}"#
+            ),
+            "HTTP 404 graceful-restart: Not Found（Hub 可能是旧版本，不支持优雅重启）"
+        );
+        assert_eq!(
+            http_error_text("graceful-restart", 409, r#"{"detail":"Hub 正在恢复会话"}"#),
+            "HTTP 409 graceful-restart: Hub 正在恢复会话（Hub 当前状态不允许重启）"
+        );
+        assert_eq!(
+            http_error_text("restart-status", 500, ""),
+            "HTTP 500 restart-status"
+        );
     }
 }

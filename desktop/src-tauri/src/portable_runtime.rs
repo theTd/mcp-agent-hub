@@ -417,51 +417,90 @@ async fn stop_hub(root_pid: u32, record: &LaunchRecord) -> Result<(), String> {
 }
 
 /// Before extraction: load the record, and when it names a running hub that this payload started,
-/// verify its command line, stop it, and report what was stopped. A live second copy of this EXE
-/// is reported but never touched. Idempotent: a second call finds nothing to stop.
+/// verify its command line, stop it, and report what was stopped. A live second copy of this app
+/// is reported but never touched — wherever it was started from.
 pub async fn recover_stale_hub(root: &Path) -> Result<RecoveryReport, PortableError> {
     let previous = hub_config::recover_launch_record(&root.join("launch.json"))
         .map_err(PortableError::from)?;
-    let live_peer = live_app_peer();
-    let mut report = RecoveryReport {
-        live_peer,
-        stopped: None,
-    };
-    if live_peer.is_some() {
-        return Ok(report);
+    let same_path_peer = live_app_peer();
+    match plan_recovery(root, previous, same_path_peer, std::process::id()) {
+        RecoveryPlan::LivePeer(peer) => Ok(RecoveryReport {
+            live_peer: Some(peer),
+            stopped: None,
+        }),
+        RecoveryPlan::Nothing => Ok(RecoveryReport::default()),
+        RecoveryPlan::Stop { root_pid, record } => {
+            let stopped = holder(root_pid);
+            stop_hub(root_pid, &record).await.map_err(|message| {
+                let holders = payload_holders(&root.join("resources").join(PAYLOAD_ID));
+                PortableError::with_holders(message, holders)
+            })?;
+            Ok(RecoveryReport {
+                live_peer: None,
+                stopped,
+            })
+        }
+    }
+}
+
+/// What `recover_stale_hub` will do, decided before anything is touched. Separating the decision
+/// from the act keeps the two "never touch a live app's hub" guards testable without stopping a
+/// process.
+#[derive(Debug)]
+enum RecoveryPlan {
+    /// Another live app owns this root; its hub and its record are left exactly as they are.
+    LivePeer(u32),
+    /// No record, or a record that does not describe a hub of this payload.
+    Nothing,
+    /// A hub of this payload that nothing else owns: stop it, then extract.
+    Stop {
+        root_pid: u32,
+        record: LaunchRecord,
+    },
+}
+
+fn plan_recovery(
+    root: &Path,
+    previous: Option<LaunchRecord>,
+    same_path_peer: Option<u32>,
+    self_pid: u32,
+) -> RecoveryPlan {
+    // Two independent probes: a peer started from this very path, and a peer the record names.
+    // The second one is what catches a copy (or a build output) running from another directory.
+    let recorded_peer = previous
+        .as_ref()
+        .and_then(|record| live_record_app_peer(record, self_pid));
+    if let Some(peer) = same_path_peer.or(recorded_peer) {
+        return RecoveryPlan::LivePeer(peer);
     }
     let Some(record) = previous else {
-        return Ok(report);
+        return RecoveryPlan::Nothing;
     };
     if !is_within(&record.repo_dir, &root.join("resources")) {
-        return Ok(report);
+        return RecoveryPlan::Nothing;
     }
     let pid = match hub_config::launch_record_owner(&record) {
         LaunchRecordOwner::Alive(identity) => {
             if !command_line_is_hub(identity.pid, &record) {
                 // The record is inconsistent; never kill a process we cannot identify.
-                return Ok(report);
+                return RecoveryPlan::Nothing;
             }
             identity.pid
         }
         LaunchRecordOwner::Unrecorded | LaunchRecordOwner::Stale => {
             let Some(pid) = windows_process::listening_pid(record.port) else {
-                return Ok(report);
+                return RecoveryPlan::Nothing;
             };
             if !command_line_is_hub(pid, &record) {
-                return Ok(report);
+                return RecoveryPlan::Nothing;
             }
             pid
         }
     };
-    let root_pid = hub_tree_root(pid, &record);
-    let stopped = holder(root_pid);
-    stop_hub(root_pid, &record).await.map_err(|message| {
-        let holders = payload_holders(&root.join("resources").join(PAYLOAD_ID));
-        PortableError::with_holders(message, holders)
-    })?;
-    report.stopped = stopped;
-    Ok(report)
+    RecoveryPlan::Stop {
+        root_pid: hub_tree_root(pid, &record),
+        record,
+    }
 }
 
 /// Recovery for the app's own portable root, for the shell's "结束残留 Hub" action.
@@ -529,15 +568,108 @@ fn live_app_peer() -> Option<u32> {
         .map(|process| process.pid)
 }
 
+/// Fragment of the shell's image name, used only to sanity-check a record that names `app_pid`
+/// without a creation time.
+const APP_IMAGE_STEM: &str = "mcp-agent-hub";
+
+/// The live desktop app that `launch.json` says owns this portable root, if any.
+///
+/// `live_app_peer` compares image paths, so it only sees a second copy started from the same file.
+/// The same app can also run from a copy or from a build output (`desktop\dist\…`), and then that
+/// comparison misses it — while the hub it owns is right here, under this root. The record's
+/// `app_pid`/`app_creation_time` identify the owner by process instance instead of by path, so a
+/// hub it owns is never mistaken for an orphan.
+fn live_record_app_peer(record: &LaunchRecord, self_pid: u32) -> Option<u32> {
+    live_record_app_peer_with(
+        record,
+        self_pid,
+        windows_process::process_is_alive,
+        windows_process::process_name,
+    )
+}
+
+fn live_record_app_peer_with(
+    record: &LaunchRecord,
+    self_pid: u32,
+    is_alive: impl Fn(ProcessIdentity) -> bool,
+    name_of: impl Fn(u32) -> Option<String>,
+) -> Option<u32> {
+    // This record may be our own: we are alive by definition, but we are not a peer.
+    if record.app_pid == Some(self_pid) {
+        return None;
+    }
+    if let Some(identity) = record.owner_app_identity() {
+        return is_alive(identity).then_some(identity.pid);
+    }
+    // Defensive: an old record with only `app_pid`. That PID proves nothing on its own, so the
+    // image name must still be this shell; a reused PID of any other program never matches.
+    let pid = record.owner_app_pid_without_identity()?;
+    let name = name_of(pid)?.to_lowercase();
+    name.contains(APP_IMAGE_STEM).then_some(pid)
+}
+
+/// The live app `launch.json` currently names, read fresh from disk (never a value computed minutes
+/// ago). `None` when there is no record, it is unreadable, it names this process, or its app is gone.
+fn recorded_live_peer(root: &Path) -> Option<u32> {
+    let record = hub_config::recover_launch_record(&root.join("launch.json"))
+        .ok()
+        .flatten()?;
+    live_record_app_peer(&record, std::process::id())
+}
+
+/// Every live app that may already own this root's port and `launch.json`: a copy started from
+/// this very image, and the app instance the on-disk record names (which also covers a copy or a
+/// build output started from another directory). Used as a *fresh* probe wherever the answer must
+/// reflect the world right now, never a value computed minutes ago.
+fn detect_live_peer(root: &Path) -> Option<u32> {
+    live_app_peer().or_else(|| recorded_live_peer(root))
+}
+
+/// What a prepare run may still do once the slow part of the preparation is over.
+#[derive(Debug, PartialEq, Eq)]
+enum PeerGate {
+    /// Keep the peer this run already knew about (Some only for a diagnostic prepare run).
+    Proceed(Option<u32>),
+    /// A live app appeared during preparation: a real start must abort instead of taking its port
+    /// and overwriting its `launch.json`.
+    Abort(String),
+}
+
+/// Decide from a *fresh* detection, so a peer that started during the minutes of preparation is
+/// never mistaken for an orphan. A diagnostic `--portable-prepare-only` run owns nothing anyway,
+/// so it only records the peer and goes on without touching the port or the record.
+fn peer_gate(detected: Option<u32>, previous: Option<u32>, prepare_only: bool) -> PeerGate {
+    match detected {
+        Some(pid) if prepare_only => PeerGate::Proceed(Some(pid)),
+        Some(pid) => PeerGate::Abort(format!(
+            "另一个便携版实例正在运行（PID {pid}），本次启动已中止；请使用该窗口，或先完全退出它"
+        )),
+        None => PeerGate::Proceed(previous),
+    }
+}
+
 /// The port chosen by `prepare` must still be ours to take when the supervisor launches the hub.
 /// A payload-owned orphan is stopped; any other listener fails closed. Binding is checked too: a
-/// listener check alone can lose the race.
+/// listener check alone can lose the race. When a live peer owns this root, its port is its own:
+/// nothing here may stop it, fail on it or claim its launch record.
 async fn ensure_port_free(
+    root: &Path,
     port: u16,
     python: &Path,
     repo_dir: &Path,
-) -> Result<(), PortableError> {
+    live_peer: Option<u32>,
+) -> Result<PortClaim, PortableError> {
+    if let Some(peer) = live_peer {
+        return Ok(PortClaim::OwnedByPeer(peer));
+    }
     if let Some(pid) = windows_process::listening_pid(port) {
+        // Second line of defence for the TOCTOU window: preparation can take minutes, and another
+        // path's live app may have started a hub here and written its own `launch.json` in the
+        // meantime. The record names that app by process instance, so it is checked *before* any
+        // stop, and its hub — and its record — are left exactly as they are.
+        if let Some(peer) = recorded_live_peer(root) {
+            return Ok(PortClaim::OwnedByPeer(peer));
+        }
         let record = LaunchRecord::prepared(python.to_path_buf(), repo_dir.to_path_buf(), port);
         if command_line_is_hub(pid, &record) {
             let root_pid = hub_tree_root(pid, &record);
@@ -556,8 +688,23 @@ async fn ensure_port_free(
     }
     hub_config::require_free_port(port).map_err(PortableError::from)?;
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .map(|_| ())
+        .map(|_| PortClaim::Free)
         .map_err(|error| PortableError::new(format!("端口 {port} 当前不可绑定：{error}")))
+}
+
+/// Who owns the port after the final check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortClaim {
+    /// Free: this run may claim the port *and* `launch.json`.
+    Free,
+    /// A live app owns this root's port (and its record): nothing was stopped, nothing may be claimed.
+    OwnedByPeer(u32),
+}
+
+/// Whether this run may claim the port and the launch record of this portable root. A live peer
+/// already owns both: its record names its hub, and its hub is serving that port.
+fn owns_portable_endpoint(live_peer: Option<u32>) -> bool {
+    live_peer.is_none()
 }
 
 #[derive(Deserialize)]
@@ -627,16 +774,17 @@ pub async fn prepare_detailed(
         }
     }
     let launch_path = root.join("launch.json");
-    // The recovery reads and, when needed, rewrites launch.json; it never touches a live peer.
+    // The recovery reads `launch.json`; it never touches a live peer's hub or its record.
     let recovery = recover_stale_hub(&root).await?;
-    if recovery.live_peer.is_some()
-        && !std::env::args().any(|arg| arg == "--portable-prepare-only")
-    {
+    let prepare_only = std::env::args().any(|arg| arg == "--portable-prepare-only");
+    if recovery.live_peer.is_some() && !prepare_only {
         return Err(PortableError::new(format!(
             "另一个便携版实例正在运行（PID {}），请使用该窗口，或先完全退出它",
             recovery.live_peer.unwrap()
         )));
     }
+    // A diagnostic `--portable-prepare-only` may run next to a live app, but it owns nothing of
+    // that app: not its port, not its launch record.
     let live_peer = recovery.live_peer;
     let file = hub_config::load_file()?;
     let resources = unpack(&root)?;
@@ -718,15 +866,45 @@ pub async fn prepare_detailed(
             .map_err(|e| e.to_string())?;
     cfg.python = result.python;
     cfg.port = hub_config::select_port(&file)?;
+    // Second look for a live app, now that the slow part is done: another path's copy can have
+    // started its hub during those minutes, and the probe taken before `unpack` is stale by
+    // construction. Without this the port of that live app would be "reclaimed" and its
+    // `launch.json` overwritten.
+    let live_peer = match peer_gate(detect_live_peer(&root), live_peer, prepare_only) {
+        PeerGate::Proceed(peer) => peer,
+        PeerGate::Abort(reason) => return Err(PortableError::new(reason)),
+    };
     // Fail closed here: preparation can take minutes, so the port that was free when selected may
     // now belong to someone else. The supervisor's post-ready job check remains the final gate.
-    ensure_port_free(cfg.port, &cfg.python, &cfg.repo_dir).await?;
-    // A live peer's record names its own hub; never clobber it with this diagnostic/prepare run.
-    if live_peer.is_none() {
-        let record = LaunchRecord::prepared(cfg.python.clone(), cfg.repo_dir.clone(), cfg.port);
-        hub_config::write_launch_record(&launch_path, &record)?;
+    match ensure_port_free(&root, cfg.port, &cfg.python, &cfg.repo_dir, live_peer).await? {
+        PortClaim::Free => {
+            // A live peer's record names its own hub; never clobber it with this run.
+            write_prepared_record(&launch_path, &cfg, live_peer)?;
+        }
+        PortClaim::OwnedByPeer(pid) => {
+            if !prepare_only {
+                return Err(PortableError::new(format!(
+                    "另一个便携版实例正在运行（PID {pid}），本次启动已中止；请使用该窗口，或先完全退出它"
+                )));
+            }
+            // A diagnostic run owns nothing of a live app: neither its port nor its record.
+        }
     }
     Ok(cfg)
+}
+
+/// Claim `launch.json` for the hub this run is about to start. A live peer already owns the record
+/// under this root, so a prepare or diagnostic run leaves it untouched.
+fn write_prepared_record(
+    launch_path: &Path,
+    cfg: &HubConfig,
+    live_peer: Option<u32>,
+) -> Result<(), String> {
+    if !owns_portable_endpoint(live_peer) {
+        return Ok(());
+    }
+    let record = LaunchRecord::prepared(cfg.python.clone(), cfg.repo_dir.clone(), cfg.port);
+    hub_config::write_launch_record(launch_path, &record)
 }
 
 #[cfg(test)]
@@ -837,5 +1015,379 @@ mod tests {
             &root.join("resources")
         ));
         assert_ne!(path_key(Path::new(r"C:\A\B\")), path_key(Path::new(r"C:\A\BC")));
+    }
+
+    // --- A hub is never stopped while the app that owns it is still running ----------------------
+
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    /// Long enough for any recovery gate in these tests to run, short enough to expire on its own.
+    const STAND_IN_SECONDS: u32 = 45;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tauri::async_runtime::block_on(f)
+    }
+
+    /// A stand-in app process that stays alive for `STAND_IN_SECONDS`.
+    fn spawn_sleeper() -> std::process::Child {
+        let script = format!("ping -n {STAND_IN_SECONDS} 127.0.0.1 >nul");
+        Command::new("cmd.exe")
+            .arg("/c")
+            .arg(script)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in process")
+    }
+
+    /// A stand-in hub: it stays alive, and its command line names the record's python and
+    /// `server.py`, so `command_line_is_hub` identifies it exactly as the real thing.
+    fn spawn_hub_stand_in(python: &Path, repo_dir: &Path) -> std::process::Child {
+        let script = format!(
+            "ping -n {STAND_IN_SECONDS} 127.0.0.1 >nul & rem {} {}",
+            python.display(),
+            repo_dir.join("server.py").display()
+        );
+        Command::new("cmd.exe")
+            .arg("/c")
+            .arg(script)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a hub stand-in")
+    }
+
+    /// End a stand-in and release its handle. Windows keeps a process object — and its creation
+    /// time — alive while any handle is open, so a leaked handle would make the PID look alive.
+    fn stop(mut child: std::process::Child) {
+        let identity = windows_process::process_identity(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        // Release the handle so the process object — and its creation time — can be destroyed.
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        if let Some(identity) = identity {
+            while windows_process::process_is_alive(identity) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Release a stand-in's handle without ending it: the recovery under test must be the only
+    /// thing able to stop it.
+    fn detach(child: std::process::Child) -> ProcessIdentity {
+        let identity = windows_process::process_identity(child.id()).expect("a live stand-in");
+        drop(child);
+        identity
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// A portable root with a payload directory the record can point at.
+    fn portable_root(temp: &Path) -> (PathBuf, PathBuf) {
+        let repo_dir = temp.join("resources").join("payload");
+        fs::create_dir_all(&repo_dir).unwrap();
+        (temp.join("venvs").join("python.exe"), repo_dir)
+    }
+
+    fn record_of(python: &Path, repo_dir: &Path, port: u16) -> LaunchRecord {
+        LaunchRecord::prepared(python.to_path_buf(), repo_dir.to_path_buf(), port)
+    }
+
+    /// A PID that no process has right now: the app that wrote the record has exited, and Windows
+    /// may hand its number to another program later. Killing a real stand-in cannot stand in for
+    /// "gone" on this host, which keeps terminated process objects visible for a while.
+    fn exited_pid() -> u32 {
+        let mut candidate = 0xF000_0001u32;
+        for _ in 0..1024 {
+            if windows_process::process_identity(candidate).is_none() {
+                return candidate;
+            }
+            candidate = candidate.wrapping_add(1);
+        }
+        panic!("no unused PID found");
+    }
+
+    /// The root PID `recover_stale_hub` would stop for this record, if any.
+    ///
+    /// The act itself is `stop_hub`, which then waits for the process object to disappear. This
+    /// host keeps terminated process objects (and their creation time) visible for a while, so the
+    /// kill cannot be observed here; the decision — clean up, or leave a live app's hub alone —
+    /// is what these tests assert, and it is the only thing that can lead to a stop.
+    fn planned_stop(root: &Path, record: LaunchRecord) -> Option<u32> {
+        match plan_recovery(root, Some(record), None, std::process::id()) {
+            RecoveryPlan::Stop { root_pid, .. } => Some(root_pid),
+            RecoveryPlan::LivePeer(_) | RecoveryPlan::Nothing => None,
+        }
+    }
+
+    #[test]
+    fn a_live_app_recorded_from_another_path_protects_its_hub() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (python, repo_dir) = portable_root(root);
+        let port = free_port();
+        let hub_identity = detach(spawn_hub_stand_in(&python, &repo_dir));
+        let app = spawn_sleeper();
+        // The app that owns the hub runs from a different image than this test binary, exactly
+        // like a copy or `desktop\dist\…` next to the installed one. `live_app_peer` cannot see
+        // it; the recorded app identity can.
+        let record = record_of(&python, &repo_dir, port)
+            .with_owner(hub_identity.pid, None)
+            .unwrap()
+            .with_runtime_metadata(app.id(), root.join("data"), "test")
+            .unwrap();
+        let record_path = root.join("launch.json");
+        hub_config::write_launch_record(&record_path, &record).unwrap();
+
+        let report = block_on(recover_stale_hub(root)).unwrap();
+
+        assert_eq!(report.live_peer, Some(app.id()), "{report:?}");
+        assert!(report.stopped.is_none(), "{report:?}");
+        assert!(
+            windows_process::process_is_alive(hub_identity),
+            "the live app's hub must still be running"
+        );
+        assert_eq!(
+            hub_config::recover_launch_record(&record_path).unwrap(),
+            Some(record),
+            "the live app's record must be neither overwritten nor moved aside"
+        );
+        windows_process::kill_identities(&[hub_identity]);
+        stop(app);
+    }
+
+    #[test]
+    fn a_reused_app_pid_no_longer_protects_the_hub() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (python, repo_dir) = portable_root(root);
+        let port = free_port();
+        let app = spawn_sleeper();
+        let app_identity = windows_process::process_identity(app.id()).unwrap();
+        let hub_identity = detach(spawn_hub_stand_in(&python, &repo_dir));
+        let mut record = record_of(&python, &repo_dir, port)
+            .with_owner(hub_identity.pid, None)
+            .unwrap()
+            .with_runtime_metadata(app_identity.pid, root.join("data"), "test")
+            .unwrap();
+        // Windows reused the PID for another program: the number matches, the instance does not.
+        record.app_creation_time = Some(app_identity.creation_time + 1);
+        hub_config::write_launch_record(&root.join("launch.json"), &record).unwrap();
+
+        assert_eq!(live_record_app_peer(&record, std::process::id()), None);
+        assert_eq!(
+            planned_stop(&root, record),
+            Some(hub_identity.pid),
+            "the hub of a replaced app is an orphan and must be selected for cleanup"
+        );
+        assert!(
+            windows_process::process_is_alive(app_identity),
+            "a process that merely holds the old PID is never stopped"
+        );
+        windows_process::kill_identities(&[hub_identity]);
+        stop(app);
+    }
+
+    #[test]
+    fn a_hub_of_a_dead_app_record_is_cleaned_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (python, repo_dir) = portable_root(root);
+        let port = free_port();
+        let hub_identity = detach(spawn_hub_stand_in(&python, &repo_dir));
+        let mut record = record_of(&python, &repo_dir, port)
+            .with_owner(hub_identity.pid, None)
+            .unwrap();
+        // The app that wrote this record has exited; its PID is nobody's now.
+        record.app_pid = Some(exited_pid());
+        record.app_creation_time = windows_process::creation_time(std::process::id());
+        hub_config::write_launch_record(&root.join("launch.json"), &record).unwrap();
+
+        assert_eq!(live_record_app_peer(&record, std::process::id()), None);
+        assert_eq!(
+            planned_stop(&root, record),
+            Some(hub_identity.pid),
+            "the hub of an app that is gone is an orphan and must be selected for cleanup"
+        );
+        windows_process::kill_identities(&[hub_identity]);
+    }
+
+    #[test]
+    fn live_record_app_peer_matches_only_the_recorded_app_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (python, repo_dir) = portable_root(temp.path());
+        let app = spawn_sleeper();
+        let identity = windows_process::process_identity(app.id()).unwrap();
+        let mut record = record_of(&python, &repo_dir, 4500);
+        record.app_pid = Some(identity.pid);
+        record.app_creation_time = Some(identity.creation_time);
+
+        assert_eq!(live_record_app_peer(&record, std::process::id()), Some(identity.pid));
+        record.app_creation_time = Some(identity.creation_time + 1);
+        assert_eq!(live_record_app_peer(&record, std::process::id()), None);
+        record.app_creation_time = Some(identity.creation_time);
+        assert_eq!(
+            live_record_app_peer(&record, identity.pid),
+            None,
+            "a record naming this process is our own, never a peer"
+        );
+        let mut record_without_app = record_of(&python, &repo_dir, 4500);
+        record_without_app.app_pid = None;
+        record_without_app.app_creation_time = None;
+        assert_eq!(live_record_app_peer(&record_without_app, std::process::id()), None);
+        stop(app);
+    }
+
+    #[test]
+    fn a_legacy_app_pid_without_a_creation_time_is_checked_by_image_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let (python, repo_dir) = portable_root(temp.path());
+        let mut record = record_of(&python, &repo_dir, 4500);
+        record.app_pid = Some(4321);
+        record.app_creation_time = None;
+        let alive = |_: ProcessIdentity| true;
+        let shell = |_pid: u32| Some("mcp-agent-hub-0.1.0-windows-x64-portable.exe".to_string());
+        assert_eq!(live_record_app_peer_with(&record, 1, alive, shell), Some(4321));
+        // The PID exists, but it is some other program that reused it.
+        assert_eq!(
+            live_record_app_peer_with(&record, 1, alive, |_| Some("notepad.exe".into())),
+            None
+        );
+        // The PID is gone.
+        assert_eq!(live_record_app_peer_with(&record, 1, alive, |_| None), None);
+        // Our own record is never a peer, even without a creation time.
+        assert_eq!(
+            live_record_app_peer_with(&record, 4321, alive, |_| {
+                Some("mcp-agent-hub.exe".into())
+            }),
+            None
+        );
+    }
+
+    // --- A prepare/diagnostic run must not take a live peer's port or record --------------------
+
+    #[test]
+    fn a_prepare_run_next_to_a_live_peer_leaves_the_port_and_record_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let python = PathBuf::from(r"C:\portable\venvs\abc\Scripts\python.exe");
+        let repo_dir = PathBuf::from(r"C:\portable\resources\payload");
+
+        assert_eq!(
+            block_on(ensure_port_free(root, port, &python, &repo_dir, Some(4321)))
+                .expect("a live peer's own port is never stopped or reported as foreign"),
+            PortClaim::OwnedByPeer(4321)
+        );
+        assert!(
+            block_on(ensure_port_free(root, port, &python, &repo_dir, None)).is_err(),
+            "without a live peer an occupied port still fails closed"
+        );
+        drop(listener);
+        assert_eq!(
+            block_on(ensure_port_free(root, port, &python, &repo_dir, None)).unwrap(),
+            PortClaim::Free
+        );
+    }
+
+    /// P0-4: there is no `launch.json` when the preparation starts, and another path's live app
+    /// starts its hub *during* the slow part. The fresh re-check must find it, and neither its
+    /// port nor its record may be taken.
+    #[test]
+    fn a_live_app_that_appears_during_preparation_is_found_by_the_second_look() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (python, repo_dir) = portable_root(root);
+        let app = spawn_sleeper();
+        let app_identity = windows_process::process_identity(app.id()).unwrap();
+        // The peer: a hub that stays alive, a socket bound to its port, and its own record — all
+        // written while this run was preparing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hub_identity = detach(spawn_hub_stand_in(&python, &repo_dir));
+        let record = record_of(&python, &repo_dir, port)
+            .with_owner(hub_identity.pid, None)
+            .unwrap()
+            .with_runtime_metadata(app_identity.pid, root.join("data"), "peer")
+            .unwrap();
+        let record_path = root.join("launch.json");
+        hub_config::write_launch_record(&record_path, &record).unwrap();
+        let published = fs::read_to_string(&record_path).unwrap();
+
+        assert_eq!(
+            detect_live_peer(root),
+            Some(app_identity.pid),
+            "the second look must see the app that started after the first probe"
+        );
+        match peer_gate(detect_live_peer(root), None, false) {
+            PeerGate::Abort(reason) => assert!(
+                reason.contains(&format!("PID {}", app_identity.pid)),
+                "{reason}"
+            ),
+            other => panic!("a real start must abort instead of taking a live peer's port: {other:?}"),
+        }
+
+        let claim = block_on(ensure_port_free(root, port, &python, &repo_dir, None))
+            .expect("a port whose record names a live app is never reclaimed");
+        assert_eq!(claim, PortClaim::OwnedByPeer(app_identity.pid));
+        assert!(
+            windows_process::process_is_alive(hub_identity),
+            "the live app's hub is never stopped"
+        );
+        assert_eq!(
+            fs::read_to_string(&record_path).unwrap(),
+            published,
+            "the live app's launch.json is never overwritten"
+        );
+
+        // A diagnostic `--portable-prepare-only` run owns nothing: it records the peer and stops.
+        assert_eq!(
+            peer_gate(detect_live_peer(root), None, true),
+            PeerGate::Proceed(Some(app_identity.pid))
+        );
+
+        windows_process::kill_identities(&[hub_identity]);
+        drop(listener);
+        stop(app);
+    }
+
+    #[test]
+    fn a_prepare_run_next_to_a_live_peer_never_rewrites_launch_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (python, repo_dir) = portable_root(root);
+        let path = root.join("launch.json");
+        let app = spawn_sleeper();
+        let record = record_of(&python, &repo_dir, 4500)
+            .with_runtime_metadata(app.id(), root.join("data"), "test")
+            .unwrap();
+        hub_config::write_launch_record(&path, &record).unwrap();
+        let published = fs::read_to_string(&path).unwrap();
+        let cfg = HubConfig {
+            repo_dir: repo_dir.clone(),
+            python: python.clone(),
+            port: 4444,
+        };
+
+        write_prepared_record(&path, &cfg, Some(app.id())).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), published);
+        // Without a live peer the record is this run's to claim.
+        write_prepared_record(&path, &cfg, None).unwrap();
+        let claimed = hub_config::recover_launch_record(&path).unwrap().unwrap();
+        assert_eq!(claimed.port, 4444);
+        assert_eq!(claimed.state, "prepared");
+        assert_eq!(claimed.app_pid, None);
+        stop(app);
     }
 }

@@ -28,6 +28,7 @@ mcp_caller_identity.py
 spawn_extra_roots.py
 tools/hub_wait.py
 tools/hub_mcp_cli.py
+tools/hub_graceful_restart.py
 engine_policies/claude_pre_tool_hook.py
 engine_policies/claude-approval.json
 engine_policies/claude-auto-approval.json

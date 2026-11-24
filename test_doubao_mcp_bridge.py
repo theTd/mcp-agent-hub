@@ -18,13 +18,14 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
 
 import mcp_session_pool as pool_mod
+from restart_resume_request import CONTINUE_TEXT, REQUEST_NAME
 from session_manager import AgentSession, HubSessionManager
 
 ROOT = Path(__file__).resolve().parent
@@ -115,10 +116,7 @@ class _BridgeCase(unittest.IsolatedAsyncioTestCase):
             self.server = importlib.import_module("server")
         self.hub_patch = patch.object(self.server, "hub", self.hub)
         self.hub_patch.start()
-        self.hub.profiles["doubao"] = {
-            "name": "doubao", "engine": "doubao", "enabled": True, "kind": "tui",
-            "command": "unused", "args": ["--profile-arg"], "task_mode": "pty_input",
-        }
+        self.hub.profiles["doubao"] = self.doubao_profile()
         self._servers = []
         self._env_before = os.environ.get("HUB_API_URL")
         self.injected = []
@@ -149,6 +147,20 @@ class _BridgeCase(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.root, ignore_errors=True)
 
     # -- helpers ---------------------------------------------------------
+
+    @staticmethod
+    def doubao_profile() -> dict:
+        return {
+            "name": "doubao", "engine": "doubao", "enabled": True, "kind": "tui",
+            "command": "unused", "args": ["--profile-arg"], "task_mode": "pty_input",
+        }
+
+    def make_restart_hub(self) -> HubSessionManager:
+        """A second hub on the same data folder: the process that starts after the restart."""
+        with patch.object(HubSessionManager, "_initial_discovery", lambda h: h._discovery_ready.set()):
+            hub = HubSessionManager(self.root / "profiles.json", base_dir=ROOT, data_dir=self.root)
+        hub.profiles["doubao"] = self.doubao_profile()
+        return hub
 
     def _noop_watch(self, *args, **kwargs):
         return _return_none()
@@ -466,6 +478,53 @@ class PreviewAndSpawnTests(_BridgeCase):
             run_cli, ["--bridge", bridge, "call", "counter", "inc"])
         self.assertEqual(code, 0)
         self.assertEqual(self.text_of(payload), "1", "the rebuilt pool starts a fresh server")
+
+    async def test_a_planned_restart_resumes_a_bridged_session_with_a_compact_note(self):
+        """The whole restart path: graceful stop, automatic resume, bridge rebuilt, parent kept waiting."""
+        sess = await self.create_bridged(task="检查 MCP 桥接")
+        session_id = sess.session_id
+        sess.conversation_ref = {"session_id": "doubao-conv-restart"}
+        await self.hub.persist_session(sess)
+        token_before = self.bridge_payload(session_id)["token"]
+        handle = (await self.hub.wait_inbox.create([session_id]))["wait_handle"]
+        (self.root / REQUEST_NAME).write_text("{}", encoding="utf-8")
+
+        await self.hub.archive_all_sessions_on_shutdown(planned=True)
+        self.assertFalse(self.bridge_file(session_id).parent.exists(),
+                         "the stop takes the bridge folder with the session")
+
+        new_url = "http://127.0.0.1:4999"  # the restarted hub is somewhere else
+        os.environ["HUB_API_URL"] = new_url
+        self.injected.clear()
+        hub = self.make_restart_hub()
+        try:
+            with patch("session_manager.wait_for_port", new_callable=AsyncMock, return_value=True), \
+                    patch.object(AgentSession, "start_pty"), \
+                    patch.object(hub, "_watch_doubao_session", self._noop_watch), \
+                    patch.object(hub, "_watch_tui_interactive_prompts", self._noop_watch), \
+                    patch.object(hub, "_auto_handle_tui_startup_and_trust", self._recording_watch):
+                await hub.start()
+                await asyncio.wait_for(hub.restart_resume_gate._open.wait(), 15)
+
+            payload = self.bridge_payload(session_id)
+            self.assertEqual(payload["hub_url"], new_url, "bridge.json names the new hub")
+            self.assertEqual(payload["token"], token_before, "the token is derived, never rewritten")
+            self.assertIsNotNone(hub.mcp_pool_registry.get(session_id), "the pool is rebuilt")
+
+            self.assertTrue(self.injected, "the resume injected nothing")
+            injected = self.injected[-1]["task_to_inject"]
+            self.assertTrue(injected.startswith("[Hub MCP]"), injected[:200])
+            self.assertIn(CONTINUE_TEXT, injected)
+            note = injected.split(CONTINUE_TEXT, 1)[0].strip()
+            self.assertLessEqual(len(note), 1200,
+                                 "a resumed composer gets a compact note plus the continue text")
+
+            # The parent's handle was not settled by the restart: it is still waiting on the worker.
+            self.assertEqual(hub.wait_inbox._row(handle)["state"], "waiting")
+            self.assertEqual(await hub.wait_inbox._take_events(handle, "hub_shutdown"), [])
+            self.assertEqual((await hub.wait_inbox.wait(handle, 0.1))["state"], "waiting")
+        finally:
+            await hub.archive_all_sessions_on_shutdown(planned=False)
 
     async def test_start_pty_failure_rolls_the_bridge_back(self):
         captured: dict = {}

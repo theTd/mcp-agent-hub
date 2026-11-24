@@ -9,6 +9,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
 
 use crate::hub_api::SessionCounts;
 use crate::hub_supervisor::{reveal_main_window, HubMode, HubShell};
@@ -32,7 +33,8 @@ pub fn badge_state(mode: HubMode, counts: &SessionCounts) -> BadgeState {
             waiting: counts.waiting > 0,
         },
         HubMode::Failed => BadgeState::Failed,
-        HubMode::Starting | HubMode::Stopping => BadgeState::None,
+        // A restart in flight is progress, not a fault: keep the plain icon.
+        HubMode::Starting | HubMode::Stopping | HubMode::Restarting => BadgeState::None,
     }
 }
 
@@ -185,6 +187,7 @@ pub fn tooltip_text(mode: HubMode, counts: &SessionCounts) -> String {
         ),
         HubMode::Starting => "MCP Agent Hub — 正在启动 Hub…".to_string(),
         HubMode::Stopping => "MCP Agent Hub — 正在停止 Hub…".to_string(),
+        HubMode::Restarting => "MCP Agent Hub — 正在优雅重启并恢复会话…".to_string(),
         HubMode::Failed => "MCP Agent Hub — Hub 未运行".to_string(),
     }
 }
@@ -196,6 +199,9 @@ fn shell(app: &AppHandle) -> Option<Arc<HubShell>> {
 fn build_menu(app: &AppHandle, mode: HubMode) -> tauri::Result<Menu<Wry>> {
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
     let external = mode == HubMode::External;
+    // A restart (in-place or an EXE swap) is in flight: offer neither, so a second click cannot
+    // re-enter the same stop/start path.
+    let can_restart = mode == HubMode::Owned;
     let menu = Menu::new(app)?;
     if external {
         menu.append(&MenuItem::with_id(
@@ -217,10 +223,19 @@ fn build_menu(app: &AppHandle, mode: HubMode) -> tauri::Result<Menu<Wry>> {
     menu.append(&MenuItem::with_id(
         app,
         "restart",
-        "重启 Hub",
-        mode == HubMode::Owned,
+        "优雅重启 Hub（保留会话）",
+        can_restart,
         None::<&str>,
     )?)?;
+    if cfg!(feature = "portable") {
+        menu.append(&MenuItem::with_id(
+            app,
+            "upgrade",
+            "重启并升级…",
+            can_restart,
+            None::<&str>,
+        )?)?;
+    }
     menu.append(&CheckMenuItem::with_id(
         app,
         "autostart",
@@ -246,7 +261,13 @@ fn build_menu(app: &AppHandle, mode: HubMode) -> tauri::Result<Menu<Wry>> {
         )?)?;
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "退出（停止 Hub 和会话）",
+        true,
+        None::<&str>,
+    )?)?;
     Ok(menu)
 }
 
@@ -330,6 +351,7 @@ fn on_menu(app: &AppHandle, id: &str) {
             let app = app.clone();
             tauri::async_runtime::spawn(async move { shell.restart(&app).await });
         }
+        "upgrade" => pick_new_exe(app, &shell),
         "takeover" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move { shell.takeover(&app).await });
@@ -348,6 +370,35 @@ fn on_menu(app: &AppHandle, id: &str) {
         }
         _ => {}
     }
+}
+
+/// 重启并升级…: choose the new EXE, then hand it to `HubShell::restart_and_upgrade` (which
+/// confirms and does the preflight/staging itself). Only portable builds install this item.
+fn pick_new_exe(app: &AppHandle, shell: &Arc<HubShell>) {
+    let app = app.clone();
+    let shell = shell.clone();
+    app.dialog()
+        .file()
+        .set_title("选择新版本的 MCP Agent Hub 程序")
+        .add_filter("可执行文件", &["exe"])
+        .pick_file(move |path| {
+            let Some(path) = path else {
+                shell.log("upgrade file picker cancelled");
+                return;
+            };
+            let picked = match path.into_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    shell.log(&format!("upgrade file picker returned an unusable path: {error}"));
+                    return;
+                }
+            };
+            let app = app.clone();
+            let shell = shell.clone();
+            tauri::async_runtime::spawn(async move {
+                shell.restart_and_upgrade(&app, picked).await
+            });
+        });
 }
 
 fn toggle_autostart(app: &AppHandle, shell: &HubShell) {
@@ -384,8 +435,30 @@ mod tests {
         );
         assert!(tooltip_text(HubMode::External, &counts).ends_with(EXTERNAL_LABEL));
         assert_eq!(
+            tooltip_text(HubMode::Restarting, &counts),
+            "MCP Agent Hub — 正在优雅重启并恢复会话…"
+        );
+        assert_eq!(
             tooltip_text(HubMode::Failed, &counts),
             "MCP Agent Hub — Hub 未运行"
+        );
+    }
+
+    #[test]
+    fn a_restart_in_flight_is_not_an_error_badge() {
+        let counts = SessionCounts {
+            live: 2,
+            waiting: 0,
+        };
+        assert_eq!(badge_state(HubMode::Restarting, &counts), BadgeState::None);
+        assert_eq!(badge_state(HubMode::Stopping, &counts), BadgeState::None);
+        assert_eq!(badge_state(HubMode::Failed, &counts), BadgeState::Failed);
+        assert_eq!(
+            badge_state(HubMode::Owned, &counts),
+            BadgeState::Active {
+                live: 2,
+                waiting: false
+            }
         );
     }
 
