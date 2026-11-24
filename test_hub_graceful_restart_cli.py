@@ -1,12 +1,14 @@
 """tools/hub_graceful_restart.py against a stub hub: status, restart and replace-exe.
 
 The stub is a real local HTTP server, so the CLI's own urllib path (proxy bypass included) is
-exercised; the Windows-only bits (process image lookup, ShellExecuteW, --print-build-info) are
-injected stubs.
+exercised; most Windows-only bits (ShellExecuteW, --print-build-info) are injected stubs, while
+`query_process_image` gets a real process of its own.
 """
 import hashlib
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -594,6 +596,32 @@ class MainTests(_RootCase):
         payload = json.loads(buffer.getvalue())
         self.assertFalse(payload["ok"])
         self.assertIn("launch.json", payload["error"])
+
+
+@unittest.skipUnless(os.name == "nt", "query_process_image 是 Win32 进程句柄查询")
+class ProcessImageTests(unittest.TestCase):
+    def test_a_running_process_reports_its_image(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        try:
+            image = cli.query_process_image(proc.pid)
+            self.assertIsNotNone(image)
+            self.assertEqual(os.path.normcase(Path(image).resolve()),
+                             os.path.normcase(Path(sys.executable).resolve()))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_an_exited_process_with_an_open_handle_is_not_running(self):
+        # Popen keeps the process handle open after the child exits, so Windows still has the
+        # process object: OpenProcess succeeds, but the image must not look like a live app.
+        proc = subprocess.Popen([sys.executable, "-c", "pass"],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        proc.wait()
+        self.assertIsNone(cli.query_process_image(proc.pid))
+        del proc  # closing the last handle is what makes the PID disappear
 
 
 if __name__ == "__main__":

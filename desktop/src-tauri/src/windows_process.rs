@@ -29,8 +29,8 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
-    TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_NAME_WIN32,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW,
+    ResumeThread, TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
 };
 
@@ -52,6 +52,11 @@ impl HubJob {
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if process.is_null() { return false; }
+            // An exited process whose handle is still open is not part of anything any more.
+            if live_creation_time(process).is_none() {
+                CloseHandle(process);
+                return false;
+            }
             let mut inside = 0;
             let ok = windows_sys::Win32::System::JobObjects::IsProcessInJob(process, self.handle, &mut inside);
             CloseHandle(process);
@@ -221,9 +226,42 @@ pub fn process_name(pid: u32) -> Option<String> {
         .map(|p| p.exe)
 }
 
+/// A process that exited with this code looks running to `GetExitCodeProcess`: the final code is
+/// indistinguishable from "still active" there, so only the exit FILETIME can settle it.
+const STILL_ACTIVE_CODE: u32 = 259;
+
+/// The creation time of the process behind `handle`, or `None` once it has exited.
+///
+/// Windows keeps a process object alive while any handle to it is open, and that zombie still
+/// answers `GetProcessTimes` with the original creation time and a non-zero `exited` FILETIME.
+/// The exit FILETIME is therefore the authoritative "gone" signal; a final exit code other than
+/// `STILL_ACTIVE` corroborates it, but cannot decide alone: a process may exit *with* 259.
+fn live_creation_time(handle: HANDLE) -> Option<u64> {
+    // SAFETY: `handle` carries PROCESS_QUERY_LIMITED_INFORMATION and is owned by the caller.
+    unsafe {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        if exited.dwLowDateTime != 0 || exited.dwHighDateTime != 0 {
+            return None;
+        }
+        let mut exit_code = 0u32;
+        if GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code != STILL_ACTIVE_CODE {
+            return None;
+        }
+        Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+}
+
 /// The creation time of `pid`, in Windows FILETIME ticks (100 ns since 1601), or `None` when the
-/// process is gone or cannot be queried. Two queries that return the same value describe the same
-/// process instance: Windows does reuse PIDs, but never with the same creation time.
+/// process is gone, has exited (even if an open handle keeps its zombie object around), or cannot
+/// be queried. Two queries that return the same value describe the same process instance: Windows
+/// does reuse PIDs, but never with the same creation time.
 pub fn creation_time(pid: u32) -> Option<u64> {
     // SAFETY: query-only handle, closed before returning.
     unsafe {
@@ -231,17 +269,9 @@ pub fn creation_time(pid: u32) -> Option<u64> {
         if h.is_null() {
             return None;
         }
-        let zero = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        let created = live_creation_time(h);
         CloseHandle(h);
-        if ok == 0 {
-            return None;
-        }
-        Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        created
     }
 }
 
@@ -299,6 +329,10 @@ pub fn process_command_line(pid: u32) -> Option<String> {
         if handle.is_null() {
             return None;
         }
+        if live_creation_time(handle).is_none() {
+            CloseHandle(handle);
+            return None;
+        }
         let mut needed = 0u32;
         // Any failure that reports the required size is usable; the second call is authoritative.
         NtQueryInformationProcess(
@@ -349,6 +383,10 @@ pub fn process_image_path(pid: u32) -> Option<PathBuf> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
+            return None;
+        }
+        if live_creation_time(handle).is_none() {
+            CloseHandle(handle);
             return None;
         }
         let mut size = 512u32;
@@ -585,6 +623,7 @@ pub fn random_token() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn entry(pid: u32, parent_pid: u32) -> ProcessEntry {
         ProcessEntry {
@@ -675,5 +714,64 @@ mod tests {
             .to_string_lossy()
             .to_lowercase();
         assert!(command_line.contains(&image_name), "{command_line}");
+    }
+
+    /// A child that blocks on its piped stdin: guaranteed to be running when the test reads its
+    /// identity, and gone as soon as the pipe is closed.
+    fn spawn_stdin_blocked_child() -> Child {
+        Command::new("cmd.exe")
+            .args(["/C", "more >nul"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn a stdin-blocked child")
+    }
+
+    /// Reap the child's exit *without* dropping it: the `Child` keeps its process handle open,
+    /// which is exactly the zombie state production hit after the app had already exited.
+    fn wait_keeping_handle(child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "the child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_zombie_handle_is_open(pid: u32) {
+        // SAFETY: query-only probe; a non-null handle is closed right away.
+        let probe = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!probe.is_null(), "the exited child must still have an open process object");
+        unsafe { CloseHandle(probe) };
+    }
+
+    #[test]
+    fn an_exited_child_with_an_open_handle_is_not_alive() {
+        let mut child = spawn_stdin_blocked_child();
+        let pid = child.id();
+        let identity = process_identity(pid).expect("a running child has an identity");
+        drop(child.stdin.take()); // closing the pipe lets `more` exit
+        wait_keeping_handle(&mut child);
+        assert_zombie_handle_is_open(pid);
+        assert_eq!(creation_time(pid), None, "a zombie handle is not a running process");
+        assert!(!process_is_alive(identity));
+        assert_eq!(process_image_path(pid), None);
+        assert_eq!(process_command_line(pid), None);
+        drop(child);
+    }
+
+    #[test]
+    fn an_exit_code_of_still_active_is_still_dead() {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "exit 259"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn a child that exits with 259");
+        let pid = child.id();
+        wait_keeping_handle(&mut child);
+        assert_zombie_handle_is_open(pid);
+        assert_eq!(creation_time(pid), None, "the exit FILETIME, not the code, decides");
+        drop(child);
     }
 }

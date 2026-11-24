@@ -170,9 +170,18 @@ def query_process_image(pid: int) -> Optional[str]:
     import ctypes
     from ctypes import wintypes
 
+    class FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(FileTime), ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime), ctypes.POINTER(FileTime)]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
     kernel32.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
     kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
@@ -181,6 +190,17 @@ def query_process_image(pid: int) -> Optional[str]:
     if not handle:
         return None
     try:
+        # An exited process whose handle someone still holds (a zombie) answers the image query
+        # too. Its non-zero exit FILETIME is decisive; a final code other than STILL_ACTIVE (259)
+        # only corroborates it, because a process may legitimately exit with 259.
+        times = [FileTime() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return None
+        if times[1].dwLowDateTime or times[1].dwHighDateTime:
+            return None
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:
+            return None
         buffer = ctypes.create_unicode_buffer(32768)
         size = wintypes.DWORD(len(buffer))
         if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):

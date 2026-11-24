@@ -596,11 +596,7 @@ pub fn launch_detached_helper(helper_exe: &Path, plan_path: &Path) -> Result<(),
     com_apartment();
     let verb = wide("open");
     let file = wide_path(helper_exe);
-    let params = wide(&format!(
-        "\"{}\" --apply-update \"{}\"",
-        helper_exe.display(),
-        plan_path.display()
-    ));
+    let params = wide(&format!("--apply-update \"{}\"", plan_path.display()));
     let directory = wide_path(
         helper_exe
             .parent()
