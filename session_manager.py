@@ -1277,6 +1277,78 @@ def split_agy_model_id(model_id: str) -> tuple:
     return mid[: m.start()], m.group(1)
 
 
+def extract_model_group(model_id: Any) -> str:
+    """Aggregator channel prefix of a model id: `google/gemini-3.1-pro` -> `google`.
+
+    Single source of truth for model grouping (backend, console and the routing guide). Only the
+    FIRST `/` splits: a nested id keeps its remaining slashes in the model name, so
+    `zenmux/anthropic/claude-sonnet-5` and `cloudflare-ai-gateway/workers-ai/@cf/x` still group by
+    their aggregator. A prefix or a remainder that is empty/whitespace means "not grouped", which
+    keeps every unprefixed engine (`gemini-4-argon`, `gpt-5`) rendering exactly as before.
+    """
+    text = str(model_id or "")
+    if "/" not in text:
+        return ""
+    prefix, rest = text.split("/", 1)
+    prefix = prefix.strip()
+    if not prefix or not rest.strip():
+        return ""
+    return prefix
+
+
+def _clean_string_list(value: Any) -> List[str]:
+    """A persisted string list, tolerating a hand-edited file: non-list/non-str/blank entries drop."""
+    if not isinstance(value, list):
+        return []
+    result: List[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
+def _clean_id(value: Any) -> str:
+    """One hand-supplied model id: anything but a string has no id at all."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _store_optional_policy_list(policy: Dict[str, Any], key: str, values: List[str]) -> None:
+    """Writes an optional policy list, or removes the key when it is empty (clean configs stay clean)."""
+    if values:
+        policy[key] = list(values)
+    else:
+        policy.pop(key, None)
+
+
+def effective_disabled_models(
+    all_models: List[str],
+    disabled_models: List[str],
+    disabled_model_groups: Optional[List[str]],
+    enabled_models: Optional[List[str]],
+) -> List[str]:
+    """The per-model disable list after applying whole-group policy and its allow-list overrides.
+
+    Without any disabled group this is exactly the persisted `disabled_models`, so clean configs
+    keep their shape. With a disabled group, every discovered model of that group joins the list
+    (a newly discovered model is therefore disabled automatically), except the models the user
+    explicitly re-enabled in `enabled_models`.
+    """
+    result = list(dict.fromkeys(str(m) for m in (disabled_models or [])))
+    groups = set(str(g) for g in (disabled_model_groups or []))
+    if not groups:
+        return result
+    allow = set(str(m) for m in (enabled_models or []))
+    for model in all_models or []:
+        mid = str(model)
+        group = extract_model_group(mid)
+        if group and group in groups and mid not in allow and mid not in result:
+            result.append(mid)
+    return result
+
+
 def _injected_flag_tokens(engine: str, args: List[str]):
     """Yields (index, flag label) for every argument the hub injects itself, for one engine."""
     eng = (engine or "").strip().lower()
@@ -5204,15 +5276,24 @@ class HubSessionManager:
         disabled_models: List[str],
         model_notes: Dict[str, str],
         details: List[Dict[str, Any]],
+        disabled_model_groups: Optional[List[str]] = None,
+        enabled_models: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """B3: the normalised `models` list the console and the routing guide use instead of raw CLI ids."""
+        """B3: the normalised `models` list the console and the routing guide use instead of raw CLI ids.
+
+        `disabled_model_groups` / `enabled_models` are optional (older callers keep working): a
+        disabled group disables every model whose id carries that aggregator prefix, except the
+        models the user explicitly re-enabled. `group` is reported on every option so the console
+        never has to re-derive it.
+        """
         engine_levels = [str(x) for x in (engine_info.get("available_thinking_levels") or [])]
         detail_by_id: Dict[str, Dict[str, Any]] = {}
         for d in details:
             mid = str(d.get("id") or "")
             if mid and mid not in detail_by_id:
                 detail_by_id[mid] = d
-        disabled = set(disabled_models or [])
+        disabled = set(effective_disabled_models(
+            all_models, disabled_models, disabled_model_groups, enabled_models))
         notes = model_notes or {}
 
         def _levels_for(mid: str) -> List[str]:
@@ -5259,6 +5340,7 @@ class HubSessionManager:
                         "default_thinking_level": first_suffix if first_suffix in levels else None,
                         "enabled": grp["enabled"],
                         "note": str(notes.get(base) or ""),
+                        "group": extract_model_group(base),
                     }
                 )
         else:
@@ -5277,11 +5359,78 @@ class HubSessionManager:
                         "default_thinking_level": default_level,
                         "enabled": mid not in disabled,
                         "note": str(notes.get(mid) or ""),
+                        "group": extract_model_group(mid),
                     }
                 )
 
         # Enabled first, discovery order preserved inside each group.
         return [m for m in result if m["enabled"]] + [m for m in result if not m["enabled"]]
+
+    def _summarise_model_groups(
+        self,
+        eng: str,
+        options: List[Dict[str, Any]],
+        all_models: List[str],
+        disabled_groups: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Per-group totals for the console's group headers, in the console's rendering order.
+
+        Groups that still have an enabled model come first, then fully-disabled ones (an aggregator
+        with 60 folded groups reads as one line per group), first-seen discovery order inside each
+        half. No group is reported for an engine whose ids carry no aggregator prefix.
+        """
+        disabled_set = set(str(g) for g in (disabled_groups or []))
+        discovery_index: Dict[str, int] = {}
+        for index, model in enumerate(all_models or []):
+            discovery_index.setdefault(str(model), index)
+
+        def _discovery_position(option_id: str) -> int:
+            if option_id in discovery_index:
+                return discovery_index[option_id]
+            if eng == "agy":
+                variants = [
+                    discovery_index[str(model)]
+                    for model in (all_models or [])
+                    if str(model) in discovery_index and split_agy_model_id(str(model))[0] == option_id
+                ]
+                if variants:
+                    return min(variants)
+            return len(discovery_index) + 1
+
+        stats: Dict[str, Dict[str, Any]] = {}
+        for option in options or []:
+            option_id = str(option.get("id") or "")
+            group = str(option.get("group") or extract_model_group(option_id))
+            if not group:
+                continue
+            if group not in stats:
+                stats[group] = {
+                    "name": group,
+                    "first": _discovery_position(option_id),
+                    "total": 0,
+                    "enabled_count": 0,
+                }
+            stats[group]["total"] += 1
+            if option.get("enabled"):
+                stats[group]["enabled_count"] += 1
+
+        summaries: Dict[str, Dict[str, Any]] = {}
+        for group, entry in stats.items():
+            total = int(entry["total"])
+            enabled_count = int(entry["enabled_count"])
+            summaries[group] = {
+                "name": group,
+                "total": total,
+                "enabled_count": enabled_count,
+                "disabled_count": total - enabled_count,
+                "enabled": enabled_count == total and total > 0,
+                "partial": 0 < enabled_count < total,
+                "group_disabled": group in disabled_set,
+            }
+        ordered = sorted(stats, key=lambda g: stats[g]["first"])
+        with_enabled = [summaries[g] for g in ordered if summaries[g]["enabled_count"] > 0]
+        without_enabled = [summaries[g] for g in ordered if summaries[g]["enabled_count"] == 0]
+        return with_enabled + without_enabled
 
     def load_profiles(self, refresh_discovery: bool = False, discovery: Optional[Dict[str, Any]] = None):
         """Rebuilds profiles from disk + discovery. Only the explicit refresh paths may discover here.
@@ -5482,21 +5631,29 @@ class HubSessionManager:
             all_mods = list(e_copy.get("all_discovered_models") or e_copy.get("available_models", []))
             pol_raw = self.engine_policies.get(eng) if isinstance(self.engine_policies, dict) else None
             pol = pol_raw if isinstance(pol_raw, dict) else {}
-            disabled_mods = list(pol.get("disabled_models") or [])
-            mod_notes = dict(pol.get("model_notes") or {})
-            enabled_mods = [m for m in all_mods if m not in disabled_mods]
+            disabled_mods = _clean_string_list(pol.get("disabled_models"))
+            notes_raw = pol.get("model_notes")
+            mod_notes = dict(notes_raw) if isinstance(notes_raw, dict) else {}
+            disabled_groups = _clean_string_list(pol.get("disabled_model_groups"))
+            allow_models = _clean_string_list(pol.get("enabled_models"))
+            # One source of truth: group policy + allow-list overrides fold into the per-model list,
+            # so available_models, resolve_launch, the MCP catalog and the routing guide all agree.
+            effective_disabled = effective_disabled_models(
+                all_mods, disabled_mods, disabled_groups, allow_models)
+            enabled_mods = [m for m in all_mods if m not in effective_disabled]
 
             e_copy["enabled"] = pol.get("enabled", True) is not False
             e_copy["all_discovered_models"] = all_mods
-            e_copy["disabled_models"] = disabled_mods
+            e_copy["disabled_models"] = effective_disabled
             e_copy["model_notes"] = mod_notes
             e_copy["available_models"] = enabled_mods
+            e_copy["disabled_model_groups"] = disabled_groups
 
             details = []
             for md in (e_copy.get("model_details") or []):
                 md_copy = dict(md)
                 mid = md_copy.get("id", "")
-                md_copy["enabled"] = mid not in disabled_mods
+                md_copy["enabled"] = mid not in effective_disabled
                 if mid in mod_notes:
                     md_copy["note"] = mod_notes[mid]
                 details.append(md_copy)
@@ -5508,7 +5665,10 @@ class HubSessionManager:
                 disabled_models=disabled_mods,
                 model_notes=mod_notes,
                 details=details,
+                disabled_model_groups=disabled_groups,
+                enabled_models=allow_models,
             )
+            e_copy["model_groups"] = self._summarise_model_groups(eng, e_copy["models"], all_mods, disabled_groups)
             e_copy["available_models"] = [
                 str(m.get("id")) for m in e_copy["models"] if m.get("enabled") and m.get("id")
             ]
@@ -5618,10 +5778,14 @@ class HubSessionManager:
             canonical = enriched.get(eng)
             if not canonical:
                 continue
-            if canonical.get("default_model"):
-                e_copy["default_model"] = canonical["default_model"]
-            if canonical.get("default_thinking_level"):
-                e_copy["default_thinking_level"] = canonical["default_thinking_level"]
+            available = [str(m) for m in (e_copy.get("available_models") or [])]
+            canonical_default = str(canonical.get("default_model") or "").strip()
+            # A canonical default that the user disabled must not be written back over the enabled
+            # model the engine already fell back to; align only when it is actually usable.
+            if canonical_default and (not available or canonical_default in available):
+                e_copy["default_model"] = canonical_default
+                if canonical.get("default_thinking_level"):
+                    e_copy["default_thinking_level"] = canonical["default_thinking_level"]
 
         # B2: discovery may still report ~/.codex [profiles.*] and recent configurations in the
         # catalog, but they no longer synthesise profiles. A Profile is a launch recipe, not a combo.
@@ -5936,6 +6100,22 @@ class HubSessionManager:
         info["enabled"] = self.engine_enabled(eng)
         return info
 
+    def _engine_policy_block(self, raw_data: Dict[str, Any], eng: str) -> Dict[str, Any]:
+        """The mutable `engine_policies.<engine>` dict, resetting a hand-edited malformed value.
+
+        A legacy `"omp": "bad"` (or a non-dict `engine_policies`) would raise AttributeError halfway
+        through a toggle and turn into an HTTP 500, so a malformed slot is replaced by a clean block.
+        """
+        policies = raw_data.get("engine_policies")
+        if not isinstance(policies, dict):
+            policies = {}
+            raw_data["engine_policies"] = policies
+        eng_pol = policies.get(eng)
+        if not isinstance(eng_pol, dict):
+            eng_pol = {}
+            policies[eng] = eng_pol
+        return eng_pol
+
     def toggle_engine_model(
         self,
         engine: str,
@@ -5974,21 +6154,41 @@ class HubSessionManager:
             targets = [mid]
 
         raw_data = self._read_profiles_file()
-        policies = raw_data.setdefault("engine_policies", {})
-        eng_pol = policies.setdefault(eng, {"disabled_models": [], "model_notes": {}})
-        disabled_list: List[str] = [str(m) for m in (eng_pol.get("disabled_models") or [])]
+        eng_pol = self._engine_policy_block(raw_data, eng)
+        disabled_list: List[str] = _clean_string_list(eng_pol.get("disabled_models"))
+        disabled_groups = _clean_string_list(eng_pol.get("disabled_model_groups"))
+        allow_list = _clean_string_list(eng_pol.get("enabled_models"))
 
         if enabled is not None:
-            for target in targets:
-                if enabled:
-                    disabled_list = [m for m in disabled_list if m != target]
-                elif target not in disabled_list:
-                    disabled_list.append(target)
+            group = extract_model_group(base if eng == "agy" else mid)
+            if group and group in disabled_groups:
+                # Inside a disabled group an enable is a cherry-pick: the allow-list carries it,
+                # the rest of the group (including models discovered later) stays off.
+                for target in targets:
+                    if enabled:
+                        if target not in allow_list:
+                            allow_list.append(target)
+                        disabled_list = [m for m in disabled_list if m != target]
+                    else:
+                        allow_list = [m for m in allow_list if m != target]
+                        disabled_list = [m for m in disabled_list if m != target]
+            else:
+                for target in targets:
+                    allow_list = [m for m in allow_list if m != target]
+                    if enabled:
+                        disabled_list = [m for m in disabled_list if m != target]
+                    elif target not in disabled_list:
+                        disabled_list.append(target)
             eng_pol["disabled_models"] = disabled_list
+            _store_optional_policy_list(eng_pol, "enabled_models", allow_list)
+            _store_optional_policy_list(eng_pol, "disabled_model_groups", disabled_groups)
 
         note_engine_key = base if eng == "agy" else mid
         if note is not None:
-            notes_map = eng_pol.setdefault("model_notes", {})
+            notes_map = eng_pol.get("model_notes")
+            if not isinstance(notes_map, dict):
+                notes_map = {}
+                eng_pol["model_notes"] = notes_map
             cleaned = str(note).strip()
             if cleaned:
                 notes_map[note_engine_key] = cleaned
@@ -5998,6 +6198,205 @@ class HubSessionManager:
         self._write_profiles_file(raw_data)
         self._reload_after_write(raw_data)
         return self.engines_catalog.get(eng, {})
+
+    def _group_targets(self, eng: str, group: str) -> tuple:
+        """(option ids, ids to write policy for) of every discovered model in one aggregator group."""
+        options: List[Dict[str, Any]] = []
+        for option in self.engine_model_options(eng):
+            option_id = str(option.get("id") or "")
+            base, _suffix = split_agy_model_id(option_id) if eng == "agy" else (option_id, None)
+            if extract_model_group(base) == group:
+                options.append(option)
+        option_ids = [str(option.get("id")) for option in options if option.get("id")]
+        all_ids = set(
+            str(x) for x in (self.engines_catalog.get(eng, {}).get("all_discovered_models") or [])
+        )
+        if eng == "agy":
+            write_targets: List[str] = []
+            for option_id in option_ids:
+                variants = sorted(m for m in all_ids if split_agy_model_id(m)[0] == option_id)
+                write_targets.extend(variants or [option_id])
+        else:
+            write_targets = list(option_ids)
+        write_targets = list(dict.fromkeys(write_targets))
+        return options, write_targets
+
+    def toggle_engine_model_group(self, engine: str, group: str, enabled: bool) -> Dict[str, Any]:
+        """Enable or disable a whole aggregator group (`google`, `ollama-cloud`, ...) in one write.
+
+        Disabling writes ONLY the group name: the group's per-model ids are stripped from
+        `disabled_models` / `enabled_models` so a 1,000-model aggregator keeps `agent_profiles.json`
+        compact, and a model discovered later is disabled by the group policy alone. Enabling clears
+        the group and every leftover per-model entry of its models.
+        """
+        eng = (engine or "").strip().lower()
+        if not eng:
+            raise ValueError("缺少引擎标识。")
+        if eng not in KNOWN_ENGINES and eng not in (self.engines_catalog or {}):
+            raise ValueError(f"未知引擎「{eng}」。可用：{', '.join(KNOWN_ENGINES)}")
+        grp = (group or "").strip() if isinstance(group, str) else ""
+        if not grp:
+            raise ValueError("缺少模型分组名。")
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值 true 或 false。")
+
+        matched_options, write_targets = self._group_targets(eng, grp)
+
+        raw_data = self._read_profiles_file()
+        eng_pol = self._engine_policy_block(raw_data, eng)
+        disabled_list: List[str] = _clean_string_list(eng_pol.get("disabled_models"))
+        disabled_groups = _clean_string_list(eng_pol.get("disabled_model_groups"))
+        allow_list = _clean_string_list(eng_pol.get("enabled_models"))
+
+        if not matched_options and not (enabled and grp in disabled_groups):
+            raise ValueError(f"引擎「{eng}」里没有模型分组「{grp}」。")
+
+        if enabled:
+            disabled_groups = [g for g in disabled_groups if g != grp]
+        elif grp not in disabled_groups:
+            disabled_groups.append(grp)
+        # The group policy now carries every model of the group: keep the per-model lists compact.
+        # Matching on the group prefix (not only the currently discovered ids) also drops a
+        # cherry-picked model that vanished from discovery for a while — otherwise it would come
+        # back enabled once rediscovered, even though the whole group is off.
+        disabled_list = [
+            m for m in disabled_list if m not in write_targets and extract_model_group(m) != grp
+        ]
+        allow_list = [
+            m for m in allow_list if m not in write_targets and extract_model_group(m) != grp
+        ]
+
+        eng_pol["disabled_models"] = disabled_list
+        _store_optional_policy_list(eng_pol, "disabled_model_groups", disabled_groups)
+        _store_optional_policy_list(eng_pol, "enabled_models", allow_list)
+
+        self._write_profiles_file(raw_data)
+        self._reload_after_write(raw_data)
+        return {
+            "ok": True,
+            "engine": eng,
+            "group": grp,
+            "enabled": enabled,
+            "affected_count": len(matched_options),
+            "engine_info": self.engines_catalog.get(eng),
+        }
+
+    def toggle_engine_models_batch(self, engine: str, models: List[str], enabled: bool) -> Dict[str, Any]:
+        """Enable or disable several models with ONE read + ONE write + ONE reload.
+
+        Applies the same group-aware rule as a single toggle: inside a disabled group an enable is a
+        cherry-pick into `enabled_models`; a disable drops the per-model entry because the group
+        policy already covers it. Whole-group enabling through the batch (「全部启用」) clears the
+        disabled group once every discovered model of it is on.
+        """
+        eng = (engine or "").strip().lower()
+        if not eng:
+            raise ValueError("缺少引擎标识。")
+        if eng not in KNOWN_ENGINES and eng not in (self.engines_catalog or {}):
+            raise ValueError(f"未知引擎「{eng}」。可用：{', '.join(KNOWN_ENGINES)}")
+        if not isinstance(models, list):
+            raise ValueError("models 必须是模型标识的数组。")
+        if type(enabled) is not bool:
+            raise ValueError("enabled 必须是布尔值 true 或 false。")
+        requested = [_clean_id(m) for m in models]
+        requested = [m for m in requested if m]
+        if not requested:
+            raise ValueError("缺少模型标识。")
+        requested = list(dict.fromkeys(requested))
+
+        catalog_ids = set(
+            str(x) for x in (self.engines_catalog.get(eng, {}).get("all_discovered_models") or [])
+        )
+        base_ids = set(str(m.get("id")) for m in self.engine_model_options(eng) if m.get("id"))
+        for model in requested:
+            base, _suffix = split_agy_model_id(model) if eng == "agy" else (model, None)
+            if catalog_ids and model not in catalog_ids and model not in base_ids and base not in base_ids:
+                raise ValueError(f"引擎「{eng}」里没有模型「{model}」。")
+
+        # Raw ids each requested model writes policy for (agy: every suffix of the base).
+        targets_by_model: Dict[str, List[str]] = {}
+        for model in requested:
+            if eng == "agy":
+                base = split_agy_model_id(model)[0]
+                targets = sorted(m for m in catalog_ids if split_agy_model_id(m)[0] == base) or [base]
+            else:
+                targets = [model]
+            targets_by_model[model] = targets
+
+        raw_data = self._read_profiles_file()
+        eng_pol = self._engine_policy_block(raw_data, eng)
+        disabled_list: List[str] = _clean_string_list(eng_pol.get("disabled_models"))
+        disabled_groups = _clean_string_list(eng_pol.get("disabled_model_groups"))
+        allow_list = _clean_string_list(eng_pol.get("enabled_models"))
+
+        for model in requested:
+            targets = targets_by_model[model]
+            group = extract_model_group(split_agy_model_id(model)[0] if eng == "agy" else model)
+            if group and group in disabled_groups:
+                for target in targets:
+                    if enabled:
+                        if target not in allow_list:
+                            allow_list.append(target)
+                        disabled_list = [m for m in disabled_list if m != target]
+                    else:
+                        allow_list = [m for m in allow_list if m != target]
+                        disabled_list = [m for m in disabled_list if m != target]
+            else:
+                for target in targets:
+                    allow_list = [m for m in allow_list if m != target]
+                    if enabled:
+                        disabled_list = [m for m in disabled_list if m != target]
+                    elif target not in disabled_list:
+                        disabled_list.append(target)
+
+        if enabled:
+            # 「全部启用」 (or any batch that turns a whole group on) also clears the group policy.
+            option_targets: Dict[str, List[str]] = {}
+            option_groups: Dict[str, List[str]] = {}
+            for option in self.engine_model_options(eng):
+                option_id = str(option.get("id") or "")
+                if not option_id:
+                    continue
+                if eng == "agy":
+                    # The option id is the base id while policy keys the raw suffixed ids.
+                    raw_targets = sorted(
+                        m for m in catalog_ids if split_agy_model_id(m)[0] == option_id) or [option_id]
+                else:
+                    raw_targets = [option_id]
+                option_targets[option_id] = raw_targets
+                group = extract_model_group(option_id)
+                if group:
+                    option_groups.setdefault(group, []).append(option_id)
+            batch_targets = set(t for ts in targets_by_model.values() for t in ts)
+            covers_all_options = bool(option_targets) and all(
+                set(raw) <= batch_targets for raw in option_targets.values())
+            granted = set(allow_list)
+            for group in list(disabled_groups):
+                members = option_groups.get(group) or []
+                group_raw = [t for m in members for t in option_targets[m]]
+                if members and all(t in granted for t in group_raw):
+                    disabled_groups = [g for g in disabled_groups if g != group]
+                    allow_list = [m for m in allow_list
+                                  if m not in group_raw and extract_model_group(m) != group]
+                elif not members and covers_all_options:
+                    # A group with no discovered model left is stale: turning every discovered model
+                    # of the engine on retires it instead of leaving it off for whatever shows up next.
+                    disabled_groups = [g for g in disabled_groups if g != group]
+                    allow_list = [m for m in allow_list if extract_model_group(m) != group]
+
+        eng_pol["disabled_models"] = disabled_list
+        _store_optional_policy_list(eng_pol, "disabled_model_groups", disabled_groups)
+        _store_optional_policy_list(eng_pol, "enabled_models", allow_list)
+
+        self._write_profiles_file(raw_data)
+        self._reload_after_write(raw_data)
+        return {
+            "ok": True,
+            "engine": eng,
+            "enabled": enabled,
+            "count": len(requested),
+            "engine_info": self.engines_catalog.get(eng),
+        }
 
     def save_global_routing_instructions(self, instructions: str, **settings) -> str:
         """Persists global routing instructions for Parent Agents into agent_profiles.json."""

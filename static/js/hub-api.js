@@ -33,6 +33,12 @@ export const hubApi = {
     request('POST', `/api/engines/${enc(engine)}/toggle`, { enabled }),
   toggleEngineModel: (engine, model, enabled) =>
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled }),
+  // One request for "全部启用" / "只保留默认" instead of one request per model.
+  toggleEngineModelsBatch: (engine, models, enabled) =>
+    request('POST', `/api/engines/${enc(engine)}/models/toggle-batch`, { models, enabled }),
+  // Aggregator channels (`google`, `ollama-cloud`, …): one switch for a whole group of models.
+  toggleEngineModelGroup: (engine, group, enabled) =>
+    request('POST', `/api/engines/${enc(engine)}/model-groups/toggle`, { group, enabled }),
   setModelNote: (engine, model, enabled, note) =>
     request('POST', `/api/engines/${enc(engine)}/models/toggle`, { model, enabled, note }),
   saveRoutingGuide: (text, timeoutMinutes) => request('POST', '/api/routing-guide', {
