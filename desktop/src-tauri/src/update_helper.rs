@@ -643,6 +643,262 @@ pub fn launch_app_detached(exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// How long the helper waits for the old WebView2 processes to release the profile singleton lock.
+const WEBVIEW_EXIT_WAIT: Duration = Duration::from_secs(8);
+const WEBVIEW_EXIT_POLL: Duration = Duration::from_millis(200);
+
+/// `%LOCALAPPDATA%\<identifier>\EBWebView`: the WebView2 user-data folder Tauri hands to WebView2
+/// for this build. `None` when the environment has no `LOCALAPPDATA` to resolve.
+pub fn webview_user_data_dir() -> Option<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
+    // Tauri derives the folder from the app identifier, which is `APP_USER_MODEL_ID` in both the
+    // installed and the portable configuration.
+    Some(webview_user_data_dir_in(
+        &local_app_data,
+        crate::desktop_toast::APP_USER_MODEL_ID,
+    ))
+}
+
+/// The WebView2 user-data folder for one identifier. Split out so the layout is unit-tested
+/// (`%LOCALAPPDATA%\<identifier>\EBWebView`).
+pub fn webview_user_data_dir_in(local_app_data: &Path, identifier: &str) -> PathBuf {
+    local_app_data.join(identifier).join("EBWebView")
+}
+
+/// Compare paths Windows-style: lowercase, `/` as `\`, no quotes, no `\\?\` prefix. WebView2 writes
+/// the profile in whichever form the parent process chose.
+fn normalize_windows_path(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => {}
+            '/' => normalized.push('\\'),
+            other => normalized.extend(other.to_lowercase()),
+        }
+    }
+    normalized.replace("\\\\?\\", "")
+}
+
+/// True when `command_line` is an `msedgewebview2.exe` invocation that uses *this* app's WebView2
+/// profile. That is exactly the process holding the profile's singleton lock across an upgrade, so
+/// matching the full `...\<identifier>\EBWebView` path never matches an unrelated WebView2 host
+/// (Edge's browser, another Tauri app).
+pub fn command_line_uses_profile(command_line: &str, profile: &Path) -> bool {
+    let profile = normalize_windows_path(&profile.to_string_lossy());
+    let profile = profile.trim_end_matches('\\');
+    if profile.is_empty() {
+        return false;
+    }
+    normalize_windows_path(command_line).contains(profile)
+}
+
+/// What the wait for the old WebView2 processes did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileWait {
+    /// The most matching processes seen at once (0 when there was nothing to wait for).
+    pub processes: usize,
+    pub waited_ms: u64,
+    pub timed_out: bool,
+    /// Process snapshots that failed outright. Each one was retried, never reported as "nothing
+    /// running".
+    pub snapshot_errors: u32,
+    /// `msedgewebview2.exe` processes that were seen but could not be inspected (access denied, or
+    /// they exited between the snapshot and the query). While this is > 0, "no matching process"
+    /// proves nothing.
+    pub uninspectable_count: usize,
+    /// True when the wait ended without a single clean snapshot: the process table could not be
+    /// read, so the "nothing is holding the profile" answer is unproven.
+    pub inspection_incomplete: bool,
+    /// The last snapshot failure, so the warn line and the result file say what went wrong.
+    pub last_snapshot_error: Option<String>,
+}
+
+/// The outcome of one look at the WebView2 processes that hold `profile`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileProbe {
+    /// Live `msedgewebview2.exe` PIDs whose command line uses this profile.
+    pub pids: Vec<u32>,
+    /// `msedgewebview2.exe` processes that could not be inspected for this profile.
+    pub uninspectable: usize,
+    /// Set when the process snapshot itself failed; `pids` / `uninspectable` are then meaningless.
+    pub snapshot_error: Option<String>,
+}
+
+impl ProfileProbe {
+    pub fn is_clean(&self) -> bool {
+        self.snapshot_error.is_none() && self.uninspectable == 0
+    }
+
+    /// A clean answer of "nothing of ours is left".
+    pub fn is_clean_and_empty(&self) -> bool {
+        self.is_clean() && self.pids.is_empty()
+    }
+}
+
+/// Inspect every `msedgewebview2.exe` process for this app's WebView2 profile, keeping the
+/// distinction between "gone", "not ours" and "could not be inspected".
+pub fn probe_webview_processes(profile: &Path) -> ProfileProbe {
+    let processes = match windows_process::list_processes() {
+        Ok(processes) => processes,
+        Err(error) => {
+            return ProfileProbe {
+                snapshot_error: Some(error.to_string()),
+                ..ProfileProbe::default()
+            }
+        }
+    };
+    let mut probe = ProfileProbe::default();
+    for process in processes
+        .into_iter()
+        .filter(|process| process.exe.eq_ignore_ascii_case("msedgewebview2.exe"))
+    {
+        match windows_process::process_command_line_result(process.pid) {
+            Ok(command_line) => {
+                if command_line_uses_profile(&command_line, profile) {
+                    probe.pids.push(process.pid);
+                }
+            }
+            // Exited between the snapshot and the query: it cannot be holding the profile any more.
+            Err(error) if error.is_gone() => {}
+            Err(_) => probe.uninspectable += 1,
+        }
+    }
+    probe
+}
+
+/// Wait for the old WebView2 processes to let go of the profile before the new app starts.
+///
+/// WebView2 keeps the user-data folder's singleton lock for up to ~65 s after its browser process
+/// went away; launching the new app inside that window makes its first `CreateCoreWebView2` block
+/// and the console opens blank, which looks exactly like the bug the user upgraded to fix. Bounded
+/// by `WEBVIEW_EXIT_WAIT`: a hung helper must never turn into a failed upgrade.
+pub fn wait_for_webview_exit(profile: &Path) -> ProfileWait {
+    wait_for_webview_probes(
+        || probe_webview_processes(profile),
+        WEBVIEW_EXIT_WAIT,
+        WEBVIEW_EXIT_POLL,
+    )
+}
+
+/// The wait loop behind [`wait_for_webview_exit`], driven by `probe` so the retry / timeout
+/// behaviour is unit-tested without inspecting the real process table.
+///
+/// Only a **clean** snapshot that finds no matching process ends the wait early. A failed snapshot
+/// is retried (it proves nothing), and an uninspectable `msedgewebview2.exe` keeps the wait going: it
+/// might be the one holding the profile, so the answer "gone" is unproven.
+fn wait_for_webview_probes<P>(mut probe: P, wait: Duration, poll: Duration) -> ProfileWait
+where
+    P: FnMut() -> ProfileProbe,
+{
+    let start = Instant::now();
+    let mut most_seen = 0usize;
+    let mut snapshot_errors = 0u32;
+    let mut uninspectable_count = 0usize;
+    let mut last_snapshot_error: Option<String> = None;
+    loop {
+        let attempt = probe();
+        if let Some(error) = attempt.snapshot_error.clone() {
+            snapshot_errors += 1;
+            last_snapshot_error = Some(error);
+        } else {
+            most_seen = most_seen.max(attempt.pids.len());
+            uninspectable_count = uninspectable_count.max(attempt.uninspectable);
+            if attempt.is_clean_and_empty() {
+                return ProfileWait {
+                    processes: most_seen,
+                    waited_ms: start.elapsed().as_millis() as u64,
+                    timed_out: false,
+                    snapshot_errors,
+                    uninspectable_count,
+                    inspection_incomplete: false,
+                    last_snapshot_error,
+                };
+            }
+        }
+        if start.elapsed() >= wait {
+            // Ending here is honest: either processes were still there, or the process table could
+            // not be read well enough to say they were gone.
+            return ProfileWait {
+                processes: most_seen,
+                waited_ms: start.elapsed().as_millis() as u64,
+                timed_out: true,
+                snapshot_errors,
+                uninspectable_count,
+                inspection_incomplete: !attempt.is_clean(),
+                last_snapshot_error,
+            };
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// The `webview2_wait` block of `restart_plan.result.json`.
+pub fn webview_wait_report(wait: Option<&ProfileWait>) -> serde_json::Value {
+    match wait {
+        Some(wait) => json!({
+            "processes": wait.processes,
+            "waited_ms": wait.waited_ms,
+            "timed_out": wait.timed_out,
+            "snapshot_errors": wait.snapshot_errors,
+            "uninspectable_count": wait.uninspectable_count,
+            "inspection_incomplete": wait.inspection_incomplete,
+            "last_snapshot_error": wait.last_snapshot_error,
+        }),
+        None => json!({
+            "processes": 0,
+            "waited_ms": 0,
+            "timed_out": false,
+            "snapshot_errors": 0,
+            "uninspectable_count": 0,
+            "inspection_incomplete": false,
+            "last_snapshot_error": serde_json::Value::Null,
+        }),
+    }
+}
+
+/// `wait_for_webview_exit` against the profile this build actually uses, logging the outcome. Returns
+/// `None` when the profile directory cannot be resolved (nothing to wait for, nothing to report).
+fn release_webview_profile() -> Option<ProfileWait> {
+    let profile = webview_user_data_dir()?;
+    let report = wait_for_webview_exit(&profile);
+    if report.processes == 0 && report.snapshot_errors == 0 && report.uninspectable_count == 0 {
+        // The common case: nothing of the old app's WebView2 was left behind.
+        return Some(report);
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "apply-update: waited {} ms for WebView2 to release {} ({} process{}, {})",
+        report.waited_ms,
+        profile.display(),
+        report.processes,
+        if report.processes == 1 { "" } else { "es" },
+        if report.timed_out { "timed out, launching anyway" } else { "gone" }
+    );
+    if report.inspection_incomplete {
+        // An empty answer we could not prove is not the same as a clean exit: say so, instead of
+        // letting a blank first window look like a mystery.
+        let _ = writeln!(
+            std::io::stderr(),
+            "apply-update: WARNING the WebView2 process inspection was incomplete ({} failed snapshot(s), {} uninspectable msedgewebview2.exe process(es){})",
+            report.snapshot_errors,
+            report.uninspectable_count,
+            report
+                .last_snapshot_error
+                .as_deref()
+                .map(|error| format!(", last error: {error}"))
+                .unwrap_or_default()
+        );
+    } else if report.snapshot_errors > 0 || report.uninspectable_count > 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "apply-update: WARNING {} failed snapshot(s) and {} uninspectable msedgewebview2.exe process(es) were retried before the profile was verified free",
+            report.snapshot_errors,
+            report.uninspectable_count
+        );
+    }
+    Some(report)
+}
+
 /// Best-effort cleanup of `%TEMP%\hub-update-helper-*.exe` older than an hour. A running helper
 /// cannot be deleted on Windows, so an in-flight upgrade is never disturbed.
 pub fn cleanup_stale_helpers() {
@@ -1242,7 +1498,9 @@ pub fn apply_update(plan_path: &Path) -> i32 {
     }
     let _ = writeln!(std::io::stderr(), "apply-update: target verified {target_sha}");
 
-    // 3. Start the new app and wait for its hub.
+    // 3. Start the new app and wait for its hub. Before that, let the old WebView2 processes
+    //    release the profile singleton: the new window would otherwise open blank for ~65 s.
+    let webview_wait = release_webview_profile();
     if let Err(message) = launch_app_detached(&paths.target) {
         return rollback_and_relaunch(plan_path, &plan, &paths, "launch_failed", &message);
     }
@@ -1267,6 +1525,7 @@ pub fn apply_update(plan_path: &Path) -> i32 {
                     "new_hub_pid": hub_pid,
                     "resume_failed": resume_failed,
                     "restart_status": status,
+                    "webview2_wait": webview_wait_report(webview_wait.as_ref()),
                     "message": if resume_failed > 0 {
                         "新版本已启动；个别会话恢复失败，未回滚 EXE".to_string()
                     } else {
@@ -1306,6 +1565,212 @@ mod tests {
 
     fn write(path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn the_webview_profile_lives_under_local_app_data_beside_the_identifier() {
+        let local = Path::new(r"C:\Users\someone\AppData\Local");
+        let profile = webview_user_data_dir_in(local, "local.mcp-agent-hub.portable");
+        assert_eq!(
+            profile,
+            Path::new(r"C:\Users\someone\AppData\Local\local.mcp-agent-hub.portable\EBWebView")
+        );
+        // The folder Tauri names after the identifier, never after the package.
+        assert!(profile.ends_with("EBWebView"));
+    }
+
+    #[test]
+    fn only_this_apps_webview2_command_lines_match_the_profile() {
+        let profile = webview_user_data_dir_in(
+            Path::new(r"C:\Users\someone\AppData\Local"),
+            "local.mcp-agent-hub.desktop",
+        );
+        let ours = r#""C:\Program Files (x86)\Microsoft\EdgeWebView\Application\120.0.0.0\msedgewebview2.exe" --embedded-browser-webview=1 --user-data-dir="C:\Users\someone\AppData\Local\local.mcp-agent-hub.desktop\EBWebView" --no-sandbox"#;
+        assert!(command_line_uses_profile(ours, &profile));
+        // WebView2 accepts both separators and any casing; quotes may be absent.
+        assert!(command_line_uses_profile(
+            "msedgewebview2.exe --user-data-dir=c:/USERS/SOMEONE/appdata/local/LOCAL.MCP-AGENT-HUB.DESKTOP/ebwebview",
+            &profile
+        ));
+        // A verbatim path and a trailing separator on the argument.
+        assert!(command_line_uses_profile(
+            r"msedgewebview2.exe --user-data-dir=\\?\C:\Users\someone\AppData\Local\local.mcp-agent-hub.desktop\EBWebView\",
+            &profile
+        ));
+        // Another app's profile, even one whose identifier starts the same.
+        assert!(!command_line_uses_profile(
+            r"msedgewebview2.exe --user-data-dir=C:\Users\someone\AppData\Local\local.mcp-agent-hub.desktop-preview\EBWebView",
+            &profile
+        ));
+        assert!(!command_line_uses_profile(
+            r"msedgewebview2.exe --user-data-dir=C:\Users\someone\AppData\Local\local.other-app.desktop\EBWebView",
+            &profile
+        ));
+        // Edge itself, and a WebView2 host that never names a profile.
+        assert!(!command_line_uses_profile(
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe --profile-directory=Default",
+            &profile
+        ));
+        assert!(!command_line_uses_profile("msedgewebview2.exe --embedded-browser-webview=1", &profile));
+        // The identifier folder alone is not the profile: the lock is on the EBWebView folder.
+        assert!(!command_line_uses_profile(
+            r"msedgewebview2.exe --user-data-dir=C:\Users\someone\AppData\Local\local.mcp-agent-hub.desktop",
+            &profile
+        ));
+        assert!(!command_line_uses_profile("anything", Path::new("")));
+    }
+
+    #[test]
+    fn the_profile_wait_reports_nothing_to_wait_for_without_matches() {
+        // A profile path no process can be using: the wait must return immediately, not consume its
+        // timeout, and must report "no processes" so the upgrade log stays quiet.
+        let profile = webview_user_data_dir_in(
+            Path::new(r"C:\definitely-not-a-profile"),
+            "no-such-identifier-for-tests",
+        );
+        let wait = wait_for_webview_exit(&profile);
+        assert_eq!(wait.processes, 0);
+        assert!(!wait.timed_out);
+        assert!(wait.waited_ms < WEBVIEW_EXIT_WAIT.as_millis() as u64);
+    }
+
+    #[test]
+    fn a_clean_empty_snapshot_means_the_profile_is_free() {
+        let wait = wait_for_webview_probes(
+            ProfileProbe::default,
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+        );
+        assert!(!wait.timed_out);
+        assert_eq!(wait.processes, 0);
+        assert_eq!(wait.snapshot_errors, 0);
+        assert_eq!(wait.uninspectable_count, 0);
+        assert!(!wait.inspection_incomplete);
+        assert_eq!(wait.last_snapshot_error, None);
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_retried_and_never_reported_as_a_clean_exit() {
+        let attempts = std::cell::Cell::new(0u32);
+        let wait = wait_for_webview_probes(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 2 {
+                    ProfileProbe {
+                        snapshot_error: Some("CreateToolhelp32Snapshot failed (error 5)".into()),
+                        ..ProfileProbe::default()
+                    }
+                } else {
+                    ProfileProbe::default()
+                }
+            },
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+        );
+        assert!(!wait.timed_out, "the transient failure is retried until it clears");
+        assert_eq!(wait.snapshot_errors, 2, "both failures stay on the record");
+        assert_eq!(
+            wait.last_snapshot_error.as_deref(),
+            Some("CreateToolhelp32Snapshot failed (error 5)")
+        );
+        assert_eq!(wait.processes, 0);
+        assert!(
+            !wait.inspection_incomplete,
+            "a clean snapshot ended the wait, so the answer is proven"
+        );
+    }
+
+    #[test]
+    fn a_persistent_snapshot_failure_times_out_instead_of_claiming_a_clean_exit() {
+        let wait = wait_for_webview_probes(
+            || ProfileProbe {
+                snapshot_error: Some("CreateToolhelp32Snapshot failed (error 1450)".into()),
+                ..ProfileProbe::default()
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+        assert!(wait.timed_out);
+        assert!(wait.snapshot_errors >= 1);
+        assert_eq!(wait.processes, 0);
+        assert!(
+            wait.inspection_incomplete,
+            "an unreadable process table can never prove the profile is free"
+        );
+        assert_eq!(
+            wait.last_snapshot_error.as_deref(),
+            Some("CreateToolhelp32Snapshot failed (error 1450)")
+        );
+    }
+
+    #[test]
+    fn an_uninspectable_webview2_process_is_not_treated_as_gone() {
+        let wait = wait_for_webview_probes(
+            || ProfileProbe {
+                pids: Vec::new(),
+                uninspectable: 1,
+                snapshot_error: None,
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+        assert!(wait.timed_out, "it might be the process holding the profile");
+        assert_eq!(wait.uninspectable_count, 1);
+        assert!(wait.inspection_incomplete);
+        assert_eq!(wait.snapshot_errors, 0);
+    }
+
+    #[test]
+    fn a_profile_holder_is_waited_for_and_reported() {
+        let attempts = std::cell::Cell::new(0u32);
+        let wait = wait_for_webview_probes(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 2 {
+                    ProfileProbe {
+                        pids: vec![1234, 5678],
+                        uninspectable: 0,
+                        snapshot_error: None,
+                    }
+                } else {
+                    ProfileProbe::default()
+                }
+            },
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+        );
+        assert!(!wait.timed_out);
+        assert_eq!(wait.processes, 2);
+        assert_eq!(wait.snapshot_errors, 0);
+        assert_eq!(wait.uninspectable_count, 0);
+    }
+
+    #[test]
+    fn the_wait_report_carries_the_inspection_diagnostics() {
+        let wait = ProfileWait {
+            processes: 2,
+            waited_ms: 400,
+            timed_out: true,
+            snapshot_errors: 3,
+            uninspectable_count: 1,
+            inspection_incomplete: true,
+            last_snapshot_error: Some("snapshot failed".into()),
+        };
+        let report = webview_wait_report(Some(&wait));
+        assert_eq!(report["processes"], 2);
+        assert_eq!(report["waited_ms"], 400);
+        assert_eq!(report["timed_out"], true);
+        assert_eq!(report["snapshot_errors"], 3);
+        assert_eq!(report["uninspectable_count"], 1);
+        assert_eq!(report["inspection_incomplete"], true);
+        assert_eq!(report["last_snapshot_error"], "snapshot failed");
+
+        // No profile to resolve still writes the block, and it never claims a verified exit.
+        let absent = webview_wait_report(None);
+        assert_eq!(absent["processes"], 0);
+        assert_eq!(absent["timed_out"], false);
+        assert_eq!(absent["inspection_incomplete"], false);
+        assert!(absent["last_snapshot_error"].is_null());
     }
 
     #[test]

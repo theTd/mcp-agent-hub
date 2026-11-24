@@ -293,7 +293,6 @@ pub fn process_is_alive(identity: ProcessIdentity) -> bool {
     creation_time(identity.pid) == Some(identity.creation_time)
 }
 
-#[cfg(any(feature = "portable", test))]
 #[repr(C)]
 struct UnicodeString {
     length: u16,
@@ -304,7 +303,6 @@ struct UnicodeString {
 // `PROCESSINFOCLASS` 60 (`ProcessCommandLineInformation`) has no kernel32 wrapper. With
 // `PROCESS_QUERY_LIMITED_INFORMATION` it returns a UNICODE_STRING followed by the UTF-16 command
 // line inside the caller's buffer.
-#[cfg(any(feature = "portable", test))]
 #[link(name = "ntdll")]
 extern "system" {
     fn NtQueryInformationProcess(
@@ -316,22 +314,71 @@ extern "system" {
     ) -> i32;
 }
 
-#[cfg(any(feature = "portable", test))]
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
 
+/// Why a process command line could not be read.
+///
+/// The distinction matters for the upgrade helper: "the process is already gone" is a clean answer
+/// (it released whatever it held), while "the process is there but could not be inspected" proves
+/// nothing at all and must never be reported as "nothing running".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandLineError {
+    /// The process no longer exists, or has already exited.
+    Gone,
+    /// `OpenProcess` failed even though the process is still in the snapshot (typically access
+    /// denied, e.g. another user's process). Carries the Win32 error code.
+    OpenFailed(u32),
+    /// The command line query itself failed (`NtQueryInformationProcess` or a malformed answer).
+    QueryFailed(String),
+}
+
+impl CommandLineError {
+    /// True when this is a real "the process is gone" answer rather than "we could not look".
+    pub fn is_gone(&self) -> bool {
+        matches!(self, CommandLineError::Gone)
+    }
+}
+
+impl std::fmt::Display for CommandLineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandLineError::Gone => write!(f, "the process is gone"),
+            CommandLineError::OpenFailed(code) => write!(f, "OpenProcess failed (error {code})"),
+            CommandLineError::QueryFailed(detail) => write!(f, "command line query failed ({detail})"),
+        }
+    }
+}
+
 /// The full command line of `pid` (UTF-16 decoded lossily), or `None` for a protected, exited or
-/// inaccessible process. Used only to tell our own hub processes from unrelated ones.
-#[cfg(any(feature = "portable", test))]
+/// inaccessible process. Used to tell our own hub processes from unrelated ones, and by the upgrade
+/// helper to find the WebView2 processes still holding the app's profile.
+///
+/// Callers that must tell "gone" from "could not look" use [`process_command_line_result`].
+// The plain query has no caller in the default build (its users are the portable runtime and the
+// tests), while the upgrade helper needs the reason a query failed.
+#[allow(dead_code)]
 pub fn process_command_line(pid: u32) -> Option<String> {
+    process_command_line_result(pid).ok()
+}
+
+/// [`process_command_line`], keeping *why* it failed.
+pub fn process_command_line_result(pid: u32) -> Result<String, CommandLineError> {
     // SAFETY: every pointer describes a live local buffer; the process handle is closed here.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return None;
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+            // A PID that is gone makes `OpenProcess` fail too; only a live PID that refuses the
+            // handle is "uninspectable".
+            return Err(if process_exists(pid) {
+                CommandLineError::OpenFailed(code)
+            } else {
+                CommandLineError::Gone
+            });
         }
         if live_creation_time(handle).is_none() {
             CloseHandle(handle);
-            return None;
+            return Err(CommandLineError::Gone);
         }
         let mut needed = 0u32;
         // Any failure that reports the required size is usable; the second call is authoritative.
@@ -344,7 +391,9 @@ pub fn process_command_line(pid: u32) -> Option<String> {
         );
         if needed == 0 {
             CloseHandle(handle);
-            return None;
+            return Err(CommandLineError::QueryFailed(
+                "the API reported no command line size".to_string(),
+            ));
         }
         // Two trailing bytes keep a NUL terminator available even if the API omits one.
         let mut buffer = vec![0u8; needed as usize + 2];
@@ -358,23 +407,34 @@ pub fn process_command_line(pid: u32) -> Option<String> {
         );
         CloseHandle(handle);
         if status != 0 {
-            return None;
+            return Err(CommandLineError::QueryFailed(format!("NTSTATUS {status:#x}")));
         }
         let header = std::ptr::read_unaligned(buffer.as_ptr() as *const UnicodeString);
         let chars = header.length as usize / 2;
         if header.buffer.is_null() || chars == 0 {
-            return None;
+            return Err(CommandLineError::QueryFailed(
+                "the API answered without a command line".to_string(),
+            ));
         }
         let start = buffer.as_ptr() as usize;
         let text = header.buffer as usize;
         if text < start || text + chars * 2 > start + buffer.len() {
-            return None;
+            return Err(CommandLineError::QueryFailed(
+                "the command line buffer is malformed".to_string(),
+            ));
         }
-        Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+        Ok(String::from_utf16_lossy(std::slice::from_raw_parts(
             header.buffer,
             chars,
         )))
     }
+}
+
+/// Whether `pid` is in the current snapshot at all (existence only, no handle needed).
+pub fn process_exists(pid: u32) -> bool {
+    list_processes()
+        .map(|processes| processes.iter().any(|process| process.pid == pid))
+        .unwrap_or(false)
 }
 
 /// The full image path of `pid`, or `None` when the process is gone or inaccessible.

@@ -22,6 +22,7 @@ use crate::owned_hub::{self, OwnedHub, ReadyError, PORT_RELEASE_WAIT};
 use crate::owned_hub::PortProbe;
 use crate::tray_menu;
 use crate::update_helper::{self, RestartPlan};
+use crate::webview_recovery::{self, PendingRecovery, Trigger};
 use crate::windows_process;
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
@@ -159,7 +160,41 @@ struct ShellState {
     owned: Option<OwnedHub>,
     splash: SplashView,
     counts: SessionCounts,
-    pending_session: Option<String>,
+    pending_session: PendingConsoleSession,
+}
+
+/// The console session a `"main"` window should open next.
+///
+/// The *latest* request wins, and the request is **consumed** by whoever navigates the window. That
+/// is what keeps a stale session from being replayed: a rebuild for session A that is overtaken by a
+/// request for session B navigates the new window to B, and a later "just open the console" cannot
+/// resurrect A out of a snapshot nobody consumed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingConsoleSession {
+    session: Option<String>,
+}
+
+impl PendingConsoleSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember the session a window should open. Only a real session id overwrites; a plain
+    /// "open the console" (`None`) must not erase a session that is still waiting for its window.
+    pub fn request(&mut self, session: Option<&str>) {
+        if let Some(session) = session {
+            self.session = Some(session.to_string());
+        }
+    }
+
+    /// Consume the session: the window that navigates now owns it.
+    pub fn take(&mut self) -> Option<String> {
+        self.session.take()
+    }
+
+    pub fn peek(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
 }
 
 /// A hub that answers: who to talk to, and the generation the caller's cursor belongs to.
@@ -183,32 +218,114 @@ pub fn is_splash_url(url: &Url) -> bool {
     url.scheme() == "tauri" || url.host_str() == Some("tauri.localhost")
 }
 
-pub fn reveal_main_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-        if let Ok(hwnd) = w.hwnd() {
-            let raw = hwnd.0;
-            // SAFETY: `raw` is the live main window HWND; restore if minimized and pulse topmost
-            // so Windows brings the window in front of other windows when activated from a toast/tray.
-            unsafe {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    BringWindowToTop, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
-                    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-                    SW_RESTORE, SW_SHOW,
-                };
-                if IsIconic(raw) != 0 {
-                    ShowWindow(raw, SW_RESTORE);
-                } else {
-                    ShowWindow(raw, SW_SHOW);
+/// Append a line to `desktop.log` through the app's shell, from places that only hold the app.
+pub fn log_from(app: &AppHandle, line: &str) {
+    if let Some(shell) = app.try_state::<Arc<HubShell>>() {
+        shell.log(line);
+    }
+}
+
+/// The URL a **newly built** `"main"` window should load right now, consuming the session that was
+/// waiting for it: the console (on the latest pending session) while the hub answers, otherwise
+/// `None` — the bundled splash / error view.
+///
+/// Called by the rebuild worker *after* the replacement window exists and before it navigates, so a
+/// session that arrived while the rebuild was in flight wins over the snapshot taken when it
+/// started, and a stale session is left nowhere to be replayed from.
+pub fn take_main_target(app: &AppHandle) -> Option<Url> {
+    app.try_state::<Arc<HubShell>>()
+        .and_then(|shell| shell.take_console_target())
+}
+
+/// Bring the `"main"` window back — and repair its WebView2 surface on the way, because a window
+/// that was merely shown again after a GPU/renderer crash stays blank forever.
+///
+/// Order matters: a pending `Rebuild` (or a missing window) is rebuilt instead of revealed; a
+/// pending `Reload` reloads the page first and escalates to a rebuild when WebView2 refuses it.
+/// Returns `false` when a rebuild was started, so the caller knows there is no live window to
+/// navigate right now — the rebuilt one loads the console itself.
+pub fn reveal_main_window(app: &AppHandle) -> bool {
+    if webview_recovery::is_rebuilding() {
+        // The rebuild reveals the window when it is done; nothing to do on this path.
+        return false;
+    }
+    match webview_recovery::take_pending() {
+        PendingRecovery::Rebuild => {
+            log_from(app, "reveal: a WebView2 failure still needs a rebuild; rebuilding \"main\"");
+            webview_recovery::rebuild_main_window(app, true, Trigger::Manual, "reveal_pending_rebuild");
+            return false;
+        }
+        PendingRecovery::Reload => {
+            if let Some(window) = app.get_webview_window("main") {
+                log_from(app, "reveal: reloading \"main\" for a pending renderer recovery");
+                match webview_recovery::reload_webview(app, &window) {
+                    Ok(()) => {
+                        show_main_window(&window);
+                        webview_recovery::resync_surface(app, &window);
+                        return true;
+                    }
+                    Err(error) => {
+                        // The reload could not even be started: a rebuild is the only repair left.
+                        log_from(app, &format!("reveal: reloading \"main\" failed ({error}); rebuilding it"));
+                        webview_recovery::record_reload_failure(app);
+                        webview_recovery::rebuild_main_window(
+                            app,
+                            true,
+                            Trigger::Manual,
+                            "reveal_reload_failed",
+                        );
+                        return false;
+                    }
                 }
-                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
-                SetWindowPos(raw, HWND_TOPMOST, 0, 0, 0, 0, flags);
-                SetForegroundWindow(raw);
-                BringWindowToTop(raw);
-                SetWindowPos(raw, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
             }
+            log_from(app, "reveal: pending reload but \"main\" is gone; rebuilding it");
+            webview_recovery::rebuild_main_window(
+                app,
+                true,
+                Trigger::Manual,
+                "reveal_reload_without_window",
+            );
+            return false;
+        }
+        PendingRecovery::None => {}
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        log_from(app, "reveal: \"main\" does not exist; rebuilding it");
+        webview_recovery::rebuild_main_window(app, true, Trigger::Manual, "reveal_missing_window");
+        return false;
+    };
+    show_main_window(&window);
+    // Re-create the D3D surface and re-apply the host rect: the repair a wedged compositor needs.
+    webview_recovery::resync_surface(app, &window);
+    true
+}
+
+/// Show, restore and raise the window. Raw Win32 on top of the Tauri calls so a minimized window
+/// really comes back in front of whatever the user was looking at.
+fn show_main_window(w: &tauri::WebviewWindow) {
+    let _ = w.show();
+    let _ = w.unminimize();
+    let _ = w.set_focus();
+    if let Ok(hwnd) = w.hwnd() {
+        let raw = hwnd.0;
+        // SAFETY: `raw` is the live main window HWND; restore if minimized and pulse topmost
+        // so Windows brings the window in front of other windows when activated from a toast/tray.
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                BringWindowToTop, IsIconic, SetForegroundWindow, SetWindowPos, ShowWindow,
+                HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+                SW_SHOW,
+            };
+            if IsIconic(raw) != 0 {
+                ShowWindow(raw, SW_RESTORE);
+            } else {
+                ShowWindow(raw, SW_SHOW);
+            }
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+            SetWindowPos(raw, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            SetForegroundWindow(raw);
+            BringWindowToTop(raw);
+            SetWindowPos(raw, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
         }
     }
 }
@@ -249,7 +366,7 @@ impl HubShell {
                     console_url: None,
                 },
                 counts: SessionCounts::default(),
-                pending_session: None,
+                pending_session: PendingConsoleSession::new(),
             }),
             ops: tokio::sync::Mutex::new(()),
             generation,
@@ -326,11 +443,17 @@ impl HubShell {
     }
 
     /// Show the window; when the hub answers, load the console (optionally on one session).
+    ///
+    /// The window is revealed first and that step is authoritative: it may reload the page, rebuild
+    /// a wedged `"main"` window, or just repair the WebView2 surface (see `reveal_main_window`).
     pub fn open_console(&self, app: &AppHandle, session_id: Option<&str>) {
-        if let Some(sid) = session_id {
-            self.st().pending_session = Some(sid.to_string());
+        self.st().pending_session.request(session_id);
+        if !reveal_main_window(app) {
+            // A rebuild owns the window from here: it builds the new one and navigates it to the
+            // console itself — consuming the pending session at that moment, so a session asked
+            // for while the rebuild runs (including this one) is what the new window loads.
+            return;
         }
-        reveal_main_window(app);
         let Some(cfg) = self.ready_config() else {
             return;
         };
@@ -359,6 +482,35 @@ impl HubShell {
                 self.log(&format!("navigate main window: {url}"));
                 let _ = w.navigate(url);
             }
+        }
+    }
+
+    /// The console URL a *newly built* window should load, consuming the session that was waiting
+    /// for it (see [`take_main_target`]) — or `None` while the hub is not answering, where the
+    /// window shows the splash / the error view.
+    pub fn take_console_target(&self) -> Option<Url> {
+        let cfg = self.ready_config()?;
+        let session = self.st().pending_session.take();
+        Url::parse(&cfg.console_url(session.as_deref())).ok()
+    }
+
+    /// Tray 重建控制台窗口 / the 1-click escape hatch for a blank window: throw the WebView2 host
+    /// away, build a fresh `"main"` window pointed at the current state, and reveal it.
+    ///
+    /// The hub backend, its sessions and the owned process are never touched — a running subagent
+    /// keeps running while the window heals.
+    pub fn rebuild_console_window(&self, app: &AppHandle, reason: &str) {
+        self.log(&format!("rebuild console window requested ({reason})"));
+        // Informational: the worker consumes the request once the new window exists, so a session
+        // asked for in the meantime replaces this one.
+        if let Some(session) = self.st().pending_session.peek() {
+            self.log(&format!(
+                "rebuild console window: the new window will open session {session} unless a newer one arrives"
+            ));
+        }
+        let scheduled = webview_recovery::rebuild_main_window(app, true, Trigger::Manual, reason);
+        if !scheduled {
+            self.log("rebuild console window: another rebuild is already in flight");
         }
     }
 
@@ -619,8 +771,7 @@ impl HubShell {
 
     /// Load the console without forcing a hidden window into view.
     fn open_console_quietly(&self, app: &AppHandle, cfg: &HubConfig) {
-        let pending = self.st().pending_session.take();
-        if let (Some(w), Ok(url)) = (
+        let pending = self.st().pending_session.take();        if let (Some(w), Ok(url)) = (
             app.get_webview_window("main"),
             Url::parse(&cfg.console_url(pending.as_deref())),
         ) {
@@ -1489,6 +1640,57 @@ mod tests {
         assert!(shell.ready_target().is_none());
     }
 
+    #[test]
+    fn pending_session_is_consumed_by_the_window_that_navigates() {
+        let mut pending = PendingConsoleSession::new();
+        assert!(pending.peek().is_none());
+        // "just open the console" never creates a request of its own.
+        pending.request(None);
+        assert_eq!(pending.take(), None);
+        pending.request(Some("session-a"));
+        assert_eq!(pending.peek(), Some("session-a"));
+        // A rebuilt window navigates: it consumes the session, so a later open_console(None) has
+        // nothing stale left to replay.
+        assert_eq!(pending.take(), Some("session-a".to_string()));
+        assert_eq!(pending.take(), None, "a stale session is never replayed");
+        assert!(pending.peek().is_none());
+    }
+
+    #[test]
+    fn a_session_that_arrives_in_flight_wins_over_the_one_being_rebuilt() {
+        let mut pending = PendingConsoleSession::new();
+        // A rebuild for session A starts and records its request ...
+        pending.request(Some("session-a"));
+        // ... and session B arrives while the window is still being rebuilt: the latest wins.
+        pending.request(Some("session-b"));
+        // The new window resolves its target *after* it exists and consumes B — never A.
+        assert_eq!(pending.take(), Some("session-b".to_string()));
+        assert_eq!(pending.take(), None);
+        // A plain `None` never erases a session that is still waiting for its window.
+        pending.request(Some("session-c"));
+        pending.request(None);
+        assert_eq!(pending.peek(), Some("session-c"));
+        assert_eq!(pending.take(), Some("session-c".to_string()));
+    }
+
+    #[test]
+    fn a_new_window_target_consumes_the_pending_session_exactly_once() {
+        let shell = HubShell::new(std::env::temp_dir());
+        shell.st().config = Some(cfg(4444));
+        shell.mark_ready_state(HubMode::Owned, &cfg(4444));
+        shell.st().pending_session.request(Some("session-a"));
+        let target = shell.take_console_target().expect("the hub answers");
+        assert_eq!(target.as_str(), "http://127.0.0.1:4444/?session=session-a");
+        // Consumed: a second window would open the plain console, not session A again.
+        let next = shell.take_console_target().expect("the hub still answers");
+        assert_eq!(next.as_str(), "http://127.0.0.1:4444/");
+        // While the hub does not answer there is no console URL, and the request is left alone.
+        shell.set_starting_state("正在启动 Hub…", "");
+        shell.st().pending_session.request(Some("session-b"));
+        assert_eq!(shell.take_console_target(), None);
+        assert_eq!(shell.st().pending_session.peek(), Some("session-b"));
+    }
+
     fn plan(mode: &str, app_pid: u32, expires_at: f64) -> RestartPlan {
         RestartPlan {
             version: update_helper::PLAN_VERSION,
@@ -1560,8 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reused_app_pid_never_turns_a_crash_into_a_planned_exit() {
-        let me = std::process::id();
+    fn a_reused_app_pid_never_turns_a_crash_into_a_planned_exit() {        let me = std::process::id();
         let now = 1_795_470_500.0;
         let mut reuse = plan("replace-exe", me, now + 100.0);
         reuse.app_creation_time = 7;
